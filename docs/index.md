@@ -1,6 +1,6 @@
 ---
 layout: home
-description: The zero-friction workflow for git worktrees and tmux, kitty, WezTerm, or Zellij
+description: Terminal-first workflow for parallel AI agents using git worktrees
 ---
 
 <div class="mono-editorial">
@@ -13,8 +13,8 @@ description: The zero-friction workflow for git worktrees and tmux, kitty, WezTe
   <div class="ed-container ed-hero-inner">
     <div class="ed-hero-text">
       <span class="ed-hero-name">workmux</span>
-      <h1 class="ed-hero-headline">Ship features in parallel from terminal.</h1>
-      <p class="ed-hero-tagline">workmux creates an isolated worktree and tmux tab per task. Run multiple agents in parallel without conflicts.</p>
+      <h1 class="ed-hero-headline">Terminal-first workflow for parallel AI agents.</h1>
+      <p class="ed-hero-tagline">Your terminal, now with parallel agents. Each task gets its own worktree and a tab. Let agents work conflict-free.</p>
       <div class="ed-hero-actions">
         <a href="/guide/quick-start" class="ed-btn-primary">Get started</a>
         <a href="https://github.com/raine/workmux" class="ed-btn-github">GitHub</a>
@@ -37,7 +37,7 @@ description: The zero-friction workflow for git worktrees and tmux, kitty, WezTe
           <span class="ed-why-icon"><svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="6" y1="3" x2="6" y2="15"></line><circle cx="18" cy="6" r="3"></circle><circle cx="6" cy="18" r="3"></circle><path d="M18 9a9 9 0 0 1-9 9"></path></svg></span>
           <h3>Parallel workflows</h3>
         </div>
-        <p>Work on multiple features, hotfixes, or AI agents at the same time. No stashing, no branch switching, no conflicts.</p>
+        <p>Work on features side by side. No stashing, no branch switching, no conflicts.</p>
       </div>
       <div class="ed-why-item">
         <div class="ed-why-header">

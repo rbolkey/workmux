@@ -307,7 +307,7 @@ Each pane supports:
 - `<agent>`: resolves to the configured agent (from `agent` config or `--agent`
   flag)
 
-Built-in agents (`claude`, `gemini`, `codex`, `opencode`) are auto-detected when
+Built-in agents (`claude`, `gemini`, `codex`, `opencode`, `kiro-cli`, `vibe`) are auto-detected when
 used as literal commands and receive prompt injection automatically, without
 needing the `<agent>` placeholder or a matching `agent` config:
 
@@ -662,7 +662,7 @@ done
 
 When you provide a prompt via `--prompt`, `--prompt-file`, or `--prompt-editor`,
 workmux automatically injects the prompt into panes running the configured agent
-command (e.g., `claude`, `codex`, `opencode`, `gemini`, or whatever you've set
+command (e.g., `claude`, `codex`, `opencode`, `gemini`, `kiro-cli`, or whatever you've set
 via the `agent` config or `--agent` flag) without requiring any `.workmux.yaml`
 changes:
 
@@ -681,7 +681,7 @@ The `--auto-name` (`-A`) flag generates a branch name from your prompt using an
 LLM. The tool used depends on your configuration:
 
 1. `auto_name.command` is set: uses that command as-is
-2. `config.agent` is a known agent (`claude`, `gemini`, `codex`, `opencode`):
+2. `config.agent` is a known agent (`claude`, `gemini`, `codex`, `opencode`, `kiro-cli`, `vibe`):
    uses the agent's CLI with a fast/cheap model
 3. Neither: falls back to the [`llm`](https://llm.datasette.io/) CLI tool
 
@@ -1586,12 +1586,19 @@ at-a-glance visibility into what the agent in each window doing.
 - 💬 = agent is waiting for user input
 - ✅ = agent finished (auto-clears on window focus)
 
-**Note**: Currently Claude Code, [OpenCode](https://opencode.ai/), and
-[Copilot CLI](https://github.com/github/copilot-cli) support hooks that enable
-this functionality. Gemini's support is
-[on the way](https://github.com/google-gemini/gemini-cli/issues/9070). Codex
-support can be tracked in
-[this issue](https://github.com/openai/codex/issues/2109).
+| Agent       | Status                                                                 |
+| ----------- | ---------------------------------------------------------------------- |
+| Claude Code | ✅ Supported                                                           |
+| Copilot CLI | ✅ Supported\*                                                         |
+| OpenCode    | ✅ Supported                                                           |
+| Gemini CLI  | [In progress](https://github.com/google-gemini/gemini-cli/issues/9070) |
+| Kiro        | [Tracking issue](https://github.com/kirodotdev/Kiro/issues/5440)       |
+| Codex       | [Tracking issue](https://github.com/openai/codex/issues/2109)          |
+
+**Notes:**
+
+- **Copilot CLI**: No 💬 waiting state
+- **Kiro**: Hooks support is messy: requires a custom agent since the default can't be edited
 
 ### Setup
 

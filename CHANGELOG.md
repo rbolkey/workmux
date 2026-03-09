@@ -17,6 +17,19 @@ description: Release notes and version history for workmux
 
 # Changelog
 
+## v0.1.133 (2026-03-09)
+
+- Fixed OpenCode plugin's waiting (💬) status not triggering when the agent
+  requests permission or asks a multiple-choice question, caused by event name
+  changes in OpenCode v2 ([#75](https://github.com/raine/workmux/pull/75))
+- Added logging for branch name auto-generation
+
+## v0.1.132 (2026-03-06)
+
+- Added support for Kiro CLI (`kiro-cli`) as a recognized agent
+- Added support for Mistral Vibe (`vibe`) as a recognized agent
+  ([#76](https://github.com/raine/workmux/issues/76))
+
 ## v0.1.131 (2026-03-05)
 
 - New `--session` flag for `workmux open` lets you open worktrees in a dedicated
@@ -29,9 +42,6 @@ description: Release notes and version history for workmux
 - `workmux setup` now offers to install bundled skills (merge, rebase, worktree,
   coordinator) during the first-run wizard
 - Agents can now communicate across projects using the coordinator skill
-- The `claude_default_panes` config option has been renamed to
-  `agent_default_panes` to reflect multi-agent support. Agent-specific default
-  panes are now also read from the global config
 - Fixed session mode not being detected correctly when reopening a worktree
   after a tmux restart
 
