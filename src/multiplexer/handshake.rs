@@ -184,6 +184,104 @@ impl PaneHandshake for TmuxHandshake {
     }
 }
 
+/// cmux wait-for based handshake with latch semantics.
+///
+/// cmux's `wait-for` has latch semantics: a signal persists until consumed by a wait.
+/// This is simpler than tmux's lock/unlock model — no need to pre-lock the channel.
+///
+/// # Protocol
+/// 1. Generate a unique channel name
+/// 2. Start the shell with a script that signals the channel when ready
+/// 3. Wait for the signal (blocks until consumed, with timeout)
+pub struct CmuxHandshake {
+    channel: String,
+}
+
+impl CmuxHandshake {
+    /// Create a new cmux handshake.
+    ///
+    /// Unlike TmuxHandshake, no pre-locking is needed because cmux's wait-for
+    /// has latch semantics (signal persists until consumed).
+    pub fn new() -> Self {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let pid = std::process::id();
+        let channel = format!("wm_ready_{}_{}", pid, nanos);
+        Self { channel }
+    }
+}
+
+impl PaneHandshake for CmuxHandshake {
+    fn wrapper_command(&self, shell: &str) -> String {
+        let escaped_shell = super::util::escape_for_sh_c_inner_single_quote(shell);
+        format!(
+            "sh -c \"cmux wait-for --signal {}; exec '{}' -l\"",
+            self.channel, escaped_shell
+        )
+    }
+
+    fn script_content(&self, shell: &str) -> String {
+        format!(
+            "cmux wait-for --signal {}; exec '{}' -l",
+            self.channel, shell
+        )
+    }
+
+    fn wait(self: Box<Self>) -> Result<()> {
+        debug!(channel = %self.channel, "cmux:handshake start");
+
+        let mut child = std::process::Command::new("cmux")
+            .args(["wait-for", &self.channel, "--timeout", "5"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .context("Failed to spawn cmux wait-for command")?;
+
+        let start = Instant::now();
+        let timeout = Duration::from_secs(HANDSHAKE_TIMEOUT_SECS);
+
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    if status.success() {
+                        debug!(channel = %self.channel, "cmux:handshake success");
+                        return Ok(());
+                    } else {
+                        warn!(channel = %self.channel, status = ?status.code(), "cmux:handshake failed");
+                        return Err(anyhow!(
+                            "Pane handshake failed - cmux wait-for returned error"
+                        ));
+                    }
+                }
+                Ok(None) => {
+                    if start.elapsed() >= timeout {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        warn!(
+                            channel = %self.channel,
+                            timeout_secs = HANDSHAKE_TIMEOUT_SECS,
+                            "cmux:handshake timeout"
+                        );
+                        return Err(anyhow!(
+                            "Pane handshake timed out after {}s - shell may have failed to start",
+                            HANDSHAKE_TIMEOUT_SECS
+                        ));
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                }
+                Err(e) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    warn!(channel = %self.channel, error = %e, "cmux:handshake error");
+                    return Err(anyhow!("Error waiting for pane handshake: {}", e));
+                }
+            }
+        }
+    }
+}
+
 /// Unix named pipe (FIFO) based handshake for backends without wait-for.
 ///
 /// Used by WezTerm and other backends that don't have a built-in synchronization
