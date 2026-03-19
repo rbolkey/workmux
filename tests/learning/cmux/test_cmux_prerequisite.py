@@ -8,7 +8,7 @@ read-screen --lines N.
 import subprocess
 import time
 
-from .helpers import run_cmux, run_cmux_json, wait_for_screen_content
+from .helpers import run_cmux_json, wait_for_screen_content
 
 
 class TestSelectWorkspace:

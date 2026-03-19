@@ -715,9 +715,7 @@ class CmuxEnvironment(MuxEnvironment):
                 if ws["ref"] in self._created_workspace_refs or ws["title"].startswith(
                     "wm-"
                 ):
-                    self._cmux(
-                        "close-workspace", "--workspace", ws["ref"], check=False
-                    )
+                    self._cmux("close-workspace", "--workspace", ws["ref"], check=False)
         except Exception:
             pass
         self._created_workspace_refs.clear()
@@ -826,7 +824,7 @@ class CmuxEnvironment(MuxEnvironment):
 
     def new_window(self, name: Optional[str] = None) -> None:
         """Create a new workspace with optional name."""
-        ws = self._create_workspace(name)
+        self._create_workspace(name)
 
     def configure_default_shell(self, shell: str) -> None:
         """Configure the default shell (via SHELL env var, like WezTerm)."""

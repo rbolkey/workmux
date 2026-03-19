@@ -47,6 +47,7 @@ pub(crate) struct ListWorkspacesResponse {
 }
 
 #[derive(Debug, serde::Deserialize)]
+#[allow(dead_code)]
 pub(crate) struct WorkspaceEntry {
     #[serde(rename = "ref")]
     pub ws_ref: String,
@@ -64,6 +65,7 @@ pub(crate) struct ListPaneSurfacesResponse {
 }
 
 #[derive(Debug, serde::Deserialize)]
+#[allow(dead_code)]
 pub(crate) struct SurfaceEntry {
     #[serde(rename = "ref")]
     pub surface_ref: String,
@@ -78,6 +80,7 @@ pub(crate) struct IdentifyResponse {
 }
 
 #[derive(Debug, serde::Deserialize)]
+#[allow(dead_code)]
 pub(crate) struct IdentifySurface {
     pub surface_ref: String,
     pub workspace_ref: String,
@@ -97,6 +100,7 @@ pub(crate) struct SurfaceHealthResponse {
 }
 
 #[derive(Debug, serde::Deserialize)]
+#[allow(dead_code)]
 pub(crate) struct SurfaceHealthEntry {
     #[serde(rename = "ref")]
     pub surface_ref: String,
@@ -106,12 +110,16 @@ pub(crate) struct SurfaceHealthEntry {
     pub index: u32,
 }
 
+/// Response from `cmux --json list-panes --workspace <ref>`.
+/// Reserved for get_all_live_pane_info batched queries.
 #[derive(Debug, serde::Deserialize)]
+#[allow(dead_code)]
 pub(crate) struct ListPanesResponse {
     pub panes: Vec<PaneEntry>,
 }
 
 #[derive(Debug, serde::Deserialize)]
+#[allow(dead_code)]
 pub(crate) struct PaneEntry {
     #[serde(rename = "ref")]
     pub pane_ref: String,
