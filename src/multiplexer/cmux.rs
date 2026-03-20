@@ -195,11 +195,47 @@ impl CmuxBackend {
     }
 
     /// Look up the workspace ref for a surface ref.
+    ///
+    /// First checks the in-memory cache (populated during create_window/split_pane),
+    /// then falls back to querying cmux directly (needed when a different workmux
+    /// process created the surface, e.g., `set-window-status` after `add`).
     fn workspace_for_surface(&self, surface_ref: &str) -> Option<String> {
-        self.surface_to_workspace
+        // Fast path: in-memory cache
+        if let Some(ws_ref) = self
+            .surface_to_workspace
             .lock()
             .ok()
             .and_then(|map| map.get(surface_ref).cloned())
+        {
+            return Some(ws_ref);
+        }
+
+        // Slow path: query cmux to find which workspace contains this surface
+        if let Ok(ws_ref) = self.discover_workspace_for_surface(surface_ref) {
+            if let Some(ref found) = ws_ref {
+                self.record_surface_mapping(surface_ref, found);
+            }
+            return ws_ref;
+        }
+
+        None
+    }
+
+    /// Query cmux to find which workspace contains a given surface ref.
+    fn discover_workspace_for_surface(&self, surface_ref: &str) -> Result<Option<String>> {
+        let data = Self::list_workspaces()?;
+        for ws in &data.workspaces {
+            if let Ok(surfaces) = Self::list_pane_surfaces(&ws.ws_ref) {
+                if surfaces
+                    .surfaces
+                    .iter()
+                    .any(|s| s.surface_ref == surface_ref)
+                {
+                    return Ok(Some(ws.ws_ref.clone()));
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// Parse `sidebar-state` key=value output into a HashMap.
@@ -607,12 +643,14 @@ impl Multiplexer for CmuxBackend {
         Ok(new_surface_ref)
     }
 
-    fn respawn_pane(&self, pane_id: &str, _cwd: &Path, cmd: Option<&str>) -> Result<String> {
+    fn respawn_pane(&self, pane_id: &str, cwd: &Path, cmd: Option<&str>) -> Result<String> {
         let ws_ref = self
             .workspace_for_surface(pane_id)
             .ok_or_else(|| anyhow!("cmux: no workspace mapping for surface {}", pane_id))?;
 
         if let Some(command) = cmd {
+            // cmux respawn-pane has no --cwd flag, so wrap the command with cd
+            let full_command = format!("cd {} && {}", Self::shell_escape(&cwd.to_string_lossy()), command);
             Cmd::new("cmux")
                 .args(&[
                     "respawn-pane",
@@ -621,7 +659,7 @@ impl Multiplexer for CmuxBackend {
                     "--surface",
                     pane_id,
                     "--command",
-                    command,
+                    &full_command,
                 ])
                 .run()
                 .context("Failed to respawn cmux pane")?;
