@@ -702,9 +702,38 @@ class CmuxEnvironment(MuxEnvironment):
         return {"workspace_ref": ws_ref, "surface_ref": surface_ref}
 
     def start_server(self) -> None:
-        """Create an isolated test workspace."""
+        """Create an isolated test workspace and wait for shell readiness."""
         ws = self._create_workspace(f"test_{self._test_id}")
         self._test_workspace_ref = ws["workspace_ref"]
+        self._test_surface_ref = ws["surface_ref"]
+
+        # Wait for the shell to be ready using a file-based probe.
+        # cmux read-screen --surface is unreliable (returns "Terminal surface
+        # not found"), so we use send + file creation to verify the shell works.
+        import time
+
+        ready_file = self.tmp_path / f".cmux_ready_{self._test_id}"
+        # Retry sending until cmux send succeeds (surface may not be ready yet)
+        for _ in range(50):
+            result = self._cmux(
+                "send",
+                "--workspace",
+                self._test_workspace_ref,
+                "--surface",
+                self._test_surface_ref,
+                f"touch {ready_file}\n",
+                check=False,
+            )
+            if result.returncode == 0:
+                break
+            time.sleep(0.2)
+
+        # Wait for the file to appear (proves the shell executed the command)
+        for _ in range(50):
+            if ready_file.exists():
+                ready_file.unlink()
+                break
+            time.sleep(0.2)
 
     def stop_server(self) -> None:
         """Close all test workspaces."""
@@ -749,41 +778,82 @@ class CmuxEnvironment(MuxEnvironment):
             pass
         return None
 
+    def _resolve_workspace_ref(self, target: str) -> Optional[str]:
+        """Resolve a target name to a workspace ref.
+
+        Handles special targets:
+        - "test:" or "test" → the test workspace
+        - Exact title match → that workspace
+        """
+        if target in ("test:", "test") or target.startswith(f"test_{self._test_id}"):
+            return self._test_workspace_ref
+        ws = self._find_workspace_by_title(target)
+        if ws:
+            return ws["ref"]
+        return None
+
+    def _resolve_surface_ref(self, ws_ref: str) -> Optional[str]:
+        """Get the surface ref for a workspace, using cached test surface if applicable."""
+        if ws_ref == self._test_workspace_ref and hasattr(self, "_test_surface_ref"):
+            return self._test_surface_ref
+        return self._find_surface_for_workspace(ws_ref)
+
     def capture_pane(self, window_name: str) -> Optional[str]:
-        """Capture pane content by workspace title."""
-        ws = self._find_workspace_by_title(window_name)
-        if not ws:
+        """Capture pane content by workspace title.
+
+        Uses read-screen without --surface flag due to cmux regression where
+        --surface causes 'Terminal surface not found' errors. Falls back to
+        selecting the workspace first, then reading the default surface.
+        """
+        ws_ref = self._resolve_workspace_ref(window_name)
+        if not ws_ref:
             return None
-        surface_ref = self._find_surface_for_workspace(ws["ref"])
-        if not surface_ref:
-            return None
+
+        # First try with --workspace only (reads focused surface in that workspace)
         result = self._cmux(
             "read-screen",
             "--workspace",
-            ws["ref"],
-            "--surface",
-            surface_ref,
+            ws_ref,
             check=False,
         )
         if result.returncode == 0:
             return result.stdout
+
+        # Fallback: select workspace, read without args, switch back
+        current = self._find_selected_workspace_ref()
+        self._cmux("select-workspace", "--workspace", ws_ref, check=False)
+        import time
+
+        time.sleep(0.1)
+        result = self._cmux("read-screen", check=False)
+        if current and current != ws_ref:
+            self._cmux("select-workspace", "--workspace", current, check=False)
+        if result.returncode == 0:
+            return result.stdout
+        return None
+
+    def _find_selected_workspace_ref(self) -> Optional[str]:
+        """Find the currently selected workspace ref."""
+        try:
+            data = self._cmux_json("list-workspaces")
+            for ws in data["workspaces"]:
+                if ws["selected"]:
+                    return ws["ref"]
+        except Exception:
+            pass
         return None
 
     def send_keys(self, target: str, text: str, enter: bool = True) -> None:
         """Send text to a pane identified by workspace title.
 
-        For cmux, target is a workspace title. The special 'test:' target
-        sends to the test workspace.
+        For cmux, target is a workspace title. The special 'test:' or 'test'
+        target sends to the test workspace.
         """
-        if target == "test:" or target.startswith(f"test_{self._test_id}"):
-            ws_ref = self._test_workspace_ref
-        else:
-            ws = self._find_workspace_by_title(target)
-            if not ws:
-                raise RuntimeError(f"Workspace '{target}' not found")
-            ws_ref = ws["ref"]
+        ws_ref = self._resolve_workspace_ref(target)
+        if not ws_ref:
+            raise RuntimeError(f"Workspace '{target}' not found")
 
-        surface_ref = self._find_surface_for_workspace(ws_ref)
+        surface_ref = self._resolve_surface_ref(ws_ref)
         if not surface_ref:
             raise RuntimeError(f"No surface in workspace {ws_ref}")
 

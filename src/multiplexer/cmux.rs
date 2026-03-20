@@ -672,13 +672,13 @@ impl Multiplexer for CmuxBackend {
     fn capture_pane(&self, pane_id: &str, lines: u16) -> Option<String> {
         let ws_ref = self.workspace_for_surface(pane_id)?;
 
+        // Try read-screen with --workspace only (without --surface, which can
+        // hit "Terminal surface not found" errors in some cmux versions)
         let result = Cmd::new("cmux")
             .args(&[
                 "read-screen",
                 "--workspace",
                 &ws_ref,
-                "--surface",
-                pane_id,
                 "--lines",
                 &lines.to_string(),
             ])
