@@ -281,29 +281,33 @@ impl Multiplexer for CmuxBackend {
     fn create_window(&self, params: CreateWindowParams) -> Result<String> {
         let full_name = format!("{}{}", params.prefix, params.name);
 
-        // Create workspace (optionally with shell in cwd)
+        // Snapshot workspace refs before creation for reliable diff
+        let before: HashSet<String> = Self::list_workspaces()?
+            .workspaces
+            .iter()
+            .map(|ws| ws.ws_ref.clone())
+            .collect();
+
+        // Create workspace
         let output = Cmd::new("cmux")
             .arg("new-workspace")
             .run_and_capture_stdout()
             .context("Failed to create cmux workspace")?;
 
-        // Parse "OK <UUID>" → UUID
+        // Parse "OK <UUID>" → UUID (validated but not used for lookup)
         let _uuid = output
             .strip_prefix("OK ")
             .ok_or_else(|| anyhow!("Unexpected new-workspace output: {}", output))?
             .trim();
 
-        // Find the new workspace ref via list-workspaces
-        // (new workspace is typically the last one, but we diff to be safe)
-        let data = Self::list_workspaces()?;
-        // The new workspace won't have our title yet (we rename below),
-        // so find it by recency (highest index)
-        let new_ws = data
+        // Find the new workspace ref by diffing before/after
+        let after = Self::list_workspaces()?;
+        let workspace_ref = after
             .workspaces
             .iter()
-            .max_by_key(|ws| ws.index)
-            .ok_or_else(|| anyhow!("No workspaces found after creation"))?;
-        let workspace_ref = new_ws.ws_ref.clone();
+            .find(|ws| !before.contains(&ws.ws_ref))
+            .map(|ws| ws.ws_ref.clone())
+            .ok_or_else(|| anyhow!("Could not identify new workspace after creation"))?;
 
         // Get initial surface ref
         let surfaces = Self::list_pane_surfaces(&workspace_ref)?;
@@ -514,8 +518,9 @@ impl Multiplexer for CmuxBackend {
                 .args(&["select-workspace", "--workspace", &ws_ref])
                 .run()
                 .context("Failed to select cmux workspace")?;
+            // focus-panel needs --workspace for cross-workspace targeting
             Cmd::new("cmux")
-                .args(&["focus-panel", "--panel", pane_id])
+                .args(&["focus-panel", "--panel", pane_id, "--workspace", &ws_ref])
                 .run()
                 .context("Failed to focus cmux panel")?;
         } else {
