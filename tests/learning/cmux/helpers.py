@@ -1,6 +1,7 @@
-"""Shared helpers for cmux learning tests."""
+"""Shared helpers for cmux learning tests and CmuxEnvironment."""
 
 import json
+import re
 import subprocess
 import time
 
@@ -20,6 +21,26 @@ def get_workspace_refs():
     """Return set of current workspace refs."""
     data = run_cmux_json("list-workspaces")
     return {ws["ref"] for ws in data["workspaces"]}
+
+
+def parse_workspace_ref(stdout: str) -> str:
+    """Extract workspace ref from ``cmux new-workspace`` output.
+
+    Parses ``OK workspace:N`` format (cmux >= 0.63.1).
+    Raises RuntimeError if the output doesn't contain a workspace ref.
+    """
+    match = re.search(r"workspace:\d+", stdout)
+    if not match:
+        raise RuntimeError(
+            f"Failed to parse workspace ref from new-workspace output: {stdout!r}"
+        )
+    return match.group(0)
+
+
+def get_initial_surface_ref(workspace_ref: str) -> str:
+    """Return the first surface ref in a workspace."""
+    surfaces = run_cmux_json("list-pane-surfaces", "--workspace", workspace_ref)
+    return surfaces["surfaces"][0]["ref"]
 
 
 def wait_for_screen_content(

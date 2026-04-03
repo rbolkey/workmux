@@ -152,12 +152,18 @@ def test_state_file_has_correct_fields(
 
     # Verify values are sensible
     assert pane_key["backend"] == env.backend_name
-    assert state["pane_pid"] > 0, "pane_pid should be positive"
+    # cmux doesn't expose PIDs (surface-health has no PID field), so pane_pid is 0
+    if env.backend_name == "cmux":
+        assert state["pane_pid"] >= 0, "pane_pid should be non-negative"
+    else:
+        assert state["pane_pid"] > 0, "pane_pid should be positive"
     assert state["status"] == "working", (
         f"Expected status 'working', got '{state['status']}'"
     )
     # Command could be "workmux" (if captured during set-window-status) or the shell
-    assert state["command"], "command should not be empty"
+    # cmux doesn't expose the current command (no PID → can't match from ps)
+    if env.backend_name != "cmux":
+        assert state["command"], "command should not be empty"
 
 
 def test_state_file_contains_pane_info(
@@ -200,10 +206,12 @@ def test_state_file_contains_pane_info(
     assert pane_key["pane_id"], "pane_id should be set"
 
     # Verify we have PID and command for stale detection
-    assert state["pane_pid"] > 0, (
-        "pane_pid should be positive (for PID-based stale detection)"
-    )
-    assert state["command"], "command should be set (for command-change detection)"
+    # cmux doesn't expose PIDs or commands (uses surface-health for liveness instead)
+    if env.backend_name != "cmux":
+        assert state["pane_pid"] > 0, (
+            "pane_pid should be positive (for PID-based stale detection)"
+        )
+        assert state["command"], "command should be set (for command-change detection)"
 
     # Verify workdir is set (useful for context)
     assert state["workdir"], "workdir should be set"

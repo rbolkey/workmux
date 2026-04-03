@@ -107,6 +107,7 @@ export default defineConfig({
       {
         text: "Alternative backends",
         items: [
+          { text: "cmux", link: "/guide/cmux" },
           { text: "kitty", link: "/guide/kitty" },
           { text: "WezTerm", link: "/guide/wezterm" },
           { text: "Zellij", link: "/guide/zellij" },
