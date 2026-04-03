@@ -29,6 +29,7 @@ windowing, git for worktrees, your agent for coding — workmux orchestrates the
 rest.
 
 <sup><sub>\* Also supports
+<a href="https://workmux.raine.dev/guide/cmux">cmux</a>,
 <a href="https://workmux.raine.dev/guide/kitty">kitty</a>,
 <a href="https://workmux.raine.dev/guide/wezterm">WezTerm</a>, and
 <a href="https://workmux.raine.dev/guide/zellij">Zellij</a> as alternative

@@ -7,10 +7,11 @@ is set and the cmux binary is available.
 import os
 import shutil
 import subprocess
+import uuid as uuid_mod
 
 import pytest
 
-from .helpers import get_workspace_refs, run_cmux_json
+from .helpers import get_initial_surface_ref, parse_workspace_ref, run_cmux_json
 
 
 def pytest_collection_modifyitems(config, items):
@@ -23,26 +24,25 @@ def pytest_collection_modifyitems(config, items):
             item.add_marker(skip)
 
 
-def _create_workspace():
-    """Create a new workspace and return its refs dict."""
-    before = get_workspace_refs()
+def _create_workspace(name=None):
+    """Create a new workspace and return its refs dict.
+
+    Uses ``cmux new-workspace --name <name>`` and parses ``OK workspace:N``
+    from stdout to obtain the workspace ref directly (cmux >= 0.63.1).
+    """
+    if name is None:
+        name = f"wm-test-{uuid_mod.uuid4().hex[:8]}"
+
     result = subprocess.run(
-        ["cmux", "new-workspace"], capture_output=True, text=True, check=True
+        ["cmux", "new-workspace", "--name", name],
+        capture_output=True,
+        text=True,
+        check=True,
     )
-    uuid = result.stdout.strip().split()[-1]  # "OK <UUID>" -> UUID
+    workspace_ref = parse_workspace_ref(result.stdout)
+    surface_ref = get_initial_surface_ref(workspace_ref)
 
-    after = get_workspace_refs()
-    new_refs = after - before
-    if len(new_refs) != 1:
-        raise RuntimeError(
-            f"Expected 1 new workspace after creation, got {len(new_refs)}: {new_refs}"
-        )
-    workspace_ref = new_refs.pop()
-
-    surfaces = run_cmux_json("list-pane-surfaces", "--workspace", workspace_ref)
-    surface_ref = surfaces["surfaces"][0]["ref"]
-
-    return {"workspace_ref": workspace_ref, "surface_ref": surface_ref, "uuid": uuid}
+    return {"workspace_ref": workspace_ref, "surface_ref": surface_ref}
 
 
 @pytest.fixture

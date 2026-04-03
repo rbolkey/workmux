@@ -9,8 +9,9 @@ description:
 workmux is a giga opinionated zero-friction workflow tool for managing
 [git worktrees](https://git-scm.com/docs/git-worktree) and tmux windows as
 isolated development environments. Also supports [kitty](/guide/kitty),
-[WezTerm](/guide/wezterm), and [Zellij](/guide/zellij) (experimental). Perfect
-for running multiple AI agents in parallel without conflict.
+[WezTerm](/guide/wezterm), [Zellij](/guide/zellij), and [cmux](/guide/cmux)
+(experimental). Perfect for running multiple AI agents in parallel without
+conflict.
 
 **Philosophy**: Build on tools you already use. tmux/zellij/kitty/etc. for
 windowing, git for worktrees, your agent for coding — workmux orchestrates the
@@ -41,8 +42,8 @@ agent commit, rebase, and merge autonomously.
 **Terminal workflow.** Build on your terminal setup instead of yet another
 agentic GUI that won't exist next year. If you don't have one yet,
 [tmux might be worth picking up](https://raine.dev/blog/my-tmux-setup/). Also
-supports [Kitty](/guide/kitty), [WezTerm](/guide/wezterm), and
-[Zellij](/guide/zellij).
+supports [Kitty](/guide/kitty), [WezTerm](/guide/wezterm),
+[Zellij](/guide/zellij), and [cmux](/guide/cmux).
 
 <div class="terminal-window">
   <div class="terminal-header">

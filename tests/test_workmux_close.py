@@ -1,3 +1,4 @@
+import shlex
 from pathlib import Path
 
 from .conftest import (
@@ -38,6 +39,9 @@ def run_workmux_close(
 
     name_arg = name if name else ""
     close_script = (
+        f"export PATH={shlex.quote(env.env['PATH'])} && "
+        f"export TMPDIR={shlex.quote(env.env.get('TMPDIR', '/tmp'))} && "
+        f"export HOME={shlex.quote(env.env.get('HOME', ''))} && "
         f"cd {repo_path} && "
         f"{workmux_exe_path} close {name_arg} "
         f"> {stdout_file} 2> {stderr_file}; "
