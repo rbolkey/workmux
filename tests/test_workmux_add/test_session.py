@@ -1,5 +1,9 @@
 """Tests for `workmux add --session` command - session mode worktree creation."""
 
+import pytest
+
+pytestmark = pytest.mark.tmux_only
+
 from ..conftest import (
     assert_session_exists,
     assert_session_not_exists,

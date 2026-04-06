@@ -434,10 +434,7 @@ impl Multiplexer for KittyBackend {
     }
 
     fn run_deferred_script(&self, script: &str) -> Result<()> {
-        // Run the script in the background using nohup
-        let bg_script = format!("nohup sh -c '{}' >/dev/null 2>&1 &", script);
-        Cmd::new("sh").args(&["-c", &bg_script]).run()?;
-        Ok(())
+        super::util::run_nohup_background(script)
     }
 
     fn shell_select_window_cmd(&self, full_name: &str) -> Result<String> {

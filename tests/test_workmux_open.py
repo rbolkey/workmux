@@ -1,3 +1,4 @@
+import shlex
 import subprocess
 from pathlib import Path
 
@@ -11,6 +12,7 @@ from .conftest import (
     assert_session_exists,
     assert_session_not_exists,
     assert_window_not_exists,
+    get_scripts_dir,
     get_session_name,
     get_window_name,
     get_worktree_path,
@@ -368,20 +370,30 @@ def test_close_in_duplicate_window_closes_correct_window(
     assert base_window in list_windows
     assert dup_window in list_windows
 
-    # Send close command directly to the duplicate window's pane using send-keys
-    # This properly sets TMUX_PANE environment variable unlike run-shell
+    # Send close command via a script file (same approach as run_workmux_command)
+    # to avoid cmux send character limits. Must export test environment (HOME, PATH)
+    # so workmux loads the test config (wm- prefix) instead of the user's global config.
     worktree_path = get_worktree_path(repo_path, branch_name)
-    env.send_keys(
-        dup_window,
-        f"cd {worktree_path} && {workmux_exe_path} close",
-        enter=True,
+    scripts_dir = get_scripts_dir(env)
+    close_script = scripts_dir / "close_dup.sh"
+    close_script.write_text(
+        f"#!/bin/sh\n"
+        f"export PATH={shlex.quote(env.env['PATH'])}\n"
+        f"export HOME={shlex.quote(env.env.get('HOME', ''))}\n"
+        f"cd {shlex.quote(str(worktree_path))}\n"
+        f"{shlex.quote(str(workmux_exe_path))} close\n"
     )
+    close_script.chmod(0o755)
+    env.send_keys(dup_window, str(close_script), enter=True)
 
     # Wait for the duplicate window to disappear
     def window_gone():
         return dup_window not in _get_all_windows(env)
 
-    assert poll_until(window_gone, timeout=5.0), "Duplicate window should be closed"
+    close_timeout = 10.0 if env.backend_name == "cmux" else 5.0
+    assert poll_until(window_gone, timeout=close_timeout), (
+        "Duplicate window should be closed"
+    )
 
     # Verify original window still exists
     list_windows = _get_all_windows(env)
