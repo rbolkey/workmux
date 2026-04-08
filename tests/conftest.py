@@ -16,6 +16,8 @@ from dataclasses import dataclass, field
 import pytest
 import yaml
 
+from tests.learning.cmux.helpers import parse_workspace_ref
+
 
 # =============================================================================
 # Shell Testing Configuration
@@ -646,6 +648,266 @@ class WezTermEnvironment(MuxEnvironment):
         self.env["SHELL"] = shell
 
 
+class CmuxEnvironment(MuxEnvironment):
+    """
+    cmux-specific test environment.
+
+    Uses cmux workspaces for isolation within the running cmux instance.
+    cmux is macOS-only and must be running (CMUX_SOCKET_PATH set).
+    """
+
+    def __init__(self, tmp_path: Path):
+        super().__init__(tmp_path)
+
+        import uuid
+
+        self._test_id = uuid.uuid4().hex[:8]
+        self._test_workspace_ref: Optional[str] = None
+        self._created_workspace_refs: list[str] = []
+
+        # Remove TMUX env var to ensure we use cmux backend
+        self.env.pop("TMUX", None)
+        self.env.pop("WEZTERM_PANE", None)
+        # Preserve CMUX_SOCKET_PATH from parent environment
+        if "CMUX_SOCKET_PATH" not in self.env:
+            socket = os.environ.get("CMUX_SOCKET_PATH", "")
+            if socket:
+                self.env["CMUX_SOCKET_PATH"] = socket
+
+    @property
+    def backend_name(self) -> str:
+        return "cmux"
+
+    def _cmux(self, *args, check=True) -> subprocess.CompletedProcess[str]:
+        """Run a cmux command."""
+        return self.run_command(["cmux", *args], check=check)
+
+    def _cmux_json(self, *args) -> Any:
+        """Run cmux --json <args> and return parsed JSON."""
+        result = self._cmux("--json", *args)
+        return json.loads(result.stdout)
+
+    def _get_workspace_refs(self) -> set[str]:
+        """Return set of current workspace refs."""
+        data = self._cmux_json("list-workspaces")
+        return {ws["ref"] for ws in data["workspaces"]}
+
+    def _create_workspace(self, name: Optional[str] = None) -> dict:
+        """Create a workspace, return refs dict.
+
+        Uses ``--name`` flag (cmux >= 0.63.1) and parses ``OK workspace:N``
+        from stdout to obtain the workspace ref directly, avoiding the
+        race-prone before/after workspace-set diff.
+
+        Parse logic is shared with learning tests via
+        ``tests.learning.cmux.helpers.parse_workspace_ref``.
+        """
+        cmd: list[str] = ["new-workspace"]
+        if name:
+            cmd += ["--name", name]
+        result = self._cmux(*cmd)
+
+        ws_ref = parse_workspace_ref(result.stdout)
+        self._created_workspace_refs.append(ws_ref)
+
+        # Get initial surface ref via the environment's own cmux runner
+        surfaces = self._cmux_json("list-pane-surfaces", "--workspace", ws_ref)
+        surface_ref = surfaces["surfaces"][0]["ref"]
+
+        return {"workspace_ref": ws_ref, "surface_ref": surface_ref}
+
+    def start_server(self) -> None:
+        """Create an isolated test workspace and wait for shell readiness."""
+        ws = self._create_workspace(f"test_{self._test_id}")
+        self._test_workspace_ref = ws["workspace_ref"]
+        self._test_surface_ref = ws["surface_ref"]
+
+        # Wait for the shell to be ready using a file-based probe.
+        # send + file creation verifies the surface's shell is accepting input.
+        import time
+
+        ready_file = self.tmp_path / f".cmux_ready_{self._test_id}"
+        # Retry sending — surface initialization takes ~200-400ms after
+        # new-workspace returns, during which send returns non-zero.
+        for _ in range(15):
+            result = self._cmux(
+                "send",
+                "--workspace",
+                self._test_workspace_ref,
+                "--surface",
+                self._test_surface_ref,
+                f"touch {ready_file}\n",
+                check=False,
+            )
+            if result.returncode == 0:
+                break
+            time.sleep(0.2)
+
+        # Wait for the file to appear (proves the shell executed the command)
+        for _ in range(50):
+            if ready_file.exists():
+                ready_file.unlink()
+                break
+            time.sleep(0.2)
+
+    def stop_server(self) -> None:
+        """Close all test workspaces."""
+        # Also find any workmux-created workspaces (wm- prefix)
+        try:
+            data = self._cmux_json("list-workspaces")
+            for ws in data["workspaces"]:
+                if ws["ref"] in self._created_workspace_refs or ws["title"].startswith(
+                    "wm-"
+                ):
+                    self._cmux("close-workspace", "--workspace", ws["ref"], check=False)
+        except Exception:
+            pass
+        self._created_workspace_refs.clear()
+
+    def mux_command(
+        self, args: list[str], check: bool = True
+    ) -> subprocess.CompletedProcess[str]:
+        """Run cmux command."""
+        return self.run_command(["cmux"] + args, check=check)
+
+    def list_windows(self) -> list[str]:
+        """List all workspace titles."""
+        data = self._cmux_json("list-workspaces")
+        return [ws["title"] for ws in data["workspaces"]]
+
+    def _find_workspace_by_title(self, title: str) -> Optional[dict]:
+        """Find a workspace entry by title."""
+        data = self._cmux_json("list-workspaces")
+        for ws in data["workspaces"]:
+            if ws["title"] == title:
+                return ws
+        return None
+
+    def _find_surface_for_workspace(self, ws_ref: str) -> Optional[str]:
+        """Get the first surface ref in a workspace."""
+        try:
+            surfaces = self._cmux_json("list-pane-surfaces", "--workspace", ws_ref)
+            if surfaces["surfaces"]:
+                return surfaces["surfaces"][0]["ref"]
+        except Exception:
+            pass
+        return None
+
+    def _resolve_workspace_ref(self, target: str) -> Optional[str]:
+        """Resolve a target name to a workspace ref.
+
+        Handles special targets:
+        - "test:" or "test" → the test workspace
+        - Exact title match → that workspace
+        """
+        if target in ("test:", "test") or target.startswith(f"test_{self._test_id}"):
+            return self._test_workspace_ref
+        ws = self._find_workspace_by_title(target)
+        if ws:
+            return ws["ref"]
+        return None
+
+    def _resolve_surface_ref(self, ws_ref: str) -> Optional[str]:
+        """Get the surface ref for a workspace, using cached test surface if applicable."""
+        if ws_ref == self._test_workspace_ref and hasattr(self, "_test_surface_ref"):
+            return self._test_surface_ref
+        return self._find_surface_for_workspace(ws_ref)
+
+    def capture_pane(self, window_name: str) -> Optional[str]:
+        """Capture pane content by workspace title.
+
+        Uses ``read-screen --workspace --surface`` for precise surface
+        targeting (cmux >= 0.63.1 fixes the non-focused workspace regression).
+        """
+        ws_ref = self._resolve_workspace_ref(window_name)
+        if not ws_ref:
+            return None
+
+        surface_ref = self._resolve_surface_ref(ws_ref)
+        if not surface_ref:
+            return None
+
+        result = self._cmux(
+            "read-screen",
+            "--workspace",
+            ws_ref,
+            "--surface",
+            surface_ref,
+            check=False,
+        )
+        if result.returncode == 0:
+            return result.stdout
+        return None
+
+    def _find_selected_workspace_ref(self) -> Optional[str]:
+        """Find the currently selected workspace ref."""
+        try:
+            data = self._cmux_json("list-workspaces")
+            for ws in data["workspaces"]:
+                if ws["selected"]:
+                    return ws["ref"]
+        except Exception:
+            pass
+        return None
+
+    def send_keys(self, target: str, text: str, enter: bool = True) -> None:
+        """Send text to a pane identified by workspace title.
+
+        For cmux, target is a workspace title. The special 'test:' or 'test'
+        target sends to the test workspace.
+        """
+        ws_ref = self._resolve_workspace_ref(target)
+        if not ws_ref:
+            raise RuntimeError(f"Workspace '{target}' not found")
+
+        surface_ref = self._resolve_surface_ref(ws_ref)
+        if not surface_ref:
+            raise RuntimeError(f"No surface in workspace {ws_ref}")
+
+        # cmux send interprets \n as Enter
+        content = f"{text}\n" if enter else text
+        self._cmux("send", "--workspace", ws_ref, "--surface", surface_ref, content)
+
+    def run_shell_background(self, script: str) -> None:
+        """Run script in background via nohup."""
+        bg_script = f"nohup sh -c {shlex.quote(script)} >/dev/null 2>&1 &"
+        self.send_keys("test:", bg_script, enter=True)
+
+    def set_session_env(self, key: str, value: str) -> None:
+        """Set environment variable via shell export (no global env in cmux)."""
+        self.send_keys("test:", f"export {key}={shlex.quote(value)}", enter=True)
+
+    def kill_window(self, window_name: str) -> None:
+        """Close a workspace by title."""
+        ws = self._find_workspace_by_title(window_name)
+        if not ws:
+            raise RuntimeError(f"Workspace '{window_name}' not found")
+        self._cmux("close-workspace", "--workspace", ws["ref"])
+
+    def get_current_window(self) -> Optional[str]:
+        """Get the title of the currently selected workspace."""
+        data = self._cmux_json("list-workspaces")
+        for ws in data["workspaces"]:
+            if ws["selected"]:
+                return ws["title"]
+        return None
+
+    def select_window(self, window_name: str) -> None:
+        """Switch focus to a workspace by title."""
+        ws = self._find_workspace_by_title(window_name)
+        if not ws:
+            raise RuntimeError(f"Workspace '{window_name}' not found")
+        self._cmux("select-workspace", "--workspace", ws["ref"])
+
+    def new_window(self, name: Optional[str] = None) -> None:
+        """Create a new workspace with optional name."""
+        self._create_workspace(name)
+
+    def configure_default_shell(self, shell: str) -> None:
+        """Configure the default shell (via SHELL env var, like WezTerm)."""
+        self.env["SHELL"] = shell
+
+
 def skip_if_backend_unavailable(backend: str):
     """
     Skip test if the required multiplexer backend is not available.
@@ -653,8 +915,10 @@ def skip_if_backend_unavailable(backend: str):
     For tmux: Checks binary exists and `tmux -V` succeeds.
     For WezTerm: Checks binary exists and `wezterm cli list` succeeds
                 (requires WezTerm to be running).
+    For cmux: Checks binary exists and `cmux ping` succeeds
+              (requires cmux to be running, macOS only).
 
-    This ensures CI environments without WezTerm can still run tmux tests.
+    This ensures CI environments without WezTerm/cmux can still run tmux tests.
     """
     if backend == "tmux":
         if not shutil.which("tmux"):
@@ -672,16 +936,24 @@ def skip_if_backend_unavailable(backend: str):
         )
         if result.returncode != 0:
             pytest.skip("wezterm not running or not available")
+    elif backend == "cmux":
+        if not shutil.which("cmux"):
+            pytest.skip("cmux not installed")
+        if not os.environ.get("CMUX_SOCKET_PATH"):
+            pytest.skip("Not running inside cmux (CMUX_SOCKET_PATH not set)")
+        result = subprocess.run(
+            ["cmux", "ping"], capture_output=True, text=True, check=False
+        )
+        if result.returncode != 0:
+            pytest.skip("cmux not running or not available")
 
 
 # Type alias for tests that accept either backend
-MuxEnv = Union[TmuxEnvironment, WezTermEnvironment]
+MuxEnv = Union[TmuxEnvironment, WezTermEnvironment, CmuxEnvironment]
 
 # Default window prefix - must match src/config.rs window_prefix() default
 DEFAULT_WINDOW_PREFIX = "wm-"
 
-# Type alias for backward compatibility - tests can use either
-MuxEnv = Union[TmuxEnvironment, WezTermEnvironment]
 
 # =============================================================================
 # Shared Assertion Helpers
@@ -1027,7 +1299,7 @@ def pytest_addoption(parser):
         "--backend",
         action="store",
         default=None,
-        help="Multiplexer backend to test: tmux, wezterm, or both (comma-separated)",
+        help="Multiplexer backend to test: tmux, wezterm, cmux, or multiple (comma-separated)",
     )
 
 
@@ -1107,6 +1379,8 @@ def mux_server(request, tmp_path: Path) -> Generator[MuxEnvironment, None, None]
 
     if backend == "tmux":
         test_env = TmuxEnvironment(tmp_path)
+    elif backend == "cmux":
+        test_env = CmuxEnvironment(tmp_path)
     else:
         test_env = WezTermEnvironment(tmp_path)
 
@@ -1143,21 +1417,21 @@ def setup_git_repo(path: Path, env_vars: Optional[dict] = None):
         capture_output=True,
         env=env_vars,
     )
-    # Configure git user for commits
-    subprocess.run(
-        ["git", "config", "user.name", "Test User"],
-        cwd=path,
-        check=True,
-        capture_output=True,
-        env=env_vars,
-    )
-    subprocess.run(
-        ["git", "config", "user.email", "test@example.com"],
-        cwd=path,
-        check=True,
-        capture_output=True,
-        env=env_vars,
-    )
+    # Configure git user for commits and disable GPG signing so tests don't
+    # require 1Password or other signing agent approval.
+    for config_args in [
+        ["user.name", "Test User"],
+        ["user.email", "test@example.com"],
+        ["commit.gpgsign", "false"],
+        ["tag.gpgsign", "false"],
+    ]:
+        subprocess.run(
+            ["git", "config", *config_args],
+            cwd=path,
+            check=True,
+            capture_output=True,
+            env=env_vars,
+        )
     # Ignore test_home directory and test output files to prevent uncommitted changes
     gitignore_path = path / ".gitignore"
     gitignore_path.write_text(
@@ -1335,9 +1609,9 @@ def write_workmux_config(
     layouts: Optional[Dict[str, Any]] = None,
 ):
     """Creates a .workmux.yaml file from structured data and optionally commits it."""
-    # Disable nerdfonts by default to ensure consistent "wm-" prefix in tests,
-    # regardless of user's global config
-    config: Dict[str, Any] = {"nerdfont": False}
+    # Disable nerdfonts and explicitly set window_prefix to ensure consistent
+    # "wm-" prefix in tests, regardless of user's global config or PUA detection.
+    config: Dict[str, Any] = {"nerdfont": False, "window_prefix": "wm-"}
     if panes is not None:
         config["panes"] = panes
     if layouts is not None:
@@ -1563,7 +1837,11 @@ export WORKMUX_TEST=1
     # Execute the script - this keeps the send_keys command short
     env.send_keys("test:", str(script_file), enter=True)
 
-    if not poll_until_file_has_content(exit_code_file, timeout=10.0):
+    # cmux has higher per-operation latency than tmux (workspace creation,
+    # shell init, surface readiness).  Use a longer timeout to avoid flaky
+    # failures under load.
+    cmd_timeout = 30.0 if isinstance(env, CmuxEnvironment) else 10.0
+    if not poll_until_file_has_content(exit_code_file, timeout=cmd_timeout):
         # Capture pane content for debugging
         pane_content = env.capture_pane("test") or "(empty)"
         raise AssertionError(
@@ -1755,11 +2033,17 @@ def run_workmux_remove(
     input_cmd = f"echo '{user_input}' | " if user_input else ""
 
     # If from_window is specified, we need to change to that window's working directory
+    env_exports = (
+        f"export PATH={shlex.quote(env.env['PATH'])} && "
+        f"export TMPDIR={shlex.quote(env.env.get('TMPDIR', '/tmp'))} && "
+        f"export HOME={shlex.quote(env.env.get('HOME', ''))} && "
+    )
     if from_window:
         worktree_path = get_worktree_path(
             repo_path, from_window.replace(DEFAULT_WINDOW_PREFIX, "")
         )
         remove_script = (
+            f"{env_exports}"
             f"cd {worktree_path} && "
             f"{input_cmd}"
             f"{workmux_exe_path} remove {force_flag}{keep_branch_flag}{gone_flag}{all_flag}{branch_arg} "
@@ -1768,6 +2052,7 @@ def run_workmux_remove(
         )
     else:
         remove_script = (
+            f"{env_exports}"
             f"cd {repo_path} && "
             f"{input_cmd}"
             f"{workmux_exe_path} remove {force_flag}{keep_branch_flag}{gone_flag}{all_flag}{branch_arg} "
@@ -1877,6 +2162,9 @@ def run_workmux_merge(
     editor_script.chmod(0o755)
 
     merge_script = (
+        f"export PATH={shlex.quote(env.env['PATH'])} && "
+        f"export TMPDIR={shlex.quote(env.env.get('TMPDIR', '/tmp'))} && "
+        f"export HOME={shlex.quote(env.env.get('HOME', ''))} && "
         f"export GIT_EDITOR={shlex.quote(str(editor_script))} && "
         f"cd {workdir} && "
         f"{workmux_exe_path} merge {flags_str} {branch_arg} "

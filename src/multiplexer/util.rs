@@ -2,8 +2,12 @@
 //!
 //! These helpers are shared between tmux, WezTerm, and any future backends.
 
+use anyhow::{Context, Result};
 use std::borrow::Cow;
 use std::path::Path;
+
+use crate::cmd::Cmd;
+use crate::shell::shell_quote;
 
 /// Helper function to add prefix to window name.
 ///
@@ -326,6 +330,20 @@ fn inject_flag_after_agent_executable(command: &str, flag: &str) -> String {
     } else {
         format!("{} {}{}", before, flag, after)
     }
+}
+
+/// Run a script in the background via `nohup sh -c '...'`.
+///
+/// Used by non-tmux backends for `run_deferred_script`. The script is properly
+/// escaped with `shell_quote` for safe embedding in `sh -c '...'`.
+/// tmux uses `run-shell -b` instead and does not call this function.
+pub fn run_nohup_background(script: &str) -> Result<()> {
+    let bg_script = format!("nohup sh -c {} >/dev/null 2>&1 &", shell_quote(script));
+    Cmd::new("sh")
+        .args(&["-c", &bg_script])
+        .run()
+        .context("Failed to run deferred background script")?;
+    Ok(())
 }
 
 #[cfg(test)]

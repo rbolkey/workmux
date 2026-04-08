@@ -22,6 +22,11 @@ docs/.vitepress/dist/
 docs/.vitepress/cache/
 docs/public/_1x/
 
+# Local planning/ideation docs (not tracked in git)
+docs/plans/
+docs/brainstorms/
+docs/ideation/
+
 # Nix
 result
 result-*

@@ -1,10 +1,13 @@
-"""Q8 + Status: Send escape handling, buffer paste, and status commands.
+"""Q8 + Status: Send escape handling, buffer paste, status, and send-key modifiers.
 
 Verifies cmux send interprets escape sequences, buffer paste round-trips
-content, and status commands succeed.
+content, status commands succeed, and expanded send-key modifiers work
+(v0.63.0 #1920, #1994).
 """
 
 import subprocess
+
+import pytest
 
 from .helpers import wait_for_screen_content
 
@@ -146,3 +149,109 @@ class TestStatusCommands:
             check=False,
         )
         assert result.returncode == 0, f"clear-status failed: {result.stderr}"
+
+
+class TestSendKeyModifiers:
+    """v0.63.0: Expanded send-key modifier combinations (#1920, #1994).
+
+    Tests arrow keys, shift+tab, ctrl+enter, home/end — key names added
+    to sendNamedKey in v0.63.0. Verifies exit codes; does not verify
+    terminal-side effect (that requires screen content inspection).
+    """
+
+    @pytest.mark.parametrize("key", ["left", "right", "up", "down"])
+    def test_send_key_arrow_keys(self, cmux_workspace, key):
+        """send-key arrow key exits 0."""
+        ws = cmux_workspace
+        result = subprocess.run(
+            [
+                "cmux",
+                "send-key",
+                "--workspace",
+                ws["workspace_ref"],
+                "--surface",
+                ws["surface_ref"],
+                key,
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, f"send-key {key} failed: {result.stderr}"
+
+    def test_send_key_shift_tab(self, cmux_workspace):
+        """send-key shift+tab exits 0."""
+        ws = cmux_workspace
+        result = subprocess.run(
+            [
+                "cmux",
+                "send-key",
+                "--workspace",
+                ws["workspace_ref"],
+                "--surface",
+                ws["surface_ref"],
+                "shift+tab",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, f"send-key shift+tab failed: {result.stderr}"
+
+    def test_send_key_ctrl_enter(self, cmux_workspace):
+        """send-key ctrl+enter exits 0."""
+        ws = cmux_workspace
+        result = subprocess.run(
+            [
+                "cmux",
+                "send-key",
+                "--workspace",
+                ws["workspace_ref"],
+                "--surface",
+                ws["surface_ref"],
+                "ctrl+enter",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, f"send-key ctrl+enter failed: {result.stderr}"
+
+    @pytest.mark.parametrize("key", ["home", "end"])
+    def test_send_key_home_end(self, cmux_workspace, key):
+        """send-key home/end exits 0."""
+        ws = cmux_workspace
+        result = subprocess.run(
+            [
+                "cmux",
+                "send-key",
+                "--workspace",
+                ws["workspace_ref"],
+                "--surface",
+                ws["surface_ref"],
+                key,
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, f"send-key {key} failed: {result.stderr}"
+
+    def test_send_key_invalid_name_fails(self, cmux_workspace):
+        """send-key with an invalid key name returns non-zero."""
+        ws = cmux_workspace
+        result = subprocess.run(
+            [
+                "cmux",
+                "send-key",
+                "--workspace",
+                ws["workspace_ref"],
+                "--surface",
+                ws["surface_ref"],
+                "invalid-key-name-xyz",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode != 0
