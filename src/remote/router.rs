@@ -298,6 +298,34 @@ pub fn relay(project: &RemoteProject) -> Result<()> {
     exit_with(run(project, &argv)?)
 }
 
+/// Relay this command, as it was typed, to every remote project, printing
+/// each one's output under its name; a project with nothing to say prints
+/// nothing. Returns how many projects failed or could not be reached.
+pub fn relay_to_every_project() -> Result<usize> {
+    let argv = relayed_argv();
+    let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let mut failures = 0;
+    for project in remote_projects()? {
+        let (name, remote) = (&project.site.name, &project.site.remote);
+        match capture(&project, &argv) {
+            Ok((code, stdout)) => {
+                if !stdout.is_empty() {
+                    println!("\n{name} (on {remote}):");
+                    print!("{}", String::from_utf8_lossy(&stdout));
+                }
+                if code != 0 {
+                    failures += 1;
+                }
+            }
+            Err(error) => {
+                eprintln!("Failed to reach remote project '{name}' on {remote}: {error:#}");
+                failures += 1;
+            }
+        }
+    }
+    Ok(failures)
+}
+
 /// Finish a command relayed to a remote with the remote command's exit code.
 pub fn exit_with(code: i32) -> Result<()> {
     if code != 0 {
