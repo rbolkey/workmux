@@ -6,7 +6,9 @@ pub mod channels;
 pub mod connection;
 pub mod handshake;
 pub mod registry;
+pub mod router;
 pub mod serve;
+pub mod session;
 pub mod ssh;
 #[cfg(test)]
 pub mod testing;

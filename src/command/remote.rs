@@ -1,17 +1,16 @@
 //! `workmux remote`: register remotes and check that they are reachable.
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand};
 use std::borrow::Cow;
-use std::path::PathBuf;
 use std::time::Duration;
 use tabled::{
     Table, Tabled,
     settings::{Padding, Style, object::Columns},
 };
 
-use crate::config::{Config, RemoteConfig, TransportKind};
-use crate::multiplexer::{create_backend, detect_backend};
+use super::global_config::{self, REMOTES};
+use crate::config::{RemoteConfig, TransportKind};
 use crate::remote::channels::{Reach, RemoteStatus};
 use crate::remote::registry;
 
@@ -88,32 +87,11 @@ pub fn run(args: RemoteArgs) -> Result<()> {
     }
 }
 
-fn global_config_file() -> Result<(PathBuf, String)> {
-    let path = crate::config::global_config_path()
-        .ok_or_else(|| anyhow!("could not determine your home directory"))?;
-    let content = match std::fs::read_to_string(&path) {
-        Ok(content) => content,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(error) => {
-            return Err(error).with_context(|| format!("failed to read {}", path.display()));
-        }
-    };
-    Ok((path, content))
-}
-
-fn write_global_config(path: &PathBuf, content: &str) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-    std::fs::write(path, content).with_context(|| format!("failed to write {}", path.display()))
-}
-
 fn add(name: &str, remote: RemoteConfig) -> Result<()> {
     registry::validate_name(name)?;
-    let (path, content) = global_config_file()?;
-    let updated = add_remote_to(&content, name, &remote)?;
-    write_global_config(&path, &updated)?;
+    let (path, content) = global_config::read()?;
+    let updated = global_config::add_entry(&content, &REMOTES, name, &remote)?;
+    global_config::write(&path, &updated)?;
     println!(
         "Added remote {name} ({} {}) to {}",
         remote.transport,
@@ -124,8 +102,8 @@ fn add(name: &str, remote: RemoteConfig) -> Result<()> {
 }
 
 fn rm(name: &str) -> Result<()> {
-    let (path, content) = global_config_file()?;
-    let users: Vec<String> = parse_config(&content)?
+    let (path, content) = global_config::read()?;
+    let users: Vec<String> = global_config::parse(&content)?
         .projects
         .into_iter()
         .filter(|(_, project)| project.remote.as_deref() == Some(name))
@@ -134,25 +112,10 @@ fn rm(name: &str) -> Result<()> {
     if !users.is_empty() {
         bail!("remote {name} is used by project(s) {}", users.join(", "));
     }
-    let updated = remove_remote_from(&content, name)?;
-    write_global_config(&path, &updated)?;
+    let updated = global_config::remove_entry(&content, &REMOTES, name)?;
+    global_config::write(&path, &updated)?;
     println!("Removed remote {name} from {}", path.display());
     Ok(())
-}
-
-/// The workstation daemon's socket, when a tmux server can host it.
-fn daemon_socket() -> Option<PathBuf> {
-    let mux = create_backend(detect_backend());
-    if mux.name() != "tmux" || !mux.is_running().unwrap_or(false) {
-        return None;
-    }
-    match crate::workstation_daemon::ensure_current() {
-        Ok(socket) => Some(socket),
-        Err(error) => {
-            tracing::warn!(error = %format!("{error:#}"), "workstation daemon unavailable; checking remotes directly");
-            None
-        }
-    }
 }
 
 /// Fetch statuses through the workstation daemon, which holds the control
@@ -167,7 +130,7 @@ fn fetch_statuses(name: Option<&str>) -> Result<Vec<RemoteStatus>> {
     if remotes.is_empty() {
         return Ok(Vec::new());
     }
-    match daemon_socket() {
+    match crate::remote::router::daemon_socket() {
         Some(socket) => {
             let result = crate::workstation_daemon::call_with_timeout(
                 &socket,
@@ -298,152 +261,10 @@ fn status(name: Option<&str>) -> Result<bool> {
     Ok(all_reachable)
 }
 
-fn parse_config(content: &str) -> Result<Config> {
-    if content.trim().is_empty() {
-        return Ok(Config::default());
-    }
-    serde_yaml::from_str(content).context("global config does not parse")
-}
-
-fn indent_of(line: &str) -> usize {
-    line.len() - line.trim_start().len()
-}
-
-fn is_blank(line: &str) -> bool {
-    line.trim().is_empty()
-}
-
-/// The top-level `remotes:` block: the header line's index, the index just
-/// past its last line, and the indent of its entries.
-fn remotes_section(lines: &[&str]) -> Result<Option<(usize, usize, Option<usize>)>> {
-    let Some(header) = lines.iter().position(|line| line.starts_with("remotes:")) else {
-        return Ok(None);
-    };
-    let rest = lines[header]["remotes:".len()..].trim();
-    if !(rest.is_empty() || rest.starts_with('#')) {
-        bail!("the remotes section of your global config is not a block mapping; edit it by hand");
-    }
-    let end = lines[header + 1..]
-        .iter()
-        .position(|line| !is_blank(line) && indent_of(line) == 0)
-        .map_or(lines.len(), |offset| header + 1 + offset);
-    let indent = lines[header + 1..end]
-        .iter()
-        .find(|line| !is_blank(line) && !line.trim_start().starts_with('#'))
-        .map(|line| indent_of(line));
-    Ok(Some((header, end, indent)))
-}
-
-fn join_lines(lines: &[String], trailing_newline: bool) -> String {
-    let mut joined = lines.join("\n");
-    if trailing_newline && !joined.is_empty() {
-        joined.push('\n');
-    }
-    joined
-}
-
-/// Add `name` to the `remotes:` section of a global config file's text,
-/// keeping the rest of the file (including comments) as it is.
-fn add_remote_to(content: &str, name: &str, remote: &RemoteConfig) -> Result<String> {
-    let before = parse_config(content)?;
-    if before.remotes.contains_key(name) {
-        bail!("remote {name} already exists");
-    }
-    let entry = serde_yaml::to_string(&std::collections::BTreeMap::from([(name, remote)]))?;
-
-    let lines: Vec<&str> = content.lines().collect();
-    let mut updated: Vec<String> = lines.iter().map(|line| line.to_string()).collect();
-    match remotes_section(&lines)? {
-        Some((header, end, indent)) => {
-            let pad = " ".repeat(indent.unwrap_or(2));
-            // Directly after the section's last non-blank line.
-            let at = (header + 1..end)
-                .rev()
-                .find(|&i| !is_blank(lines[i]))
-                .map_or(header + 1, |i| i + 1);
-            let entry_lines = entry.lines().map(|line| format!("{pad}{line}"));
-            updated.splice(at..at, entry_lines);
-        }
-        None => {
-            updated.push("remotes:".to_string());
-            updated.extend(entry.lines().map(|line| format!("  {line}")));
-        }
-    }
-    let updated = join_lines(&updated, true);
-
-    let after = parse_config(&updated)
-        .ok()
-        .filter(|after| after.remotes.get(name) == Some(remote))
-        .filter(|after| after.remotes.len() == before.remotes.len() + 1);
-    if after.is_none() {
-        bail!("could not add remote {name} to your global config automatically; add it by hand");
-    }
-    Ok(updated)
-}
-
-/// Remove `name` from the `remotes:` section of a global config file's text.
-fn remove_remote_from(content: &str, name: &str) -> Result<String> {
-    let before = parse_config(content)?;
-    if !before.remotes.contains_key(name) {
-        bail!("no remote named {name}");
-    }
-    let lines: Vec<&str> = content.lines().collect();
-    let (header, end, indent) = remotes_section(&lines)?
-        .ok_or_else(|| anyhow!("no remotes section in your global config"))?;
-    let indent = indent.unwrap_or(2);
-    let is_entry_line = |line: &str| {
-        indent_of(line) == indent && {
-            let key = line.trim_start();
-            [
-                format!("{name}:"),
-                format!("\"{name}\":"),
-                format!("'{name}':"),
-            ]
-            .iter()
-            .any(|prefix| {
-                key.strip_prefix(prefix.as_str())
-                    .is_some_and(|rest| rest.trim().is_empty() || rest.trim().starts_with('#'))
-            })
-        }
-    };
-    let start = (header + 1..end)
-        .find(|&i| is_entry_line(lines[i]))
-        .ok_or_else(|| {
-            anyhow!("could not find remote {name} in your global config; remove it by hand")
-        })?;
-    let stop = (start + 1..end)
-        .find(|&i| !is_blank(lines[i]) && indent_of(lines[i]) <= indent)
-        .unwrap_or(end);
-
-    let mut kept: Vec<&str> = lines.clone();
-    kept.drain(start..stop);
-    let section_end = end - (stop - start);
-    let section_empty = kept[header + 1..section_end]
-        .iter()
-        .all(|line| is_blank(line) || line.trim_start().starts_with('#'));
-    if section_empty {
-        kept.drain(header..section_end);
-    }
-    let updated = join_lines(
-        &kept.iter().map(|line| line.to_string()).collect::<Vec<_>>(),
-        content.ends_with('\n'),
-    );
-
-    let after = parse_config(&updated)
-        .ok()
-        .filter(|after| !after.remotes.contains_key(name))
-        .filter(|after| after.remotes.len() + 1 == before.remotes.len());
-    if after.is_none() {
-        bail!(
-            "could not remove remote {name} from your global config automatically; remove it by hand"
-        );
-    }
-    Ok(updated)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
 
     fn ssh(target: &str) -> RemoteConfig {
         RemoteConfig {
@@ -462,7 +283,8 @@ mod tests {
     fn adding_to_a_config_without_remotes_appends_the_section() {
         let content = "# my settings\nnerdfont: true\n";
 
-        let updated = add_remote_to(content, "devbox", &ssh("me@devbox")).unwrap();
+        let updated =
+            global_config::add_entry(content, &REMOTES, "devbox", &ssh("me@devbox")).unwrap();
 
         assert!(updated.starts_with(content), "{updated}");
         assert_eq!(parse(&updated).remotes["devbox"], ssh("me@devbox"));
@@ -471,7 +293,7 @@ mod tests {
 
     #[test]
     fn adding_to_an_empty_config_creates_it() {
-        let updated = add_remote_to("", "devbox", &ssh("devbox")).unwrap();
+        let updated = global_config::add_entry("", &REMOTES, "devbox", &ssh("devbox")).unwrap();
 
         assert_eq!(parse(&updated).remotes["devbox"], ssh("devbox"));
     }
@@ -487,8 +309,9 @@ remotes:
 nerdfont: true
 ";
 
-        let updated = add_remote_to(
+        let updated = global_config::add_entry(
             content,
+            &REMOTES,
             "gpu",
             &RemoteConfig {
                 builtin_shims: Some(false),
@@ -510,7 +333,8 @@ nerdfont: true
     fn adding_a_remote_that_exists_is_refused() {
         let content = "remotes:\n  devbox:\n    transport: ssh\n    target: devbox\n";
 
-        let error = add_remote_to(content, "devbox", &ssh("other")).unwrap_err();
+        let error =
+            global_config::add_entry(content, &REMOTES, "devbox", &ssh("other")).unwrap_err();
 
         assert_eq!(error.to_string(), "remote devbox already exists");
     }
@@ -532,7 +356,7 @@ remotes:
 nerdfont: true
 ";
 
-        let updated = remove_remote_from(content, "devbox").unwrap();
+        let updated = global_config::remove_entry(content, &REMOTES, "devbox").unwrap();
 
         let config = parse(&updated);
         assert!(!config.remotes.contains_key("devbox"));
@@ -546,14 +370,15 @@ nerdfont: true
         let content =
             "remotes:\n  devbox:\n    transport: ssh\n    target: devbox\nnerdfont: true\n";
 
-        let updated = remove_remote_from(content, "devbox").unwrap();
+        let updated = global_config::remove_entry(content, &REMOTES, "devbox").unwrap();
 
         assert_eq!(updated, "nerdfont: true\n");
     }
 
     #[test]
     fn removing_an_unknown_remote_is_an_error() {
-        let error = remove_remote_from("nerdfont: true\n", "devbox").unwrap_err();
+        let error =
+            global_config::remove_entry("nerdfont: true\n", &REMOTES, "devbox").unwrap_err();
 
         assert_eq!(error.to_string(), "no remote named devbox");
     }

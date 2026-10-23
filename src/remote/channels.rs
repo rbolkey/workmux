@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use super::channel::Handler;
 use super::connection::{Connection, HELLO_TIMEOUT};
+use super::session::{self, CommandRequest, Sessions, Stream};
 use super::transport::{RemoteState, Transport};
 use crate::config::{RemoteConfig, TransportKind};
 
@@ -68,11 +69,20 @@ pub enum Reach {
 }
 
 /// Answers requests remote workmux sends over its control channel.
-struct WorkstationHandler;
+struct WorkstationHandler {
+    sessions: Arc<Sessions>,
+}
 
 impl Handler for WorkstationHandler {
     fn request(&self, method: &str, _params: Value) -> Result<Value, String> {
         Err(format!("unknown method: {method}"))
+    }
+
+    fn notification(&self, method: &str, params: Value) {
+        match method {
+            session::OUTPUT_METHOD => self.sessions.output(params),
+            method => tracing::warn!(method, "ignoring unknown notification"),
+        }
     }
 }
 
@@ -80,6 +90,9 @@ struct Slot {
     config: RemoteConfig,
     connection: Option<Arc<Connection>>,
     last_used: Instant,
+    /// Command sessions running on this remote; the channel is wanted while
+    /// any is.
+    holds: usize,
     /// Set while a background reconnect loop runs for this remote.
     reconnecting: bool,
 }
@@ -91,6 +104,7 @@ struct Shared {
     /// Serializes connection attempts, so a burst of requests opens one
     /// channel per remote.
     connecting: Mutex<()>,
+    sessions: Arc<Sessions>,
 }
 
 /// The workstation daemon's control channels.
@@ -107,6 +121,7 @@ impl Channels {
                 policy,
                 slots: Mutex::new(HashMap::new()),
                 connecting: Mutex::new(()),
+                sessions: Arc::new(Sessions::default()),
             }),
         }
     }
@@ -151,7 +166,6 @@ impl Channels {
     }
 
     /// The open channel to `name`, opened on demand.
-    #[allow(dead_code)] // Used by commands routed to a remote
     pub fn channel(&self, name: &str, config: &RemoteConfig) -> Result<Arc<Connection>> {
         self.channel_for(name, config, true)
     }
@@ -204,7 +218,9 @@ impl Channels {
         let connection = Arc::new(Connection::open(
             name,
             transport,
-            WorkstationHandler,
+            WorkstationHandler {
+                sessions: self.shared.sessions.clone(),
+            },
             self.shared.policy.hello_timeout,
         )?);
         tracing::info!(remote = name, workmux = %connection.hello.workmux, "control channel open");
@@ -213,6 +229,7 @@ impl Channels {
             config: config.clone(),
             connection: None,
             last_used: Instant::now(),
+            holds: 0,
             reconnecting: false,
         });
         slot.connection = Some(connection.clone());
@@ -299,7 +316,30 @@ impl Channels {
     }
 
     fn wanted(&self, slot: &Slot) -> bool {
-        slot.last_used.elapsed() < self.shared.policy.linger
+        slot.holds > 0 || slot.last_used.elapsed() < self.shared.policy.linger
+    }
+
+    /// Run a command session on `name`, passing its output to `sink` as it
+    /// arrives. Returns the command's exit code.
+    pub fn run_command(
+        &self,
+        name: &str,
+        config: &RemoteConfig,
+        request: &CommandRequest,
+        sink: &mut dyn FnMut(Stream, &[u8]),
+    ) -> Result<i32> {
+        let connection = self.channel(name, config)?;
+        self.hold(name, 1);
+        let exit = self.shared.sessions.run(&connection.peer, request, sink);
+        self.hold(name, -1);
+        exit
+    }
+
+    fn hold(&self, name: &str, change: isize) {
+        if let Some(slot) = self.shared.slots.lock().unwrap().get_mut(name) {
+            slot.holds = slot.holds.saturating_add_signed(change);
+            slot.last_used = Instant::now();
+        }
     }
 
     /// Close channels that have gone unused for the linger period.

@@ -544,6 +544,10 @@ enum Commands {
         #[arg(long)]
         all: bool,
 
+        /// List a project registered on a remote
+        #[arg(long, value_name = "NAME", conflicts_with = "all")]
+        project: Option<String>,
+
         /// Filter by worktree name or branch (supports multiple)
         #[arg(value_parser = WorktreeBranchParser::new())]
         filter: Vec<String>,
@@ -554,6 +558,14 @@ enum Commands {
         /// Worktree name (directory name)
         #[arg(value_parser = WorktreeHandleParser::new())]
         name: String,
+
+        /// Project registered on a remote that holds the worktree
+        #[arg(long, value_name = "NAME")]
+        project: Option<String>,
+
+        /// Output as JSON: {"remote": ..., "path": ...}
+        #[arg(long)]
+        json: bool,
     },
 
     /// Send a prompt or instruction to a running agent
@@ -775,6 +787,9 @@ enum Commands {
 
     /// Manage remotes: project hosts reached through a transport
     Remote(command::remote::RemoteArgs),
+
+    /// Manage projects that live on a remote
+    Project(command::project::ProjectArgs),
 
     /// Set agent status for the current tmux window (used by hooks)
     #[command(hide = true)]
@@ -1189,9 +1204,14 @@ pub fn run() -> Result<()> {
             pr,
             json,
             all,
+            project,
             filter,
-        } => command::list::run(pr, json, all, &filter),
-        Commands::Path { name } => command::path::run(&name),
+        } => command::list::run(pr, json, all, project.as_deref(), &filter),
+        Commands::Path {
+            name,
+            project,
+            json,
+        } => command::path::run(&name, project.as_deref(), json),
         Commands::Send { name, text, file } => {
             command::send::run(&name, text.as_deref(), file.as_deref())
         }
@@ -1306,6 +1326,7 @@ pub fn run() -> Result<()> {
         },
         Commands::Sandbox(args) => command::sandbox::run(args),
         Commands::Remote(args) => command::remote::run(args),
+        Commands::Project(args) => command::project::run(args),
         Commands::SetWindowStatus { command } => command::set_window_status::run(command),
         Commands::RegisterAgent => command::set_window_status::register_agent(),
         Commands::SetBase { base } => command::set_base::run(&base),
