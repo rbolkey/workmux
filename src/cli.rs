@@ -973,6 +973,20 @@ fn should_prompt_status_setup(cmd: &Commands) -> bool {
         )
 }
 
+/// Whether the command acts on workstation tmux, which a remote shell can
+/// reach only while its control channel is connected.
+fn needs_workstation(cmd: &Commands) -> bool {
+    matches!(
+        cmd,
+        Commands::Add { .. }
+            | Commands::Open { .. }
+            | Commands::Close { .. }
+            | Commands::Remove { .. }
+            | Commands::Merge { .. }
+            | Commands::Rename { .. }
+    )
+}
+
 /// Check if the command should trigger a background update check.
 fn should_check_update(cmd: &Commands) -> bool {
     !is_headless_add(cmd) && matches!(cmd, Commands::Add { .. })
@@ -1009,6 +1023,13 @@ pub fn run() -> Result<()> {
             e.exit()
         }
     };
+
+    // In a remote shell, fail before doing half the work.
+    if needs_workstation(&cli.command)
+        && let Some(shell) = crate::remote::shell::Shell::current()
+    {
+        shell.ensure_connected()?;
+    }
 
     // Extract config override early so the side-effect loads (nerdfont, update
     // check) respect the user's explicit --config choice.

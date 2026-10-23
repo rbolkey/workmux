@@ -51,6 +51,9 @@ pub fn run(
     timeout_secs: Option<u64>,
     any: bool,
 ) -> Result<()> {
+    if let Some(code) = crate::remote::shell::run_relayed(crate::remote::shell::own_argv(), None)? {
+        std::process::exit(code);
+    }
     let target = parse_status(target_status)?;
     let mux = create_backend(detect_backend());
     let start = Instant::now();
