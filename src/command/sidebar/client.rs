@@ -1,6 +1,6 @@
-//! Unix socket client for receiving snapshots from the sidebar daemon.
+//! Unix socket client for receiving snapshots from the workstation daemon.
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::mpsc;
@@ -51,7 +51,7 @@ fn connection_loop(path: &Path, latest: &Latest, wake_tx: &mpsc::SyncSender<()>)
     loop {
         let connected_at = Instant::now();
 
-        if let Ok(stream) = UnixStream::connect(path) {
+        if let Ok(stream) = subscribe(path) {
             backoff = min_backoff;
             if read_loop(stream, latest, wake_tx).is_err() {
                 break; // Wake channel closed, main thread exited
@@ -66,6 +66,13 @@ fn connection_loop(path: &Path, latest: &Latest, wake_tx: &mpsc::SyncSender<()>)
 
         thread::sleep(backoff + jitter);
     }
+}
+
+/// Connect to the workstation daemon and subscribe to snapshot pushes.
+pub fn subscribe(path: &Path) -> std::io::Result<UnixStream> {
+    let mut stream = UnixStream::connect(path)?;
+    stream.write_all(&crate::workstation_daemon::subscribe_line())?;
+    Ok(stream)
 }
 
 /// Returns Err if the wake channel is closed (main thread exited).
