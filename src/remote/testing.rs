@@ -16,6 +16,8 @@ pub const SERVE_CHILD: &str = "remote::testing::serve_child";
 #[derive(Default)]
 pub struct ServeTransport {
     pub pids: Mutex<Vec<u32>>,
+    /// Extra environment for the remote, such as its state dir.
+    pub env: Vec<(String, std::path::PathBuf)>,
 }
 
 impl ServeTransport {
@@ -41,7 +43,8 @@ impl Transport for ServeTransport {
         let mut command = Command::new(std::env::current_exe()?);
         command
             .args([SERVE_CHILD, "--exact", "--nocapture", "--ignored"])
-            .env(crate::test_support::ISOLATED_TEST_ENV, SERVE_CHILD);
+            .env(crate::test_support::ISOLATED_TEST_ENV, SERVE_CHILD)
+            .envs(self.env.iter().map(|(k, v)| (k, v)));
         let process = StdioProcess::spawn(command)?;
         self.pids.lock().unwrap().push(process.id());
         Ok(process)

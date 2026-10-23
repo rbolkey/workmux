@@ -187,6 +187,10 @@ pub struct Loopback {
     workmux: std::path::PathBuf,
 }
 
+/// A file in a loopback root that makes the remote unreachable, standing in
+/// for a network outage.
+pub const OFFLINE_FILE: &str = "offline";
+
 /// Environment that points a process at the workstation's multiplexer or
 /// sandbox supervisor; a loopback remote must not inherit it.
 const WORKSTATION_ENV: &[&str] = &[
@@ -225,6 +229,9 @@ impl Loopback {
                 "loopback root {} does not exist",
                 self.root.display()
             ));
+        }
+        if self.root.join(OFFLINE_FILE).exists() {
+            return Err(anyhow!("loopback remote is offline"));
         }
         let (program, args) = argv
             .split_first()
@@ -356,6 +363,19 @@ mod tests {
             error.to_string(),
             "loopback root /nonexistent/wm-loopback does not exist"
         );
+    }
+
+    #[test]
+    fn a_loopback_root_holding_an_offline_file_is_unreachable() {
+        let root = tempfile::tempdir().unwrap();
+        let loopback = Loopback::with_workmux(root.path(), "/bin/echo");
+        std::fs::write(root.path().join(OFFLINE_FILE), "").unwrap();
+
+        let error = loopback.exec_stdio(&argv(&["workmux"])).err().unwrap();
+
+        assert_eq!(error.to_string(), "loopback remote is offline");
+        std::fs::remove_file(root.path().join(OFFLINE_FILE)).unwrap();
+        assert!(loopback.exec_stdio(&argv(&["workmux"])).is_ok());
     }
 
     #[test]
