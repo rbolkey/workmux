@@ -248,6 +248,41 @@ impl SessionHolder {
         }
     }
 
+    /// The remote panes of `project` that still run, in the order they were
+    /// started.
+    pub fn running(&self, project: &str) -> Result<Vec<RemotePaneId>> {
+        let mut running = Vec::new();
+        for worktree in subdirectories(&self.dir.join(project))? {
+            let dir = self.worktree_dir(project, &worktree);
+            for entry in std::fs::read_dir(&dir)
+                .with_context(|| format!("failed to read {}", dir.display()))?
+            {
+                let name = entry?.file_name();
+                let Some(slot) = name
+                    .to_str()
+                    .and_then(|name| name.strip_suffix(".sock"))
+                    .and_then(|slot| slot.parse().ok())
+                else {
+                    continue;
+                };
+                let id = RemotePaneId {
+                    project: project.to_string(),
+                    worktree: worktree.clone(),
+                    slot,
+                };
+                // The pid file is made when the slot is reserved.
+                let started = std::fs::metadata(self.pid_file(&id))
+                    .and_then(|meta| meta.created().or_else(|_| meta.modified()))
+                    .ok();
+                if self.state(&id)? == PaneState::Running {
+                    running.push((started, id));
+                }
+            }
+        }
+        running.sort_by(|(a, a_id), (b, b_id)| a.cmp(b).then(a_id.slot.cmp(&b_id.slot)));
+        Ok(running.into_iter().map(|(_, id)| id).collect())
+    }
+
     /// End remote pane `id`: hang up its process, as closing a terminal
     /// would, and kill it if it does not exit.
     pub fn kill(&self, id: &RemotePaneId) -> Result<()> {
@@ -290,9 +325,32 @@ impl SessionHolder {
     }
 }
 
+/// The names of the directories in `dir`; none when it does not exist.
+fn subdirectories(dir: &Path) -> Result<Vec<String>> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(anyhow::Error::from(error)
+                .context(format!("failed to read {}", dir.display())));
+        }
+    };
+    let mut names = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        if entry.file_type()?.is_dir()
+            && let Some(name) = entry.file_name().to_str().filter(|n| is_component(n))
+        {
+            names.push(name.to_string());
+        }
+    }
+    names.sort();
+    Ok(names)
+}
+
 /// The name of the worktree holding `workdir`: the nearest directory with a
 /// `.git` entry, else `workdir` itself.
-fn worktree_name(workdir: &Path) -> String {
+pub fn worktree_name(workdir: &Path) -> String {
     let root = workdir
         .ancestors()
         .find(|dir| dir.join(".git").exists())
@@ -411,6 +469,36 @@ pub mod tests {
         let reused = holder.create("api", &feature, &sleep).unwrap();
         assert_eq!(reused.slot, 0);
         for id in [reused, second, other] {
+            holder.kill(&id).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_projects_running_panes_are_listed_in_the_order_they_were_started() {
+        let Some((temp, holder)) = holder() else {
+            return;
+        };
+        let feature = worktree(&temp, "feature");
+        let bugfix = worktree(&temp, "bugfix");
+        let sleep = argv(&["sleep", "30"]);
+        let first = holder.create("api", &feature, &sleep).unwrap();
+        let second = holder.create("api", &feature, &sleep).unwrap();
+        let other = holder.create("web", &feature, &sleep).unwrap();
+        let ended = holder
+            .create("api", &bugfix, &argv(&["sh", "-c", "exit 0"]))
+            .unwrap();
+        wait_ended(&holder, &ended);
+        holder.kill(&first).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        // Started last, though it reuses the lowest slot.
+        let third = holder.create("api", &feature, &sleep).unwrap();
+        assert_eq!(third.slot, 0);
+
+        let running = holder.running("api").unwrap();
+
+        assert_eq!(running, vec![second.clone(), third.clone()]);
+        assert_eq!(holder.running("nothing").unwrap(), vec![]);
+        for id in [second, third, other] {
             holder.kill(&id).unwrap();
         }
     }
