@@ -43,7 +43,7 @@ impl App {
             let filter_lower = self.filter_text.to_lowercase();
             let window_prefix = self.config.window_prefix();
             self.agents.retain(|a| {
-                let project = Self::project(a).name.to_lowercase();
+                let project = Self::project(a).group_label().to_lowercase();
                 let (worktree, _) = agent::extract_worktree_name(
                     &a.session,
                     &a.window_name,

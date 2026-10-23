@@ -1487,3 +1487,147 @@ def test_remote_agent_status_shows_live_turns_stale_and_catches_up_on_reconnect(
         (remote_root / "offline").unlink(missing_ok=True)
         if daemon_pid is not None:
             os.kill(daemon_pid, signal.SIGTERM)
+
+
+def dashboard_row(screen: str, text: str) -> str:
+    return next((line for line in screen.splitlines() if text in line), "")
+
+
+@requires_dtach
+@pytest.mark.tmux_only
+def test_dashboard_reviews_stages_and_closes_a_remote_worktree(
+    mux_server: MuxEnvironment,
+    workmux_exe_path: Path,
+    repo_path: Path,
+    short_tmp: dict,
+    remote_root: Path,
+):
+    """The dashboard, filtered to the project's session, lists the remote
+    agent with its remote worktree's changes and not an agent of another
+    session. Its diff comes from the remote, staging a hunk changes the
+    remote's index, and killing the entry ends the remote pane too."""
+    env = mux_server
+    assert isinstance(env, TmuxEnvironment)
+    control = Path(short_tmp["TMPDIR"])
+    next_status, done = control / "next", control / "done"
+    agent = control / "agent.sh"
+    hook = (
+        f"env TMUX=/nonexistent/tmux,0,0 TMUX_TMPDIR={control} "
+        f"{shlex.quote(str(workmux_exe_path))}"
+    )
+    agent.write_text(STATUS_AGENT.format(next=next_status, done=done, workmux=hook))
+    origin = make_origin(
+        env, env.tmp_path / "origin", f"panes:\n  - command: sh {agent}\n"
+    )
+    lines = "".join(f"line {n}\n" for n in range(1, 21))
+    (origin / "notes.txt").write_text(lines)
+    env.run_command(["git", "add", "notes.txt"], cwd=origin)
+    env.run_command(
+        ["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q"]
+        + ["-m", "notes"],
+        cwd=origin,
+    )
+
+    def wm(command):
+        return run_workmux_command(
+            env,
+            workmux_exe_path,
+            repo_path,
+            command,
+            pre_run_env=short_tmp,
+            timeout=60.0,
+        )
+
+    wm(f"remote add lb --transport loopback --target {remote_root}")
+    wm(f"project add api --remote lb --repo {origin} --path code/api")
+    daemon_pid = None
+    try:
+        wm("add feature --project api")
+        daemon_pid = remote_daemon_ping(env, workmux_exe_path, repo_path, short_tmp)[
+            "pid"
+        ]
+        pane = tmux_value(env, "=api:wm-feature", "#{pane_id}")
+        remote_pane = tmux_value(env, pane, "#{@workmux_remote_pane}")
+        next_status.write_text("waiting")
+        wait_until(lambda: done.exists(), "the remote agent's status hook")
+        worktree = remote_root / "home" / "code" / "api__worktrees" / "feature"
+        (worktree / "notes.txt").write_text(
+            lines.replace("line 2\n", "line two\n").replace(
+                "line 19\n", "line nineteen\n"
+            )
+        )
+
+        # An agent of the workstation, in another session.
+        local_agent = control / "local-agent.sh"
+        local_agent.write_text(
+            f"export PATH={shlex.quote(env.env['PATH'])} "
+            f"HOME={shlex.quote(str(env.home_path))}\n"
+            f"cd {repo_path} && {workmux_exe_path} set-window-status waiting"
+            f" && touch {control}/local-waiting\n"
+            # Block in the shell itself, so the pane's command stays the agent's.
+            f"mkfifo {control}/hold && read _ < {control}/hold\n"
+        )
+        env.tmux(
+            ["new-window", "-d", "-t", "test:", "-n", "wm-local", f"sh {local_agent}"]
+        )
+        wait_until(
+            lambda: (control / "local-waiting").exists(), "the local agent's status"
+        )
+
+        env.tmux(["new-window", "-t", "api:", "-n", "dash"])
+        env.tmux(["resize-window", "-t", "=api:dash", "-x", "220", "-y", "50"])
+        launch = control / "dashboard.sh"
+        launch.write_text(
+            f"export PATH={shlex.quote(env.env['PATH'])} "
+            f"HOME={shlex.quote(str(env.home_path))} "
+            f"TMPDIR={short_tmp['TMPDIR']} WORKMUX_TEST=1\n"
+            f"exec {workmux_exe_path} dashboard --session\n"
+        )
+        env.send_keys("=api:dash", f"sh {launch}", enter=True)
+
+        def screen() -> str:
+            return env.capture_pane("=api:dash") or ""
+
+        def wait_for_screen(predicate, what: str, timeout=15.0):
+            try:
+                wait_until(lambda: predicate(screen()), what, timeout)
+            except AssertionError as error:
+                raise AssertionError(f"{error}\n{screen()}") from None
+
+        wait_for_screen(
+            lambda shown: (
+                "+2" in dashboard_row(shown, "feature")
+                and "-2" in dashboard_row(shown, "feature")
+            ),
+            "the remote worktree's changes in the dashboard",
+            timeout=30.0,
+        )
+        assert "api@lb" in dashboard_row(screen(), "feature"), screen()
+        assert "local" not in screen(), screen()
+
+        # The diff is the remote worktree's; stage its first hunk.
+        env.send_keys("=api:dash", "d", enter=False)
+        wait_for_screen(lambda shown: "line nineteen" in shown, "the remote diff")
+        env.send_keys("=api:dash", "a", enter=False)
+        wait_for_screen(lambda shown: "line two" in shown, "patch mode")
+        env.send_keys("=api:dash", "y", enter=False)
+        wait_until(
+            lambda: "+line two" in git_in(env, worktree, "diff", "--cached"),
+            "the hunk staged in the remote's index",
+        )
+        assert "nineteen" not in git_in(env, worktree, "diff", "--cached")
+        env.send_keys("=api:dash", "q", enter=False)
+        env.send_keys("=api:dash", "q", enter=False)
+
+        # Killing the remote entry ends the remote pane, not just its view.
+        socket_path = (
+            remote_root / f"home/.local/state/workmux/panes/{remote_pane}.sock"
+        )
+        assert socket_path.exists()
+        env.send_keys("=api:dash", "X", enter=False)
+        wait_until(lambda: not socket_path.exists(), "the remote pane to end")
+        panes = env.tmux(["list-panes", "-a", "-F", "#{pane_id}"]).stdout.split()
+        assert pane not in panes
+    finally:
+        if daemon_pid is not None:
+            os.kill(daemon_pid, signal.SIGTERM)
