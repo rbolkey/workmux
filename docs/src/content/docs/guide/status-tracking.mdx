@@ -60,6 +60,8 @@ workmux setup
 
 This detects Claude Code, Codex, Copilot CLI, Gemini CLI, Grok, Antigravity CLI, OpenCode, Pi, and Oh My Pi by checking for their executable or configuration directories, then offers to install the appropriate hooks. Agent-specific configuration directory overrides are respected. Workmux also offers updates when an installed integration differs from its bundled version.
 
+Pass `--yes` to install without prompting, for example in a provisioning script: `workmux setup --hooks --yes`.
+
 Workmux automatically modifies your tmux `window-status-format` to display the status icons. This happens once per session and only affects the current tmux session (not your global config).
 
 ## Claude Code setup

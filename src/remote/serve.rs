@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use super::channel::{Handler, Peer};
 use super::handshake::{Hello, write_hello};
-use super::{forwarding, session};
+use super::{forwarding, provision, session};
 
 /// Answer to a `ping` health check.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -18,6 +18,9 @@ pub struct Ping {
     pub workmux: String,
     pub protocol: u32,
     pub pid: u32,
+    /// Problems with this remote's setup, such as agents without hooks.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 /// Answers the workstation's requests. Holds this side's peer, set once the
@@ -46,6 +49,7 @@ impl Handler for RemoteHandler {
                     workmux: hello.workmux,
                     protocol: hello.protocol,
                     pid: std::process::id(),
+                    warnings: provision::current_warnings(),
                 })
                 .map_err(|e| e.to_string())
             }

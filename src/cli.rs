@@ -718,6 +718,9 @@ enum Commands {
         /// Only install skills
         #[arg(long)]
         skills: bool,
+        /// Install without asking, so setup runs without a terminal
+        #[arg(short, long)]
+        yes: bool,
     },
 
     /// Remove agent status tracking hooks, skills, and cache/state dirs
@@ -1322,7 +1325,7 @@ pub fn run() -> Result<()> {
             }
             crate::config::Config::init()
         }
-        Commands::Setup { hooks, skills } => command::setup::run(hooks, skills),
+        Commands::Setup { hooks, skills, yes } => command::setup::run(hooks, skills, yes),
         Commands::Uninstall { dry_run } => command::uninstall::run(dry_run),
         Commands::Docs => command::docs::run(),
         Commands::Changelog => command::changelog::run(),

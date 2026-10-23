@@ -1140,3 +1140,170 @@ def test_remote_panes_survive_drops_and_reattach(
             os.kill(int(pid), signal.SIGKILL)
         if daemon_pid is not None:
             os.kill(daemon_pid, signal.SIGTERM)
+
+
+FAKE_NIX = """#!/bin/sh
+# Records how it was called, then runs the devshell's command as is.
+echo "$@" >> nix-args.txt
+while [ "$#" -gt 0 ] && [ "$1" != "--command" ]; do shift; done
+shift
+exec "$@"
+"""
+
+FAKE_CLAUDE = """#!/bin/sh
+echo "args:$*" >> agent-args.txt
+"""
+
+
+def claude_project_dir(home: Path, worktree: Path) -> Path:
+    """Where Claude Code keeps a worktree's conversations under `home`."""
+    encoded = "".join(
+        c if c.isalnum() or c == "-" else "-" for c in str(worktree.resolve())
+    )
+    return home / ".claude" / "projects" / encoded
+
+
+@requires_dtach
+@pytest.mark.tmux_only
+def test_remote_agents_start_in_the_devshell_and_resume_conversations(
+    mux_server: MuxEnvironment,
+    workmux_exe_path: Path,
+    repo_path: Path,
+    short_tmp: dict,
+    remote_root: Path,
+):
+    """A remote project with `flake.nix` starts its agent through
+    `nix develop` on the remote. `add --fork` forks a conversation stored on
+    the remote, and `add --continue` resumes one."""
+    env = mux_server
+    assert isinstance(env, TmuxEnvironment)
+    root = remote_root
+    home = root / "home"
+    (home / ".zshrc").write_text("")
+    for name, script in [("nix", FAKE_NIX), ("claude", FAKE_CLAUDE)]:
+        path = env.fake_bin_dir / name
+        path.write_text(script)
+        path.chmod(0o755)
+    origin = make_origin(
+        env,
+        env.tmp_path / "origin",
+        "agent: claude\npanes:\n  - command: <agent>\n",
+    )
+    (origin / "flake.nix").write_text("{ outputs = _: { }; }\n")
+    env.run_command(["git", "add", "flake.nix"], cwd=origin)
+    env.run_command(
+        ["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q"]
+        + ["-m", "flake"],
+        cwd=origin,
+    )
+
+    def wm(command):
+        return run_workmux_command(
+            env,
+            workmux_exe_path,
+            repo_path,
+            command,
+            pre_run_env=short_tmp,
+            timeout=60.0,
+        )
+
+    wm(f"remote add lb --transport loopback --target {root}")
+    wm(f"project add api --remote lb --repo {origin} --path code/api")
+    worktrees = home / "code" / "api__worktrees"
+    daemon_pid = None
+    try:
+        wm("add feature --project api")
+        daemon_pid = remote_daemon_ping(env, workmux_exe_path, repo_path, short_tmp)[
+            "pid"
+        ]
+        feature = worktrees / "feature"
+        assert wait_for(feature / "nix-args.txt").strip() == (
+            "develop --command bash -c claude"
+        )
+        assert wait_for(feature / "agent-args.txt").strip() == "args:"
+
+        # A conversation Claude Code stored on the remote for the clone.
+        session_id = "0a1b2c3d-1111-2222-3333-444455556666"
+        stored = claude_project_dir(home, home / "code" / "api")
+        stored.mkdir(parents=True)
+        (stored / f"{session_id}.jsonl").write_text('{"type":"user"}\n')
+
+        env.tmux(["select-window", "-t", env.runner_pane_id or "test:0"])
+        wm("add forked --project api --fork")
+        forked = worktrees / "forked"
+        assert wait_for(forked / "agent-args.txt").strip() == (
+            f"args:--resume {session_id}"
+        )
+        copied = claude_project_dir(home, forked) / f"{session_id}.jsonl"
+        assert copied.read_text() == '{"type":"user"}\n'
+
+        env.tmux(["select-window", "-t", env.runner_pane_id or "test:0"])
+        wm("add again --project api --continue")
+        assert wait_for(worktrees / "again" / "agent-args.txt").strip() == (
+            "args:--continue"
+        )
+    finally:
+        if daemon_pid is not None:
+            os.kill(daemon_pid, signal.SIGTERM)
+
+
+@requires_dtach
+@pytest.mark.tmux_only
+def test_provisioning_installs_agent_hooks_and_status_warns_without_them(
+    mux_server: MuxEnvironment,
+    workmux_exe_path: Path,
+    repo_path: Path,
+    short_tmp: dict,
+):
+    """The first use of a remote project installs agent hooks on the remote
+    without asking. `remote status` warns about a remote whose agents have
+    no hooks."""
+    env = mux_server
+    provisioned = env.tmp_path / "provisioned"
+    bare = env.tmp_path / "bare"
+    for root in [provisioned, bare]:
+        (root / "home" / ".claude").mkdir(parents=True)
+    origin = make_origin(env, env.tmp_path / "origin", "panes: []\n")
+
+    def wm(command, expect_fail=False):
+        return run_workmux_command(
+            env,
+            workmux_exe_path,
+            repo_path,
+            command,
+            pre_run_env=short_tmp,
+            expect_fail=expect_fail,
+            timeout=60.0,
+        )
+
+    wm(f"remote add lb --transport loopback --target {provisioned}")
+    wm(f"remote add bare --transport loopback --target {bare}")
+    wm(f"project add api --remote lb --repo {origin} --path code/api")
+    daemon_pid = None
+    try:
+        listing = wm("list --project api")
+        daemon_pid = remote_daemon_ping(env, workmux_exe_path, repo_path, short_tmp)[
+            "pid"
+        ]
+        assert "Installed hooks to" in listing.stdout + listing.stderr
+        settings = json.loads(
+            (provisioned / "home" / ".claude" / "settings.json").read_text()
+        )
+        assert "hooks" in settings
+
+        status = wm("remote status lb").stdout
+        assert "status:   reachable" in status
+        # Agents found on the workstation's PATH (the loopback shares it)
+        # may warn too; Claude Code's hooks were installed.
+        assert "Claude Code has no status hooks" not in status, status
+        assert "dtach" not in status, status
+
+        status = wm("remote status bare").stdout
+        assert "status:   reachable" in status
+        assert (
+            "warning:  Claude Code has no status hooks on this remote,"
+            " so its agents show no status; run `workmux setup --hooks` there"
+        ) in status, status
+    finally:
+        if daemon_pid is not None:
+            os.kill(daemon_pid, signal.SIGTERM)
