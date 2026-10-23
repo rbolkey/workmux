@@ -1,5 +1,6 @@
 import json
 import os
+import shlex
 import shutil
 import signal
 import socket
@@ -357,6 +358,165 @@ def test_remote_project_is_cloned_on_first_use_and_answers_list_and_path(
         local = wm("list")
         assert local.stdout.splitlines()[0].split()[0] == "BRANCH"
         assert "remote" not in json.loads(wm("list --json").stdout)[0]
+    finally:
+        if daemon_pid is not None:
+            os.kill(daemon_pid, signal.SIGTERM)
+
+
+def make_origin(env, path: Path, workmux_yaml: str) -> Path:
+    """A git repository the loopback remote clones, with its own
+    `.workmux.yaml` (which only the remote reads)."""
+    path.mkdir()
+    env.run_command(["git", "init", "-q", "-b", "main"], cwd=path)
+    (path / ".workmux.yaml").write_text(workmux_yaml)
+    env.run_command(["git", "add", ".workmux.yaml"], cwd=path)
+    env.run_command(
+        ["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q"]
+        + ["-m", "initial"],
+        cwd=path,
+    )
+    return path
+
+
+def run_in_pane(env, target: str, script_body: str, out_dir: Path, timeout=30.0):
+    """Run a shell snippet in the tmux pane `target`, returning (exit code,
+    stdout, stderr)."""
+    out_dir.mkdir(exist_ok=True)
+    for name in ["out", "err", "code"]:
+        (out_dir / name).unlink(missing_ok=True)
+    script = out_dir / "run.sh"
+    script.write_text(
+        f"trap 'echo $? > {out_dir}/code' EXIT\n"
+        f"export PATH={shlex.quote(env.env['PATH'])} HOME={shlex.quote(str(env.home_path))}\n"
+        f"export WORKMUX_TEST=1\n"
+        f"({script_body}) > {out_dir}/out 2> {out_dir}/err\n"
+    )
+    env.send_keys(target, f"/bin/sh {script}", enter=True)
+    deadline = time.monotonic() + timeout
+    while not (out_dir / "code").exists() or not (out_dir / "code").read_text():
+        assert time.monotonic() < deadline, env.capture_pane(target)
+        time.sleep(0.05)
+    return (
+        int((out_dir / "code").read_text()),
+        (out_dir / "out").read_text(),
+        (out_dir / "err").read_text(),
+    )
+
+
+def tmux_value(env, target: str, fmt: str) -> str:
+    return env.tmux(["display-message", "-p", "-t", target, fmt]).stdout.strip()
+
+
+def session_tag(env, session: str) -> str:
+    return env.tmux(
+        ["show-options", "-qv", "-t", session, "@workmux_project"], check=False
+    ).stdout.strip()
+
+
+def wait_for(path: Path, timeout=15.0) -> str:
+    deadline = time.monotonic() + timeout
+    while not path.exists() or not path.read_text():
+        assert time.monotonic() < deadline, f"{path} never written"
+        time.sleep(0.05)
+    return path.read_text()
+
+
+@pytest.mark.tmux_only
+def test_remote_add_places_windows_in_the_project_session(
+    mux_server: MuxEnvironment,
+    workmux_exe_path: Path,
+    repo_path: Path,
+    short_tmp: dict,
+):
+    """`add` on a remote project creates the worktree on the remote, runs its
+    post-create hooks there with output streamed back, and puts the window in
+    a workstation session named after the project, whatever session the
+    command was typed in. A session the user made is adopted; the `session:`
+    override, current-session placement and session mode still work."""
+    env = mux_server
+    root = env.tmp_path / "remote-root"
+    (root / "home").mkdir(parents=True)
+    # The remote terminal is an interactive login shell in an empty HOME.
+    (root / "home" / ".zshrc").write_text("")
+    workmux_yaml = (
+        "post_create:\n"
+        '  - echo "post-create ran in $PWD"\n'
+        "panes:\n"
+        "  - command: pwd -P > pane-ran.txt\n"
+    )
+    origin = make_origin(env, env.tmp_path / "origin", workmux_yaml)
+
+    def wm(command, expect_fail=False):
+        return run_workmux_command(
+            env,
+            workmux_exe_path,
+            repo_path,
+            command,
+            pre_run_env=short_tmp,
+            expect_fail=expect_fail,
+            timeout=60.0,
+        )
+
+    wm(f"remote add lb --transport loopback --target {root}")
+    wm(f"project add api --remote lb --repo {origin} --path code/api")
+    wm(f"project add web --remote lb --repo {origin} --path code/web --session frontend")
+    wm(
+        f"project add docs --remote lb --repo {origin} --path code/docs"
+        " --placement current-session"
+    )
+    daemon_pid = None
+    try:
+        # Typed in session "test"; the window goes to the project's session.
+        added = wm("add feature --project api")
+        daemon_pid = remote_daemon_ping(env, workmux_exe_path, repo_path, short_tmp)[
+            "pid"
+        ]
+        assert "post-create ran in" in added.stdout + added.stderr
+        worktree = root / "home" / "code" / "api__worktrees" / "feature"
+        assert worktree.is_dir()
+        assert tmux_value(env, "=api:wm-feature", "#{session_name}") == "api"
+        assert session_tag(env, "api") == "lb:api"
+        # The branch lives in the remote's clone, not on the workstation.
+        for repo in [origin, repo_path]:
+            branches = env.run_command(
+                ["git", "branch", "--list", "feature"], cwd=repo
+            ).stdout
+            assert branches.strip() == ""
+        # The pane runs on the remote, in the remote worktree.
+        ran = wait_for(worktree / "pane-ran.txt")
+        assert ran.strip() == str(worktree.resolve())
+
+        # A session the user made is adopted and tagged.
+        env.tmux(["new-session", "-d", "-s", "frontend"])
+        wm("add other --project web")
+        assert tmux_value(env, "=frontend:wm-other", "#{session_name}") == "frontend"
+        assert session_tag(env, "frontend") == "lb:web"
+
+        # Current-session placement keeps the window where the command ran.
+        wm("add notes --project docs")
+        assert tmux_value(env, "=test:wm-notes", "#{session_name}") == "test"
+        assert session_tag(env, "test") == ""
+
+        # The new window took focus; later commands run in the test pane.
+        env.tmux(["select-window", "-t", env.runner_pane_id])
+
+        # Session mode gives the worktree its own session.
+        wm("add solo --project api --mode session")
+        assert session_tag(env, "wm-solo") == "lb:api"
+
+        # Typed without --project in the project's session (in a pane of the
+        # user's own), the command targets the tagged project.
+        env.tmux(["new-window", "-d", "-t", "api:", "-n", "mine"])
+        code, out, err = run_in_pane(
+            env,
+            "=api:mine",
+            f"cd /tmp && TMPDIR={short_tmp['TMPDIR']} {workmux_exe_path} add tagged",
+            env.tmp_path / "pane-run",
+            timeout=60.0,
+        )
+        assert code == 0, err
+        assert (root / "home" / "code" / "api__worktrees" / "tagged").is_dir()
+        assert tmux_value(env, "=api:wm-tagged", "#{session_name}") == "api"
     finally:
         if daemon_pid is not None:
             os.kill(daemon_pid, signal.SIGTERM)

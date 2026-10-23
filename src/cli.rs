@@ -379,6 +379,10 @@ enum Commands {
         /// Use an alternate config file for this invocation (still merges with global config)
         #[arg(long, value_hint = clap::ValueHint::FilePath)]
         config: Option<PathBuf>,
+
+        /// Add the worktree to a project registered on a remote
+        #[arg(long)]
+        project: Option<String>,
     },
 
     /// Open a tmux window for an existing worktree
@@ -1109,7 +1113,15 @@ pub fn run() -> Result<()> {
             headless,
             json,
             config,
+            project,
         } => {
+            if let Some(project) = crate::remote::router::resolve(project.as_deref())? {
+                let argv = crate::remote::router::relayed_argv();
+                let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+                return crate::remote::router::exit_with(crate::remote::router::run(
+                    &project, &argv,
+                )?);
+            }
             let mode_override = mode
                 .map(MuxMode::from)
                 .or(session.then_some(MuxMode::Session));

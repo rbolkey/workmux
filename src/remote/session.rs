@@ -37,6 +37,8 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(7 * 24 * 3600);
 /// project: the remote's name and the project's registered name.
 pub const REMOTE_ENV: &str = "WORKMUX_REMOTE_NAME";
 pub const PROJECT_ENV: &str = "WORKMUX_PROJECT_NAME";
+/// The workstation session for the project's windows, when it has one.
+pub const PROJECT_SESSION_ENV: &str = "WORKMUX_PROJECT_SESSION";
 
 /// A remote project as remote workmux needs it to run a command.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,6 +49,10 @@ pub struct ProjectSite {
     /// from the remote's home directory.
     pub path: String,
     pub git_url: Option<String>,
+    /// Workstation session for the project's windows in window mode; `None`
+    /// places them in the invoking session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
 }
 
 /// One command to run in a remote project. In `argv`, `workmux` means
@@ -333,6 +339,10 @@ pub fn run_on_remote(
         .current_dir(&path)
         .env(REMOTE_ENV, &request.project.remote)
         .env(PROJECT_ENV, &request.project.name);
+    match &request.project.session {
+        Some(session) => command.env(PROJECT_SESSION_ENV, session),
+        None => command.env_remove(PROJECT_SESSION_ENV),
+    };
     if let Some(forwarding) = forwarding {
         command
             .env(forwarding::SOCKET_ENV, forwarding.socket)
@@ -347,13 +357,17 @@ pub fn run_on_remote(
 pub struct ServedProject {
     pub remote: String,
     pub name: String,
+    /// Workstation session for the project's windows in window mode.
+    pub session: Option<String>,
 }
 
 impl ServedProject {
     pub fn current() -> Option<Self> {
+        let var = |name| std::env::var(name).ok().filter(|v: &String| !v.is_empty());
         Some(Self {
-            remote: std::env::var(REMOTE_ENV).ok().filter(|v| !v.is_empty())?,
-            name: std::env::var(PROJECT_ENV).ok().filter(|v| !v.is_empty())?,
+            remote: var(REMOTE_ENV)?,
+            name: var(PROJECT_ENV)?,
+            session: var(PROJECT_SESSION_ENV),
         })
     }
 }
@@ -391,6 +405,7 @@ mod tests {
                 name: "api".to_string(),
                 path: path.display().to_string(),
                 git_url: git_url.map(|url| url.display().to_string()),
+                session: None,
             },
             argv: ["sh", "-c", script].map(String::from).to_vec(),
         }

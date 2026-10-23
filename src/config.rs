@@ -1082,6 +1082,22 @@ pub struct ProjectEntry {
     /// Workstation session name for the project's windows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
+
+    /// Where the project's windows go in window mode: its own session
+    /// (default) or the session the command was run from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement: Option<ProjectPlacement>,
+}
+
+/// Workstation placement of a remote project's windows in window mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProjectPlacement {
+    /// A session named after the project, or its `session` override.
+    #[default]
+    ProjectSession,
+    /// The session the command was run from.
+    CurrentSession,
 }
 
 /// A named agent environment value.

@@ -188,7 +188,8 @@ impl Workstation<'_> {
             }
             MuxRequest::SwitchToPane { pane_id } => {
                 self.check_pane(&pane_id)?;
-                json!(tmux.switch_to_pane(&pane_id, None)?)
+                self.switch_invoking_clients(&pane_id)?;
+                Value::Null
             }
             MuxRequest::SelectWindow { name } => {
                 let window = self.window_named(&name)?;
@@ -202,7 +203,8 @@ impl Workstation<'_> {
             }
             MuxRequest::SwitchToSession { name } => {
                 self.check_session(&name)?;
-                json!(tmux.switch_to_session("", &name)?)
+                self.switch_invoking_clients(&name)?;
+                Value::Null
             }
             MuxRequest::KillSession { name } => {
                 self.check_session(&name)?;
@@ -237,6 +239,26 @@ impl Workstation<'_> {
                 json!(tmux.kill_pane(&pane_id)?)
             }
         })
+    }
+
+    /// Switch the tmux clients viewing the invoking session to `target`. The
+    /// workstation daemon has no client of its own; with no client viewing
+    /// the invoking session there is nothing to switch.
+    fn switch_invoking_clients(&self, target: &str) -> Result<()> {
+        let Some(session) = self.tmux.current_session_id()? else {
+            return Ok(());
+        };
+        let clients = self
+            .tmux
+            .query(&["list-clients", "-F", "#{client_name}\t#{session_id}"])?;
+        for client in clients.lines().filter_map(|line| {
+            let (client, client_session) = line.split_once('\t')?;
+            (client_session == session).then_some(client)
+        }) {
+            self.tmux
+                .query(&["switch-client", "-c", client, "-t", target])?;
+        }
+        Ok(())
     }
 
     fn refusal(&self, what: &str) -> anyhow::Error {

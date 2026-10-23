@@ -4,7 +4,7 @@ use anyhow::{Result, bail};
 use clap::{Args, Subcommand};
 
 use super::global_config::{self, PROJECTS};
-use crate::config::ProjectEntry;
+use crate::config::{ProjectEntry, ProjectPlacement};
 use crate::remote::registry;
 
 #[derive(Debug, Args)]
@@ -31,6 +31,9 @@ pub enum ProjectCommand {
         /// Workstation session for the project's windows (default: the project name)
         #[arg(long)]
         session: Option<String>,
+        /// Where the project's windows go in window mode
+        #[arg(long, value_enum)]
+        placement: Option<ProjectPlacement>,
     },
 }
 
@@ -42,6 +45,7 @@ pub fn run(args: ProjectArgs) -> Result<()> {
             repo,
             path,
             session,
+            placement,
         } => add(
             &name,
             ProjectEntry {
@@ -49,6 +53,7 @@ pub fn run(args: ProjectArgs) -> Result<()> {
                 remote: Some(remote),
                 git_url: Some(repo),
                 session,
+                placement,
             },
         ),
     }
@@ -100,6 +105,7 @@ remotes:
             git_url: Some("git@github.com:me/api.git".to_string()),
             path: Some("~/code/api".to_string()),
             session: None,
+            placement: Some(ProjectPlacement::CurrentSession),
         }
     }
 
