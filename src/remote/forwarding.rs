@@ -22,6 +22,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use super::channel::Peer;
+use super::pane::{RemotePaneId, SessionHolder};
 use super::session;
 use crate::config::SplitDirection;
 use crate::multiplexer::types::{
@@ -33,16 +34,9 @@ use crate::multiplexer::{Multiplexer, util};
 /// Control channel method carrying one forwarded multiplexer request.
 pub const FORWARD_METHOD: &str = "mux.call";
 
-/// A terminal for a workstation pane: what runs on the remote, and where.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RemoteTty {
-    pub argv: Vec<String>,
-    /// Working directory on the remote.
-    pub workdir: String,
-}
-
 /// One multiplexer operation forwarded from a remote. Windows are named by
-/// their full (prefixed) names.
+/// their full (prefixed) names; a new or respawned pane attaches to the
+/// remote pane the remote has already started for it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum MuxRequest {
@@ -67,28 +61,28 @@ pub enum MuxRequest {
     CreateWindow {
         name: String,
         after_window: Option<String>,
-        tty: RemoteTty,
+        pane: RemotePaneId,
     },
     CreateSession {
         name: String,
         initial_window_name: Option<String>,
-        tty: RemoteTty,
+        pane: RemotePaneId,
     },
     CreateWindowInSession {
         session: String,
         name: Option<String>,
-        tty: RemoteTty,
+        pane: RemotePaneId,
     },
     RespawnPane {
         pane_id: String,
-        tty: RemoteTty,
+        pane: RemotePaneId,
     },
     SplitPane {
         target_pane_id: String,
         direction: SplitDirection,
         size: Option<u16>,
         percentage: Option<u8>,
-        tty: RemoteTty,
+        pane: RemotePaneId,
     },
     SetWindowOwnership {
         pane_id: String,
@@ -257,14 +251,23 @@ pub struct ForwardingMux {
     socket: PathBuf,
     session: u64,
     connection: Mutex<Option<Connection>>,
+    /// Project whose remote panes this command starts.
+    project: String,
+    holder: SessionHolder,
+    /// The remote pane each workstation pane this command made shows, so a
+    /// respawn can end the one it replaces.
+    panes: Mutex<HashMap<String, RemotePaneId>>,
 }
 
 impl ForwardingMux {
-    pub fn new(socket: PathBuf, session: u64) -> Self {
+    pub fn new(socket: PathBuf, session: u64, project: String, holder: SessionHolder) -> Self {
         Self {
             socket,
             session,
             connection: Mutex::new(None),
+            project,
+            holder,
+            panes: Mutex::new(HashMap::new()),
         }
     }
 
@@ -273,7 +276,11 @@ impl ForwardingMux {
     pub fn from_env() -> Option<Self> {
         let socket = std::env::var_os(SOCKET_ENV).filter(|v| !v.is_empty())?;
         let session = std::env::var(SESSION_ENV).ok()?.parse().ok()?;
-        Some(Self::new(PathBuf::from(socket), session))
+        let project = std::env::var(super::session::PROJECT_ENV).ok()?;
+        let holder = SessionHolder::for_this_remote()
+            .inspect_err(|error| tracing::warn!(error = %format!("{error:#}"), "no session holder"))
+            .ok()?;
+        Some(Self::new(PathBuf::from(socket), session, project, holder))
     }
 
     fn call(&self, request: MuxRequest) -> Result<Value> {
@@ -337,20 +344,45 @@ impl ForwardingMux {
         self.call(request).map(drop)
     }
 
-    fn login_shell(&self, workdir: &Path) -> Result<RemoteTty> {
-        Ok(RemoteTty {
-            argv: vec![self.get_default_shell()?, "-l".to_string()],
-            workdir: workdir.display().to_string(),
-        })
+    /// Forward a kill, then end the remote panes the killed workstation
+    /// panes showed.
+    fn kill(&self, request: MuxRequest) -> Result<()> {
+        let ended: Vec<RemotePaneId> = self.get(request)?;
+        for pane in ended {
+            if let Err(error) = self.holder.kill(&pane) {
+                tracing::warn!(%pane, error = %format!("{error:#}"), "failed to end remote pane");
+            }
+        }
+        Ok(())
     }
 
-    fn tty(&self, workdir: &Path, command: Option<&str>) -> Result<RemoteTty> {
-        match command {
-            Some(script) => Ok(RemoteTty {
-                argv: ["sh", "-c", script].map(String::from).to_vec(),
-                workdir: workdir.display().to_string(),
-            }),
-            None => self.login_shell(workdir),
+    /// Start `command` (else a login shell) in a new remote pane in
+    /// `workdir`, then forward the request that attaches a workstation pane
+    /// to it. The remote pane a respawned workstation pane showed is ended
+    /// once the new one is attached; a refused request ends the new one.
+    fn attach_new_pane(
+        &self,
+        workdir: &Path,
+        command: Option<&str>,
+        request: impl FnOnce(RemotePaneId) -> MuxRequest,
+    ) -> Result<String> {
+        let argv = match command {
+            Some(script) => ["sh", "-c", script].map(String::from).to_vec(),
+            None => vec![self.get_default_shell()?, "-l".to_string()],
+        };
+        let pane = self.holder.create(&self.project, workdir, &argv)?;
+        match self.get::<String>(request(pane.clone())) {
+            Ok(pane_id) => {
+                let replaced = self.panes.lock().unwrap().insert(pane_id.clone(), pane);
+                if let Some(replaced) = replaced {
+                    let _ = self.holder.kill(&replaced);
+                }
+                Ok(pane_id)
+            }
+            Err(error) => {
+                let _ = self.holder.kill(&pane);
+                Err(error)
+            }
         }
     }
 }
@@ -393,26 +425,26 @@ impl Multiplexer for ForwardingMux {
     }
 
     fn create_window(&self, params: CreateWindowParams) -> Result<String> {
-        self.get(MuxRequest::CreateWindow {
+        self.attach_new_pane(params.cwd, None, |pane| MuxRequest::CreateWindow {
             name: util::prefixed(params.prefix, params.name),
             after_window: params.after_window.map(str::to_string),
-            tty: self.login_shell(params.cwd)?,
+            pane,
         })
     }
 
     fn create_session(&self, params: CreateSessionParams) -> Result<String> {
-        self.get(MuxRequest::CreateSession {
+        self.attach_new_pane(params.cwd, None, |pane| MuxRequest::CreateSession {
             name: util::prefixed(params.prefix, params.name),
             initial_window_name: params.initial_window_name.map(str::to_string),
-            tty: self.login_shell(params.cwd)?,
+            pane,
         })
     }
 
     fn create_window_in_session(&self, params: CreateWindowInSessionParams) -> Result<String> {
-        self.get(MuxRequest::CreateWindowInSession {
+        self.attach_new_pane(params.cwd, None, |pane| MuxRequest::CreateWindowInSession {
             session: params.session_name.to_string(),
             name: params.name.map(str::to_string),
-            tty: self.login_shell(params.cwd)?,
+            pane,
         })
     }
 
@@ -441,19 +473,19 @@ impl Multiplexer for ForwardingMux {
     }
 
     fn kill_session(&self, full_name: &str) -> Result<()> {
-        self.act(MuxRequest::KillSession {
+        self.kill(MuxRequest::KillSession {
             name: full_name.to_string(),
         })
     }
 
     fn kill_window(&self, full_name: &str) -> Result<()> {
-        self.act(MuxRequest::KillWindow {
+        self.kill(MuxRequest::KillWindow {
             name: full_name.to_string(),
         })
     }
 
     fn kill_window_target(&self, target: &WindowTarget) -> Result<()> {
-        self.act(MuxRequest::KillWindowTarget {
+        self.kill(MuxRequest::KillWindowTarget {
             target: target.clone(),
         })
     }
@@ -559,15 +591,15 @@ impl Multiplexer for ForwardingMux {
     }
 
     fn kill_pane(&self, pane_id: &str) -> Result<()> {
-        self.act(MuxRequest::KillPane {
+        self.kill(MuxRequest::KillPane {
             pane_id: pane_id.to_string(),
         })
     }
 
     fn respawn_pane(&self, pane_id: &str, cwd: &Path, cmd: Option<&str>) -> Result<String> {
-        self.get(MuxRequest::RespawnPane {
+        self.attach_new_pane(cwd, cmd, |pane| MuxRequest::RespawnPane {
             pane_id: pane_id.to_string(),
-            tty: self.tty(cwd, cmd)?,
+            pane,
         })
     }
 
@@ -632,12 +664,12 @@ impl Multiplexer for ForwardingMux {
         percentage: Option<u8>,
         command: Option<&str>,
     ) -> Result<String> {
-        self.get(MuxRequest::SplitPane {
+        self.attach_new_pane(cwd, command, |pane| MuxRequest::SplitPane {
             target_pane_id: target_pane_id.to_string(),
             direction: direction.clone(),
             size,
             percentage,
-            tty: self.tty(cwd, command)?,
+            pane,
         })
     }
 
@@ -674,6 +706,7 @@ mod tests {
     use crate::multiplexer::InvocationContext;
     use crate::remote::channels::{ChannelPolicy, Channels};
     use crate::remote::forwarded::WINDOW_TAG;
+    use crate::remote::pane::PaneState;
     use crate::remote::session::{CommandRequest, ProjectSite, Stream};
     use crate::remote::testing::ServeTransport;
     use crate::remote::transport::Transport;
@@ -690,18 +723,32 @@ mod tests {
         }
     }
 
+    /// Stands in for workstation workmux in panes: stays attached.
+    fn fake_workmux(dir: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("workmux");
+        std::fs::write(&path, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
     /// A command running in a command session on `transport`'s remote,
-    /// invoked from `invocation`. Yields the forwarding multiplexer it was
-    /// given, then holds the session open until `release` exists.
+    /// invoked from `invocation`, whose remote panes `holder` keeps. Yields
+    /// the forwarding multiplexer it was given, then holds the session open
+    /// until `release` exists.
     fn command_session(
         transport: Arc<ServeTransport>,
         invocation: InvocationContext,
         project: &std::path::Path,
         release: &std::path::Path,
+        holder: SessionHolder,
     ) -> (ForwardingMux, std::thread::JoinHandle<Result<i32>>) {
         let channels = Channels::new(
             Arc::new(move |_, _| Ok(transport.clone() as Arc<dyn Transport>)),
-            ChannelPolicy::default(),
+            ChannelPolicy {
+                workmux: fake_workmux(release.parent().unwrap()),
+                ..ChannelPolicy::default()
+            },
         );
         let request = CommandRequest {
             project: ProjectSite {
@@ -741,17 +788,31 @@ mod tests {
             .expect("the command printed its forwarding environment");
         let (socket, session_id) = line.trim().split_once(' ').unwrap();
         (
-            ForwardingMux::new(PathBuf::from(socket), session_id.parse().unwrap()),
+            ForwardingMux::new(
+                PathBuf::from(socket),
+                session_id.parse().unwrap(),
+                "api".to_string(),
+                holder,
+            ),
             session,
         )
     }
 
+    fn start_command(server: &PrivateTmuxServer, pane: &str) -> String {
+        server.query(&["display-message", "-p", "-t", pane, "#{pane_start_command}"])
+    }
+
     #[test]
-    fn a_command_on_the_remote_creates_a_project_window_in_workstation_tmux() {
+    fn a_command_on_the_remote_creates_a_project_window_attached_to_a_remote_pane() {
         let Some(server) = PrivateTmuxServer::start() else {
             return;
         };
+        let Some((panes, holder)) = crate::remote::pane::tests::holder() else {
+            return;
+        };
         let temp = tempfile::tempdir().unwrap();
+        let worktree = panes.path().join("feature");
+        std::fs::create_dir_all(worktree.join(".git")).unwrap();
         let invoking = server.new_session("mine", temp.path());
         let release = temp.path().join("release");
         let invocation = InvocationContext {
@@ -764,6 +825,7 @@ mod tests {
             invocation,
             temp.path(),
             &release,
+            SessionHolder::new(panes.path().join("panes")),
         );
 
         assert_eq!(mux.current_pane_id(), Some(invoking));
@@ -772,7 +834,7 @@ mod tests {
             .create_session(CreateSessionParams {
                 prefix: "",
                 name: "api",
-                cwd: temp.path(),
+                cwd: &worktree,
                 initial_window_name: Some("wm-feature"),
             })
             .unwrap();
@@ -791,6 +853,30 @@ mod tests {
             server.query(&["show-options", "-wqv", "-t", &pane, WINDOW_TAG]),
             "devbox:api"
         );
+        let shell: RemotePaneId = "api/feature/0".parse().unwrap();
+        assert!(
+            start_command(&server, &pane).contains("remote attach devbox api/feature/0"),
+            "{}",
+            start_command(&server, &pane)
+        );
+        assert_eq!(holder.state(&shell).unwrap(), PaneState::Running);
+
+        // Respawned with a command, the pane shows a new remote pane and
+        // the login shell it replaced ends.
+        mux.respawn_pane(&pane, &worktree, Some("exec sleep 30"))
+            .unwrap();
+        assert!(
+            start_command(&server, &pane).contains("remote attach devbox api/feature/1"),
+            "{}",
+            start_command(&server, &pane)
+        );
+        assert_eq!(holder.state(&shell).unwrap(), PaneState::Ended);
+        let agent: RemotePaneId = "api/feature/1".parse().unwrap();
+        assert_eq!(holder.state(&agent).unwrap(), PaneState::Running);
+
+        // Killing the window's session ends the remote panes it showed.
+        mux.kill_session("api").unwrap();
+        assert_eq!(holder.state(&agent).unwrap(), PaneState::Ended);
         std::fs::write(&release, "").unwrap();
         assert_eq!(session.join().unwrap().unwrap(), 0);
     }
@@ -810,8 +896,14 @@ mod tests {
             },
             temp.path(),
             &release,
+            SessionHolder::new(temp.path().join("panes")),
         );
-        let forged = ForwardingMux::new(mux.socket.clone(), mux.session + 100);
+        let forged = ForwardingMux::new(
+            mux.socket.clone(),
+            mux.session + 100,
+            "api".to_string(),
+            SessionHolder::new(temp.path().join("panes")),
+        );
 
         let error = forged.session_exists("api").unwrap_err().to_string();
 
@@ -823,7 +915,12 @@ mod tests {
     #[test]
     fn without_the_control_channel_requests_fail_as_not_connected() {
         let temp = tempfile::tempdir().unwrap();
-        let mux = ForwardingMux::new(temp.path().join("gone.sock"), 1);
+        let mux = ForwardingMux::new(
+            temp.path().join("gone.sock"),
+            1,
+            "api".to_string(),
+            SessionHolder::new(temp.path().join("panes")),
+        );
 
         let error = mux.is_running().unwrap_err().to_string();
 
@@ -833,7 +930,12 @@ mod tests {
     #[test]
     fn workflow_only_operations_are_unsupported_on_remote() {
         let temp = tempfile::tempdir().unwrap();
-        let mux = ForwardingMux::new(temp.path().join("gone.sock"), 1);
+        let mux = ForwardingMux::new(
+            temp.path().join("gone.sock"),
+            1,
+            "api".to_string(),
+            SessionHolder::new(temp.path().join("panes")),
+        );
 
         let error = mux
             .schedule_window_close("wm-x", Duration::from_secs(1))
