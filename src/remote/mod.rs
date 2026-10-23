@@ -2,14 +2,14 @@
 //! transport and spoken to over a control channel (ADR 0001).
 
 pub mod channel;
-pub mod handshake;
-pub mod transport;
-pub mod connection;
-pub mod serve;
 pub mod channels;
+pub mod connection;
+pub mod handshake;
+pub mod registry;
+pub mod serve;
 #[cfg(test)]
 pub mod testing;
-pub mod registry;
+pub mod transport;
 
 use anyhow::{Result, anyhow};
 use std::collections::BTreeMap;

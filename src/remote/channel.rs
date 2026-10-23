@@ -270,7 +270,9 @@ pub(crate) fn read_line(reader: &mut impl BufRead) -> Result<Option<Vec<u8>>> {
         return Ok(None);
     }
     if line.len() > MAX_LINE_BYTES {
-        return Err(anyhow!("control channel line exceeds {MAX_LINE_BYTES} bytes"));
+        return Err(anyhow!(
+            "control channel line exceeds {MAX_LINE_BYTES} bytes"
+        ));
     }
     if line.last() == Some(&b'\n') {
         line.pop();
@@ -403,7 +405,10 @@ mod tests {
         assert_eq!(finished.len(), 6);
         // Fast answers are not queued behind the slow ones.
         let first_slow = finished.iter().position(|f| f.1 == "slow").unwrap();
-        assert!(first_slow >= 4, "slow requests blocked others: {finished:?}");
+        assert!(
+            first_slow >= 4,
+            "slow requests blocked others: {finished:?}"
+        );
         for (_, label, answer) in &finished {
             match *label {
                 "slow" => assert_eq!(answer, &json!({ "ms": 300 })),
@@ -424,7 +429,10 @@ mod tests {
             .notify("status", json!({ "pane": "%1" }))
             .unwrap();
         // A request after the notification proves it was read first.
-        workstation.peer.request("echo", Value::Null, TIMEOUT).unwrap();
+        workstation
+            .peer
+            .request("echo", Value::Null, TIMEOUT)
+            .unwrap();
 
         assert_eq!(
             *remote.notifications.lock().unwrap(),

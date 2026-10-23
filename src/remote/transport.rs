@@ -200,7 +200,10 @@ impl Loopback {
     }
 
     #[cfg(test)]
-    pub fn with_workmux(root: impl Into<std::path::PathBuf>, workmux: impl Into<std::path::PathBuf>) -> Self {
+    pub fn with_workmux(
+        root: impl Into<std::path::PathBuf>,
+        workmux: impl Into<std::path::PathBuf>,
+    ) -> Self {
         Self {
             root: root.into(),
             workmux: workmux.into(),

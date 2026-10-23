@@ -4131,10 +4131,9 @@ projects:
 
     #[test]
     fn remotes_and_projects_in_project_config_are_ignored_with_a_warning() {
-        let global: Config = serde_yaml::from_str(
-            "remotes:\n  devbox:\n    transport: ssh\n    target: devbox\n",
-        )
-        .expect("global config parses");
+        let global: Config =
+            serde_yaml::from_str("remotes:\n  devbox:\n    transport: ssh\n    target: devbox\n")
+                .expect("global config parses");
         let project: Config = serde_yaml::from_str(REMOTES_YAML).expect("project config parses");
 
         let (merged, logs) = capture_logs(|| global.merge(project));

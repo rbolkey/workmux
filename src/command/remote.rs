@@ -53,9 +53,7 @@ pub enum RemoteCommand {
         name: Option<String>,
     },
     /// Remove a remote from your global config
-    Rm {
-        name: String,
-    },
+    Rm { name: String },
     /// Serve the control channel on stdin and stdout (run by transports)
     #[command(hide = true)]
     Serve,
@@ -226,7 +224,9 @@ impl Tabled for Row {
 fn list() -> Result<()> {
     let statuses = fetch_statuses(None)?;
     if statuses.is_empty() {
-        println!("No remotes. Add one with: workmux remote add <name> --transport ssh --target <host>");
+        println!(
+            "No remotes. Add one with: workmux remote add <name> --transport ssh --target <host>"
+        );
         return Ok(());
     }
     let rows: Vec<Row> = statuses
@@ -259,7 +259,9 @@ fn list() -> Result<()> {
 fn status(name: Option<&str>) -> Result<bool> {
     let statuses = fetch_statuses(name)?;
     if statuses.is_empty() {
-        println!("No remotes. Add one with: workmux remote add <name> --transport ssh --target <host>");
+        println!(
+            "No remotes. Add one with: workmux remote add <name> --transport ssh --target <host>"
+        );
         return Ok(true);
     }
     let mut all_reachable = true;
@@ -392,17 +394,23 @@ fn remove_remote_from(content: &str, name: &str) -> Result<String> {
     let is_entry_line = |line: &str| {
         indent_of(line) == indent && {
             let key = line.trim_start();
-            [format!("{name}:"), format!("\"{name}\":"), format!("'{name}':")]
-                .iter()
-                .any(|prefix| {
-                    key.strip_prefix(prefix.as_str())
-                        .is_some_and(|rest| rest.trim().is_empty() || rest.trim().starts_with('#'))
-                })
+            [
+                format!("{name}:"),
+                format!("\"{name}\":"),
+                format!("'{name}':"),
+            ]
+            .iter()
+            .any(|prefix| {
+                key.strip_prefix(prefix.as_str())
+                    .is_some_and(|rest| rest.trim().is_empty() || rest.trim().starts_with('#'))
+            })
         }
     };
     let start = (header + 1..end)
         .find(|&i| is_entry_line(lines[i]))
-        .ok_or_else(|| anyhow!("could not find remote {name} in your global config; remove it by hand"))?;
+        .ok_or_else(|| {
+            anyhow!("could not find remote {name} in your global config; remove it by hand")
+        })?;
     let stop = (start + 1..end)
         .find(|&i| !is_blank(lines[i]) && indent_of(lines[i]) <= indent)
         .unwrap_or(end);
@@ -426,7 +434,9 @@ fn remove_remote_from(content: &str, name: &str) -> Result<String> {
         .filter(|after| !after.remotes.contains_key(name))
         .filter(|after| after.remotes.len() + 1 == before.remotes.len());
     if after.is_none() {
-        bail!("could not remove remote {name} from your global config automatically; remove it by hand");
+        bail!(
+            "could not remove remote {name} from your global config automatically; remove it by hand"
+        );
     }
     Ok(updated)
 }
@@ -533,7 +543,8 @@ nerdfont: true
 
     #[test]
     fn removing_the_last_remote_removes_the_section() {
-        let content = "remotes:\n  devbox:\n    transport: ssh\n    target: devbox\nnerdfont: true\n";
+        let content =
+            "remotes:\n  devbox:\n    transport: ssh\n    target: devbox\nnerdfont: true\n";
 
         let updated = remove_remote_from(content, "devbox").unwrap();
 

@@ -151,8 +151,10 @@ mod tests {
 
     #[test]
     fn a_stream_that_ends_before_the_hello_is_an_error() {
-        let error = read_hello(&mut Cursor::new(b"bash: workmux: command not found\n".to_vec()))
-            .unwrap_err();
+        let error = read_hello(&mut Cursor::new(
+            b"bash: workmux: command not found\n".to_vec(),
+        ))
+        .unwrap_err();
 
         assert!(
             error.to_string().contains("ended before its hello"),

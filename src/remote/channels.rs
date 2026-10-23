@@ -266,7 +266,11 @@ impl Channels {
             return;
         };
         if let Some(connection) = dropped {
-            tracing::warn!(remote = name, reason = connection.failure(), "control channel dropped");
+            tracing::warn!(
+                remote = name,
+                reason = connection.failure(),
+                "control channel dropped"
+            );
         }
 
         let mut backoff = self.shared.policy.backoff_initial;
@@ -403,7 +407,10 @@ mod tests {
             })
             .collect();
         for thread in threads {
-            assert!(matches!(thread.join().unwrap().reach, Reach::Reachable { .. }));
+            assert!(matches!(
+                thread.join().unwrap().reach,
+                Reach::Reachable { .. }
+            ));
         }
 
         assert_eq!(transport.exec_count(), 1);
