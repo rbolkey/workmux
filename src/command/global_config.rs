@@ -72,17 +72,12 @@ fn is_blank(line: &str) -> bool {
 /// past its last line, and the indent of its entries.
 fn find_section(lines: &[&str], key: &str) -> Result<Option<(usize, usize, Option<usize>)>> {
     let header_text = format!("{key}:");
-    let Some(header) = lines
-        .iter()
-        .position(|line| line.starts_with(&header_text))
-    else {
+    let Some(header) = lines.iter().position(|line| line.starts_with(&header_text)) else {
         return Ok(None);
     };
     let rest = lines[header][header_text.len()..].trim();
     if !(rest.is_empty() || rest.starts_with('#')) {
-        bail!(
-            "the {key} section of your global config is not a block mapping; edit it by hand"
-        );
+        bail!("the {key} section of your global config is not a block mapping; edit it by hand");
     }
     let end = lines[header + 1..]
         .iter()

@@ -97,7 +97,12 @@ fn session(
         argv: argv.iter().map(|arg| arg.to_string()).collect(),
     };
     let Some(socket) = daemon_socket() else {
-        return super::channels().run_command(&project.site.remote, &project.remote, &request, sink);
+        return super::channels().run_command(
+            &project.site.remote,
+            &project.remote,
+            &request,
+            sink,
+        );
     };
     let mut undelivered = None;
     let result = crate::workstation_daemon::call_streaming(
@@ -195,7 +200,10 @@ projects:
 
         assert_eq!(api.project(), Project::remote("devbox", "api"));
         assert_eq!(api.site.path, "~/code/api");
-        assert_eq!(api.site.git_url.as_deref(), Some("git@github.com:me/api.git"));
+        assert_eq!(
+            api.site.git_url.as_deref(),
+            Some("git@github.com:me/api.git")
+        );
         assert_eq!(api.remote.target, "me@devbox");
     }
 

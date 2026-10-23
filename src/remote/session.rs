@@ -14,9 +14,9 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::Mutex;
 use std::time::Duration;
 
 use super::channel::Peer;
@@ -262,7 +262,7 @@ fn ensure_cloned(
         )
         .as_bytes(),
     );
-    let mut clone = Command::new("git");
+    let mut clone = crate::git::unattended_git(None)?;
     clone.arg("clone").arg("--quiet").arg(git_url).arg(path);
     let status = run_streamed(clone, emit)?;
     if !status.success() {
@@ -357,10 +357,7 @@ mod tests {
         stderr: String,
     }
 
-    fn run(
-        request: &CommandRequest,
-        mut on_stdout: impl FnMut(&str),
-    ) -> (Result<i32>, Captured) {
+    fn run(request: &CommandRequest, mut on_stdout: impl FnMut(&str)) -> (Result<i32>, Captured) {
         let mut captured = Captured::default();
         let exit = channels().run_command("devbox", &remote(), request, &mut |stream, data| {
             let text = String::from_utf8_lossy(data);
@@ -402,7 +399,11 @@ mod tests {
         let path = project.path().canonicalize().unwrap();
 
         let (exit, captured) = run(
-            &request(&path, None, "pwd; echo $WORKMUX_REMOTE_NAME $WORKMUX_PROJECT_NAME"),
+            &request(
+                &path,
+                None,
+                "pwd; echo $WORKMUX_REMOTE_NAME $WORKMUX_PROJECT_NAME",
+            ),
             |_| {},
         );
 

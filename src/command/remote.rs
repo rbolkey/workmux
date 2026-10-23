@@ -283,7 +283,8 @@ mod tests {
     fn adding_to_a_config_without_remotes_appends_the_section() {
         let content = "# my settings\nnerdfont: true\n";
 
-        let updated = global_config::add_entry(content, &REMOTES, "devbox", &ssh("me@devbox")).unwrap();
+        let updated =
+            global_config::add_entry(content, &REMOTES, "devbox", &ssh("me@devbox")).unwrap();
 
         assert!(updated.starts_with(content), "{updated}");
         assert_eq!(parse(&updated).remotes["devbox"], ssh("me@devbox"));
@@ -332,7 +333,8 @@ nerdfont: true
     fn adding_a_remote_that_exists_is_refused() {
         let content = "remotes:\n  devbox:\n    transport: ssh\n    target: devbox\n";
 
-        let error = global_config::add_entry(content, &REMOTES, "devbox", &ssh("other")).unwrap_err();
+        let error =
+            global_config::add_entry(content, &REMOTES, "devbox", &ssh("other")).unwrap_err();
 
         assert_eq!(error.to_string(), "remote devbox already exists");
     }
@@ -375,7 +377,8 @@ nerdfont: true
 
     #[test]
     fn removing_an_unknown_remote_is_an_error() {
-        let error = global_config::remove_entry("nerdfont: true\n", &REMOTES, "devbox").unwrap_err();
+        let error =
+            global_config::remove_entry("nerdfont: true\n", &REMOTES, "devbox").unwrap_err();
 
         assert_eq!(error.to_string(), "no remote named devbox");
     }

@@ -265,9 +265,8 @@ pub fn call_streaming(
         },
     )?;
     let response = loop {
-        let line = read_line(&mut reader)?.ok_or_else(|| {
-            anyhow!("workstation daemon closed the connection without answering")
-        })?;
+        let line = read_line(&mut reader)?
+            .ok_or_else(|| anyhow!("workstation daemon closed the connection without answering"))?;
         if let Ok(notification) = serde_json::from_slice::<Notification>(&line) {
             on_notification(&notification.method, notification.params);
             continue;

@@ -247,10 +247,7 @@ fn list_project(
 }
 
 /// List a remote project's worktrees through remote workmux.
-fn list_remote_project(
-    remote: &RemoteProject,
-    filter: &[String],
-) -> Result<Vec<ProjectWorktree>> {
+fn list_remote_project(remote: &RemoteProject, filter: &[String]) -> Result<Vec<ProjectWorktree>> {
     let mut argv = vec!["workmux", "list", "--json"];
     argv.extend(filter.iter().map(String::as_str));
     let (exit, stdout) = router::capture(remote, &argv)?;
@@ -348,9 +345,9 @@ pub fn run(
                         MuxMode::Window => "window".to_string(),
                         MuxMode::Session => "session".to_string(),
                     },
-                    has_uncommitted_changes: entry.has_uncommitted_changes.unwrap_or_else(|| {
-                        git::has_uncommitted_changes(&wt.path).unwrap_or(true)
-                    }),
+                    has_uncommitted_changes: entry
+                        .has_uncommitted_changes
+                        .unwrap_or_else(|| git::has_uncommitted_changes(&wt.path).unwrap_or(true)),
                     is_open: wt.has_mux_window,
                     agent_statuses: wt
                         .agent_status

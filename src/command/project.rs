@@ -75,7 +75,9 @@ fn add_project_to(content: &str, name: &str, project: &ProjectEntry) -> Result<S
     if let Some(remote) = &project.remote
         && !config.remotes.contains_key(remote)
     {
-        bail!("no remote named {remote}; add it with: workmux remote add {remote} --transport ssh --target <host>");
+        bail!(
+            "no remote named {remote}; add it with: workmux remote add {remote} --transport ssh --target <host>"
+        );
     }
     global_config::add_entry(content, &PROJECTS, name, project)
 }
