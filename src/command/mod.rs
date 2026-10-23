@@ -18,6 +18,7 @@ pub mod pane_history;
 pub mod path;
 pub mod reap_agents;
 pub mod rebase;
+pub mod remote;
 pub mod remove;
 pub mod rename;
 pub mod resurrect;

@@ -1001,6 +1001,87 @@ pub struct Config {
     /// Container sandbox configuration
     #[serde(default)]
     pub sandbox: SandboxConfig,
+
+    /// Remotes, by name, that projects can live on. Global-only.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub remotes: BTreeMap<String, RemoteConfig>,
+
+    /// Projects registered on a remote, by name. Global-only.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub projects: BTreeMap<String, ProjectEntry>,
+}
+
+/// How the workstation reaches a remote.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum TransportKind {
+    Ssh,
+    Openshell,
+    /// Runs remote workmux as a local child process rooted in the target
+    /// directory. Stands in for a real remote in tests.
+    #[value(hide = true)]
+    Loopback,
+}
+
+impl TransportKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TransportKind::Ssh => "ssh",
+            TransportKind::Openshell => "openshell",
+            TransportKind::Loopback => "loopback",
+        }
+    }
+}
+
+impl std::fmt::Display for TransportKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A remote entry in global config.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+pub struct RemoteConfig {
+    pub transport: TransportKind,
+
+    /// Transport-specific target: an SSH host, a sandbox name, or a loopback
+    /// root directory.
+    pub target: String,
+
+    /// Whether the built-in shims (sound playback, clipboard read) are
+    /// available to this remote. Defaults to true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub builtin_shims: Option<bool>,
+
+    /// Host commands this remote may run on the workstation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub host_commands: Vec<String>,
+}
+
+impl RemoteConfig {
+    #[allow(dead_code)] // Read once remotes get the guest shims
+    pub fn builtin_shims(&self) -> bool {
+        self.builtin_shims.unwrap_or(true)
+    }
+}
+
+/// A project entry in global config.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, Default)]
+pub struct ProjectEntry {
+    /// Name of the remote the project lives on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_url: Option<String>,
+
+    /// Path of the project's clone on the remote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+
+    /// Workstation session name for the project's windows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
 }
 
 /// A named agent environment value.
@@ -3006,6 +3087,13 @@ impl Config {
         Ok(Some(config))
     }
 
+    /// Load only the global configuration, or the defaults if there is none.
+    /// For workstation-wide settings such as remotes, which no project
+    /// config may set.
+    pub fn load_global_only() -> anyhow::Result<Self> {
+        Ok(Self::load_global()?.unwrap_or_default())
+    }
+
     /// Load the global configuration file.
     ///
     /// Uses `global_config_path()` which resolves via XDG_CONFIG_HOME with
@@ -3422,6 +3510,23 @@ impl Config {
         } else {
             self.agents
         };
+
+        // Security: remotes and projects are global-only, so a repository's
+        // .workmux.yaml cannot redirect where workmux sends commands.
+        if !project.remotes.is_empty() {
+            tracing::warn!(
+                "remotes in project config (.workmux.yaml) is ignored -- \
+                move it to your global config (~/.config/workmux/config.yaml)"
+            );
+        }
+        merged.remotes = self.remotes;
+        if !project.projects.is_empty() {
+            tracing::warn!(
+                "projects in project config (.workmux.yaml) is ignored -- \
+                move it to your global config (~/.config/workmux/config.yaml)"
+            );
+        }
+        merged.projects = self.projects;
 
         merged
     }
@@ -3956,6 +4061,94 @@ mod tests {
     use super::{DashboardConfig, InputExitKey};
     use crate::test_support;
     use tempfile::TempDir;
+
+    /// Run `f`, returning its result and the log lines it emitted.
+    fn capture_logs<T>(f: impl FnOnce() -> T) -> (T, String) {
+        #[derive(Clone, Default)]
+        struct Sink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let sink = Sink::default();
+        let writer = sink.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        let result = tracing::subscriber::with_default(subscriber, f);
+        let logs = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+        (result, logs)
+    }
+
+    const REMOTES_YAML: &str = "\
+remotes:
+  devbox:
+    transport: ssh
+    target: me@devbox
+    builtin_shims: false
+    host_commands: [just]
+projects:
+  api:
+    remote: devbox
+    git_url: git@github.com:me/api.git
+    path: ~/src/api
+    session: api-work
+";
+
+    #[test]
+    fn global_config_registers_remotes_and_projects() {
+        let global: Config = serde_yaml::from_str(REMOTES_YAML).expect("config parses");
+
+        let merged = global.merge(Config::default());
+
+        let devbox = &merged.remotes["devbox"];
+        assert_eq!(devbox.transport, super::TransportKind::Ssh);
+        assert_eq!(devbox.target, "me@devbox");
+        assert!(!devbox.builtin_shims());
+        assert_eq!(devbox.host_commands, vec!["just".to_string()]);
+        let api = &merged.projects["api"];
+        assert_eq!(api.remote.as_deref(), Some("devbox"));
+        assert_eq!(api.git_url.as_deref(), Some("git@github.com:me/api.git"));
+        assert_eq!(api.path.as_deref(), Some("~/src/api"));
+        assert_eq!(api.session.as_deref(), Some("api-work"));
+    }
+
+    #[test]
+    fn builtin_shims_are_on_by_default_for_a_remote() {
+        let config: Config =
+            serde_yaml::from_str("remotes:\n  devbox:\n    transport: ssh\n    target: devbox\n")
+                .expect("config parses");
+
+        assert!(config.remotes["devbox"].builtin_shims());
+        assert!(config.remotes["devbox"].host_commands.is_empty());
+    }
+
+    #[test]
+    fn remotes_and_projects_in_project_config_are_ignored_with_a_warning() {
+        let global: Config =
+            serde_yaml::from_str("remotes:\n  devbox:\n    transport: ssh\n    target: devbox\n")
+                .expect("global config parses");
+        let project: Config = serde_yaml::from_str(REMOTES_YAML).expect("project config parses");
+
+        let (merged, logs) = capture_logs(|| global.merge(project));
+
+        assert_eq!(merged.remotes["devbox"].target, "devbox");
+        assert!(merged.projects.is_empty());
+        assert!(
+            logs.contains("remotes in project config (.workmux.yaml) is ignored"),
+            "logs: {logs}"
+        );
+        assert!(
+            logs.contains("projects in project config (.workmux.yaml) is ignored"),
+            "logs: {logs}"
+        );
+    }
 
     #[test]
     fn default_session_is_none_by_default() {

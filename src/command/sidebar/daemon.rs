@@ -2556,7 +2556,10 @@ pub fn run() -> Result<()> {
         if scheduler.maintenance_due(now) {
             scheduler.finish_maintenance(now);
             let client_count = server.client_count();
-            if client_count > 0 || server.take_request_activity() {
+            // Open control channels keep the daemon alive; idle ones close.
+            let channels = crate::remote::channels();
+            channels.close_idle();
+            if client_count > 0 || server.take_request_activity() || channels.open_count() > 0 {
                 last_client_seen = now;
             } else if now.duration_since(last_client_seen) > Duration::from_secs(10) {
                 tracing::info!("workstation daemon exiting: no clients for 10s");
