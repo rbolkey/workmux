@@ -118,16 +118,31 @@ impl FromStr for PaneState {
 /// and attaches to remote panes kept under one directory.
 pub struct SessionHolder {
     dir: PathBuf,
+    /// What a remote pane's shell reaches the workstation through: the
+    /// shell socket, and the directory of shims put first on its PATH.
+    shell: Option<(PathBuf, PathBuf)>,
 }
 
 impl SessionHolder {
     pub fn new(dir: impl Into<PathBuf>) -> Self {
-        Self { dir: dir.into() }
+        Self {
+            dir: dir.into(),
+            shell: None,
+        }
+    }
+
+    /// Remote panes this holder starts reach the workstation through the
+    /// shell socket `socket` and the shims in `shims`.
+    pub fn with_shell(mut self, socket: PathBuf, shims: PathBuf) -> Self {
+        self.shell = Some((socket, shims));
+        self
     }
 
     /// The session holder for this remote's panes, under its state dir.
     pub fn for_this_remote() -> Result<Self> {
-        Ok(Self::new(crate::xdg::state_dir()?.join("panes")))
+        let state = crate::xdg::state_dir()?;
+        Ok(Self::new(state.join("panes"))
+            .with_shell(super::shell::socket_path()?, super::shell::shims_dir()?))
     }
 
     fn socket(&self, id: &RemotePaneId) -> PathBuf {
@@ -183,6 +198,16 @@ impl SessionHolder {
             .stderr(Stdio::null());
         if std::env::var("TERM").map_or(true, |term| term.is_empty() || term == "dumb") {
             command.env("TERM", DEFAULT_TERM);
+        }
+        if let Some((socket, shims)) = &self.shell {
+            let path = std::env::var_os("PATH").unwrap_or_default();
+            let path = std::env::join_paths(
+                std::iter::once(shims.clone()).chain(std::env::split_paths(&path)),
+            )
+            .context("the shims directory cannot go on PATH")?;
+            command
+                .env(super::shell::SOCKET_ENV, socket)
+                .env("PATH", path);
         }
         let status = command.status();
         let failure = match status {
@@ -291,13 +316,18 @@ impl SessionHolder {
         Ok(running.into_iter().map(|(_, id)| id).collect())
     }
 
-    /// End every remote pane of `project`'s `worktree`, whether or not a
-    /// workstation pane shows it.
-    pub fn end_worktree(&self, project: &str, worktree: &str) -> Result<()> {
+    /// End every remote pane of `project`'s `worktree` but `except`,
+    /// whether or not a workstation pane shows it.
+    pub fn end_worktree(
+        &self,
+        project: &str,
+        worktree: &str,
+        except: Option<&RemotePaneId>,
+    ) -> Result<()> {
         let panes: Vec<RemotePaneId> = self
             .running(project)?
             .into_iter()
-            .filter(|pane| pane.worktree == worktree)
+            .filter(|pane| pane.worktree == worktree && Some(pane) != except)
             .collect();
         std::thread::scope(|scope| {
             let ending: Vec<_> = panes
@@ -363,13 +393,19 @@ impl SessionHolder {
 /// On a remote, end every remote pane of the served project's worktree at
 /// `worktree_path`, including those no workstation pane shows (a view
 /// closed in tmux, the survivors of a window killed outside workmux).
-/// Elsewhere there are none.
+/// Elsewhere there are none. The remote pane this command was typed in is
+/// left to the deferred close of its window, which ends it once the
+/// command is done.
 pub fn end_served_worktree_panes(worktree_path: &Path) {
     let Some(served) = super::session::ServedProject::current() else {
         return;
     };
-    let ended = SessionHolder::for_this_remote()
-        .and_then(|holder| holder.end_worktree(&served.name, &worktree_name(worktree_path)));
+    let own = std::env::var(PANE_ENV)
+        .ok()
+        .and_then(|pane| pane.parse().ok());
+    let ended = SessionHolder::for_this_remote().and_then(|holder| {
+        holder.end_worktree(&served.name, &worktree_name(worktree_path), own.as_ref())
+    });
     if let Err(error) = ended {
         tracing::warn!(error = %format!("{error:#}"), "failed to end the worktree's remote panes");
     }
@@ -498,6 +534,36 @@ pub mod tests {
     }
 
     #[test]
+    fn a_remote_panes_shell_reaches_the_workstation_through_the_shell_socket_and_shims() {
+        let Some((temp, holder)) = holder() else {
+            return;
+        };
+        let feature = worktree(&temp, "feature");
+        let holder = holder.with_shell(temp.path().join("shell.sock"), temp.path().join("shims"));
+
+        let id = holder
+            .create(
+                "api",
+                &feature,
+                &argv(&[
+                    "sh",
+                    "-c",
+                    "echo \"$WORKMUX_SHELL_SOCKET $PATH\" > ran; exec sleep 30",
+                ]),
+            )
+            .unwrap();
+
+        let ran = wait_for_file(&feature.join("ran"));
+        let (socket, path) = ran.trim().split_once(' ').unwrap();
+        assert_eq!(socket, temp.path().join("shell.sock").display().to_string());
+        assert_eq!(
+            path.split(':').next(),
+            Some(temp.path().join("shims").display().to_string().as_str())
+        );
+        holder.kill(&id).unwrap();
+    }
+
+    #[test]
     fn panes_of_one_worktree_take_the_next_free_slot() {
         let Some((temp, holder)) = holder() else {
             return;
@@ -575,7 +641,7 @@ pub mod tests {
         let other_worktree = holder.create("api", &bugfix, &sleep).unwrap();
         let other_project = holder.create("web", &feature, &sleep).unwrap();
 
-        holder.end_worktree("api", "feature").unwrap();
+        holder.end_worktree("api", "feature", None).unwrap();
 
         for id in &ending {
             assert_eq!(holder.state(id).unwrap(), PaneState::Ended, "{id}");

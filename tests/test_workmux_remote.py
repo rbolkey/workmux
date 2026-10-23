@@ -1838,3 +1838,178 @@ def test_close_and_remove_end_the_worktrees_unshown_remote_panes_too(
     finally:
         if daemon_pid is not None:
             os.kill(daemon_pid, signal.SIGTERM)
+
+
+def shows_prompt(env, pane: str):
+    """Wait until the agent pane's `sh` shows its prompt: keys typed before
+    it starts are lost."""
+    wait_until(
+        lambda: "$" in env.tmux(["capture-pane", "-p", "-t", pane], check=False).stdout,
+        f"a shell prompt in {pane}",
+    )
+
+
+def run_in_remote_pane(env, target: str, script_body: str, out_dir: Path, timeout=60.0):
+    """Run a shell snippet in the remote pane the tmux pane `target` shows,
+    in the remote pane's own environment, returning (exit code, stdout,
+    stderr). Keys typed while the pane (re)attaches can be lost, so they are
+    typed again until the script starts; it runs at most once."""
+    out_dir.mkdir(exist_ok=True)
+    for name in ["out", "err", "code"]:
+        (out_dir / name).unlink(missing_ok=True)
+    started = out_dir / "started"
+    shutil.rmtree(started, ignore_errors=True)
+    script = out_dir / "run.sh"
+    script.write_text(
+        f"mkdir {started} 2>/dev/null || exit 0\n"
+        f"trap 'echo $? > {out_dir}/code' EXIT\n"
+        f"({script_body}) > {out_dir}/out 2> {out_dir}/err\n"
+    )
+    deadline = time.monotonic() + timeout
+    while not started.exists():
+        assert time.monotonic() < deadline, env.capture_pane(target)
+        env.send_keys(target, f"/bin/sh {script}", enter=True)
+        retry = time.monotonic() + 3.0
+        while not started.exists() and time.monotonic() < retry:
+            time.sleep(0.05)
+    while not (out_dir / "code").exists() or not (out_dir / "code").read_text():
+        assert time.monotonic() < deadline, "\n".join(
+            path.read_text() if path.exists() else f"(no {path.name})"
+            for path in [out_dir / "out", out_dir / "err"]
+        )
+        time.sleep(0.05)
+    return (
+        int((out_dir / "code").read_text()),
+        (out_dir / "out").read_text(),
+        (out_dir / "err").read_text(),
+    )
+
+
+@requires_dtach
+@pytest.mark.tmux_only
+def test_commands_typed_in_a_remote_pane_reach_the_workstation(
+    mux_server: MuxEnvironment,
+    workmux_exe_path: Path,
+    repo_path: Path,
+    short_tmp: dict,
+    remote_root: Path,
+):
+    """A remote pane's shell reaches the workstation through the shell
+    socket, never a tmux of its own: `add` typed there creates a worktree on
+    the remote and a window on the workstation, `close` typed in a window's
+    own pane closes it (and `remove` removes it), the built-in and allowlisted shims run on the
+    workstation and anything else is refused, and with the channel gone
+    commands fail as not connected."""
+    env = mux_server
+    assert isinstance(env, TmuxEnvironment)
+    root = remote_root
+    origin = make_origin(env, env.tmp_path / "origin", "panes:\n  - command: sh\n")
+    worktrees = root / "home" / "code" / "api__worktrees"
+    bin_dir = root / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "workmux").symlink_to(workmux_exe_path)
+    # The shims stay first on PATH, then the workmux under test, ahead of
+    # any installed one.
+    shims = root / "home/.local/state/workmux/shims/bin"
+    with_workmux = f'export PATH="{shims}:{bin_dir}:$PATH" WORKMUX_TEST=1; '
+
+    def wm(command):
+        return run_workmux_command(
+            env,
+            workmux_exe_path,
+            repo_path,
+            command,
+            pre_run_env=short_tmp,
+            timeout=60.0,
+        )
+
+    def windows():
+        return env.tmux(
+            ["list-windows", "-a", "-F", "#{session_name}:#{window_name}"]
+        ).stdout.split()
+
+    wm(f"remote add lb --transport loopback --target {root} --host-command pwd")
+    wm(f"project add api --remote lb --repo {origin} --path code/api")
+    daemon_pid = None
+    try:
+        wm("add feature --project api")
+        daemon_pid = remote_daemon_ping(env, workmux_exe_path, repo_path, short_tmp)[
+            "pid"
+        ]
+        env.tmux(["select-window", "-t", env.runner_pane_id or "test:0"])
+        pane = tmux_value(env, "=api:wm-feature", "#{pane_id}")
+        out = env.tmp_path / "pane-out"
+        shows_prompt(env, pane)
+
+        def in_pane(body: str):
+            return run_in_remote_pane(env, pane, with_workmux + body, out)
+
+        # The remote pane's shell has no tmux of its own.
+        code, stdout, _ = in_pane('echo "tmux=${TMUX:-none}"; command -v afplay')
+        assert code == 0
+        assert stdout.splitlines() == [
+            "tmux=none",
+            f"{root}/home/.local/state/workmux/shims/bin/afplay",
+        ]
+
+        # `add` typed in the remote pane: the worktree on the remote, the
+        # window in the project's session on the workstation.
+        code, stdout, stderr = in_pane("workmux add second")
+        assert code == 0, stderr
+        assert (worktrees / "second").is_dir()
+        assert "api:wm-second" in windows()
+        second = tmux_value(env, "=api:wm-second", "#{pane_id}")
+        shows_prompt(env, second)
+        assert (
+            env.tmux(
+                ["show-options", "-wqv", "-t", second, "@workmux_project_window"]
+            ).stdout.strip()
+            == "lb:api"
+        )
+
+        # An allowlisted host command runs on the workstation; anything
+        # else is refused.
+        code, stdout, stderr = in_pane("pwd -P; env pwd")
+        assert code == 0, stderr
+        here, there = stdout.splitlines()
+        assert here == str((worktrees / "feature").resolve())
+        assert there.endswith("/workmux-host-exec/lb"), stdout
+        code, _, stderr = in_pane("workmux host-exec ls")
+        assert code != 0
+        assert "host command ls is not allowed for remote lb" in stderr
+
+        # `close` typed in a window's own pane closes that window.
+        code, _, stderr = in_pane("workmux close")
+        assert code == 0, stderr
+        wait_until(lambda: "api:wm-feature" not in windows(), "the window to close")
+        assert (worktrees / "feature").is_dir()
+        holders = f"dtach -n {root}/home/.local/state/workmux/panes/api/feature/"
+        wait_until(
+            lambda: subprocess.run(["pgrep", "-f", holders]).returncode == 1,
+            "the window's remote panes to end",
+        )
+
+        # So does `remove`, which then removes the worktree.
+        code, _, stderr = run_in_remote_pane(
+            env, second, with_workmux + "workmux add third && workmux remove", out
+        )
+        assert code == 0, stderr
+        wait_until(lambda: "api:wm-second" not in windows(), "the window to close")
+        wait_until(lambda: not (worktrees / "second").exists(), "the worktree to go")
+        third = tmux_value(env, "=api:wm-third", "#{pane_id}")
+        shows_prompt(env, third)
+
+        # With the control channel gone, commands fail as not connected.
+        os.kill(daemon_pid, signal.SIGTERM)
+        daemon_pid = None
+        socket_path = root / "home/.local/state/workmux/shell.sock"
+        wait_until(lambda: not socket_path.exists(), "the shell socket to go")
+        code, _, stderr = run_in_remote_pane(
+            env, third, with_workmux + "workmux add fourth", out
+        )
+        assert code != 0
+        assert "workstation not connected" in stderr
+        assert not (worktrees / "fourth").exists()
+    finally:
+        if daemon_pid is not None:
+            os.kill(daemon_pid, signal.SIGTERM)

@@ -4,13 +4,16 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::io::{BufRead, Write};
-use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
+use std::os::unix::fs::DirBuilderExt;
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use super::channel::{Handler, Peer};
+use super::forwarding::{self, SocketGuard};
 use super::handshake::{Hello, write_hello};
-use super::{forwarding, provision, session, status};
+use super::{provision, session, shell, shims, status};
 
 /// Answer to a `ping` health check.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -43,6 +46,9 @@ impl Handler for RemoteHandler {
                 params,
             )
             .map_err(|error| format!("{error:#}")),
+            shims::INSTALL_METHOD => {
+                shims::serve_install(params).map_err(|error| format!("{error:#}"))
+            }
             "ping" => {
                 let hello = Hello::current();
                 serde_json::to_value(Ping {
@@ -76,6 +82,12 @@ pub fn serve(
     reader: impl BufRead + Send + 'static,
     mut writer: impl Write + Send + 'static,
 ) -> Result<()> {
+    // Bound before the hello, so remote shells are connected as soon as
+    // the channel is open.
+    let shell_path = shell::socket_path()
+        .inspect_err(|error| tracing::warn!(error = %format!("{error:#}"), "no shell socket"))
+        .ok();
+    let shell_listener = shell_path.as_ref().and_then(|path| bind_shell_socket(path));
     write_hello(&mut writer, &Hello::current())?;
     let handler = RemoteHandler::default();
     let peer = Peer::start(reader, writer, handler.clone());
@@ -88,6 +100,14 @@ pub fn serve(
     let _ = handler
         .forwarding
         .set(socket.as_ref().map(|socket| socket.path.clone()));
+    let shell = Arc::new(Mutex::new(None));
+    if let Some((listener, guard)) = shell_listener {
+        forwarding::relay_from(listener, peer.clone());
+        *shell.lock().unwrap() = Some(guard);
+    }
+    if let Some(path) = shell_path {
+        claim_shell_socket(peer.clone(), path, shell.clone());
+    }
     match status::StatusFiles::for_this_remote() {
         Ok(files) => {
             let peer = peer.clone();
@@ -97,9 +117,57 @@ pub fn serve(
     }
     while !peer.wait_closed(Duration::from_secs(3600)) {}
     tracing::info!(reason = ?peer.closed_reason(), "control channel closed");
+    // Remote shells are no longer connected.
+    shell.lock().unwrap().take();
     // Nothing can read their output or answer their prompts any more.
     handler.running.shut_down();
     Ok(())
+}
+
+/// How often a `remote serve` without the shell socket checks whether the
+/// one holding it has gone.
+const SHELL_SOCKET_CLAIM: Duration = Duration::from_secs(2);
+
+/// Bind the shell socket at `path`, unless another `remote serve` is
+/// listening there.
+fn bind_shell_socket(path: &Path) -> Option<(UnixListener, SocketGuard)> {
+    if UnixStream::connect(path).is_ok() {
+        return None;
+    }
+    let bound = path
+        .parent()
+        .map_or(Ok(()), |dir| {
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(dir)
+        })
+        .map_err(anyhow::Error::from)
+        .and_then(|()| {
+            let _ = std::fs::remove_file(path);
+            forwarding::bind(path.to_path_buf())
+        });
+    bound
+        .inspect_err(|error| {
+            tracing::warn!(error = %format!("{error:#}"), "failed to claim the shell socket")
+        })
+        .ok()
+}
+
+/// While `peer` is open, take over the shell socket at `path` whenever the
+/// `remote serve` holding it has gone.
+fn claim_shell_socket(peer: Peer, path: PathBuf, held: Arc<Mutex<Option<SocketGuard>>>) {
+    std::thread::spawn(move || {
+        while !peer.wait_closed(SHELL_SOCKET_CLAIM) {
+            let mut guard = held.lock().unwrap();
+            if guard.is_none()
+                && let Some((listener, socket)) = bind_shell_socket(&path)
+            {
+                forwarding::relay_from(listener, peer.clone());
+                *guard = Some(socket);
+            }
+        }
+    });
 }
 
 /// Run `workmux remote serve` on this process's stdin and stdout.

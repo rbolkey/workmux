@@ -209,6 +209,25 @@ impl Sessions {
         self.open.lock().unwrap().remove(&id);
     }
 
+    /// Open a session for the commands run in a remote pane's shell: their
+    /// forwarded requests are scoped and answered like a command session's,
+    /// but their output and prompts stay in the remote pane.
+    pub fn open_shell(&self, scope: SessionScope) -> u64 {
+        let (id, _, _) = self.open(scope);
+        id
+    }
+
+    /// Close shell session `id` of `remote`, once its connection closes.
+    pub fn close_shell(&self, id: u64, remote: &str) {
+        let mut open = self.open.lock().unwrap();
+        if open
+            .get(&id)
+            .is_some_and(|session| session.scope.remote == remote)
+        {
+            open.remove(&id);
+        }
+    }
+
     /// Deliver a `command.output` notification to its session.
     pub fn output(&self, params: Value) {
         let delivered = serde_json::from_value::<OutputParams>(params)

@@ -15,6 +15,8 @@ pub mod registry;
 pub mod router;
 pub mod serve;
 pub mod session;
+pub mod shell;
+pub mod shims;
 pub mod ssh;
 pub mod status;
 #[cfg(test)]

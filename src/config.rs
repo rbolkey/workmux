@@ -1059,7 +1059,6 @@ pub struct RemoteConfig {
 }
 
 impl RemoteConfig {
-    #[allow(dead_code)] // Read once remotes get the guest shims
     pub fn builtin_shims(&self) -> bool {
         self.builtin_shims.unwrap_or(true)
     }
@@ -4015,6 +4014,10 @@ pub fn resolve_executable_path(executable: &str) -> Option<String> {
 }
 
 pub fn tmux_global_path() -> Option<String> {
+    // Remote workmux's panes run on the remote, not in a tmux there.
+    if crate::remote::session::ServedProject::current().is_some() {
+        return None;
+    }
     let output = cmd::Cmd::new("tmux")
         .args(&["show-environment", "-g", "PATH"])
         .run_and_capture_stdout()

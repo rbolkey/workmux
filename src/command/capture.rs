@@ -5,6 +5,9 @@ use crate::multiplexer::{create_backend, detect_backend};
 use crate::workflow;
 
 pub fn run(name: &str, lines: u16) -> Result<()> {
+    if let Some(code) = crate::remote::shell::run_relayed(crate::remote::shell::own_argv(), None)? {
+        std::process::exit(code);
+    }
     let mux = create_backend(detect_backend());
     let (_path, agent) = workflow::resolve_worktree_agent(name, mux.as_ref())?;
 
