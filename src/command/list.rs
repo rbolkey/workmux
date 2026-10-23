@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use crate::config;
 use crate::config::MuxMode;
 use crate::multiplexer::{AgentStatus, create_backend, detect_backend};
+use crate::project::Project;
 use crate::util::format_compact_age;
 use crate::workflow::types::AgentStatusSummary;
 use crate::{git, nerdfont, workflow};
@@ -156,15 +157,14 @@ struct JsonWorktree {
 }
 
 struct ProjectWorktree {
-    project: String,
+    project: Project,
     project_path: PathBuf,
     worktree: workflow::types::WorktreeInfo,
 }
 
-fn project_name(root: &Path) -> String {
-    root.file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| root.to_string_lossy().into_owned())
+fn project(root: &Path) -> Project {
+    Project::from_main_worktree_root(root)
+        .unwrap_or_else(|| Project::workstation(root.to_string_lossy()))
 }
 
 fn discover_project_roots(mux: &dyn crate::multiplexer::Multiplexer) -> Result<Vec<PathBuf>> {
@@ -184,7 +184,7 @@ fn list_project(
     filter: &[String],
 ) -> Result<Vec<ProjectWorktree>> {
     let (config, _) = config::Config::load_with_location_from(root, None)?;
-    let project = project_name(root);
+    let project = project(root);
     let worktrees = workflow::list_in(&config, mux, show_pr, filter, Some(root))?;
     Ok(worktrees
         .into_iter()
@@ -206,7 +206,7 @@ pub fn run(show_pr: bool, json: bool, all: bool, filter: &[String]) -> Result<()
         }
     } else {
         let root = git::get_main_worktree_root()?;
-        let project = project_name(&root);
+        let project = project(&root);
         worktrees.extend(
             workflow::list(&display_config, mux.as_ref(), show_pr && !json, filter)?
                 .into_iter()
@@ -233,7 +233,7 @@ pub fn run(show_pr: bool, json: bool, all: bool, filter: &[String]) -> Result<()
             .map(|entry| {
                 let wt = entry.worktree;
                 JsonWorktree {
-                    project: entry.project,
+                    project: entry.project.name,
                     project_path: entry.project_path.to_string_lossy().into_owned(),
                     handle: wt.handle,
                     branch: wt.branch,
@@ -289,7 +289,7 @@ pub fn run(show_pr: bool, json: bool, all: bool, filter: &[String]) -> Result<()
             };
 
             WorktreeRow {
-                project: entry.project,
+                project: entry.project.name,
                 branch: wt.branch,
                 age,
                 pr_status: format_pr_status(wt.pr_info),

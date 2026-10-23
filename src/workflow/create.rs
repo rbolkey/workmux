@@ -137,12 +137,8 @@ fn create_impl(
         let mut target_exists = target.exists()?;
         let mut current_target_name = requested_target_name.to_string();
         if target_exists && !worktree_exists && !is_explicit_name && !explicit_target_name {
-            let project_name = context
-                .main_worktree_root
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("repo");
-            let mut project_slug = slug::slugify(project_name);
+            let project_name = context.project().map(|project| project.name);
+            let mut project_slug = slug::slugify(project_name.as_deref().unwrap_or("repo"));
             if project_slug.is_empty() || project_slug.chars().all(|c| c.is_ascii_digit()) {
                 project_slug = format!(
                     "repo-{}",
@@ -393,16 +389,14 @@ fn create_impl(
         crate::util::expand_worktree_dir(worktree_dir, &context.main_worktree_root)?
     } else {
         // Default behavior: <main_worktree_root>/../<project_name>__worktrees
-        let project_name = context
-            .main_worktree_root
-            .file_name()
-            .and_then(|n| n.to_str())
+        let project = context
+            .project()
             .ok_or_else(|| anyhow!("Could not determine project name"))?;
         context
             .main_worktree_root
             .parent()
             .ok_or_else(|| anyhow!("Could not determine parent directory"))?
-            .join(format!("{}__worktrees", project_name))
+            .join(format!("{}__worktrees", project.name))
     };
     // Use current_handle for the worktree directory name (may be suffixed for cross-repo collision)
     let worktree_path = base_dir.join(&current_handle);

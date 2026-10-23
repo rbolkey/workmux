@@ -1,7 +1,7 @@
 //! Pure helper functions for agent data extraction and formatting.
 
 // Re-export shared display helpers so existing `agent::extract_*` paths keep working.
-pub use crate::agent_display::{extract_project_name, extract_worktree_name};
+pub use crate::agent_display::extract_worktree_name;
 
 /// Get elapsed seconds since the status timestamp.
 pub fn elapsed_secs(status_ts: Option<u64>, now_secs: u64) -> Option<u64> {

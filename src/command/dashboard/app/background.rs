@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::git;
+use crate::project::Project;
 
 use super::App;
 use super::types::AppEvent;
@@ -120,7 +121,7 @@ impl App {
 
             let priority_repo = priority_path
                 .as_deref()
-                .and_then(|path| git::get_repository_key_in(Some(path)).ok());
+                .and_then(|path| Project::of_workstation_path(path).cache_key(path).ok());
 
             // Sort repos so the priority repo (current project) is fetched first
             let mut repos: VecDeque<_> = repo_branches.into_iter().collect();
