@@ -14,16 +14,14 @@ pub fn fallback_worktree_path(handle: &str, context: &WorkflowContext) -> Result
     let base_dir = if let Some(ref worktree_dir) = context.config.worktree_dir {
         crate::util::expand_worktree_dir(worktree_dir, &context.main_worktree_root)?
     } else {
-        let project_name = context
-            .main_worktree_root
-            .file_name()
-            .and_then(|n| n.to_str())
+        let project = context
+            .project()
             .ok_or_else(|| anyhow!("Could not determine project name"))?;
         context
             .main_worktree_root
             .parent()
             .ok_or_else(|| anyhow!("Could not determine parent directory"))?
-            .join(format!("{}__worktrees", project_name))
+            .join(format!("{}__worktrees", project.name))
     };
 
     let path = base_dir.join(handle);

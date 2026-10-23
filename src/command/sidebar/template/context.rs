@@ -2,14 +2,13 @@
 
 use ratatui::style::{Color, Modifier, Style};
 
-use crate::agent_display::{
-    extract_project_name, extract_worktree_name, resolve_labels, sanitize_pane_title,
-};
+use crate::agent_display::{extract_worktree_name, resolve_labels, sanitize_pane_title};
 use crate::agent_identity::AgentKind;
 use crate::git::GitStatus;
 use crate::github::{CheckSummary, PrSummary};
 use crate::multiplexer::agent::resolve_profile_for_display;
 use crate::multiplexer::{AgentPane, AgentStatus};
+use crate::project::Project;
 use crate::ui::theme::ThemePalette;
 
 use super::super::app::{ResolvedAgentIcons, SidebarApp};
@@ -73,7 +72,7 @@ impl<'a> RowContext<'a> {
         now_secs: u64,
         selected_idx: Option<usize>,
     ) -> Self {
-        let project = extract_project_name(&agent.path);
+        let project = Project::of_workstation_path(&agent.path).name;
         let (label_worktree, _) = extract_worktree_name(
             &agent.session,
             &agent.window_name,

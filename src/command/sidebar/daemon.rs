@@ -1,4 +1,5 @@
-//! Sidebar daemon: single process that polls tmux and pushes snapshots to clients.
+//! Workstation daemon main loop: polls tmux, pushes snapshots to sidebars and
+//! answers request/response calls on the same socket.
 
 use anyhow::Result;
 use ignore::gitignore::Gitignore;
@@ -21,21 +22,10 @@ use crate::git::GitStatus;
 use crate::github::{CheckSummary, PrSummary};
 use crate::multiplexer::{LivePaneInfo, Multiplexer, TmuxBackend, create_backend, detect_backend};
 use crate::state::StateStore;
+use crate::workstation_daemon::Connection;
 
 use super::app::{SidebarFilterMode, SidebarLayoutMode};
 use super::snapshot::{CheckPathEntry, PrPathEntry, SnapshotInputs, build_snapshot};
-
-/// Compute the socket path for a multiplexer instance.
-pub fn socket_path(instance_id: &str) -> PathBuf {
-    // FNV-1a provides a stable fixed-width key across the controller and daemon
-    // while keeping long tmux socket paths below Unix socket limits.
-    let mut key = 0xcbf29ce484222325u64;
-    for byte in instance_id.as_bytes() {
-        key ^= u64::from(*byte);
-        key = key.wrapping_mul(0x100000001b3);
-    }
-    std::env::temp_dir().join(format!("workmux-sidebar-{key:016x}.sock"))
-}
 
 /// Result of a batched tmux query.
 #[derive(Clone)]
@@ -169,9 +159,33 @@ fn stream_is_connected(stream: &UnixStream) -> bool {
     )
 }
 
-/// Unix socket server for broadcasting snapshots to clients.
+/// Unix socket server: broadcasts snapshots to subscribed sidebars and
+/// answers request/response calls from CLI clients.
 struct SocketServer {
     state: Arc<Mutex<SocketState>>,
+    request_activity: Arc<AtomicBool>,
+}
+
+/// Register a subscriber after sending it the latest cached snapshot.
+fn register_subscriber(state: &Mutex<SocketState>, mut stream: UnixStream) {
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(100)));
+    loop {
+        let (generation, payload) = {
+            let state = state.lock().unwrap();
+            (state.cached.generation, state.cached.payload.clone())
+        };
+        if !payload.is_empty() && stream.write_all(&payload).is_err() {
+            return;
+        }
+
+        let mut state = state.lock().unwrap();
+        if state.cached.generation != generation {
+            continue;
+        }
+        state.clients.push(stream);
+        tracing::debug!(clients = state.clients.len(), "sidebar client connected");
+        return;
+    }
 }
 
 impl SocketServer {
@@ -187,40 +201,48 @@ impl SocketServer {
                 generation: 0,
             },
         }));
+        let request_activity = Arc::new(AtomicBool::new(false));
         let accept_state = state.clone();
+        let accept_activity = request_activity.clone();
 
         thread::spawn(move || {
             loop {
-                let mut stream = match listener.accept() {
+                let stream = match listener.accept() {
                     Ok((stream, _)) => stream,
                     Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(error) => {
-                        tracing::error!(%error, "sidebar socket accept failed");
+                        tracing::error!(%error, "workstation daemon socket accept failed");
                         break;
                     }
                 };
-                let _ = stream.set_write_timeout(Some(Duration::from_millis(100)));
-                loop {
-                    let (generation, payload) = {
-                        let state = accept_state.lock().unwrap();
-                        (state.cached.generation, state.cached.payload.clone())
-                    };
-                    if !payload.is_empty() && stream.write_all(&payload).is_err() {
-                        break;
+                let state = accept_state.clone();
+                let activity = accept_activity.clone();
+                thread::spawn(move || match crate::workstation_daemon::classify(&stream) {
+                    Ok(Connection::Subscriber) => register_subscriber(&state, stream),
+                    Ok(Connection::Requests(first_line)) => {
+                        activity.store(true, Ordering::Relaxed);
+                        if let Err(error) =
+                            crate::workstation_daemon::serve_requests(stream, Some(first_line))
+                        {
+                            tracing::debug!(%error, "workstation daemon request client failed");
+                        }
                     }
-
-                    let mut state = accept_state.lock().unwrap();
-                    if state.cached.generation != generation {
-                        continue;
+                    Err(error) => {
+                        tracing::debug!(%error, "workstation daemon client dropped before its first line");
                     }
-                    state.clients.push(stream);
-                    tracing::debug!(clients = state.clients.len(), "sidebar client connected");
-                    break;
-                }
+                });
             }
         });
 
-        Ok(Self { state })
+        Ok(Self {
+            state,
+            request_activity,
+        })
+    }
+
+    /// Whether any request client connected since the last call.
+    fn take_request_activity(&self) -> bool {
+        self.request_activity.swap(false, Ordering::Relaxed)
     }
 
     /// Publish a snapshot when its sidebar-visible contents change.
@@ -930,7 +952,9 @@ fn github_fetch_due(branch_set_changed: bool, elapsed: Duration) -> bool {
 }
 
 fn github_repo_key(path: &Path) -> Option<PathBuf> {
-    crate::git::get_repository_key_in(Some(path)).ok()
+    crate::project::Project::of_workstation_path(path)
+        .cache_key(path)
+        .ok()
 }
 
 fn group_github_branches(
@@ -2216,7 +2240,7 @@ impl Scheduler {
     }
 }
 
-/// Run the sidebar daemon (headless, no TUI).
+/// Run the workstation daemon (headless, no TUI).
 pub fn run() -> Result<()> {
     let mux = create_backend(detect_backend());
     let instance_id = mux.instance_id();
@@ -2229,7 +2253,7 @@ pub fn run() -> Result<()> {
     let status_icons = config.lock().unwrap().status_icons.clone();
     let config_version = Arc::new(AtomicU64::new(0));
 
-    tracing::info!(instance_id = %instance_id, "sidebar daemon starting");
+    tracing::info!(instance_id = %instance_id, "workstation daemon starting");
 
     let term = Arc::new(AtomicBool::new(false));
     let observation_dirty = Arc::new(AtomicBool::new(false));
@@ -2239,7 +2263,7 @@ pub fn run() -> Result<()> {
         spawn_signal_listener(term.clone(), observation_dirty.clone(), wake_tx.clone())?;
     let _wake_tx_keepalive = wake_tx.clone();
 
-    let sock_path = socket_path(&instance_id);
+    let sock_path = crate::workstation_daemon::socket_path(&instance_id);
     let _ = std::fs::remove_file(&sock_path);
     let server = SocketServer::bind(&sock_path)?;
 
@@ -2532,14 +2556,14 @@ pub fn run() -> Result<()> {
         if scheduler.maintenance_due(now) {
             scheduler.finish_maintenance(now);
             let client_count = server.client_count();
-            if client_count > 0 {
+            if client_count > 0 || server.take_request_activity() {
                 last_client_seen = now;
             } else if now.duration_since(last_client_seen) > Duration::from_secs(10) {
-                tracing::info!("sidebar daemon exiting: no clients for 10s");
+                tracing::info!("workstation daemon exiting: no clients for 10s");
                 break;
             }
             if now.duration_since(last_health_log) >= Duration::from_secs(60) {
-                tracing::info!(clients = client_count, "sidebar daemon alive");
+                tracing::info!(clients = client_count, "workstation daemon alive");
                 last_health_log = now;
             }
         }
@@ -2548,7 +2572,7 @@ pub fn run() -> Result<()> {
     }
 
     if term.load(Ordering::Relaxed) {
-        tracing::info!("sidebar daemon exiting: SIGTERM received");
+        tracing::info!("workstation daemon exiting: SIGTERM received");
     }
     signal_handle.close();
     let _ = signal_thread.join();
@@ -3052,42 +3076,6 @@ mod tests {
         assert!(!result.changed);
     }
 
-    #[test]
-    fn socket_path_uses_a_stable_fixed_width_instance_key() {
-        let default = socket_path("/private/tmp/tmux-501/default");
-        let long = socket_path("/private/tmp/tmux-501/sidebar-repro-socket");
-        let unicode = socket_path("/private/tmp/tmux-501/サイドバー");
-
-        assert_eq!(default.parent(), Some(std::env::temp_dir().as_path()));
-        assert_eq!(
-            default.file_name().unwrap(),
-            "workmux-sidebar-3d3d4a9387e30f49.sock"
-        );
-        assert_eq!(
-            long.file_name().unwrap(),
-            "workmux-sidebar-51c46e2d6ee045f1.sock"
-        );
-        assert_eq!(
-            unicode.file_name().unwrap(),
-            "workmux-sidebar-b596df9918d556c8.sock"
-        );
-    }
-
-    #[test]
-    fn socket_path_for_a_long_instance_can_be_bound() {
-        let unique = tempfile::tempdir().unwrap();
-        let instance_id = format!(
-            "/private/tmp/tmux-501/{}/{}",
-            unique.path().display(),
-            "long-unicode-name-サイドバー".repeat(8)
-        );
-        let path = socket_path(&instance_id);
-
-        let listener = UnixListener::bind(&path).unwrap();
-        drop(listener);
-        std::fs::remove_file(path).unwrap();
-    }
-
     fn working_agent(pane_id: &str, updated_ts: u64) -> AgentPane {
         AgentPane {
             session: String::new(),
@@ -3502,7 +3490,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("sidebar.sock");
         let server = SocketServer::bind(&socket).unwrap();
-        let mut first = UnixStream::connect(&socket).unwrap();
+        let mut first = super::super::client::subscribe(&socket).unwrap();
         first
             .set_read_timeout(Some(Duration::from_millis(250)))
             .unwrap();
@@ -3511,7 +3499,7 @@ mod tests {
         assert!(server.broadcast(&snapshot));
         assert_eq!(read_snapshot(&mut first).config_version, 0);
 
-        let mut late = UnixStream::connect(&socket).unwrap();
+        let mut late = super::super::client::subscribe(&socket).unwrap();
         late.set_read_timeout(Some(Duration::from_millis(250)))
             .unwrap();
         assert_eq!(read_snapshot(&mut late).config_version, 0);
@@ -3550,10 +3538,48 @@ mod tests {
         drop(late);
         wait_for_clients(&server, 0);
 
-        let mut malformed = UnixStream::connect(&socket).unwrap();
+        let mut malformed = super::super::client::subscribe(&socket).unwrap();
         wait_for_clients(&server, 1);
         malformed.write_all(b"unexpected").unwrap();
         wait_for_clients(&server, 0);
+    }
+
+    #[test]
+    fn socket_server_answers_requests_alongside_subscribers() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("daemon.sock");
+        let server = SocketServer::bind(&socket).unwrap();
+        assert!(server.broadcast(&empty_snapshot()));
+        let mut subscriber = super::super::client::subscribe(&socket).unwrap();
+        subscriber
+            .set_read_timeout(Some(Duration::from_millis(250)))
+            .unwrap();
+        assert_eq!(read_snapshot(&mut subscriber).config_version, 0);
+
+        let ping = crate::workstation_daemon::ping(&socket).unwrap();
+
+        assert_eq!(ping.pid, std::process::id());
+        assert!(server.take_request_activity());
+        assert!(!server.take_request_activity());
+        wait_for_clients(&server, 1);
+    }
+
+    #[test]
+    fn socket_server_treats_a_silent_client_as_a_subscriber() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("daemon.sock");
+        let server = SocketServer::bind(&socket).unwrap();
+        assert!(server.broadcast(&empty_snapshot()));
+
+        // Sidebars from before the workstation daemon connect without a
+        // subscribe line.
+        let mut legacy = UnixStream::connect(&socket).unwrap();
+        legacy
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+
+        assert_eq!(read_snapshot(&mut legacy).config_version, 0);
+        wait_for_clients(&server, 1);
     }
 
     #[test]
@@ -3572,7 +3598,7 @@ mod tests {
                 thread::sleep(Duration::from_millis(1));
             }
         });
-        let mut client = UnixStream::connect(&socket).unwrap();
+        let mut client = super::super::client::subscribe(&socket).unwrap();
         client
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();

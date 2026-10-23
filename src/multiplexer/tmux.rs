@@ -14,15 +14,25 @@ use crate::config::{SplitDirection as ConfigSplitDirection, WindowPlacement};
 
 use super::handshake::TmuxHandshake;
 use super::types::*;
-use super::{Multiplexer, PaneHandshake, util};
+use super::{InvocationContext, Multiplexer, PaneHandshake, util};
 
 /// tmux backend implementation.
 ///
 /// This struct wraps all tmux-specific operations and implements the Multiplexer
 /// trait to provide a unified interface with other backends.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct TmuxBackend {
     socket_path: Option<String>,
+    invocation: InvocationContext,
+}
+
+impl Default for TmuxBackend {
+    fn default() -> Self {
+        Self {
+            socket_path: None,
+            invocation: InvocationContext::current().clone(),
+        }
+    }
 }
 
 const LIVE_PANE_RECORD_SEPARATOR: char = '\x1e';
@@ -395,7 +405,16 @@ impl TmuxBackend {
     pub fn for_socket(socket_path: &str) -> Self {
         Self {
             socket_path: (socket_path != "default").then(|| socket_path.to_string()),
+            ..Self::default()
         }
+    }
+
+    /// Resolve placement and the current pane, window and session from
+    /// `invocation` instead of this CLI invocation's own context.
+    #[allow(dead_code)] // Reserved for answering requests carried from remotes
+    pub fn with_invocation_context(mut self, invocation: InvocationContext) -> Self {
+        self.invocation = invocation;
+        self
     }
 
     fn tmux_command(&self) -> Cmd<'_> {
@@ -417,15 +436,8 @@ impl TmuxBackend {
         if let Some(pane) = self.current_pane_id() {
             return Some(pane);
         }
-        let context = std::env::var("TMUX").ok()?;
-        let mut fields = context.rsplitn(3, ',');
-        let session = fields.next()?.parse::<u64>().ok()?;
-        let pid = fields.next()?.parse::<u32>().ok()?;
-        let socket = fields.next()?;
-        if socket.is_empty() {
-            return None;
-        }
-        let target = format!("${session}:");
+        let (pid, session_id) = self.invocation.tmux_client_session()?;
+        let target = format!("{session_id}:");
         let identity = self
             .tmux_query(&[
                 "display-message",
@@ -435,7 +447,7 @@ impl TmuxBackend {
                 "#{pid},#{session_id}",
             ])
             .ok()?;
-        (identity.trim() == format!("{pid},${session}")).then_some(target)
+        (identity.trim() == format!("{pid},{session_id}")).then_some(target)
     }
 
     /// Prefer intentional destinations only for clients still viewing the source.
@@ -483,7 +495,7 @@ impl TmuxBackend {
         ))
     }
 
-    /// Query all tmux state consumed by one sidebar daemon refresh.
+    /// Query all tmux state consumed by one workstation daemon refresh.
     pub(crate) fn sidebar_snapshot(&self) -> Result<TmuxSidebarSnapshot> {
         let output = self.tmux_query(&["list-panes", "-a", "-F", SIDEBAR_STATE_FORMAT])?;
         parse_sidebar_snapshot(&output)
@@ -609,9 +621,9 @@ impl TmuxBackend {
             return Ok(window_id.trim().to_string());
         }
 
-        if let Ok(cwd) = std::env::current_dir()
+        if let Some(cwd) = self.invocation.cwd.as_deref()
             && let Ok(live_panes) = self.get_all_live_pane_info()
-            && let Some(session_id) = select_session_for_cwd(&live_panes, &cwd)
+            && let Some(session_id) = select_session_for_cwd(&live_panes, cwd)
         {
             return self.active_window_id(&session_id);
         }
@@ -798,7 +810,7 @@ impl Multiplexer for TmuxBackend {
     }
 
     fn current_pane_id(&self) -> Option<String> {
-        std::env::var("TMUX_PANE").ok()
+        self.invocation.pane_id.clone()
     }
 
     fn active_pane_id(&self) -> Option<String> {
@@ -1565,12 +1577,8 @@ impl Multiplexer for TmuxBackend {
 
         // TMUX env var format: /path/to/socket,pid,session_index
         // The socket path identifies the server shared by all of its sessions.
-        if let Some(socket_path) = std::env::var("TMUX")
-            .ok()
-            .and_then(|tmux| tmux.split(',').next().map(String::from))
-            .filter(|socket_path| !socket_path.is_empty())
-        {
-            return Ok(socket_path);
+        if let Some(socket_path) = self.invocation.tmux_socket_path() {
+            return Ok(socket_path.to_string());
         }
 
         let socket_path = self
@@ -1701,6 +1709,133 @@ mod tests {
         run_result.unwrap();
         assert_eq!(output_result.unwrap(), literal);
         assert!(!marker_exists);
+    }
+
+    struct PrivateTmuxServer {
+        _temp: tempfile::TempDir,
+        socket: String,
+    }
+
+    impl PrivateTmuxServer {
+        fn start() -> Option<Self> {
+            which::which("tmux").ok()?;
+            let temp = tempfile::tempdir().unwrap();
+            let socket = temp.path().join("tmux.sock").to_string_lossy().into_owned();
+            Some(Self {
+                _temp: temp,
+                socket,
+            })
+        }
+
+        fn query(&self, args: &[&str]) -> String {
+            Cmd::new("tmux")
+                .args(&["-S", &self.socket])
+                .args(args)
+                .run_and_capture_stdout()
+                .unwrap()
+                .trim()
+                .to_string()
+        }
+
+        /// Starts a detached session and returns its first pane.
+        fn new_session(&self, name: &str, cwd: &Path) -> String {
+            let cwd = cwd.to_string_lossy();
+            self.query(&[
+                "new-session",
+                "-d",
+                "-P",
+                "-F",
+                "#{pane_id}",
+                "-s",
+                name,
+                "-c",
+                &cwd,
+            ])
+        }
+
+        fn new_window(&self, session: &str) -> String {
+            self.query(&[
+                "new-window",
+                "-d",
+                "-P",
+                "-F",
+                "#{window_id}",
+                "-t",
+                &format!("{session}:"),
+            ])
+        }
+
+        fn window_of(&self, pane_id: &str) -> String {
+            self.query(&["display-message", "-p", "-t", pane_id, "#{window_id}"])
+        }
+    }
+
+    impl Drop for PrivateTmuxServer {
+        fn drop(&mut self) {
+            let _ = Cmd::new("tmux")
+                .args(&["-S", &self.socket, "kill-server"])
+                .run();
+        }
+    }
+
+    #[test]
+    fn placement_resolves_from_supplied_invocation_context_pane() {
+        let Some(server) = PrivateTmuxServer::start() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        server.new_session("first", dir.path());
+        let invoking_pane = server.new_session("second", dir.path());
+        let invoking_window = server.window_of(&invoking_pane);
+        let rightmost_window = server.new_window("second");
+
+        let backend =
+            TmuxBackend::for_socket(&server.socket).with_invocation_context(InvocationContext {
+                pane_id: Some(invoking_pane),
+                ..InvocationContext::default()
+            });
+
+        assert_eq!(
+            backend
+                .resolve_window_placement_target(WindowPlacement::AfterCurrent)
+                .unwrap(),
+            Some(invoking_window)
+        );
+        assert_eq!(
+            backend
+                .resolve_window_placement_target(WindowPlacement::Rightmost)
+                .unwrap(),
+            Some(rightmost_window)
+        );
+    }
+
+    #[test]
+    fn placement_resolves_from_supplied_invocation_context_cwd() {
+        let Some(server) = PrivateTmuxServer::start() else {
+            return;
+        };
+        let first_dir = tempfile::tempdir().unwrap();
+        let second_dir = tempfile::tempdir().unwrap();
+        server.new_session("first", first_dir.path());
+        let second_pane = server.new_session("second", second_dir.path());
+        let second_window = server.window_of(&second_pane);
+        let nested = second_dir.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+
+        // The process cwd is the repository, which no session's pane is in, so
+        // only the supplied working directory can pick the second session.
+        let backend =
+            TmuxBackend::for_socket(&server.socket).with_invocation_context(InvocationContext {
+                cwd: Some(nested),
+                ..InvocationContext::default()
+            });
+
+        assert_eq!(
+            backend
+                .resolve_window_placement_target(WindowPlacement::AfterCurrent)
+                .unwrap(),
+            Some(second_window)
+        );
     }
 
     fn live_pane(path: &str, session_id: &str) -> LivePaneInfo {

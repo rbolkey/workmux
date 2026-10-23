@@ -5,11 +5,11 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::agent_display::extract_project_name;
 use crate::config::{SidebarGroupBy, SidebarPosition, SidebarSort, StatusIcons};
 use crate::git::GitStatus;
 use crate::github::{CheckSummary, PrSummary};
 use crate::multiplexer::{AgentPane, AgentStatus};
+use crate::project::Project;
 
 use super::app::{SidebarFilterMode, SidebarLayoutMode};
 
@@ -93,7 +93,7 @@ fn default_stale_threshold_secs() -> u64 {
 /// The group an agent belongs to under the given grouping mode.
 pub fn group_label(agent: &AgentPane, group_by: SidebarGroupBy) -> String {
     let raw = match group_by {
-        SidebarGroupBy::Project => extract_project_name(&agent.path),
+        SidebarGroupBy::Project => Project::of_workstation_path(&agent.path).group_label(),
         SidebarGroupBy::Session => agent.session.clone(),
         SidebarGroupBy::None => String::new(),
     };

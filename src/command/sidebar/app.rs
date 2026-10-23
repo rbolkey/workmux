@@ -1818,7 +1818,10 @@ fn parse_templates(strings: &TemplateStrings) -> (ParsedTemplates, Option<Templa
 }
 
 fn query_tmux_format_for_current_pane(format: &str) -> Option<String> {
-    let pane_id = std::env::var("TMUX_PANE").unwrap_or_default();
+    let pane_id = crate::multiplexer::InvocationContext::current()
+        .pane_id
+        .clone()
+        .unwrap_or_default();
     let mut args = vec!["display-message", "-p"];
     if !pane_id.is_empty() {
         args.extend_from_slice(&["-t", &pane_id]);
@@ -1951,8 +1954,9 @@ fn try_reparse_templates(
 
 /// Detect the sidebar's stable host identity from its tmux pane.
 fn detect_host_identity() -> Option<HostIdentity> {
-    let pane_id = std::env::var("TMUX_PANE")
-        .ok()
+    let pane_id = crate::multiplexer::InvocationContext::current()
+        .pane_id
+        .clone()
         .filter(|pane_id| !pane_id.is_empty())?;
     let output = Cmd::new("tmux")
         .args(&[

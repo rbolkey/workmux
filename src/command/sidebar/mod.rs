@@ -786,7 +786,7 @@ pub(crate) fn request_refresh_for(mux: &dyn crate::multiplexer::Multiplexer) {
     signal_daemon_for(mux);
 }
 
-/// Run the sidebar daemon (called by the hidden `_sidebar-daemon` command).
+/// Run the workstation daemon's refresh loop (see `crate::workstation_daemon::run`).
 pub fn run_daemon() -> Result<()> {
     daemon::run()
 }

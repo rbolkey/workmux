@@ -734,9 +734,13 @@ enum Commands {
         exclude: Option<String>,
     },
 
-    /// Run the sidebar daemon (internal use)
-    #[command(hide = true, name = "_sidebar-daemon")]
-    SidebarDaemon,
+    /// Run the workstation daemon (internal use)
+    #[command(hide = true, name = "_workstation-daemon", alias = "_sidebar-daemon")]
+    WorkstationDaemon,
+
+    /// Start the workstation daemon if absent and print its ping (internal use)
+    #[command(hide = true, name = "_workstation-daemon-ping")]
+    WorkstationDaemonPing,
 
     /// Show a TUI dashboard of all active workmux agents across all sessions
     Dashboard {
@@ -1285,7 +1289,8 @@ pub fn run() -> Result<()> {
         Commands::SidebarSync { window } => command::sidebar::sync(window.as_deref()),
         Commands::SidebarReflow { window } => command::sidebar::reflow(window.as_deref()),
         Commands::SidebarReflowAll { exclude } => command::sidebar::reflow_all(exclude.as_deref()),
-        Commands::SidebarDaemon => command::sidebar::run_daemon(),
+        Commands::WorkstationDaemon => crate::workstation_daemon::run(),
+        Commands::WorkstationDaemonPing => crate::workstation_daemon::run_ping(),
         Commands::Dashboard {
             preview_size,
             diff,

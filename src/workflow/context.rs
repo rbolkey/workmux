@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::multiplexer::Multiplexer;
+use crate::project::Project;
 use crate::{config, git};
 use tracing::debug;
 
@@ -136,6 +137,11 @@ impl WorkflowContext {
     }
 
     /// Return whether a path identifies the main worktree.
+    /// The project this context operates on, named after its main worktree.
+    pub fn project(&self) -> Option<Project> {
+        Project::from_main_worktree_root(&self.main_worktree_root)
+    }
+
     pub fn is_main_worktree(&self, path: &Path) -> bool {
         paths_identify_same_worktree(path, &self.main_worktree_root)
     }
