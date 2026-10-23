@@ -2,3 +2,4 @@
 //! transport and spoken to over a control channel (ADR 0001).
 
 pub mod channel;
+pub mod handshake;
