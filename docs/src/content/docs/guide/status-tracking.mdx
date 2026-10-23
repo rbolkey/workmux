@@ -274,7 +274,7 @@ set -g window-status-current-format '#I:#W#{?@workmux_status, #{@workmux_status}
 
 When an agent is in "working" status but its pane output hasn't changed for 10 seconds, workmux automatically detects it as interrupted. This typically happens when a user presses Ctrl+C to stop an agent.
 
-The detection runs in the sidebar daemon. If the agent resumes producing output, the interrupted indicator clears automatically. The dashboard reads the detection results from a shared runtime file, so both views stay in sync.
+The detection runs in the workstation daemon, the background process that feeds the sidebar. If the agent resumes producing output, the interrupted indicator clears automatically. The dashboard reads the detection results from a shared runtime file, so both views stay in sync.
 
 ## Jump to completed or waiting agents
 

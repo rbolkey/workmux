@@ -483,7 +483,7 @@ impl TmuxBackend {
         ))
     }
 
-    /// Query all tmux state consumed by one sidebar daemon refresh.
+    /// Query all tmux state consumed by one workstation daemon refresh.
     pub(crate) fn sidebar_snapshot(&self) -> Result<TmuxSidebarSnapshot> {
         let output = self.tmux_query(&["list-panes", "-a", "-F", SIDEBAR_STATE_FORMAT])?;
         parse_sidebar_snapshot(&output)

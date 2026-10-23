@@ -122,7 +122,7 @@ sidebar:
       - "{pane_title}"
 ```
 
-Set `sidebar.git_status: false` in the global config to stop the sidebar daemon
+Set `sidebar.git_status: false` in the global config to stop the workstation daemon
 from watching worktrees and collecting Git status. Git status, pull request, and
 check tokens then render empty. This setting is daemon-wide and does not affect
 the dashboard's independent Git status updates.
