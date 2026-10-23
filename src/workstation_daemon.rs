@@ -85,6 +85,16 @@ fn dispatch(request: &Request) -> Response {
             })
             .expect("ping serializes"),
         ),
+        "remote.status" => {
+            let name = request.params.get("name").and_then(Value::as_str);
+            let statuses = crate::remote::registry::remotes().and_then(|remotes| {
+                crate::remote::statuses(crate::remote::channels(), &remotes, name)
+            });
+            match statuses.and_then(|statuses| Ok(serde_json::to_value(statuses)?)) {
+                Ok(result) => Response::ok(request.id, result),
+                Err(error) => Response::err(Some(request.id), format!("{error:#}")),
+            }
+        }
         method => Response::err(Some(request.id), format!("unknown method: {method}")),
     }
 }
@@ -150,9 +160,20 @@ pub(crate) fn serve_requests(stream: UnixStream, first_line: Option<Vec<u8>>) ->
 
 /// Make one request/response call to the workstation daemon at `socket`.
 pub fn call(socket: &Path, method: &str, params: Value) -> Result<Value> {
+    call_with_timeout(socket, method, params, CALL_TIMEOUT)
+}
+
+/// Make one call that may take up to `timeout`, such as one that opens
+/// control channels.
+pub fn call_with_timeout(
+    socket: &Path,
+    method: &str,
+    params: Value,
+    timeout: Duration,
+) -> Result<Value> {
     let stream = UnixStream::connect(socket)
         .with_context(|| format!("connect to workstation daemon at {}", socket.display()))?;
-    stream.set_read_timeout(Some(CALL_TIMEOUT))?;
+    stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(CALL_TIMEOUT))?;
     let mut writer = stream.try_clone()?;
     let mut reader = BufReader::new(stream);
@@ -273,6 +294,82 @@ pub fn ensure_running() -> Result<PathBuf> {
     Ok(socket)
 }
 
+/// Like `ensure_running`, but first stops a daemon from another workmux
+/// release, which may not understand newer requests.
+pub fn ensure_current() -> Result<PathBuf> {
+    let mux = create_backend(detect_backend());
+    let socket = socket_path(&mux.instance_id());
+    ensure_current_at(&socket, stop_daemon, spawn_daemon, Duration::from_secs(2))?;
+    Ok(socket)
+}
+
+fn ensure_current_at(
+    socket: &Path,
+    stop: impl FnOnce(Option<u32>) -> Result<()>,
+    start: impl FnOnce() -> Result<()>,
+    timeout: Duration,
+) -> Result<()> {
+    if UnixStream::connect(socket).is_ok() {
+        let stale_pid = match ping(socket) {
+            Ok(ping) if ping.version == env!("CARGO_PKG_VERSION") => return Ok(()),
+            Ok(ping) => {
+                tracing::info!(
+                    version = ping.version,
+                    pid = ping.pid,
+                    "restarting workstation daemon from another release"
+                );
+                Some(ping.pid)
+            }
+            Err(error) => {
+                tracing::info!(%error, "restarting workstation daemon that failed its ping");
+                None
+            }
+        };
+        stop(stale_pid)?;
+        let started = Instant::now();
+        while UnixStream::connect(socket).is_ok() {
+            if started.elapsed() >= timeout {
+                return Err(anyhow!(
+                    "workstation daemon from another release did not stop"
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    ensure_running_at(socket, start, timeout)
+}
+
+/// Stop a running daemon: by the pid it reported, else the pid it recorded
+/// in tmux. Waits for it to exit so it cannot remove its successor's socket.
+fn stop_daemon(pid: Option<u32>) -> Result<()> {
+    let pid = match pid {
+        Some(pid) => pid,
+        None => {
+            let mux = create_backend(detect_backend());
+            crate::multiplexer::TmuxBackend::for_socket(&mux.instance_id())
+                .global_option("@workmux_sidebar_daemon_pid")
+                .ok()
+                .flatten()
+                .and_then(|pid| pid.trim().parse().ok())
+                .ok_or_else(|| {
+                    anyhow!("a workstation daemon from another release is running and its pid is unknown")
+                })?
+        }
+    };
+    let pid = pid as libc::pid_t;
+    unsafe {
+        libc::kill(pid, libc::SIGTERM);
+    }
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(2) {
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Ok(())
+}
+
 fn ensure_running_at(
     socket: &Path,
     start: impl FnOnce() -> Result<()>,
@@ -388,6 +485,80 @@ mod tests {
 
         assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(ping(&socket).unwrap().protocol, PROTOCOL_VERSION);
+    }
+
+    /// Serve `ping` on `socket` as a daemon of release `version` would,
+    /// until told to stop.
+    fn fake_daemon(socket: &Path, version: &'static str) -> std::sync::mpsc::Sender<()> {
+        let listener = UnixListener::bind(socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let socket = socket.to_path_buf();
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            while stop_rx.try_recv().is_err() {
+                let Ok((stream, _)) = listener.accept() else {
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                };
+                stream.set_nonblocking(false).unwrap();
+                let mut writer = stream.try_clone().unwrap();
+                let mut reader = BufReader::new(stream);
+                if let Ok(Some(line)) = read_line(&mut reader) {
+                    let request: Request = serde_json::from_slice(&line).unwrap();
+                    let ping = Ping {
+                        version: version.to_string(),
+                        protocol: PROTOCOL_VERSION,
+                        pid: 4242,
+                    };
+                    let response = Response::ok(request.id, serde_json::to_value(ping).unwrap());
+                    write_message(&mut writer, &response).unwrap();
+                }
+            }
+            std::fs::remove_file(socket).ok();
+        });
+        stop_tx
+    }
+
+    #[test]
+    fn a_daemon_from_another_release_is_restarted() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("daemon.sock");
+        let old = fake_daemon(&socket, "0.0.1");
+        let stopped = std::sync::Mutex::new(Vec::new());
+
+        ensure_current_at(
+            &socket,
+            |pid| {
+                stopped.lock().unwrap().push(pid);
+                old.send(()).unwrap();
+                Ok(())
+            },
+            || {
+                // Leak the new daemon's stop handle: it serves until the test ends.
+                std::mem::forget(fake_daemon(&socket, env!("CARGO_PKG_VERSION")));
+                Ok(())
+            },
+            Duration::from_secs(2),
+        )
+        .unwrap();
+
+        assert_eq!(*stopped.lock().unwrap(), vec![Some(4242)]);
+        assert_eq!(ping(&socket).unwrap().version, env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn a_current_daemon_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("daemon.sock");
+        let _current = fake_daemon(&socket, env!("CARGO_PKG_VERSION"));
+
+        ensure_current_at(
+            &socket,
+            |_| panic!("a current daemon must not be stopped"),
+            || panic!("a current daemon must not be restarted"),
+            Duration::from_secs(2),
+        )
+        .unwrap();
     }
 
     #[test]

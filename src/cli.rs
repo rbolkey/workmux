@@ -773,6 +773,9 @@ enum Commands {
     /// Manage sandbox settings
     Sandbox(command::sandbox::SandboxArgs),
 
+    /// Manage remotes: project hosts reached through a transport
+    Remote(command::remote::RemoteArgs),
+
     /// Set agent status for the current tmux window (used by hooks)
     #[command(hide = true)]
     SetWindowStatus {
@@ -1302,6 +1305,7 @@ pub fn run() -> Result<()> {
             ClaudeCommands::Prune => prune_claude_config(),
         },
         Commands::Sandbox(args) => command::sandbox::run(args),
+        Commands::Remote(args) => command::remote::run(args),
         Commands::SetWindowStatus { command } => command::set_window_status::run(command),
         Commands::RegisterAgent => command::set_window_status::register_agent(),
         Commands::SetBase { base } => command::set_base::run(&base),

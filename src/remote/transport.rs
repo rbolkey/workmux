@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 const STDERR_TAIL_BYTES: usize = 4096;
 
 /// An interactive command for a remote pane.
+#[allow(dead_code)] // Constructed once remote panes attach
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TtyExec {
     pub argv: Vec<String>,
@@ -26,6 +27,7 @@ pub struct TtyExec {
 }
 
 /// Lifecycle of a remote as its transport reports it.
+#[allow(dead_code)] // Stopped and Missing come from the OpenShell transport
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RemoteState {
     Running,
@@ -35,6 +37,7 @@ pub enum RemoteState {
 
 /// Optional lifecycle hooks for transports that manage their remote, such as
 /// an OpenShell sandbox.
+#[allow(dead_code)] // Lifecycle calls arrive with the OpenShell transport
 pub trait Provisioning: Send + Sync {
     fn status(&self) -> Result<RemoteState>;
     fn create(&self) -> Result<()>;
@@ -43,6 +46,7 @@ pub trait Provisioning: Send + Sync {
     fn delete(&self) -> Result<()>;
 }
 
+#[allow(dead_code)] // Captured and TTY exec are used by later remote commands and panes
 pub trait Transport: Send + Sync {
     /// Run a command to completion, capturing its output.
     fn exec_captured(&self, argv: &[String]) -> Result<Output>;
@@ -120,6 +124,7 @@ impl StdioProcess {
         )
     }
 
+    #[allow(dead_code)] // Used by tests that kill a remote
     pub fn id(&self) -> u32 {
         self.child.id()
     }

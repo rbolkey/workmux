@@ -155,6 +155,7 @@ impl Peer {
     }
 
     /// Send a notification, which gets no answer.
+    #[allow(dead_code)] // Used once status records and streamed output flow
     pub fn notify(&self, method: &str, params: Value) -> Result<()> {
         self.inner.send(&Message {
             method: Some(method.to_string()),

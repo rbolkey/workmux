@@ -151,6 +151,7 @@ impl Channels {
     }
 
     /// The open channel to `name`, opened on demand.
+    #[allow(dead_code)] // Used by commands routed to a remote
     pub fn channel(&self, name: &str, config: &RemoteConfig) -> Result<Arc<Connection>> {
         self.channel_for(name, config, true)
     }

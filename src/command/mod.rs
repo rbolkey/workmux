@@ -22,6 +22,7 @@ pub mod remove;
 pub mod rename;
 pub mod resurrect;
 pub mod run;
+pub mod remote;
 pub mod sandbox;
 pub mod sandbox_run;
 pub mod send;

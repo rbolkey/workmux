@@ -1012,13 +1012,14 @@ pub struct Config {
 }
 
 /// How the workstation reaches a remote.
-#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum TransportKind {
     Ssh,
     Openshell,
     /// Runs remote workmux as a local child process rooted in the target
     /// directory. Stands in for a real remote in tests.
+    #[value(hide = true)]
     Loopback,
 }
 
@@ -1058,6 +1059,7 @@ pub struct RemoteConfig {
 }
 
 impl RemoteConfig {
+    #[allow(dead_code)] // Read once remotes get the guest shims
     pub fn builtin_shims(&self) -> bool {
         self.builtin_shims.unwrap_or(true)
     }
@@ -3083,6 +3085,13 @@ impl Config {
         let config: Config = serde_yaml::from_str(&contents)
             .map_err(|e| anyhow::anyhow!("Failed to parse config at {}: {}", path.display(), e))?;
         Ok(Some(config))
+    }
+
+    /// Load only the global configuration, or the defaults if there is none.
+    /// For workstation-wide settings such as remotes, which no project
+    /// config may set.
+    pub fn load_global_only() -> anyhow::Result<Self> {
+        Ok(Self::load_global()?.unwrap_or_default())
     }
 
     /// Load the global configuration file.
