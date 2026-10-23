@@ -24,6 +24,8 @@ mod sandbox;
 mod shell;
 mod skills;
 mod spinner;
+#[cfg(test)]
+mod ssh_learning;
 mod state;
 mod template;
 #[cfg(test)]
