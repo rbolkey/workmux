@@ -38,8 +38,14 @@ fn run_served(served: &ServedProject, older_than_secs: u64, force: bool) -> Resu
             .into_iter()
             .filter_map(|agent| {
                 // An agent's hooks record when it entered its status; one
-                // without hooks is as old as its terminal's last use.
+                // without hooks is as old as its terminal's last use. A
+                // working agent may have entered its status long ago, so
+                // output since then makes it young: never reap it mid-task.
                 let (last_activity, status) = match status_files.read(&agent.pane) {
+                    Some(record) if record.status == Some(AgentStatus::Working) => (
+                        Some(record.event_ts.max(agent.last_activity().unwrap_or(0))),
+                        record.status,
+                    ),
                     Some(record) => (Some(record.event_ts), record.status),
                     None => (agent.last_activity(), None),
                 };

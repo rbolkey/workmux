@@ -1720,6 +1720,7 @@ def test_reap_agents_reaps_aged_agents_on_the_remote(
         ]
         finished = add_agent("finished")
         unhooked = add_agent("unhooked")
+        long_task = add_agent("longtask")
         env.tmux(["select-window", "-t", env.runner_pane_id or "test:0"])
         time.sleep(0.5)
         now = time.time()
@@ -1731,6 +1732,8 @@ def test_reap_agents_reaps_aged_agents_on_the_remote(
         status_file("finished", "done", two_hours_ago)
         # No hooks: its terminal was last used two hours ago.
         idle_terminal(unhooked, two_hours_ago)
+        # Working on one task for two hours, still producing output: not old.
+        status_file("longtask", "working", two_hours_ago)
 
         listed = wm("reap-agents --hours 1")
         assert "api (on lb):" in listed.stdout
@@ -1739,6 +1742,7 @@ def test_reap_agents_reaps_aged_agents_on_the_remote(
         assert "Would exit api/unhooked/" in listed.stdout
         assert "in unhooked (2h, unknown, fake-agent)" in listed.stdout
         assert "busy" not in listed.stdout
+        assert "longtask" not in listed.stdout
         assert pid_alive(finished) and pid_alive(unhooked)
 
         reaped = wm("reap-agents --hours 1 --force")
@@ -1748,7 +1752,7 @@ def test_reap_agents_reaps_aged_agents_on_the_remote(
             lambda: not pid_alive(finished) and not pid_alive(unhooked),
             "the idle agents to exit",
         )
-        assert pid_alive(busy)
+        assert pid_alive(busy) and pid_alive(long_task)
         assert tmux_value(env, "=api:wm-finished", "#{window_name}") == "wm-finished"
     finally:
         for pid in started.read_text().split() if started.exists() else []:
