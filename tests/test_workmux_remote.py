@@ -1359,8 +1359,8 @@ class SidebarFeed:
         self.sock.close()
 
 
-def agent_in(snapshot: dict, pane: str):
-    return next((a for a in snapshot.get("agents", []) if a["pane_id"] == pane), None)
+def agent_in(snapshot: dict, pane: str) -> dict:
+    return next((a for a in snapshot.get("agents", []) if a["pane_id"] == pane), {})
 
 
 @requires_dtach
@@ -1428,7 +1428,7 @@ def test_remote_agent_status_shows_live_turns_stale_and_catches_up_on_reconnect(
 
         hook_runs("working")
         snapshot = feed.wait(
-            lambda s: (agent_in(s, pane) or {}).get("status") == "working",
+            lambda s: agent_in(s, pane).get("status") == "working",
             "the remote agent working",
         )
         entry = agent_in(snapshot, pane)
@@ -1449,7 +1449,7 @@ def test_remote_agent_status_shows_live_turns_stale_and_catches_up_on_reconnect(
         for pid in serves:
             os.kill(int(pid), signal.SIGKILL)
         snapshot = feed.wait(
-            lambda s: (agent_in(s, pane) or {}).get("remote", {}).get("stale"),
+            lambda s: agent_in(s, pane).get("remote", {}).get("stale"),
             "the entry to turn stale",
         )
         assert agent_in(snapshot, pane)["status"] == "working"
@@ -1467,7 +1467,7 @@ def test_remote_agent_status_shows_live_turns_stale_and_catches_up_on_reconnect(
 
         snapshot = feed.wait(
             lambda s: (
-                (agent_in(s, pane) or {}).get("status") == "waiting"
+                agent_in(s, pane).get("status") == "waiting"
                 and not agent_in(s, pane)["remote"]["stale"]
             ),
             "the reconnected remote's status",
