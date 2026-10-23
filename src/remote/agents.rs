@@ -67,7 +67,11 @@ fn alive(pid: i32) -> bool {
         && !Command::new("ps")
             .args(["-o", "stat=", "-p", &pid.to_string()])
             .output()
-            .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).trim_start().starts_with('Z'))
+            .is_ok_and(|out| {
+                String::from_utf8_lossy(&out.stdout)
+                    .trim_start()
+                    .starts_with('Z')
+            })
 }
 
 /// The agents running in `project`'s remote panes, one per pane at most.
@@ -119,10 +123,10 @@ impl Process {
         let mut words = self.args.split_whitespace();
         let mut names = Vec::new();
         if let Some(program) = words.next().and_then(stem) {
-            if INTERPRETERS.contains(&program.as_str()) {
-                if let Some(script) = words.find(|word| !word.starts_with('-')).and_then(stem) {
-                    names.push(script);
-                }
+            if INTERPRETERS.contains(&program.as_str())
+                && let Some(script) = words.find(|word| !word.starts_with('-')).and_then(stem)
+            {
+                names.push(script);
             }
             names.push(program);
         }
@@ -162,7 +166,13 @@ impl ProcessTable {
             if let Some(found) = name(&process) {
                 return Some((process, found));
             }
-            queue.extend(self.children.get(&process.pid).into_iter().flatten().cloned());
+            queue.extend(
+                self.children
+                    .get(&process.pid)
+                    .into_iter()
+                    .flatten()
+                    .cloned(),
+            );
         }
         None
     }
@@ -173,7 +183,9 @@ fn process_table() -> Result<ProcessTable> {
         .args(["-A", "-o", "pid=,ppid=,tty=,args="])
         .output()
         .context("failed to list processes")?;
-    Ok(parse_process_table(&String::from_utf8_lossy(&output.stdout)))
+    Ok(parse_process_table(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
 }
 
 fn parse_process_table(text: &str) -> ProcessTable {
@@ -265,10 +277,7 @@ mod tests {
         let (codex, name) = table.topmost(10, known).unwrap();
 
         assert_eq!((codex.pid, name.as_str()), (11, "codex"));
-        assert_eq!(
-            codex.tty_path().as_deref(),
-            Some(Path::new("/dev/ttys001"))
-        );
+        assert_eq!(codex.tty_path().as_deref(), Some(Path::new("/dev/ttys001")));
         assert_eq!(table.topmost(20, known).unwrap().1, "claude");
         assert!(table.topmost(12, known).is_none());
         assert_eq!(table.by_pid[&20].tty_path(), None);

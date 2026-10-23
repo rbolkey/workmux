@@ -335,8 +335,9 @@ fn subdirectories(dir: &Path) -> Result<Vec<String>> {
         Ok(entries) => entries,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => {
-            return Err(anyhow::Error::from(error)
-                .context(format!("failed to read {}", dir.display())));
+            return Err(
+                anyhow::Error::from(error).context(format!("failed to read {}", dir.display()))
+            );
         }
     };
     let mut names = Vec::new();

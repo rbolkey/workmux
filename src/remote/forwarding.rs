@@ -996,8 +996,7 @@ mod tests {
     }
 
     #[test]
-    fn a_new_window_shows_the_worktrees_surviving_remote_panes_instead_of_starting_its_commands()
-    {
+    fn a_new_window_shows_the_worktrees_surviving_remote_panes_instead_of_starting_its_commands() {
         let Some(server) = PrivateTmuxServer::start() else {
             return;
         };
@@ -1073,13 +1072,8 @@ mod tests {
             )
             .unwrap();
 
-        let window_panes = server.query(&[
-            "list-panes",
-            "-t",
-            &window,
-            "-F",
-            "#{@workmux_remote_pane}",
-        ]);
+        let window_panes =
+            server.query(&["list-panes", "-t", &window, "-F", "#{@workmux_remote_pane}"]);
         assert_eq!(
             window_panes.lines().collect::<Vec<_>>(),
             vec![agent.to_string(), shell.to_string()],
