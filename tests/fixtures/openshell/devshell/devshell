@@ -1,0 +1,5 @@
+#!/bin/bash
+# Run a command inside the baked devshell: load the environment the workstation
+# recorded with `nix print-dev-env`, then exec the command (default: bash).
+source /nix/devshell-env.sh
+exec "${@:-bash}"

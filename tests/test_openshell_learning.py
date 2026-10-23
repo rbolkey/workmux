@@ -3,7 +3,9 @@
 Run with WORKMUX_TEST_OPENSHELL=1 and an active OpenShell gateway. The git push
 test also needs WORKMUX_TEST_OPENSHELL_GITHUB_PROVIDER (a configured `github`
 provider) and WORKMUX_TEST_OPENSHELL_GITHUB_REPO (an HTTPS repository the token
-may push scratch branches to). Findings live in ticket 01's `## Answer`.
+may push scratch branches to). Findings live in ticket 01's `## Answer`; the
+policy composition, live policy change and baked devshell findings live in
+ticket 21's `## Answer`.
 """
 
 import fcntl
@@ -16,11 +18,13 @@ import subprocess
 import termios
 import time
 import uuid
+from pathlib import Path
 from typing import Generator, Optional
 
 import pytest
 
 from .support.openshell import (
+    DEVSHELL_IMAGE,
     Sandbox,
     FIXTURE_DIR,
     create_sandbox,
@@ -101,13 +105,17 @@ def read_until_sentinel(reader: LineReader) -> list[str]:
 
 
 def test_exec_holds_bidirectional_stdio_for_minutes(sandbox: Sandbox):
+    assert_stdio_round_trips(sandbox, HOLD_SECONDS)
+
+
+def assert_stdio_round_trips(sandbox: Sandbox, hold_seconds: float) -> None:
     process = spawn_echo_loop(sandbox)
     reader = LineReader(process)
     try:
         noise = read_until_sentinel(reader)
         print(f"stdout before sentinel: {noise!r}")
 
-        deadline = time.monotonic() + HOLD_SECONDS
+        deadline = time.monotonic() + hold_seconds
         worst = 0.0
         count = 0
         while time.monotonic() < deadline:
@@ -118,7 +126,7 @@ def test_exec_holds_bidirectional_stdio_for_minutes(sandbox: Sandbox):
             worst = max(worst, time.monotonic() - sent)
             count += 1
             time.sleep(5)
-        print(f"{count} round trips over {HOLD_SECONDS}s, worst {worst:.3f}s")
+        print(f"{count} round trips over {hold_seconds}s, worst {worst:.3f}s")
         assert worst < 2.0
     finally:
         process.kill()
@@ -214,6 +222,10 @@ def test_tty_resize_propagates_sigwinch(sandbox: Sandbox):
 
 
 def test_git_worktree_lifecycle_under_default_policy(sandbox: Sandbox):
+    assert_git_worktree_lifecycle(sandbox)
+
+
+def assert_git_worktree_lifecycle(sandbox: Sandbox) -> None:
     root = f"{workspace_dir(sandbox)}/wm-learn-git-{uuid.uuid4().hex[:6]}"
     sandbox.sh_ok(
         f"""set -eu
@@ -237,6 +249,10 @@ def test_git_worktree_lifecycle_under_default_policy(sandbox: Sandbox):
 
 
 def test_unix_socket_in_workspace(sandbox: Sandbox):
+    assert_unix_socket_round_trip(sandbox)
+
+
+def assert_unix_socket_round_trip(sandbox: Sandbox) -> None:
     path = f"{workspace_dir(sandbox)}/wm-learn-{uuid.uuid4().hex[:6]}.sock"
     output = sandbox.sh_ok(
         f"""python3 - <<'EOF'
@@ -493,16 +509,26 @@ def pty_sandbox() -> Generator[Sandbox, None, None]:
 def test_dtach_holder_with_pty_devices_in_policy(pty_sandbox: Sandbox, socket_dir: str):
     """Ticket 02 criterion 3: with /dev/pts and /dev/ptmx read-write, a dtach
     remote pane can be created by one exec and attached from another."""
+    assert_dtach_holder_attaches(pty_sandbox, socket_dir)
+
+
+def assert_dtach_holder_attaches(
+    sandbox: Sandbox, socket_dir: str, command: str = "sh -c"
+) -> None:
+    """Start a ticking dtach holder from one exec and see it from a TTY attach.
+
+    `command` prefixes the holder's script, e.g. to run it in a devshell.
+    """
     socket = f"{socket_dir}/t-{uuid.uuid4().hex[:6]}.sock"
     # The holder must not inherit the exec's stdio, or the exec never returns.
-    pty_sandbox.sh_ok(
+    sandbox.sh_ok(
         f'mkdir -p "$(dirname {socket})" && '
-        f"dtach -n {socket} -E sh -c 'while :; do echo tick; sleep 1; done' "
+        f"dtach -n {socket} -E {command} 'while :; do echo tick; sleep 1; done' "
         "</dev/null >/dev/null 2>&1",
         timeout=60,
     )
     process, master = run_in_pty(
-        pty_sandbox.exec_args(
+        sandbox.exec_args(
             ["sh", "-c", f"exec dtach -a {socket} -E -r winch"], tty=True
         ),
         rows=24,
@@ -514,4 +540,269 @@ def test_dtach_holder_with_pty_devices_in_policy(pty_sandbox: Sandbox, socket_di
         process.kill()
         process.wait()
         os.close(master)
-    pty_sandbox.sh_ok(f"pkill -f '^dtach -n {socket}'; rm -f {socket}")
+    sandbox.sh_ok(f"pkill -f '^dtach -n {socket}'; rm -f {socket}")
+
+
+# Ticket 21: policy composition, policy changes on a running sandbox, and a
+# devshell baked into the image under the candidate workmux base policy.
+
+BASE_POLICY = str(FIXTURE_DIR / "base-policy.yaml")
+# OpenShell's built-in filesystem policy, as `sandbox get` reports it.
+DEFAULT_FILESYSTEM = {
+    "include_workdir": True,
+    "read_only": ["/usr", "/lib", "/etc", "/var/log", "/proc", "/dev/urandom"],
+    "read_write": ["/tmp", "/dev/null"],
+}
+NIXOS_ORG = """network_policies:
+  nixorg:
+    endpoints:
+      - { host: nixos.org, port: 443 }
+    binaries:
+      - path: /usr/bin/curl
+"""
+CURL_NIXOS_ORG = "curl -sS -m 10 -o /dev/null https://nixos.org; echo curl=$?"
+
+
+def write_policy(tmp_path: Path, name: str, body: str) -> str:
+    path = tmp_path / f"{name}.yaml"
+    path.write_text(f"version: 1\n{body}")
+    return str(path)
+
+
+def base_policy_with(extra: str) -> str:
+    """The base policy fixture's YAML with `extra` appended."""
+    return (FIXTURE_DIR / "base-policy.yaml").read_text() + extra
+
+
+def test_create_takes_exactly_one_policy_file():
+    refused = openshell(
+        [
+            "sandbox",
+            "create",
+            "--name",
+            new_sandbox_name("twop"),
+            "--policy",
+            BASE_POLICY,
+            "--policy",
+            BASE_POLICY,
+            "--detach",
+        ]
+    )
+    assert refused.returncode != 0
+    assert "cannot be used multiple times" in refused.stderr
+
+
+def test_sections_missing_from_the_policy_file_fall_back_to_the_default(
+    tmp_path: Path,
+):
+    """A network-only policy keeps the default filesystem section, so OpenShell
+    composes per top-level section, not per entry."""
+    netonly, created = create_sandbox(
+        "neto", policy=write_policy(tmp_path, "netonly", NIXOS_ORG)
+    )
+    try:
+        assert created.returncode == 0, created.stderr
+        netonly.wait_for_phase("Ready")
+        policy = netonly.policy()
+        assert policy["filesystem_policy"] == DEFAULT_FILESYSTEM
+        assert list(policy["network_policies"]) == ["nixorg"]
+        assert "curl=0" in netonly.sh_ok(CURL_NIXOS_ORG)
+    finally:
+        netonly.delete()
+
+
+def test_filesystem_lists_are_stored_verbatim_and_grants_add_up(tmp_path: Path):
+    """No dedup and no conflict check: a path in both lists is writable."""
+    overlap, created = create_sandbox(
+        "ovlp",
+        policy=write_policy(
+            tmp_path,
+            "overlap",
+            "filesystem_policy:\n"
+            "  include_workdir: true\n"
+            "  read_only: [/usr, /lib, /etc, /proc, /tmp]\n"
+            "  read_write: [/tmp, /dev/null, /dev/null]\n",
+        ),
+    )
+    try:
+        assert created.returncode == 0, created.stderr
+        overlap.wait_for_phase("Ready")
+        assert overlap.policy()["filesystem_policy"]["read_write"] == [
+            "/tmp",
+            "/dev/null",
+            "/dev/null",
+        ]
+        overlap.sh_ok("echo written > /tmp/wm-learn-overlap")
+    finally:
+        overlap.delete()
+
+
+def test_duplicate_network_policy_names_are_refused(tmp_path: Path):
+    duplicate = NIXOS_ORG + NIXOS_ORG.split("\n", 1)[1]
+    refused, created = create_sandbox(
+        "dupk", policy=write_policy(tmp_path, "dupkey", duplicate)
+    )
+    try:
+        assert created.returncode != 0
+        assert 'duplicate key "nixorg"' in created.stderr
+    finally:
+        refused.delete()
+
+
+def test_policy_set_on_a_running_sandbox(tmp_path: Path):
+    """Network changes apply at once. Filesystem changes are stored at once but
+    only reach the sandbox's processes after stop and start, and paths from the
+    create-time policy can never be removed: that needs a new sandbox."""
+    pty_policy = (FIXTURE_DIR / "pty-policy.yaml").read_text()
+    live, created = create_sandbox("live", policy=str(FIXTURE_DIR / "pty-policy.yaml"))
+    try:
+        assert created.returncode == 0, created.stderr
+        live.wait_for_phase("Ready")
+        assert "curl=7" in live.sh_ok(CURL_NIXOS_ORG)
+        assert "Permission denied" in live.sh("ls /nix").stderr
+
+        widened = tmp_path / "widened.yaml"
+        widened.write_text(base_policy_with(NIXOS_ORG))
+        assert live.set_policy(str(widened)).returncode == 0
+        assert "/nix" in live.policy()["filesystem_policy"]["read_only"]
+        assert "curl=0" in live.sh_ok(CURL_NIXOS_ORG)
+        assert "Permission denied" in live.sh("ls /nix").stderr
+
+        live.restart()
+        assert "curl=0" in live.sh_ok(CURL_NIXOS_ORG)
+        live.sh_ok("ls /nix")
+
+        without_pts = tmp_path / "without-pts.yaml"
+        without_pts.write_text(pty_policy.replace(", /dev/pts, /dev/ptmx]", "]"))
+        refused = live.set_policy(str(without_pts))
+        print(refused.stderr)
+        assert refused.returncode != 0
+        assert (
+            "read_write path '/dev/pts' cannot be removed on a live sandbox"
+            in " ".join(refused.stderr.split()).replace("│ ", "")
+        )
+
+        assert live.set_policy(str(FIXTURE_DIR / "pty-policy.yaml")).returncode == 0
+        live.sh_ok("ls /nix")
+        live.restart()
+        assert "Permission denied" in live.sh("ls /nix").stderr
+        assert "curl=7" in live.sh_ok(CURL_NIXOS_ORG)
+        print(openshell(["policy", "list", live.name]).stdout)
+    finally:
+        live.delete()
+
+
+def test_policy_update_adds_a_network_endpoint_live():
+    live, created = create_sandbox("upd", policy=BASE_POLICY)
+    try:
+        assert created.returncode == 0, created.stderr
+        live.wait_for_phase("Ready")
+        updated = openshell(
+            [
+                "policy",
+                "update",
+                live.name,
+                "--add-endpoint",
+                "nixos.org:443",
+                "--binary",
+                "/usr/bin/curl",
+                "--wait",
+            ]
+        )
+        assert updated.returncode == 0, updated.stderr
+        assert "curl=0" in live.sh_ok(CURL_NIXOS_ORG)
+        assert list(live.policy()["network_policies"]) == ["allow_nixos_org_443"]
+    finally:
+        live.delete()
+
+
+@pytest.fixture(scope="module")
+def devshell_sandbox() -> Generator[Sandbox, None, None]:
+    """The devshell image under the candidate base policy alone."""
+    sandbox, created = create_sandbox("dev", image=DEVSHELL_IMAGE, policy=BASE_POLICY)
+    try:
+        assert created.returncode == 0, created.stderr
+        sandbox.wait_for_phase("Ready")
+        yield sandbox
+    finally:
+        sandbox.delete()
+
+
+def test_baked_devshell_tools_run_through_exec(devshell_sandbox: Sandbox):
+    """Prebuilt store paths run without the `opening file "/"` denial that
+    nix's own commands hit; the wrapper sources the recorded environment."""
+    output = devshell_sandbox.sh_ok(
+        'devshell sh -c \'echo "devshell=$WM_LEARN_DEVSHELL"; command -v jq; '
+        "jq -n 1+1; echo needle | rg -c needle; git --version'"
+    )
+    print(output)
+    lines = output.splitlines()
+    assert "devshell=1" in lines
+    assert any(
+        line.startswith("/nix/store/") and line.endswith("/bin/jq") for line in lines
+    )
+    assert "2" in lines and "1" in lines
+    assert any(line.startswith("git version") for line in lines)
+
+
+def test_baked_devshell_runs_an_agent_command_in_a_tty(devshell_sandbox: Sandbox):
+    process, master = run_in_pty(
+        devshell_sandbox.exec_args(
+            ["devshell", "bash", "-c", "jq -M -c -n '{agent: \"ok\"}'; tty; echo DONE"],
+            tty=True,
+        ),
+        rows=24,
+        cols=80,
+    )
+    try:
+        output = read_pty_until(master, "DONE", timeout=60)
+        print(repr(output))
+        assert '{"agent":"ok"}' in output
+        assert "/dev/pts/" in output
+    finally:
+        process.kill()
+        process.wait()
+        os.close(master)
+
+
+def test_baked_devshell_as_a_session_holder_command(devshell_sandbox: Sandbox):
+    assert_dtach_holder_attaches(
+        devshell_sandbox, "$HOME/.local/state/workmux", command="devshell bash -c"
+    )
+
+
+def test_baked_devshell_needs_nix_in_the_policy():
+    """Without /nix read-only the baked store is unreadable."""
+    denied, created = create_sandbox(
+        "nonx", image=DEVSHELL_IMAGE, policy=str(FIXTURE_DIR / "pty-policy.yaml")
+    )
+    try:
+        assert created.returncode == 0, created.stderr
+        denied.wait_for_phase("Ready")
+        result = denied.sh("devshell jq -n 1")
+        print(result.stdout, result.stderr)
+        assert result.returncode != 0
+        assert "Permission denied" in result.stderr
+    finally:
+        denied.delete()
+
+
+@pytest.mark.parametrize(
+    "socket_dir", ["$PWD/.workmux/panes", "$HOME/.local/state/workmux", "/tmp"]
+)
+def test_base_policy_keeps_the_session_holder_working(
+    devshell_sandbox: Sandbox, socket_dir: str
+):
+    assert_dtach_holder_attaches(devshell_sandbox, socket_dir)
+
+
+def test_base_policy_keeps_git_worktrees_working(devshell_sandbox: Sandbox):
+    assert_git_worktree_lifecycle(devshell_sandbox)
+
+
+def test_base_policy_keeps_unix_sockets_working(devshell_sandbox: Sandbox):
+    assert_unix_socket_round_trip(devshell_sandbox)
+
+
+def test_base_policy_keeps_the_stdio_channel_working(devshell_sandbox: Sandbox):
+    assert_stdio_round_trips(devshell_sandbox, min(HOLD_SECONDS, 60))

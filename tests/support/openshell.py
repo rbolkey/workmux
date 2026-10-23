@@ -19,6 +19,7 @@ import pytest
 
 SANDBOX_PREFIX = "wm-learn-"
 LEARNING_IMAGE = "wm-learn-openshell:latest"
+DEVSHELL_IMAGE = "wm-learn-devshell:latest"
 FIXTURE_DIR = Path(__file__).parent.parent / "fixtures" / "openshell"
 READY_TIMEOUT = float(os.environ.get("WORKMUX_TEST_OPENSHELL_READY_TIMEOUT", "300"))
 
@@ -61,6 +62,22 @@ def build_learning_image() -> str:
         capture_output=True,
     )
     return LEARNING_IMAGE
+
+
+@functools.cache
+def build_devshell_image() -> str:
+    """Build the learning image with a flake devshell's closure baked into /nix.
+
+    The closure is built by a nix builder stage on the workstation, so the
+    sandbox never evaluates or builds anything.
+    """
+    build_learning_image()
+    subprocess.run(
+        ["docker", "build", "-q", "-t", DEVSHELL_IMAGE, str(FIXTURE_DIR / "devshell")],
+        check=True,
+        capture_output=True,
+    )
+    return DEVSHELL_IMAGE
 
 
 @dataclass
@@ -127,11 +144,27 @@ class Sandbox:
             time.sleep(2)
         raise AssertionError(f"{self.name} never reached {wanted}; last phase {seen!r}")
 
+    def policy(self) -> dict:
+        """The sandbox's effective policy as `sandbox get` reports it."""
+        result = self.get()
+        assert result.returncode == 0, result.stderr
+        return json.loads(result.stdout)["policy"]
+
+    def set_policy(self, policy: str) -> subprocess.CompletedProcess[str]:
+        """Replace the policy of the running sandbox and wait until it is loaded."""
+        return openshell(["policy", "set", self.name, "--policy", policy, "--wait"])
+
     def stop(self) -> subprocess.CompletedProcess[str]:
         return openshell(["sandbox", "stop", self.name])
 
     def start(self) -> subprocess.CompletedProcess[str]:
         return openshell(["sandbox", "start", self.name])
+
+    def restart(self) -> None:
+        assert self.stop().returncode == 0
+        self.wait_for_phase("Stopped")
+        assert self.start().returncode == 0
+        self.wait_for_phase("Ready")
 
     def delete(self) -> None:
         openshell(["sandbox", "delete", self.name], timeout=300)
@@ -152,6 +185,8 @@ def create_sandbox(
     """
     if image == LEARNING_IMAGE:
         build_learning_image()
+    elif image == DEVSHELL_IMAGE:
+        build_devshell_image()
     sandbox = Sandbox(new_sandbox_name(label))
     args = [
         "sandbox",
