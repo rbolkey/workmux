@@ -283,6 +283,29 @@ impl SessionHolder {
         Ok(running.into_iter().map(|(_, id)| id).collect())
     }
 
+    /// End every remote pane of `project`'s `worktree`, whether or not a
+    /// workstation pane shows it.
+    pub fn end_worktree(&self, project: &str, worktree: &str) -> Result<()> {
+        let panes: Vec<RemotePaneId> = self
+            .running(project)?
+            .into_iter()
+            .filter(|pane| pane.worktree == worktree)
+            .collect();
+        std::thread::scope(|scope| {
+            let ending: Vec<_> = panes
+                .iter()
+                .map(|pane| scope.spawn(move || (pane, self.kill(pane))))
+                .collect();
+            for end in ending {
+                let (pane, result) = end.join().expect("ending a remote pane panicked");
+                if let Err(error) = result {
+                    tracing::warn!(%pane, error = %format!("{error:#}"), "failed to end remote pane");
+                }
+            }
+        });
+        Ok(())
+    }
+
     /// The pid of the process remote pane `id` started, once it is known.
     pub fn pid(&self, id: &RemotePaneId) -> Option<i32> {
         std::fs::read_to_string(self.pid_file(id))
@@ -326,6 +349,21 @@ impl SessionHolder {
             .arg(self.socket(id))
             .args(["-E", "-z", "-r", "winch"]);
         command
+    }
+}
+
+/// On a remote, end every remote pane of the served project's worktree at
+/// `worktree_path`, including those no workstation pane shows (a view
+/// closed in tmux, the survivors of a window killed outside workmux).
+/// Elsewhere there are none.
+pub fn end_served_worktree_panes(worktree_path: &Path) {
+    let Some(served) = super::session::ServedProject::current() else {
+        return;
+    };
+    let ended = SessionHolder::for_this_remote()
+        .and_then(|holder| holder.end_worktree(&served.name, &worktree_name(worktree_path)));
+    if let Err(error) = ended {
+        tracing::warn!(error = %format!("{error:#}"), "failed to end the worktree's remote panes");
     }
 }
 
@@ -504,6 +542,33 @@ pub mod tests {
         assert_eq!(running, vec![second.clone(), third.clone()]);
         assert_eq!(holder.running("nothing").unwrap(), vec![]);
         for id in [second, third, other] {
+            holder.kill(&id).unwrap();
+        }
+    }
+
+    #[test]
+    fn ending_a_worktree_ends_all_its_panes_and_no_others() {
+        let Some((temp, holder)) = holder() else {
+            return;
+        };
+        let feature = worktree(&temp, "feature");
+        let bugfix = worktree(&temp, "bugfix");
+        let sleep = argv(&["sleep", "30"]);
+        let ending = [
+            holder.create("api", &feature, &sleep).unwrap(),
+            holder.create("api", &feature, &sleep).unwrap(),
+        ];
+        let other_worktree = holder.create("api", &bugfix, &sleep).unwrap();
+        let other_project = holder.create("web", &feature, &sleep).unwrap();
+
+        holder.end_worktree("api", "feature").unwrap();
+
+        for id in &ending {
+            assert_eq!(holder.state(id).unwrap(), PaneState::Ended, "{id}");
+        }
+        assert_eq!(holder.running("api").unwrap(), vec![other_worktree.clone()]);
+        assert_eq!(holder.running("web").unwrap(), vec![other_project.clone()]);
+        for id in [other_worktree, other_project] {
             holder.kill(&id).unwrap();
         }
     }

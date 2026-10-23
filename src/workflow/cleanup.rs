@@ -99,6 +99,7 @@ fn prepare_destructive_cleanup(
     no_hooks: bool,
     show_hook_output: bool,
 ) -> Result<()> {
+    crate::remote::pane::end_served_worktree_panes(worktree_path);
     // Hooks observe the live worktree before prompt files or repository state disappear.
     if worktree_path.exists() && !no_hooks {
         run_pre_remove_hooks(
@@ -496,6 +497,7 @@ fn cleanup_impl(
     {
         info!(branch = branch_name, handle, path = %worktree_path.display(), "cleanup:headless");
         context.chdir_to_main_worktree()?;
+        crate::remote::pane::end_served_worktree_panes(worktree_path);
         if worktree_path.exists() && !no_hooks {
             run_pre_remove_hooks(
                 context,

@@ -1544,3 +1544,78 @@ def test_reap_agents_reaps_aged_agents_on_the_remote(
                 pass
         if daemon_pid is not None:
             os.kill(daemon_pid, signal.SIGTERM)
+
+
+@requires_dtach
+@pytest.mark.tmux_only
+def test_close_and_remove_end_the_worktrees_unshown_remote_panes_too(
+    mux_server: MuxEnvironment,
+    workmux_exe_path: Path,
+    repo_path: Path,
+    short_tmp: dict,
+    remote_root: Path,
+):
+    """`close` and `remove` end every remote pane of the worktree, not only
+    those its window shows: a pane whose view was closed in tmux, and the
+    survivors of a window killed outside workmux."""
+    env = mux_server
+    assert isinstance(env, TmuxEnvironment)
+    origin = make_origin(env, env.tmp_path / "origin", "panes:\n  - command: sh\n")
+    holders = f"dtach -n {remote_root}/home/.local/state/workmux/panes/api/feature/"
+
+    def wm(command):
+        return run_workmux_command(
+            env,
+            workmux_exe_path,
+            repo_path,
+            command,
+            pre_run_env=short_tmp,
+            timeout=60.0,
+        )
+
+    def running() -> int:
+        return len(pids(holders))
+
+    wm(f"remote add lb --transport loopback --target {remote_root}")
+    wm(f"project add api --remote lb --repo {origin} --path code/api")
+    daemon_pid = None
+    try:
+        wm("add feature --project api")
+        daemon_pid = remote_daemon_ping(env, workmux_exe_path, repo_path, short_tmp)[
+            "pid"
+        ]
+        env.tmux(["select-window", "-t", env.runner_pane_id or "test:0"])
+        window = "=api:wm-feature"
+        [shown] = env.tmux(
+            ["list-panes", "-t", window, "-F", "#{pane_id}"]
+        ).stdout.split()
+
+        # A long `run` gets a remote pane; its view is closed in tmux.
+        wm("run feature --project api --background -- sleep 600")
+        wait_until(lambda: running() == 2, "the run's remote pane")
+        [run_view] = [
+            pane
+            for pane in env.tmux(
+                ["list-panes", "-t", window, "-F", "#{pane_id}"]
+            ).stdout.split()
+            if pane != shown
+        ]
+        env.tmux(["kill-pane", "-t", run_view])
+        time.sleep(0.5)
+        assert running() == 2
+
+        wm("close feature --project api")
+        wait_until(lambda: running() == 0, "close to end every remote pane")
+
+        # The window is killed outside workmux; `remove` ends its survivors.
+        wm("open feature --project api")
+        wait_until(lambda: running() == 1, "the reopened window's remote pane")
+        env.tmux(["kill-window", "-t", window])
+        time.sleep(0.5)
+        assert running() == 1
+
+        wm("remove feature --project api")
+        wait_until(lambda: running() == 0, "remove to end every remote pane")
+    finally:
+        if daemon_pid is not None:
+            os.kill(daemon_pid, signal.SIGTERM)
