@@ -251,6 +251,7 @@ pub(crate) mod tests {
             remote: remote.map(|(remote, project)| RemoteAgentPane {
                 remote: remote.to_string(),
                 project: project.to_string(),
+                worktree: "feature".to_string(),
                 stale: false,
             }),
         }

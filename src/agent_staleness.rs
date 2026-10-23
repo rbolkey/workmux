@@ -30,6 +30,27 @@ pub(crate) fn is_stale(
         .unwrap_or(true)
 }
 
+/// Whether `agent` counts as stale: a remote agent whose remote is
+/// disconnected (it keeps its last status), or one not visibly progressing,
+/// per [`is_stale`]. The sidebar and dashboard share this.
+pub fn agent_is_stale(
+    agent: &crate::multiplexer::AgentPane,
+    now_secs: u64,
+    stale_threshold_secs: u64,
+    is_sleeping: bool,
+    is_interrupted: bool,
+) -> bool {
+    agent.is_remote_stale()
+        || is_stale(
+            agent.activity_ts(),
+            agent.status,
+            now_secs,
+            stale_threshold_secs,
+            is_sleeping,
+            is_interrupted,
+        )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -102,5 +123,19 @@ mod tests {
             false,
             true,
         ));
+    }
+
+    #[test]
+    fn a_disconnected_remotes_agent_is_stale_with_fresh_activity() {
+        let mut agent: crate::multiplexer::AgentPane = serde_json::from_value(serde_json::json!({
+            "session": "api", "window_name": "wm-feature", "pane_id": "%1",
+            "path": "/remote/api__worktrees/feature", "pane_title": null,
+            "status": "working", "status_ts": 100, "activity_ts": 100,
+            "remote": {"remote": "lb", "project": "api", "worktree": "feature", "stale": false},
+        }))
+        .unwrap();
+        assert!(!agent_is_stale(&agent, 110, 3600, false, false));
+        agent.remote.as_mut().unwrap().stale = true;
+        assert!(agent_is_stale(&agent, 110, 3600, false, false));
     }
 }

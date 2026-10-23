@@ -65,9 +65,8 @@ impl App {
             let sleeping = &self.sleeping_pane_ids;
             let interrupted = &self.interrupted_pane_ids;
             self.agents.retain(|agent| {
-                !crate::agent_staleness::is_stale(
-                    agent.activity_ts(),
-                    agent.status,
+                !crate::agent_staleness::agent_is_stale(
+                    agent,
                     now,
                     threshold,
                     sleeping.contains(&agent.pane_id),
@@ -146,9 +145,8 @@ impl App {
 
         // Helper closure to get status priority (lower = higher priority)
         let get_priority = |agent: &AgentPane| -> u8 {
-            let is_stale = crate::agent_staleness::is_stale(
-                agent.activity_ts(),
-                agent.status,
+            let is_stale = crate::agent_staleness::agent_is_stale(
+                agent,
                 now,
                 stale_threshold,
                 sleeping.contains(&agent.pane_id),
@@ -480,9 +478,8 @@ impl App {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        crate::agent_staleness::is_stale(
-            agent.activity_ts(),
-            agent.status,
+        crate::agent_staleness::agent_is_stale(
+            agent,
             now,
             self.stale_threshold_secs,
             self.sleeping_pane_ids.contains(&agent.pane_id),
