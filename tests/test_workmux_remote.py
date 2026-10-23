@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from .conftest import MuxEnvironment, run_workmux_command
+from .conftest import MuxEnvironment, TmuxEnvironment, run_workmux_command
 
 
 @pytest.fixture
@@ -434,6 +434,7 @@ def test_remote_add_places_windows_in_the_project_session(
     command was typed in. A session the user made is adopted; the `session:`
     override, current-session placement and session mode still work."""
     env = mux_server
+    assert isinstance(env, TmuxEnvironment)
     root = env.tmp_path / "remote-root"
     (root / "home").mkdir(parents=True)
     # The remote terminal is an interactive login shell in an empty HOME.
@@ -500,7 +501,7 @@ def test_remote_add_places_windows_in_the_project_session(
         assert session_tag(env, "test") == ""
 
         # The new window took focus; later commands run in the test pane.
-        env.tmux(["select-window", "-t", env.runner_pane_id])
+        env.tmux(["select-window", "-t", env.runner_pane_id or "test:0"])
 
         # Session mode gives the worktree its own session.
         wm("add solo --project api --mode session")
