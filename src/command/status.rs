@@ -10,7 +10,9 @@ use tabled::{
 };
 
 use crate::git;
-use crate::multiplexer::{AgentPane, AgentStatus, create_backend, detect_backend_strict};
+use crate::multiplexer::{
+    AgentPane, AgentStatus, RemoteAgentPane, create_backend, detect_backend_strict,
+};
 use crate::state::StateStore;
 use crate::util;
 use crate::workflow;
@@ -32,6 +34,9 @@ struct StatusEntry {
     updated_ts: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     git: Option<GitInfo>,
+    /// Set for an agent on a remote; `stale` while its channel is down.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    remote: Option<RemoteAgentPane>,
 }
 
 #[derive(Serialize)]
@@ -178,7 +183,11 @@ fn status_entry(
     now: u64,
     git: Option<GitInfo>,
 ) -> StatusEntry {
-    let (project, project_path) = git::project_identity(&agent.path);
+    // A remote agent's path is the remote's: its project is its tag.
+    let (project, project_path) = match &agent.remote {
+        Some(_) => (Some(agent.project().group_label()), None),
+        None => git::project_identity(&agent.path),
+    };
     StatusEntry {
         worktree,
         branch,
@@ -194,6 +203,27 @@ fn status_entry(
         window_name: optional_name(&agent.window_name),
         updated_ts: agent.updated_ts,
         git,
+        remote: agent.remote.clone(),
+    }
+}
+
+/// A remote agent's entry. Its worktree is named by its remote pane, and
+/// git runs on the remote, not here.
+fn remote_status_entry(agent: &AgentPane, now: u64) -> StatusEntry {
+    let worktree = agent
+        .remote
+        .as_ref()
+        .map(|remote| remote.worktree.clone())
+        .unwrap_or_default();
+    status_entry(agent, worktree.clone(), worktree, now, None)
+}
+
+/// The table's status: a stale remote entry shows its last known status.
+fn status_cell(entry: &StatusEntry) -> String {
+    if entry.remote.as_ref().is_some_and(|remote| remote.stale) {
+        format!("{} (stale)", entry.status)
+    } else {
+        entry.status.clone()
     }
 }
 
@@ -241,7 +271,26 @@ pub fn run(worktrees: &[String], json: bool, all: bool, show_git: bool) -> Resul
     let mut target_errors = Vec::new();
     let repository;
 
-    if worktrees.is_empty() {
+    // A remote project's tagged session scopes like a local repository.
+    let session_project = if worktrees.is_empty() && !all {
+        crate::remote::router::resolve(None)?
+    } else {
+        None
+    };
+
+    if let Some(project) = session_project {
+        repository = None;
+        entries.extend(
+            agent_panes
+                .iter()
+                .filter(|agent| {
+                    agent.remote.as_ref().is_some_and(|remote| {
+                        remote.remote == project.site.remote && remote.project == project.site.name
+                    })
+                })
+                .map(|agent| remote_status_entry(agent, now)),
+        );
+    } else if worktrees.is_empty() {
         if !all && git::get_repo_root_if_present()?.is_some() {
             let all_worktrees = git::list_worktrees()?;
             repository = Some(git::get_main_worktree_root()?);
@@ -289,6 +338,10 @@ pub fn run(worktrees: &[String], json: bool, all: bool, show_git: bool) -> Resul
         } else {
             repository = None;
             for agent in &agent_panes {
+                if agent.remote.is_some() {
+                    entries.push(remote_status_entry(agent, now));
+                    continue;
+                }
                 let worktree_path =
                     workflow::find_worktree_root(&agent.path).unwrap_or_else(|| agent.path.clone());
                 let worktree_name = worktree_path
@@ -329,6 +382,10 @@ pub fn run(worktrees: &[String], json: bool, all: bool, show_git: bool) -> Resul
                     }
                 };
             if matching.is_empty() {
+                continue;
+            }
+            if matching[0].remote.is_some() {
+                entries.extend(matching.iter().map(|agent| remote_status_entry(agent, now)));
                 continue;
             }
             let worktree_name = wt_path
@@ -411,7 +468,7 @@ pub fn run(worktrees: &[String], json: bool, all: bool, show_git: bool) -> Resul
                         project: e.project.clone().unwrap_or("-".to_string()),
                         session: e.session.clone().unwrap_or("-".to_string()),
                         worktree,
-                        status: e.status.clone(),
+                        status: status_cell(e),
                         elapsed: e
                             .elapsed_secs
                             .map(util::format_elapsed_secs)
@@ -480,7 +537,45 @@ mod tests {
             window_name: None,
             updated_ts: None,
             git: None,
+            remote: None,
         }
+    }
+
+    #[test]
+    fn a_remote_entry_is_tagged_with_its_remote_and_marked_stale() {
+        let mut agent: AgentPane = serde_json::from_value(serde_json::json!({
+            "session": "api",
+            "window_name": "wm-feature",
+            "pane_id": "%3",
+            "path": "/remote/api__worktrees/feature",
+            "status": "done",
+        }))
+        .unwrap();
+        agent.remote = Some(crate::multiplexer::RemoteAgentPane {
+            remote: "devbox".to_string(),
+            project: "api".to_string(),
+            worktree: "feature".to_string(),
+            stale: true,
+        });
+
+        let remote = status_entry(&agent, "feature".into(), "feature".into(), 0, None);
+        assert_eq!(remote.project.as_deref(), Some("api@devbox"));
+        assert_eq!(remote.project_path, None);
+        assert_eq!(status_cell(&remote), "done (stale)");
+        let json = serde_json::to_value(&remote).unwrap();
+        assert_eq!(json["status"], "done");
+        assert_eq!(
+            json["remote"],
+            serde_json::json!({
+                "remote": "devbox", "project": "api", "worktree": "feature", "stale": true
+            })
+        );
+        assert!(
+            serde_json::to_value(entry("/a"))
+                .unwrap()
+                .get("remote")
+                .is_none()
+        );
     }
 
     #[test]

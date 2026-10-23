@@ -146,67 +146,120 @@ impl AgentProject {
     }
 }
 
-/// Search all reconciled agents globally by worktree directory name.
+/// The worktree an agent works in: a workstation directory, or a worktree
+/// of a remote project. A remote agent's path is the remote's, so it is
+/// keyed by its project host instead.
+#[derive(PartialEq, Eq, Hash)]
+enum AgentWorktree {
+    Workstation(PathBuf),
+    Remote {
+        remote: String,
+        project: String,
+        worktree: String,
+    },
+}
+
+impl AgentWorktree {
+    fn of(agent: &AgentPane) -> Self {
+        match &agent.remote {
+            Some(remote) => Self::Remote {
+                remote: remote.remote.clone(),
+                project: remote.project.clone(),
+                worktree: remote.worktree.clone(),
+            },
+            None => Self::Workstation(
+                find_worktree_root(&agent.path).unwrap_or_else(|| agent.path.clone()),
+            ),
+        }
+    }
+
+    fn handle(&self) -> String {
+        match self {
+            Self::Workstation(root) => root
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default(),
+            Self::Remote { worktree, .. } => worktree.clone(),
+        }
+    }
+
+    fn project(&self) -> AgentProject {
+        match self {
+            Self::Workstation(root) => AgentProject::for_worktree(root),
+            Self::Remote {
+                remote, project, ..
+            } => AgentProject {
+                name: Some(crate::project::Project::remote(remote, project).group_label()),
+                parent_name: Some(project.clone()),
+            },
+        }
+    }
+}
+
+/// Search all reconciled agents globally by worktree name.
 ///
-/// Groups agents by their worktree root. If `project` is provided, also filters
-/// by the repository name or parent-directory alias. Returns an error on ambiguity.
+/// Groups agents by their worktree. If `project` is provided, also filters
+/// by the repository name or parent-directory alias (for a remote project,
+/// its name or `project@remote`). Returns an error on ambiguity.
 fn resolve_global_agents(
     agent_panes: &[AgentPane],
     handle: &str,
     project: Option<&str>,
 ) -> Result<(PathBuf, Vec<AgentPane>)> {
-    // Group agents by their worktree root
-    let mut by_root: HashMap<PathBuf, Vec<&AgentPane>> = HashMap::new();
-
+    let mut by_worktree: HashMap<AgentWorktree, Vec<&AgentPane>> = HashMap::new();
     for agent in agent_panes {
-        let wt_root = match find_worktree_root(&agent.path) {
-            Some(root) => root,
-            None => agent.path.clone(),
-        };
-
-        let root_name = wt_root
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
-
-        if root_name != handle {
-            continue;
+        let worktree = AgentWorktree::of(agent);
+        if worktree.handle() == handle {
+            by_worktree.entry(worktree).or_default().push(agent);
         }
-
-        by_root.entry(wt_root).or_default().push(agent);
     }
 
     // Resolve identity once per matching worktree, regardless of pane count.
     // A unique unqualified handle needs no project lookup.
-    let projects: HashMap<PathBuf, AgentProject> = if project.is_some() || by_root.len() > 1 {
-        by_root
-            .keys()
-            .map(|root| (root.clone(), AgentProject::for_worktree(root)))
-            .collect()
-    } else {
-        HashMap::new()
-    };
+    let mut groups: Vec<(AgentWorktree, Vec<&AgentPane>, Option<AgentProject>)> = by_worktree
+        .into_iter()
+        .map(|(worktree, agents)| (worktree, agents, None))
+        .collect();
+    if project.is_some() || groups.len() > 1 {
+        for (worktree, _, identity) in &mut groups {
+            *identity = Some(worktree.project());
+        }
+    }
     if let Some(qualifier) = project {
-        by_root.retain(|root, _| projects[root].matches(qualifier));
+        groups.retain(|(_, _, identity)| identity.as_ref().unwrap().matches(qualifier));
     }
 
-    match by_root.len() {
+    // A remote worktree's root on the remote is the shallowest agent path.
+    let root = |worktree: &AgentWorktree, agents: &[&AgentPane]| match worktree {
+        AgentWorktree::Workstation(root) => root.clone(),
+        AgentWorktree::Remote { .. } => agents
+            .iter()
+            .map(|agent| agent.path.clone())
+            .min_by_key(|path| path.components().count())
+            .unwrap_or_default(),
+    };
+
+    match groups.len() {
         0 => Err(anyhow!(
             "No agent found matching '{}'",
             format_selector(handle, project)
         )),
         1 => {
-            let (root, agents) = by_root.into_iter().next().unwrap();
-            Ok((root, agents.into_iter().cloned().collect()))
+            let (worktree, agents, _) = groups.pop().unwrap();
+            Ok((
+                root(&worktree, &agents),
+                agents.into_iter().cloned().collect(),
+            ))
         }
         _ => {
-            let mut options: Vec<String> = by_root
-                .keys()
-                .map(|root| {
-                    let selector = projects[root]
-                        .selector(handle)
+            let mut options: Vec<String> = groups
+                .iter()
+                .map(|(worktree, agents, identity)| {
+                    let selector = identity
+                        .as_ref()
+                        .and_then(|identity| identity.selector(handle))
                         .unwrap_or_else(|| handle.to_string());
-                    format!("{} ({})", selector, root.display())
+                    format!("{} ({})", selector, root(worktree, agents).display())
                 })
                 .collect();
             options.sort();
@@ -330,6 +383,44 @@ mod tests {
                 "No agent found matching 'wrong:feature'"
             );
         }
+    }
+
+    fn remote_agent(project: &str, worktree: &str, pane_id: &str) -> AgentPane {
+        // The remote's directory, which does not exist on the workstation.
+        let mut agent = agent_at(
+            Path::new(&format!("/remote/{project}__worktrees/{worktree}")),
+            pane_id,
+        );
+        agent.remote = Some(crate::multiplexer::RemoteAgentPane {
+            remote: "devbox".to_string(),
+            project: project.to_string(),
+            worktree: worktree.to_string(),
+            stale: false,
+        });
+        agent
+    }
+
+    #[test]
+    fn remote_agents_resolve_by_their_remote_worktree_and_project() {
+        let panes = [
+            remote_agent("api", "feature", "%1"),
+            remote_agent("web", "feature", "%2"),
+            remote_agent("api", "fix", "%3"),
+        ];
+
+        let (root, matched) = resolve_worktree_agents_from_snapshot("fix", &panes).unwrap();
+        assert_eq!(root, PathBuf::from("/remote/api__worktrees/fix"));
+        assert_eq!(matched, [panes[2].clone()]);
+        for selector in ["api:feature", "api@devbox:feature"] {
+            let (_, matched) = resolve_worktree_agents_from_snapshot(selector, &panes).unwrap();
+            assert_eq!(matched, [panes[0].clone()], "{selector}");
+        }
+        let error = resolve_worktree_agents_from_snapshot("feature", &panes)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("api@devbox:feature"), "{error}");
+        assert!(error.contains("web@devbox:feature"), "{error}");
+        assert!(resolve_worktree_agents_from_snapshot("api@other:feature", &panes).is_err());
     }
 
     #[test]

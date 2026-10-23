@@ -137,6 +137,9 @@ pub struct AgentPane {
 pub struct RemoteAgentPane {
     pub remote: String,
     pub project: String,
+    /// The worktree's name on the remote.
+    #[serde(default)]
+    pub worktree: String,
     /// The remote's control channel is down: the status is the last known.
     #[serde(default)]
     pub stale: bool,

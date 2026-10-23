@@ -1247,6 +1247,25 @@ impl StateStore {
         }
     }
 
+    /// Mark remote agents stale unless a running workstation daemon holds
+    /// their remote's control channel, as its runtime file records. Only the
+    /// daemon knows the channel state; other processes read it here.
+    pub fn mark_stale_remote_agents(
+        &self,
+        agents: &mut [crate::multiplexer::AgentPane],
+        backend: &str,
+        instance: &str,
+        now: u64,
+    ) {
+        if agents.iter().all(|agent| agent.remote.is_none()) {
+            return;
+        }
+        let runtime = self.read_runtime(backend, instance);
+        for remote in agents.iter_mut().filter_map(|agent| agent.remote.as_mut()) {
+            remote.stale = !runtime.holds_channel(&remote.remote, now);
+        }
+    }
+
     /// Delete runtime state for a multiplexer instance.
     pub fn delete_runtime(&self, backend: &str, instance: &str) {
         let safe_instance =
@@ -1313,6 +1332,29 @@ impl StateStore {
     }
 
     fn reconcile_agents_for_context(
+        &self,
+        all_agents: Vec<AgentState>,
+        mux: &dyn crate::multiplexer::Multiplexer,
+        instance: &str,
+        strict_server_identity: bool,
+        prune_stale: bool,
+    ) -> Result<Vec<crate::multiplexer::AgentPane>> {
+        let mut agents = self.reconcile_agents_with_live_panes(
+            all_agents,
+            mux,
+            instance,
+            strict_server_identity,
+            prune_stale,
+        )?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.mark_stale_remote_agents(&mut agents, mux.name(), instance, now);
+        Ok(agents)
+    }
+
+    fn reconcile_agents_with_live_panes(
         &self,
         all_agents: Vec<AgentState>,
         mux: &dyn crate::multiplexer::Multiplexer,
@@ -1629,6 +1671,50 @@ mod tests {
             prompt: None,
             remote: None,
         }
+    }
+
+    #[test]
+    fn remote_agents_are_stale_unless_a_live_daemon_holds_their_channel() {
+        let (store, _dir) = test_store();
+        let agent = |remote: Option<&str>| crate::multiplexer::AgentPane {
+            remote: remote.map(|remote| crate::multiplexer::RemoteAgentPane {
+                remote: remote.to_string(),
+                project: "api".to_string(),
+                worktree: "feature".to_string(),
+                stale: false,
+            }),
+            ..test_agent_state(test_pane_key()).to_agent_pane(String::new(), String::new())
+        };
+        let stale = |agents: &[crate::multiplexer::AgentPane]| {
+            agents
+                .iter()
+                .map(|agent| agent.is_remote_stale())
+                .collect::<Vec<_>>()
+        };
+        let now = 1_000;
+        let runtime = |updated_ts| super::super::types::RuntimeState {
+            connected_remotes: ["devbox".to_string()].into(),
+            updated_ts,
+            ..Default::default()
+        };
+
+        // No daemon has written the runtime file: nothing holds a channel.
+        let mut agents = vec![agent(None), agent(Some("devbox")), agent(Some("other"))];
+        store.mark_stale_remote_agents(&mut agents, "tmux", "default", now);
+        assert_eq!(stale(&agents), [false, true, true]);
+
+        store
+            .write_runtime("tmux", "default", &runtime(now - 5))
+            .unwrap();
+        store.mark_stale_remote_agents(&mut agents, "tmux", "default", now);
+        assert_eq!(stale(&agents), [false, false, true]);
+
+        // The daemon stopped writing: its channels are gone with it.
+        store
+            .write_runtime("tmux", "default", &runtime(now - 60))
+            .unwrap();
+        store.mark_stale_remote_agents(&mut agents, "tmux", "default", now);
+        assert_eq!(stale(&agents), [false, true, true]);
     }
 
     #[test]
