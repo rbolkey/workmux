@@ -196,8 +196,7 @@ fn command_session(request: &Request, writer: &mut impl Write) -> Response {
             &crate::config::Config::load_global_only()?,
             &params.request.project.name,
         )?;
-        if project.site.remote != params.remote || params.request.project.remote != params.remote
-        {
+        if project.site.remote != params.remote || params.request.project.remote != params.remote {
             bail!(
                 "project {} is not on remote {}",
                 params.request.project.name,

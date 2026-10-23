@@ -520,3 +520,56 @@ def test_remote_add_places_windows_in_the_project_session(
     finally:
         if daemon_pid is not None:
             os.kill(daemon_pid, signal.SIGTERM)
+
+
+@pytest.mark.tmux_only
+def test_remote_add_over_ssh_to_localhost(
+    mux_server: MuxEnvironment,
+    workmux_exe_path: Path,
+    repo_path: Path,
+    short_tmp: dict,
+    local_sshd: Path,
+):
+    """`add` over the SSH transport creates the worktree on the remote and a
+    window in the project's session whose pane runs there."""
+    env = mux_server
+    env.install_script(
+        env.fake_bin_dir / "ssh", f'#!/bin/sh\nexec /usr/bin/ssh -F {local_sshd} "$@"\n'
+    )
+    remote_home = local_sshd.parent / "remote-home"
+    origin = make_origin(
+        env,
+        env.tmp_path / "origin",
+        'post_create:\n  - echo "post-create ran in $PWD"\n'
+        "panes:\n  - command: pwd -P > pane-ran.txt\n",
+    )
+
+    def wm(command):
+        return run_workmux_command(
+            env,
+            workmux_exe_path,
+            repo_path,
+            command,
+            pre_run_env=short_tmp,
+            timeout=60.0,
+        )
+
+    wm("remote add box --transport ssh --target wmx-test")
+    wm(f"project add api --remote box --repo {origin} --path code/api")
+    daemon_pid = None
+    try:
+        added = wm("add feature --project api")
+        daemon_pid = remote_daemon_ping(env, workmux_exe_path, repo_path, short_tmp)[
+            "pid"
+        ]
+        assert "post-create ran in" in added.stdout + added.stderr
+        worktree = remote_home / "code" / "api__worktrees" / "feature"
+        assert worktree.is_dir()
+        assert tmux_value(env, "=api:wm-feature", "#{session_name}") == "api"
+        assert session_tag(env, "api") == "box:api"
+        assert wait_for(worktree / "pane-ran.txt", timeout=30).strip() == str(
+            worktree.resolve()
+        )
+    finally:
+        if daemon_pid is not None:
+            os.kill(daemon_pid, signal.SIGTERM)

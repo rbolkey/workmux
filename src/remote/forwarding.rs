@@ -174,8 +174,8 @@ pub fn listen(peer: Peer) -> Result<SocketGuard> {
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
     let path = dir.join(format!("serve-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&path);
-    let listener =
-        UnixListener::bind(&path).with_context(|| format!("failed to listen on {}", path.display()))?;
+    let listener = UnixListener::bind(&path)
+        .with_context(|| format!("failed to listen on {}", path.display()))?;
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(stream) = stream else { break };
@@ -656,11 +656,17 @@ mod tests {
         };
         let (env, received) = mpsc::channel();
         let session = std::thread::spawn(move || {
-            channels.run_command("devbox", &remote(), &request, &invocation, &mut |stream, data| {
-                if stream == Stream::Stdout {
-                    let _ = env.send(String::from_utf8_lossy(data).into_owned());
-                }
-            })
+            channels.run_command(
+                "devbox",
+                &remote(),
+                &request,
+                &invocation,
+                &mut |stream, data| {
+                    if stream == Stream::Stdout {
+                        let _ = env.send(String::from_utf8_lossy(data).into_owned());
+                    }
+                },
+            )
         });
         let line = received
             .recv_timeout(Duration::from_secs(20))
@@ -704,7 +710,13 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            server.query(&["display-message", "-p", "-t", &pane, "#{session_name}:#{window_name}"]),
+            server.query(&[
+                "display-message",
+                "-p",
+                "-t",
+                &pane,
+                "#{session_name}:#{window_name}"
+            ]),
             "api:wm-feature"
         );
         assert_eq!(

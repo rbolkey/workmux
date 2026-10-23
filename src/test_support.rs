@@ -187,4 +187,3 @@ impl Drop for PrivateTmuxServer {
             .run();
     }
 }
-

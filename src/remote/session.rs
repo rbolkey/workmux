@@ -419,16 +419,22 @@ mod tests {
 
     fn run(request: &CommandRequest, mut on_stdout: impl FnMut(&str)) -> (Result<i32>, Captured) {
         let mut captured = Captured::default();
-        let exit = channels().run_command("devbox", &remote(), request, &InvocationContext::default(), &mut |stream, data| {
-            let text = String::from_utf8_lossy(data);
-            match stream {
-                Stream::Stdout => {
-                    captured.stdout.push_str(&text);
-                    on_stdout(&captured.stdout);
+        let exit = channels().run_command(
+            "devbox",
+            &remote(),
+            request,
+            &InvocationContext::default(),
+            &mut |stream, data| {
+                let text = String::from_utf8_lossy(data);
+                match stream {
+                    Stream::Stdout => {
+                        captured.stdout.push_str(&text);
+                        on_stdout(&captured.stdout);
+                    }
+                    Stream::Stderr => captured.stderr.push_str(&text),
                 }
-                Stream::Stderr => captured.stderr.push_str(&text),
-            }
-        });
+            },
+        );
         (exit, captured)
     }
 

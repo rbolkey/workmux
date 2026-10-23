@@ -488,7 +488,11 @@ mod tests {
             {
                 return text;
             }
-            assert!(Instant::now() < deadline, "{} never written", path.display());
+            assert!(
+                Instant::now() < deadline,
+                "{} never written",
+                path.display()
+            );
             std::thread::sleep(Duration::from_millis(20));
         }
     }
@@ -514,7 +518,13 @@ mod tests {
         );
 
         assert_eq!(
-            ws.tmux(&["display-message", "-p", "-t", &pane_id, "#{session_name}:#{window_name}"]),
+            ws.tmux(&[
+                "display-message",
+                "-p",
+                "-t",
+                &pane_id,
+                "#{session_name}:#{window_name}"
+            ]),
             "api:wm-feature"
         );
         assert_eq!(
@@ -528,7 +538,12 @@ mod tests {
         let ran = wait_for_file(&ws.remote_root.path().join("ran"));
         assert_eq!(
             ran.trim(),
-            ws.remote_root.path().canonicalize().unwrap().display().to_string()
+            ws.remote_root
+                .path()
+                .canonicalize()
+                .unwrap()
+                .display()
+                .to_string()
         );
     }
 

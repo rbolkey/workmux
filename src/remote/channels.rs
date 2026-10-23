@@ -16,9 +16,9 @@ use super::connection::{Connection, HELLO_TIMEOUT};
 use super::forwarded;
 use super::forwarding::{FORWARD_METHOD, Forwarded};
 use super::session::{self, CommandRequest, Sessions, Stream};
-use crate::multiplexer::InvocationContext;
 use super::transport::{RemoteState, Transport};
 use crate::config::{RemoteConfig, TransportKind};
+use crate::multiplexer::InvocationContext;
 
 /// Builds the transport for a configured remote.
 pub type TransportFactory =
@@ -86,7 +86,12 @@ impl WorkstationHandler {
             .sessions
             .scope(session)
             .filter(|scope| scope.remote == self.remote)
-            .ok_or_else(|| anyhow!("refused: no command session {session} on remote {}", self.remote))?;
+            .ok_or_else(|| {
+                anyhow!(
+                    "refused: no command session {session} on remote {}",
+                    self.remote
+                )
+            })?;
         forwarded::answer(&scope, &scope.tmux(), self.transport.as_ref(), request)
     }
 }

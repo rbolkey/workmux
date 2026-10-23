@@ -105,9 +105,11 @@ mod tests {
             name: "api".to_string(),
             session: None,
         };
-        let project =
-            Project::at_main_worktree_root_served(Path::new("/home/me/code/api-clone"), Some(served))
-                .unwrap();
+        let project = Project::at_main_worktree_root_served(
+            Path::new("/home/me/code/api-clone"),
+            Some(served),
+        )
+        .unwrap();
         assert_eq!(project, Project::remote("devbox", "api"));
         assert_eq!(project.expand_placeholder("wm-{project}-"), "wm-api-");
     }

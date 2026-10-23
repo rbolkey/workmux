@@ -9,10 +9,10 @@ use anyhow::{Context, Result, anyhow};
 use std::io::Write;
 use std::path::PathBuf;
 
-use super::session::{CommandRequest, OutputParams, ProjectSite, Stream};
-use crate::config::{Config, ProjectPlacement, RemoteConfig};
 use super::forwarded;
 use super::session::ServedProject;
+use super::session::{CommandRequest, OutputParams, ProjectSite, Stream};
+use crate::config::{Config, ProjectPlacement, RemoteConfig};
 use crate::multiplexer::{InvocationContext, TmuxBackend, create_backend, detect_backend};
 use crate::project::Project;
 
@@ -312,7 +312,13 @@ projects:
             args(&["workmux", "add", "feature", "-p", "x"])
         );
         assert_eq!(
-            without_project(args(&["add", "--project=api", "feature", "--", "--project"])),
+            without_project(args(&[
+                "add",
+                "--project=api",
+                "feature",
+                "--",
+                "--project"
+            ])),
             args(&["workmux", "add", "feature", "--", "--project"])
         );
     }
