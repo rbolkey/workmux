@@ -429,6 +429,10 @@ enum Commands {
         /// Use an alternate config file for this invocation (still merges with global config)
         #[arg(long, value_hint = clap::ValueHint::FilePath)]
         config: Option<PathBuf>,
+
+        /// Open a worktree of a project registered on a remote
+        #[arg(long)]
+        project: Option<String>,
     },
 
     /// Close a worktree's tmux window (keeps the worktree and branch)
@@ -669,6 +673,10 @@ enum Commands {
         /// Maximum wait time in seconds
         #[arg(long)]
         timeout: Option<u64>,
+
+        /// Run in a worktree of a project registered on a remote
+        #[arg(long)]
+        project: Option<String>,
     },
 
     /// Exit tracked agent processes older than a configured age
@@ -1169,7 +1177,11 @@ pub fn run() -> Result<()> {
             continue_session,
             prompt,
             config,
+            project,
         } => {
+            if let Some(project) = crate::remote::router::resolve(project.as_deref())? {
+                return crate::remote::router::relay(&project);
+            }
             let mode_override = mode
                 .map(MuxMode::from)
                 .or(session.then_some(MuxMode::Session));
@@ -1271,7 +1283,13 @@ pub fn run() -> Result<()> {
             background,
             keep,
             timeout,
-        } => command::run::run(&name, command, background, keep, timeout),
+            project,
+        } => {
+            if let Some(project) = crate::remote::router::resolve(project.as_deref())? {
+                return crate::remote::router::relay(&project);
+            }
+            command::run::run(&name, command, background, keep, timeout)
+        }
         Commands::ReapAgents { hours, force } => {
             command::reap_agents::run(hours.saturating_mul(3600), force)
         }

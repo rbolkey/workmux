@@ -1027,3 +1027,103 @@ def test_remote_panes_survive_drops_and_reattach(
             os.kill(int(pid), signal.SIGKILL)
         if daemon_pid is not None:
             os.kill(daemon_pid, signal.SIGTERM)
+
+
+@requires_dtach
+@pytest.mark.tmux_only
+def test_open_and_resurrect_reattach_to_surviving_remote_panes(
+    mux_server: MuxEnvironment,
+    workmux_exe_path: Path,
+    repo_path: Path,
+    short_tmp: dict,
+    remote_root: Path,
+):
+    """A remote worktree's window that goes away without workmux (killed in
+    tmux, or lost with the whole tmux server) leaves its remote panes
+    running. `open` and `resurrect` bring the window back showing those same
+    remote panes in the configured layout, without starting the agent
+    again."""
+    env = mux_server
+    assert isinstance(env, TmuxEnvironment)
+    started = remote_root / "agent.pids"
+    agent = remote_root / "agent.sh"
+    agent.write_text(f"echo $$ >> {started}\nexec sleep 600\n")
+    origin = make_origin(
+        env,
+        env.tmp_path / "origin",
+        f"panes:\n  - command: sh {agent}\n  - split: horizontal\n",
+    )
+
+    def wm(command):
+        return run_workmux_command(
+            env,
+            workmux_exe_path,
+            repo_path,
+            command,
+            pre_run_env=short_tmp,
+            timeout=60.0,
+        )
+
+    def remote_panes(window: str) -> list[str]:
+        return env.tmux(
+            ["list-panes", "-t", window, "-F", "#{@workmux_remote_pane}"]
+        ).stdout.split()
+
+    def window_gone(window: str) -> bool:
+        return (
+            env.tmux(["list-panes", "-t", window], check=False).returncode != 0
+        )
+
+    wm(f"remote add lb --transport loopback --target {remote_root}")
+    wm(f"project add api --remote lb --repo {origin} --path code/api")
+    daemons = []
+    try:
+        wm("add feature --project api")
+        daemons.append(
+            remote_daemon_ping(env, workmux_exe_path, repo_path, short_tmp)["pid"]
+        )
+        window = "=api:wm-feature"
+        shown = remote_panes(window)
+        assert len(shown) == 2, shown
+        agent_pid = int(wait_for(started).strip())
+
+        # The window is killed in tmux: its remote panes keep running.
+        env.tmux(["kill-window", "-t", window])
+        assert window_gone(window)
+        assert pid_alive(agent_pid)
+
+        reopened = wm("open feature --project api")
+        assert "Opened tmux window for 'feature'" in reopened.stdout
+        assert remote_panes(window) == shown
+        assert started.read_text().split() == [str(agent_pid)]
+
+        # Opening an open window only switches to it.
+        again = wm("open feature --project api")
+        assert "Switched to existing tmux window" in again.stdout
+        assert remote_panes(window) == shown
+
+        # The workstation's tmux server dies; the remote panes survive it.
+        env.tmux(["kill-server"], check=False)
+        env.start_server()
+        assert pid_alive(agent_pid)
+
+        planned = wm("resurrect --dry-run")
+        assert "feature" in planned.stdout and "restoring" in planned.stdout
+        assert window_gone(window)
+
+        restored = wm("resurrect")
+        assert "✓ Restored 1 worktree(s): feature" in restored.stdout
+        assert remote_panes(window) == shown
+        assert started.read_text().split() == [str(agent_pid)]
+        daemons.append(
+            remote_daemon_ping(env, workmux_exe_path, repo_path, short_tmp)["pid"]
+        )
+
+        # Nothing survives unshown now: a second resurrect restores nothing.
+        assert "Restored" not in wm("resurrect").stdout
+    finally:
+        for pid in daemons:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass

@@ -394,16 +394,16 @@ impl ForwardingMux {
         Ok(pane_id)
     }
 
-    /// The remote panes of `worktree` that still run but no workstation
-    /// pane shows, in the order they were started: those of a window that
-    /// was closed outside workmux or lost with the workstation's tmux.
-    pub fn surviving_panes(&self, worktree: &str) -> Result<Vec<RemotePaneId>> {
+    /// The project's remote panes that still run but no workstation pane
+    /// shows, in the order they were started: those of a window that was
+    /// closed outside workmux or lost with the workstation's tmux.
+    pub fn surviving_panes(&self) -> Result<Vec<RemotePaneId>> {
         let shown: HashSet<RemotePaneId> = self.get(MuxRequest::ShownRemotePanes)?;
         Ok(self
             .holder
             .running(&self.project)?
             .into_iter()
-            .filter(|pane| pane.worktree == worktree && !shown.contains(pane))
+            .filter(|pane| !shown.contains(pane))
             .collect())
     }
 
@@ -768,7 +768,11 @@ impl Multiplexer for ForwardingMux {
         task_agent: Option<&str>,
     ) -> Result<PaneSetupResult> {
         let worktree = worktree_name(options.worktree_root.unwrap_or(working_dir));
-        let surviving = self.surviving_panes(&worktree)?;
+        let surviving: Vec<RemotePaneId> = self
+            .surviving_panes()?
+            .into_iter()
+            .filter(|pane| pane.worktree == worktree)
+            .collect();
         if surviving.is_empty() {
             return setup_configured_panes(
                 self,
