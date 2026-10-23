@@ -797,7 +797,7 @@ const EXEC_ENV_ALLOWLIST: &[&str] = &[
 /// Only variables in the allowlist are included. PATH is normalized to
 /// contain only absolute entries (prevents relative-path hijacking from
 /// the worktree's current directory).
-fn sanitized_env() -> std::collections::HashMap<String, String> {
+pub(crate) fn sanitized_env() -> std::collections::HashMap<String, String> {
     let mut envs = std::collections::HashMap::new();
     for key in EXEC_ENV_ALLOWLIST {
         if let Ok(val) = std::env::var(key) {

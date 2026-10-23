@@ -1,5 +1,6 @@
 //! Read clipboard image from host via RPC and shared filesystem.
-//! Used by wl-paste/xclip shims inside the sandbox.
+//! Used by wl-paste/xclip shims inside the sandbox, and in remote panes,
+//! where the image arrives through the shell socket.
 
 use anyhow::{Result, bail};
 use std::io::Write;
@@ -9,6 +10,15 @@ use crate::sandbox::rpc::{RpcClient, RpcRequest, RpcResponse};
 /// Read clipboard image and write raw bytes to stdout.
 /// Returns exit code (0 = success, 1 = no image).
 pub fn run(mime: &str) -> Result<i32> {
+    if let Some(shell) = crate::remote::shell::Shell::current() {
+        let Some(image) = crate::remote::shims::clipboard_read(&shell.socket, mime)? else {
+            return Ok(1);
+        };
+        let mut stdout = std::io::stdout().lock();
+        stdout.write_all(&image)?;
+        stdout.flush()?;
+        return Ok(0);
+    }
     if !crate::sandbox::guest::is_sandbox_guest() {
         bail!("clipboard-read only works inside a sandbox guest (WM_SANDBOX_GUEST=1)");
     }
