@@ -127,9 +127,35 @@ pub struct AgentPane {
     /// Latest user prompt captured from the agent's hooks.
     #[serde(default)]
     pub prompt: Option<String>,
+    /// Set when the agent runs on a remote rather than the workstation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<RemoteAgentPane>,
+}
+
+/// Where a remote agent runs, as the sidebar and dashboard show it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteAgentPane {
+    pub remote: String,
+    pub project: String,
+    /// The remote's control channel is down: the status is the last known.
+    #[serde(default)]
+    pub stale: bool,
 }
 
 impl AgentPane {
+    /// The project this agent works on.
+    pub fn project(&self) -> crate::project::Project {
+        match &self.remote {
+            Some(remote) => crate::project::Project::remote(&remote.remote, &remote.project),
+            None => crate::project::Project::of_workstation_path(&self.path),
+        }
+    }
+
+    /// Whether this is a remote agent whose control channel is down.
+    pub fn is_remote_stale(&self) -> bool {
+        self.remote.as_ref().is_some_and(|remote| remote.stale)
+    }
+
     /// Timestamp used for recency ordering and age-based staleness.
     pub fn activity_ts(&self) -> Option<u64> {
         self.activity_ts

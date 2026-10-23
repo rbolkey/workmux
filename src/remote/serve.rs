@@ -13,7 +13,7 @@ use std::time::Duration;
 use super::channel::{Handler, Peer};
 use super::forwarding::{self, SocketGuard};
 use super::handshake::{Hello, write_hello};
-use super::{session, shell, shims};
+use super::{provision, session, shell, shims, status};
 
 /// Answer to a `ping` health check.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -21,6 +21,9 @@ pub struct Ping {
     pub workmux: String,
     pub protocol: u32,
     pub pid: u32,
+    /// Problems with this remote's setup, such as agents without hooks.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 /// Answers the workstation's requests. Holds this side's peer, set once the
@@ -52,6 +55,7 @@ impl Handler for RemoteHandler {
                     workmux: hello.workmux,
                     protocol: hello.protocol,
                     pid: std::process::id(),
+                    warnings: provision::current_warnings(),
                 })
                 .map_err(|e| e.to_string())
             }
@@ -103,6 +107,13 @@ pub fn serve(
     }
     if let Some(path) = shell_path {
         claim_shell_socket(peer.clone(), path, shell.clone());
+    }
+    match status::StatusFiles::for_this_remote() {
+        Ok(files) => {
+            let peer = peer.clone();
+            std::thread::spawn(move || status::send_until_closed(&peer, &files));
+        }
+        Err(error) => tracing::warn!(error = %format!("{error:#}"), "no status files"),
     }
     while !peer.wait_closed(Duration::from_secs(3600)) {}
     tracing::info!(reason = ?peer.closed_reason(), "control channel closed");

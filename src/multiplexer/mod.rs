@@ -125,6 +125,12 @@ pub trait Multiplexer: Send + Sync {
     /// Returns the name of this backend (e.g., "tmux", "wezterm")
     fn name(&self) -> &'static str;
 
+    /// Whether panes run on a remote, where remote workmux starts agents in
+    /// the project's devshell.
+    fn runs_on_remote(&self) -> bool {
+        false
+    }
+
     // === Server/Session ===
 
     /// Check if the multiplexer server is running
@@ -657,238 +663,15 @@ pub trait Multiplexer: Send + Sync {
         config: &Config,
         task_agent: Option<&str>,
     ) -> Result<PaneSetupResult> {
-        if panes.is_empty() {
-            return Ok(PaneSetupResult {
-                focus_pane_id: initial_pane_id.to_string(),
-                zoom_pane_id: None,
-            });
-        }
-
-        let mut focus_pane_id: Option<String> = None;
-        let mut zoom_pane_id: Option<String> = None;
-        let mut pane_ids: Vec<String> = vec![initial_pane_id.to_string()];
-        let shell = self.get_default_shell()?;
-
-        for (i, pane_config) in panes.iter().enumerate() {
-            let is_first = i == 0;
-
-            // Skip non-first panes that have no split direction
-            if !is_first && pane_config.split.is_none() {
-                continue;
-            }
-
-            // Resolve command: handle <agent> placeholders and prompt injection
-            let adjusted_command = util::resolve_pane_command_with_config(
-                pane_config.command.as_deref(),
-                options.run_commands,
-                options.prompt_file_path,
-                working_dir,
-                config,
-                task_agent,
-                &shell,
-            );
-
-            let pane_id = if let Some(mut resolved) = adjusted_command {
-                let is_agent_pane = resolved.selected_agent.is_some();
-
-                // Spawn with handshake so we can send the command after shell is ready
-                let handshake = self.create_handshake()?;
-                let script = handshake.script_content(&shell);
-
-                let spawned_id = if is_first {
-                    self.respawn_pane(&pane_ids[0], working_dir, Some(&script))?
-                } else {
-                    let direction = pane_config.split.as_ref().unwrap();
-                    let target_idx = pane_config.target.unwrap_or(pane_ids.len() - 1);
-                    let target = pane_ids
-                        .get(target_idx)
-                        .ok_or_else(|| anyhow!("Invalid target pane index: {}", target_idx))?;
-                    self.split_pane(
-                        target,
-                        direction,
-                        working_dir,
-                        pane_config.size,
-                        pane_config.percentage,
-                        Some(&script),
-                    )?
-                };
-
-                handshake.wait()?;
-
-                // Inject resume/continue arguments for agent panes when requested
-                if let Some(selected_agent) = resolved.selected_agent.as_mut() {
-                    match &options.resume_mode {
-                        crate::multiplexer::types::ResumeMode::Continue => {
-                            let profile = selected_agent.profile;
-                            if let Some(flag) = profile.continue_flag() {
-                                selected_agent.command.append_args_fragment(flag);
-                            } else {
-                                tracing::warn!(
-                                    agent = profile.name(),
-                                    "agent does not support --continue, flag ignored"
-                                );
-                            }
-                        }
-                        crate::multiplexer::types::ResumeMode::ForkSession(session_id) => {
-                            let agent_name = selected_agent.kind();
-                            if let Some(forker) =
-                                crate::multiplexer::conversation::resolve_forker(agent_name)
-                            {
-                                let resume_args = forker.resume_args(session_id, working_dir);
-                                selected_agent.command.args.extend(resume_args);
-                            } else {
-                                tracing::warn!(
-                                    agent = agent_name,
-                                    "agent does not support forking, resume flag ignored"
-                                );
-                            }
-                        }
-                        crate::multiplexer::types::ResumeMode::None => {}
-                    }
-                }
-
-                // Apply sandbox wrapping if enabled for this pane type
-                let final_command = if config.sandbox.is_enabled() {
-                    let should_wrap = match config.sandbox.target() {
-                        crate::config::SandboxTarget::All => true,
-                        crate::config::SandboxTarget::Agent => is_agent_pane,
-                    };
-                    if should_wrap {
-                        crate::sandbox::notice::show_once();
-
-                        // Use worktree_root for mounting, working_dir for cwd
-                        let wt_root = options.worktree_root.unwrap_or(working_dir);
-
-                        // Inject skip-permissions flag for agent panes only
-                        // (sandbox provides the security boundary, so permission
-                        // prompts are unnecessary and break autonomous workflow)
-                        let command_to_wrap =
-                            if let Some(selected_agent) = resolved.selected_agent.as_mut() {
-                                if let Some(flag) = selected_agent.profile.skip_permissions_flag() {
-                                    selected_agent.command.prepend_args_fragment(flag);
-                                }
-                                resolved.render_command()
-                            } else {
-                                resolved.command.clone()
-                            };
-
-                        // Choose backend based on config
-                        let wrap_result = match config.sandbox.backend() {
-                            crate::config::SandboxBackend::Container => {
-                                crate::sandbox::wrap_for_container(
-                                    &command_to_wrap,
-                                    &config.sandbox,
-                                    wt_root,
-                                    working_dir,
-                                )
-                            }
-                            crate::config::SandboxBackend::Lima => {
-                                let vm_name = options.lima_vm_name.ok_or_else(|| {
-                                    anyhow!(
-                                        "Lima VM name missing despite sandbox wrap request. \
-                                         This is a bug in workmux."
-                                    )
-                                })?;
-                                crate::sandbox::wrap_for_lima(
-                                    &command_to_wrap,
-                                    config,
-                                    vm_name,
-                                    working_dir,
-                                )
-                            }
-                        };
-
-                        // Fail closed: if sandbox is enabled but wrapping fails, don't fall back to unsandboxed
-                        match wrap_result {
-                            Ok(wrapped) => wrapped,
-                            Err(e) => {
-                                return Err(anyhow!(
-                                    "Sandbox is enabled but failed to wrap command: {}. \
-                                     To disable sandbox, set 'sandbox.enabled: false' in config.",
-                                    e
-                                ));
-                            }
-                        }
-                    } else {
-                        resolved.render_command()
-                    }
-                } else {
-                    resolved.render_command()
-                };
-
-                let final_command = if is_agent_pane && self.name() == "zellij" {
-                    command_with_status_target(
-                        &final_command,
-                        self.name(),
-                        &self.instance_id(),
-                        &spawned_id,
-                    )
-                } else {
-                    final_command
-                };
-
-                let _ = self.clear_pane(&spawned_id);
-                self.send_keys(&spawned_id, &final_command)?;
-
-                // Set working status for agent panes with injected prompts
-                if resolved.prompt_injected
-                    && resolved
-                        .selected_agent
-                        .as_ref()
-                        .is_some_and(|agent| agent.profile.needs_auto_status())
-                {
-                    let icon = config.status_icons.working();
-                    if config.status_format.unwrap_or(true) {
-                        let _ = self.ensure_status_format(&spawned_id);
-                    }
-                    let _ = self.set_status(&spawned_id, icon, false);
-                }
-
-                spawned_id
-            } else if is_first {
-                // No command for first pane - keep as-is
-                pane_ids[0].clone()
-            } else {
-                // No command - just split
-                let direction = pane_config.split.as_ref().unwrap();
-                let target_idx = pane_config.target.unwrap_or(pane_ids.len() - 1);
-                let target = pane_ids
-                    .get(target_idx)
-                    .ok_or_else(|| anyhow!("Invalid target pane index: {}", target_idx))?;
-                self.split_pane(
-                    target,
-                    direction,
-                    working_dir,
-                    pane_config.size,
-                    pane_config.percentage,
-                    None,
-                )?
-            };
-
-            if is_first {
-                pane_ids[0] = pane_id.clone();
-            } else {
-                pane_ids.push(pane_id.clone());
-            }
-
-            if let Some(name) = pane_config.name.as_deref() {
-                self.set_pane_name(&pane_id, name)
-                    .with_context(|| format!("Failed to set pane name '{}'", name))?;
-            }
-
-            if pane_config.zoom || pane_config.focus {
-                focus_pane_id = Some(pane_id.clone());
-            }
-
-            if pane_config.zoom {
-                zoom_pane_id = Some(pane_id);
-            }
-        }
-
-        Ok(PaneSetupResult {
-            focus_pane_id: focus_pane_id.unwrap_or_else(|| pane_ids[0].clone()),
-            zoom_pane_id,
-        })
+        setup_configured_panes(
+            self,
+            initial_pane_id,
+            panes,
+            working_dir,
+            options,
+            config,
+            task_agent,
+        )
     }
 
     // === Multi-Session/Workspace Support ===
@@ -990,6 +773,261 @@ pub trait Multiplexer: Send + Sync {
             Some(_) => Ok(true), // Valid
         }
     }
+}
+
+/// The default [`Multiplexer::setup_panes`]: start each configured pane's
+/// command through a shell handshake, with prompt injection and auto-status.
+pub fn setup_configured_panes<M: Multiplexer + ?Sized>(
+    mux: &M,
+    initial_pane_id: &str,
+    panes: &[PaneConfig],
+    working_dir: &Path,
+    options: PaneSetupOptions<'_>,
+    config: &Config,
+    task_agent: Option<&str>,
+) -> Result<PaneSetupResult> {
+    if panes.is_empty() {
+        return Ok(PaneSetupResult {
+            focus_pane_id: initial_pane_id.to_string(),
+            zoom_pane_id: None,
+        });
+    }
+
+    let mut focus_pane_id: Option<String> = None;
+    let mut zoom_pane_id: Option<String> = None;
+    let mut pane_ids: Vec<String> = vec![initial_pane_id.to_string()];
+    let shell = mux.get_default_shell()?;
+
+    for (i, pane_config) in panes.iter().enumerate() {
+        let is_first = i == 0;
+
+        // Skip non-first panes that have no split direction
+        if !is_first && pane_config.split.is_none() {
+            continue;
+        }
+
+        // Resolve command: handle <agent> placeholders and prompt injection
+        let adjusted_command = util::resolve_pane_command_with_config(
+            pane_config.command.as_deref(),
+            options.run_commands,
+            options.prompt_file_path,
+            working_dir,
+            config,
+            task_agent,
+            &shell,
+        );
+
+        let pane_id = if let Some(mut resolved) = adjusted_command {
+            let is_agent_pane = resolved.selected_agent.is_some();
+
+            // Spawn with handshake so we can send the command after shell is ready
+            let handshake = mux.create_handshake()?;
+            let script = handshake.script_content(&shell);
+
+            let spawned_id = if is_first {
+                mux.respawn_pane(&pane_ids[0], working_dir, Some(&script))?
+            } else {
+                let direction = pane_config.split.as_ref().unwrap();
+                let target_idx = pane_config.target.unwrap_or(pane_ids.len() - 1);
+                let target = pane_ids
+                    .get(target_idx)
+                    .ok_or_else(|| anyhow!("Invalid target pane index: {}", target_idx))?;
+                mux.split_pane(
+                    target,
+                    direction,
+                    working_dir,
+                    pane_config.size,
+                    pane_config.percentage,
+                    Some(&script),
+                )?
+            };
+
+            handshake.wait()?;
+
+            // Inject resume/continue arguments for agent panes when requested
+            if let Some(selected_agent) = resolved.selected_agent.as_mut() {
+                match &options.resume_mode {
+                    crate::multiplexer::types::ResumeMode::Continue => {
+                        let profile = selected_agent.profile;
+                        if let Some(flag) = profile.continue_flag() {
+                            selected_agent.command.append_args_fragment(flag);
+                        } else {
+                            tracing::warn!(
+                                agent = profile.name(),
+                                "agent does not support --continue, flag ignored"
+                            );
+                        }
+                    }
+                    crate::multiplexer::types::ResumeMode::ForkSession(session_id) => {
+                        let agent_name = selected_agent.kind();
+                        if let Some(forker) =
+                            crate::multiplexer::conversation::resolve_forker(agent_name)
+                        {
+                            let resume_args = forker.resume_args(session_id, working_dir);
+                            selected_agent.command.args.extend(resume_args);
+                        } else {
+                            tracing::warn!(
+                                agent = agent_name,
+                                "agent does not support forking, resume flag ignored"
+                            );
+                        }
+                    }
+                    crate::multiplexer::types::ResumeMode::None => {}
+                }
+            }
+
+            // Apply sandbox wrapping if enabled for this pane type
+            let final_command = if config.sandbox.is_enabled() {
+                let should_wrap = match config.sandbox.target() {
+                    crate::config::SandboxTarget::All => true,
+                    crate::config::SandboxTarget::Agent => is_agent_pane,
+                };
+                if should_wrap {
+                    crate::sandbox::notice::show_once();
+
+                    // Use worktree_root for mounting, working_dir for cwd
+                    let wt_root = options.worktree_root.unwrap_or(working_dir);
+
+                    // Inject skip-permissions flag for agent panes only
+                    // (sandbox provides the security boundary, so permission
+                    // prompts are unnecessary and break autonomous workflow)
+                    let command_to_wrap =
+                        if let Some(selected_agent) = resolved.selected_agent.as_mut() {
+                            if let Some(flag) = selected_agent.profile.skip_permissions_flag() {
+                                selected_agent.command.prepend_args_fragment(flag);
+                            }
+                            resolved.render_command()
+                        } else {
+                            resolved.command.clone()
+                        };
+
+                    // Choose backend based on config
+                    let wrap_result = match config.sandbox.backend() {
+                        crate::config::SandboxBackend::Container => {
+                            crate::sandbox::wrap_for_container(
+                                &command_to_wrap,
+                                &config.sandbox,
+                                wt_root,
+                                working_dir,
+                            )
+                        }
+                        crate::config::SandboxBackend::Lima => {
+                            let vm_name = options.lima_vm_name.ok_or_else(|| {
+                                anyhow!(
+                                    "Lima VM name missing despite sandbox wrap request. \
+                                     This is a bug in workmux."
+                                )
+                            })?;
+                            crate::sandbox::wrap_for_lima(
+                                &command_to_wrap,
+                                config,
+                                vm_name,
+                                working_dir,
+                            )
+                        }
+                    };
+
+                    // Fail closed: if sandbox is enabled but wrapping fails, don't fall back to unsandboxed
+                    match wrap_result {
+                        Ok(wrapped) => wrapped,
+                        Err(e) => {
+                            return Err(anyhow!(
+                                "Sandbox is enabled but failed to wrap command: {}. \
+                                 To disable sandbox, set 'sandbox.enabled: false' in config.",
+                                e
+                            ));
+                        }
+                    }
+                } else {
+                    resolved.render_command()
+                }
+            } else {
+                resolved.render_command()
+            };
+
+            let final_command = if is_agent_pane && mux.runs_on_remote() {
+                let toolchain = crate::sandbox::toolchain::resolve_toolchain(
+                    &config.sandbox.toolchain(),
+                    options.worktree_root.unwrap_or(working_dir),
+                );
+                crate::sandbox::toolchain::wrap_command(&final_command, &toolchain)
+            } else {
+                final_command
+            };
+
+            let final_command = if is_agent_pane && mux.name() == "zellij" {
+                command_with_status_target(
+                    &final_command,
+                    mux.name(),
+                    &mux.instance_id(),
+                    &spawned_id,
+                )
+            } else {
+                final_command
+            };
+
+            let _ = mux.clear_pane(&spawned_id);
+            mux.send_keys(&spawned_id, &final_command)?;
+
+            // Set working status for agent panes with injected prompts
+            if resolved.prompt_injected
+                && resolved
+                    .selected_agent
+                    .as_ref()
+                    .is_some_and(|agent| agent.profile.needs_auto_status())
+            {
+                let icon = config.status_icons.working();
+                if config.status_format.unwrap_or(true) {
+                    let _ = mux.ensure_status_format(&spawned_id);
+                }
+                let _ = mux.set_status(&spawned_id, icon, false);
+            }
+
+            spawned_id
+        } else if is_first {
+            // No command for first pane - keep as-is
+            pane_ids[0].clone()
+        } else {
+            // No command - just split
+            let direction = pane_config.split.as_ref().unwrap();
+            let target_idx = pane_config.target.unwrap_or(pane_ids.len() - 1);
+            let target = pane_ids
+                .get(target_idx)
+                .ok_or_else(|| anyhow!("Invalid target pane index: {}", target_idx))?;
+            mux.split_pane(
+                target,
+                direction,
+                working_dir,
+                pane_config.size,
+                pane_config.percentage,
+                None,
+            )?
+        };
+
+        if is_first {
+            pane_ids[0] = pane_id.clone();
+        } else {
+            pane_ids.push(pane_id.clone());
+        }
+
+        if let Some(name) = pane_config.name.as_deref() {
+            mux.set_pane_name(&pane_id, name)
+                .with_context(|| format!("Failed to set pane name '{}'", name))?;
+        }
+
+        if pane_config.zoom || pane_config.focus {
+            focus_pane_id = Some(pane_id.clone());
+        }
+
+        if pane_config.zoom {
+            zoom_pane_id = Some(pane_id);
+        }
+    }
+
+    Ok(PaneSetupResult {
+        focus_pane_id: focus_pane_id.unwrap_or_else(|| pane_ids[0].clone()),
+        zoom_pane_id,
+    })
 }
 
 /// Detect which backend to use based on environment.

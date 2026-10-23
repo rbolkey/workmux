@@ -2,7 +2,7 @@
 //! output, confirmation prompts, cancellation and exit code.
 //!
 //! The workstation sends `command.run` over the control channel. Remote
-//! workmux clones the project on first use, runs the command in the
+//! workmux clones and provisions the project on first use, runs the command in the
 //! project's clone and streams its stdout and stderr back as
 //! `command.output` notifications before answering with the exit code.
 //! When the command reads an answer to a prompt, it sends `command.prompt`
@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use super::channel::Peer;
 use super::forwarded::SessionScope;
-use super::forwarding;
+use super::{forwarding, provision};
 use crate::multiplexer::InvocationContext;
 
 /// Request method that starts a command session on the remote.
@@ -79,6 +79,11 @@ pub struct ProjectSite {
 pub struct CommandRequest {
     pub project: ProjectSite,
     pub argv: Vec<String>,
+    /// Ownership token of the workstation window the command was typed in,
+    /// when that window belongs to the project: the command then runs in
+    /// that window's worktree, as it would locally.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invoking_window_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -461,15 +466,16 @@ fn exit_code(status: std::process::ExitStatus) -> i32 {
         .unwrap_or(1)
 }
 
-/// Clone the project to its registered path if it is missing.
+/// Clone the project to its registered path if it is missing. Returns
+/// whether it cloned.
 fn ensure_cloned(
     project: &ProjectSite,
     path: &Path,
     tracked: Option<Tracked>,
     emit: &(dyn Fn(Stream, &[u8]) + Sync),
-) -> Result<()> {
+) -> Result<bool> {
     if path.exists() {
-        return Ok(());
+        return Ok(false);
     }
     let Some(git_url) = &project.git_url else {
         bail!(
@@ -498,7 +504,65 @@ fn ensure_cloned(
     if !status.success() {
         bail!("git clone of {git_url} into {} failed", path.display());
     }
+    Ok(true)
+}
+
+/// Provision this remote for the project just cloned at `path`. A failed
+/// step is a warning: the command it came before still runs.
+fn provision(
+    project: &ProjectSite,
+    path: &Path,
+    tracked: Option<Tracked>,
+    emit: &(dyn Fn(Stream, &[u8]) + Sync),
+) -> Result<()> {
+    let mode = crate::config::Config::load_with_location_from(path, None)
+        .map(|(config, _)| config.sandbox.toolchain())
+        .unwrap_or_default();
+    let toolchain = crate::sandbox::toolchain::resolve_toolchain(&mode, path);
+    let plan = provision::plan(&toolchain, provision::has_command);
+    let remote = &project.remote;
+    for warning in &plan.warnings {
+        emit(
+            Stream::Stderr,
+            format!("warning: {}\n", warning.replace("this remote", remote)).as_bytes(),
+        );
+    }
+    for step in &plan.steps {
+        emit(
+            Stream::Stderr,
+            format!("Provisioning {remote}: {}\n", step.what).as_bytes(),
+        );
+        let mut command = remote_command(&step.argv)?;
+        command.current_dir(path);
+        // Its output is not the command's: keep the command's stdout clean.
+        let status = run_streamed(command, tracked, &|_, data| emit(Stream::Stderr, data))?;
+        if !status.success() {
+            emit(
+                Stream::Stderr,
+                format!(
+                    "warning: {} on {remote} failed ({status}); do it there yourself\n",
+                    step.what
+                )
+                .as_bytes(),
+            );
+        }
+    }
     Ok(())
+}
+
+/// The command for `argv` on this machine, the remote, where `workmux`
+/// means remote workmux.
+fn remote_command(argv: &[String]) -> Result<Command> {
+    let (program, args) = argv
+        .split_first()
+        .ok_or_else(|| anyhow!("no command to run"))?;
+    let mut command = if program == "workmux" {
+        Command::new(std::env::current_exe().context("failed to locate the workmux binary")?)
+    } else {
+        Command::new(program)
+    };
+    command.args(args);
+    Ok(command)
 }
 
 /// Where a command run in a command session forwards its multiplexer
@@ -509,8 +573,8 @@ pub struct Forwarding<'a> {
     pub session: u64,
 }
 
-/// Run `request` on this machine, the remote: clone the project on first
-/// use, then run the command in its clone.
+/// Run `request` on this machine, the remote: clone and provision the
+/// project on first use, then run the command in its clone.
 pub fn run_on_remote(
     request: &CommandRequest,
     forwarding: Option<Forwarding>,
@@ -518,19 +582,17 @@ pub fn run_on_remote(
     emit: &(dyn Fn(Stream, &[u8]) + Sync),
 ) -> Result<i32> {
     let path = clone_path(&request.project.path)?;
-    ensure_cloned(&request.project, &path, tracked, emit)?;
-    let (program, args) = request
-        .argv
-        .split_first()
-        .ok_or_else(|| anyhow!("no command to run"))?;
-    let mut command = if program == "workmux" {
-        Command::new(std::env::current_exe().context("failed to locate the workmux binary")?)
-    } else {
-        Command::new(program)
-    };
+    if ensure_cloned(&request.project, &path, tracked, emit)? {
+        provision(&request.project, &path, tracked, emit)?;
+    }
+    let mut command = remote_command(&request.argv)?;
+    let workdir = request
+        .invoking_window_token
+        .as_deref()
+        .and_then(|token| worktree_with_window_token(&path, token))
+        .unwrap_or(path);
     command
-        .args(args)
-        .current_dir(&path)
+        .current_dir(&workdir)
         .env(REMOTE_ENV, &request.project.remote)
         .env(PROJECT_ENV, &request.project.name);
     match &request.project.session {
@@ -543,6 +605,20 @@ pub fn run_on_remote(
             .env(forwarding::SESSION_ENV, forwarding.session.to_string());
     }
     Ok(exit_code(run_streamed(command, tracked, emit)?))
+}
+
+/// The worktree of the clone at `clone` whose window carries `token`.
+fn worktree_with_window_token(clone: &Path, token: &str) -> Option<PathBuf> {
+    crate::git::list_worktrees_in(Some(clone))
+        .ok()?
+        .into_iter()
+        .map(|(path, _)| path)
+        .find(|path| {
+            path.file_name()
+                .and_then(|handle| handle.to_str())
+                .and_then(|handle| crate::git::get_worktree_window_token_in(handle, Some(clone)))
+                .is_some_and(|candidate| candidate == token)
+        })
 }
 
 /// The remote project a command runs for, when remote workmux runs it in
@@ -602,6 +678,7 @@ mod tests {
                 session: None,
             },
             argv: ["sh", "-c", script].map(String::from).to_vec(),
+            invoking_window_token: None,
         }
     }
 
@@ -789,6 +866,40 @@ mod tests {
 
         assert_eq!(exit.unwrap(), 0);
         assert_eq!(captured.stdout, format!("{}\ndevbox api\n", path.display()));
+    }
+
+    #[test]
+    fn a_command_from_a_worktree_window_runs_in_that_worktree() {
+        let temp = tempfile::tempdir().unwrap();
+        let clone = temp.path().canonicalize().unwrap().join("api");
+        std::fs::create_dir(&clone).unwrap();
+        crate::test_support::init_repo(&clone);
+        let worktree = clone.with_file_name("api__worktrees").join("feature");
+        crate::test_support::run_git(
+            &clone,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature",
+                worktree.to_str().unwrap(),
+            ],
+        );
+        crate::test_support::run_git(
+            &clone,
+            &["config", "workmux.worktree.feature.window-token", "f00d"],
+        );
+        let mut from_window = request(&clone, None, "pwd");
+        from_window.invoking_window_token = Some("f00d".to_string());
+        let mut from_elsewhere = from_window.clone();
+        from_elsewhere.invoking_window_token = Some("beef".to_string());
+
+        let (exit, captured) = run(&from_window, |_| {});
+        let (_, elsewhere) = run(&from_elsewhere, |_| {});
+
+        assert_eq!(exit.unwrap(), 0);
+        assert_eq!(captured.stdout, format!("{}\n", worktree.display()));
+        assert_eq!(elsewhere.stdout, format!("{}\n", clone.display()));
     }
 
     #[test]

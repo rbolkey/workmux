@@ -1440,11 +1440,14 @@ impl StateStore {
                         }
                     }
                 }
+                // A remote agent's pane is a view: its foreground command is
+                // the attach client, not the agent.
                 Some(live)
-                    if live
-                        .current_command
-                        .as_ref()
-                        .is_some_and(|cmd| *cmd != state.command) =>
+                    if state.remote.is_none()
+                        && live
+                            .current_command
+                            .as_ref()
+                            .is_some_and(|cmd| *cmd != state.command) =>
                 {
                     if previous_server {
                         // Command changed after server restart - preserve for resurrect
@@ -1624,6 +1627,7 @@ mod tests {
             agent_kind: None,
             agent_session_id: None,
             prompt: None,
+            remote: None,
         }
     }
 

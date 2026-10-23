@@ -515,7 +515,7 @@ impl App {
     }
 
     pub fn project(agent_pane: &AgentPane) -> Project {
-        Project::of_workstation_path(&agent_pane.path)
+        agent_pane.project()
     }
 
     /// Get PR info for an agent by looking up its branch in PR statuses

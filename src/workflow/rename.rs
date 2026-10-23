@@ -109,6 +109,13 @@ pub fn rename(
     let old_full = prefixed(&context.prefix, &old_handle);
     let new_full = prefixed(&context.prefix, &new_handle);
     let mux_running = context.mux.is_running().unwrap_or(false);
+    // A window placed in another session (a remote project's session, say)
+    // is looked up there rather than in the current session.
+    let window_session = git::get_worktree_window_session(&old_handle);
+    let window_names = || match &window_session {
+        Some(session) => context.mux.get_window_names_in_session(session),
+        None => context.mux.get_all_window_names(),
+    };
 
     if mux_running && attachment.manages_mux() && new_handle != old_handle {
         match mode {
@@ -118,7 +125,7 @@ pub fn rename(
                 }
             }
             MuxMode::Window => {
-                let all = context.mux.get_all_window_names()?;
+                let all = window_names()?;
                 let re = duplicate_name_regex(&new_full);
                 if all.iter().any(|w| re.is_match(w)) {
                     return Err(anyhow!(
@@ -194,7 +201,7 @@ pub fn rename(
                 }
             }
             MuxMode::Window => {
-                let all = context.mux.get_all_window_names().unwrap_or_default();
+                let all = window_names().unwrap_or_default();
                 let re = duplicate_name_regex(&old_full);
                 let matches: Vec<String> = all.into_iter().filter(|w| re.is_match(w)).collect();
                 for old_name in &matches {

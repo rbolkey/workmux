@@ -429,6 +429,10 @@ enum Commands {
         /// Use an alternate config file for this invocation (still merges with global config)
         #[arg(long, value_hint = clap::ValueHint::FilePath)]
         config: Option<PathBuf>,
+
+        /// Open a worktree of a project registered on a remote
+        #[arg(long)]
+        project: Option<String>,
     },
 
     /// Close a worktree's tmux window (keeps the worktree and branch)
@@ -504,6 +508,10 @@ enum Commands {
         /// Worktree name or branch (defaults to current directory)
         #[arg(value_parser = WorktreeHandleParser::new())]
         name: Option<String>,
+
+        /// Project registered on a remote that holds the worktree
+        #[arg(long, value_name = "NAME")]
+        project: Option<String>,
     },
 
     /// Rename a worktree, its tmux window/session, and (optionally) its branch
@@ -515,6 +523,10 @@ enum Commands {
         /// Also rename the underlying git branch to match the new handle
         #[arg(short = 'b', long)]
         branch: bool,
+
+        /// Project registered on a remote that holds the worktree
+        #[arg(long, value_name = "NAME")]
+        project: Option<String>,
     },
 
     /// Remove a worktree, tmux window, and branch without merging
@@ -669,6 +681,10 @@ enum Commands {
         /// Maximum wait time in seconds
         #[arg(long)]
         timeout: Option<u64>,
+
+        /// Run in a worktree of a project registered on a remote
+        #[arg(long)]
+        project: Option<String>,
     },
 
     /// Exit tracked agent processes older than a configured age
@@ -689,10 +705,18 @@ enum Commands {
         /// Sync all worktrees instead of just the current one
         #[arg(long)]
         all: bool,
+
+        /// Project registered on a remote that holds the worktree
+        #[arg(long, value_name = "NAME")]
+        project: Option<String>,
     },
 
     /// Generate example .workmux.yaml configuration file
-    Init,
+    Init {
+        /// Project registered on a remote to write the file into
+        #[arg(long, value_name = "NAME")]
+        project: Option<String>,
+    },
 
     /// Set up agent status tracking hooks and install skills
     Setup {
@@ -702,6 +726,9 @@ enum Commands {
         /// Only install skills
         #[arg(long)]
         skills: bool,
+        /// Install without asking, so setup runs without a terminal
+        #[arg(short, long)]
+        yes: bool,
     },
 
     /// Remove agent status tracking hooks, skills, and cache/state dirs
@@ -824,6 +851,10 @@ enum Commands {
         /// The new base branch
         #[arg(value_parser = GitBranchParser::new())]
         base: String,
+
+        /// Project registered on a remote that holds the worktree
+        #[arg(long, value_name = "NAME")]
+        project: Option<String>,
     },
 
     /// Execute a run spec (internal use)
@@ -956,7 +987,7 @@ fn should_prompt_nerdfont(cmd: &Commands) -> bool {
         && matches!(
             cmd,
             Commands::Add { .. }
-                | Commands::Init
+                | Commands::Init { .. }
                 | Commands::Dashboard { .. }
                 | Commands::List { .. }
         )
@@ -969,7 +1000,7 @@ fn should_prompt_status_setup(cmd: &Commands) -> bool {
     !is_headless_add(cmd)
         && matches!(
             cmd,
-            Commands::Add { .. } | Commands::Init | Commands::List { .. }
+            Commands::Add { .. } | Commands::Init { .. } | Commands::List { .. }
         )
 }
 
@@ -1190,7 +1221,11 @@ pub fn run() -> Result<()> {
             continue_session,
             prompt,
             config,
+            project,
         } => {
+            if let Some(project) = crate::remote::router::resolve(project.as_deref())? {
+                return crate::remote::router::relay(&project);
+            }
             let mode_override = mode
                 .map(MuxMode::from)
                 .or(session.then_some(MuxMode::Session));
@@ -1243,7 +1278,12 @@ pub fn run() -> Result<()> {
                 notification,
             )
         }
-        Commands::Rebase { name } => command::rebase::run(name.as_deref()),
+        Commands::Rebase { name, project } => {
+            if let Some(project) = crate::remote::router::resolve(project.as_deref())? {
+                return crate::remote::router::relay(&project);
+            }
+            command::rebase::run(name.as_deref())
+        }
         Commands::Remove {
             names,
             gone,
@@ -1257,7 +1297,16 @@ pub fn run() -> Result<()> {
             }
             command::remove::run(names, gone, all, force, keep_branch)
         }
-        Commands::Rename { names, branch } => command::rename::run(names, branch),
+        Commands::Rename {
+            names,
+            branch,
+            project,
+        } => {
+            if let Some(project) = crate::remote::router::resolve(project.as_deref())? {
+                return crate::remote::router::relay(&project);
+            }
+            command::rename::run(names, branch)
+        }
         Commands::List {
             pr,
             json,
@@ -1292,14 +1341,30 @@ pub fn run() -> Result<()> {
             background,
             keep,
             timeout,
-        } => command::run::run(&name, command, background, keep, timeout),
+            project,
+        } => {
+            if let Some(project) = crate::remote::router::resolve(project.as_deref())? {
+                return crate::remote::router::relay(&project);
+            }
+            command::run::run(&name, command, background, keep, timeout)
+        }
         Commands::ReapAgents { hours, force } => {
             command::reap_agents::run(hours.saturating_mul(3600), force)
         }
         Commands::Exec { run_dir } => command::exec::run(&run_dir),
-        Commands::SyncFiles { all } => command::sync_files::run(all),
-        Commands::Init => crate::config::Config::init(),
-        Commands::Setup { hooks, skills } => command::setup::run(hooks, skills),
+        Commands::SyncFiles { all, project } => {
+            if let Some(project) = crate::remote::router::resolve(project.as_deref())? {
+                return crate::remote::router::relay(&project);
+            }
+            command::sync_files::run(all)
+        }
+        Commands::Init { project } => {
+            if let Some(project) = crate::remote::router::resolve(project.as_deref())? {
+                return crate::remote::router::relay(&project);
+            }
+            crate::config::Config::init()
+        }
+        Commands::Setup { hooks, skills, yes } => command::setup::run(hooks, skills, yes),
         Commands::Uninstall { dry_run } => command::uninstall::run(dry_run),
         Commands::Docs => command::docs::run(),
         Commands::Changelog => command::changelog::run(),
@@ -1387,7 +1452,12 @@ pub fn run() -> Result<()> {
         Commands::Project(args) => command::project::run(args),
         Commands::SetWindowStatus { command } => command::set_window_status::run(command),
         Commands::RegisterAgent => command::set_window_status::register_agent(),
-        Commands::SetBase { base } => command::set_base::run(&base),
+        Commands::SetBase { base, project } => {
+            if let Some(project) = crate::remote::router::resolve(project.as_deref())? {
+                return crate::remote::router::relay(&project);
+            }
+            command::set_base::run(&base)
+        }
         Commands::LastDone => command::last_done::run(),
         Commands::LastAgent => command::last_agent::run(),
         Commands::HostExec { args } => {

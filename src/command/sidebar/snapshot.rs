@@ -9,7 +9,6 @@ use crate::config::{SidebarGroupBy, SidebarPosition, SidebarSort, StatusIcons};
 use crate::git::GitStatus;
 use crate::github::{CheckSummary, PrSummary};
 use crate::multiplexer::{AgentPane, AgentStatus};
-use crate::project::Project;
 
 use super::app::{SidebarFilterMode, SidebarLayoutMode};
 
@@ -93,7 +92,7 @@ fn default_stale_threshold_secs() -> u64 {
 /// The group an agent belongs to under the given grouping mode.
 pub fn group_label(agent: &AgentPane, group_by: SidebarGroupBy) -> String {
     let raw = match group_by {
-        SidebarGroupBy::Project => Project::of_workstation_path(&agent.path).group_label(),
+        SidebarGroupBy::Project => agent.project().group_label(),
         SidebarGroupBy::Session => agent.session.clone(),
         SidebarGroupBy::None => String::new(),
     };
@@ -464,6 +463,7 @@ mod tests {
             agent_command: None,
             agent_kind: None,
             prompt: None,
+            remote: None,
         }
     }
 
@@ -767,6 +767,22 @@ mod tests {
             false,
         );
         assert_eq!(order(&agents), ["%1", "%2"]);
+    }
+
+    #[test]
+    fn a_remote_agent_groups_under_its_remote_project_and_its_workstation_session() {
+        let local = agent("/tmp/api__worktrees/w1");
+        let mut remote = agent("/home/me/api__worktrees/w2");
+        remote.session = "api".to_string();
+        remote.remote = Some(crate::multiplexer::RemoteAgentPane {
+            remote: "devbox".to_string(),
+            project: "api".to_string(),
+            stale: false,
+        });
+
+        assert_eq!(group_label(&local, SidebarGroupBy::Project), "api");
+        assert_eq!(group_label(&remote, SidebarGroupBy::Project), "api@devbox");
+        assert_eq!(group_label(&remote, SidebarGroupBy::Session), "api");
     }
 
     #[test]

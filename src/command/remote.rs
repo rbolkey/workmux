@@ -278,11 +278,12 @@ fn status(name: Option<&str>) -> Result<bool> {
                 workmux,
                 protocol,
                 warning,
+                warnings,
             } => {
                 println!("  status:   reachable");
                 println!("  workmux:  {workmux}");
                 println!("  protocol: {protocol}");
-                if let Some(warning) = warning {
+                for warning in warning.iter().chain(warnings) {
                     println!("  warning:  {warning}");
                 }
             }

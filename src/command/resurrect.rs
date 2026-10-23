@@ -8,6 +8,87 @@ use crate::workflow::resurrect::{ResurrectAction, plan};
 use crate::workflow::{self, SetupOptions, WorkflowContext};
 
 pub fn run(dry_run: bool) -> Result<()> {
+    if crate::remote::session::ServedProject::current().is_some() {
+        return run_served(dry_run);
+    }
+    let local = run_local(dry_run);
+    let remote_failures = crate::remote::router::relay_to_every_project()?;
+    local?;
+    if remote_failures > 0 {
+        return Err(anyhow!(
+            "Failed to restore {} remote project(s)",
+            remote_failures
+        ));
+    }
+    Ok(())
+}
+
+/// Resurrect, on a remote, the windows of the served project's worktrees
+/// whose remote panes survive unshown: each reopens showing them.
+fn run_served(dry_run: bool) -> Result<()> {
+    let surviving = crate::remote::forwarding::ForwardingMux::from_env()
+        .ok_or_else(|| anyhow!("workstation not connected"))?
+        .surviving_panes()?;
+    let mut handles: Vec<String> = surviving.into_iter().map(|pane| pane.worktree).collect();
+    handles.sort();
+    handles.dedup();
+    if handles.is_empty() {
+        return Ok(());
+    }
+    if dry_run {
+        for handle in &handles {
+            println!("  {:<20} -> restoring", handle);
+        }
+        println!("\nDry run: would restore {} worktree(s)", handles.len());
+        return Ok(());
+    }
+
+    let config = config::Config::load(None)?;
+    let context = WorkflowContext::new(config, create_backend(detect_backend()), None)?;
+    let mut restored = Vec::new();
+    let mut failed = Vec::new();
+    for handle in &handles {
+        let mut options = SetupOptions::new(false, false, true);
+        options.focus_window = false;
+        options.mode = context.config.mode();
+        options.resume_mode = crate::multiplexer::types::ResumeMode::Continue;
+        match workflow::open(handle, &context, options, false, None, None, None) {
+            Ok(result) if result.did_switch => {
+                println!("  {:<20} -> skipping (already open)", handle);
+            }
+            Ok(_) => {
+                println!("  {:<20} -> restoring", handle);
+                restored.push(handle.clone());
+            }
+            Err(e) => {
+                eprintln!("  Failed to restore '{}': {}", handle, e);
+                failed.push(handle.clone());
+            }
+        }
+    }
+    summarize(&restored, &failed)
+}
+
+fn summarize(restored: &[String], failed: &[String]) -> Result<()> {
+    if !restored.is_empty() {
+        println!(
+            "\n✓ Restored {} worktree(s): {}",
+            restored.len(),
+            restored.join(", ")
+        );
+    }
+    if !failed.is_empty() {
+        eprintln!(
+            "✗ Failed to restore {} worktree(s): {}",
+            failed.len(),
+            failed.join(", ")
+        );
+        return Err(anyhow!("Failed to restore {} worktree(s)", failed.len()));
+    }
+    Ok(())
+}
+
+fn run_local(dry_run: bool) -> Result<()> {
     let config = config::Config::load(None)?;
     let mux = create_backend(detect_backend());
     let store = StateStore::new()?;
@@ -121,22 +202,5 @@ pub fn run(dry_run: bool) -> Result<()> {
         }
     }
 
-    // Summary
-    if !restored.is_empty() {
-        println!(
-            "\n✓ Restored {} worktree(s): {}",
-            restored.len(),
-            restored.join(", ")
-        );
-    }
-    if !failed.is_empty() {
-        eprintln!(
-            "✗ Failed to restore {} worktree(s): {}",
-            failed.len(),
-            failed.join(", ")
-        );
-        return Err(anyhow!("Failed to restore {} worktree(s)", failed.len()));
-    }
-
-    Ok(())
+    summarize(&restored, &failed)
 }

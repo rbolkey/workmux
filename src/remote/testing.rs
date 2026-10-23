@@ -16,6 +16,8 @@ pub const SERVE_CHILD: &str = "remote::testing::serve_child";
 /// keeps its state (the shell socket, shims) in a directory of its own.
 pub struct ServeTransport {
     pub pids: Mutex<Vec<u32>>,
+    /// Extra environment for the remote, such as another state dir.
+    pub env: Vec<(String, std::path::PathBuf)>,
     state: tempfile::TempDir,
 }
 
@@ -23,6 +25,7 @@ impl Default for ServeTransport {
     fn default() -> Self {
         Self {
             pids: Mutex::new(Vec::new()),
+            env: Vec::new(),
             state: tempfile::Builder::new()
                 .prefix("wms")
                 .tempdir_in("/tmp")
@@ -69,7 +72,8 @@ impl Transport for ServeTransport {
         command
             .args([SERVE_CHILD, "--exact", "--nocapture", "--ignored"])
             .env(crate::test_support::ISOLATED_TEST_ENV, SERVE_CHILD)
-            .env("XDG_STATE_HOME", self.state.path());
+            .env("XDG_STATE_HOME", self.state.path())
+            .envs(self.env.iter().map(|(k, v)| (k, v)));
         let process = StdioProcess::spawn(command)?;
         self.pids.lock().unwrap().push(process.id());
         Ok(process)

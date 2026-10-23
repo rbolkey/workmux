@@ -100,7 +100,12 @@ impl Workstation<'_> {
             MuxRequest::CurrentSession => json!(tmux.current_session()),
             MuxRequest::ClientSession => json!(tmux.client_session()),
             MuxRequest::SessionExists { name } => json!(tmux.session_exists(&name)?),
-            MuxRequest::AllWindowNames => json!(tmux.get_all_window_names()?),
+            // "The current session" is the one the command was typed in, not
+            // whichever session tmux picks for the client-less daemon.
+            MuxRequest::AllWindowNames => match tmux.current_session_id()? {
+                Some(session) => json!(tmux.get_window_names_in_session(&session)?),
+                None => json!(tmux.get_all_window_names()?),
+            },
             MuxRequest::WindowNamesInSession { session } => {
                 json!(tmux.get_window_names_in_session(&session)?)
             }
@@ -243,6 +248,15 @@ impl Workstation<'_> {
                 Some(id) => tmux.window_target_exists(&target)? && self.check_window(id).is_ok(),
                 None => self.window_named(&target.full_name).is_ok(),
             }),
+            MuxRequest::RenameWindow { old, new } => {
+                let window = self.window_named(&old)?;
+                tmux.query(&["rename-window", "-t", &window, &new])?;
+                Value::Null
+            }
+            MuxRequest::RenameSession { old, new } => {
+                self.check_session(&old)?;
+                json!(tmux.rename_session(&old, &new)?)
+            }
             MuxRequest::SwitchToSession { name } => {
                 self.check_session(&name)?;
                 self.switch_invoking_clients(&name)?;
@@ -296,6 +310,23 @@ impl Workstation<'_> {
                 ])?;
                 tmux.kill_pane(&pane_id)?;
                 json!(ended)
+            }
+            MuxRequest::ShownRemotePanes => {
+                let tag = self.scope.tag();
+                let panes = tmux.query(&[
+                    "list-panes",
+                    "-a",
+                    "-F",
+                    &format!("#{{{WINDOW_TAG}}}\t{REMOTE_PANE_FORMAT}"),
+                ])?;
+                json!(
+                    panes
+                        .lines()
+                        .filter_map(|line| line.split_once('\t'))
+                        .filter(|(window, _)| *window == tag)
+                        .filter_map(|(_, pane)| pane.parse::<RemotePaneId>().ok())
+                        .collect::<Vec<_>>()
+                )
             }
         })
     }
@@ -792,6 +823,110 @@ mod tests {
         let windows = ws.tmux(&["list-windows", "-a", "-F", "#{window_id}"]);
         assert!(!windows.lines().any(|id| id == ours), "{windows}");
         assert!(windows.lines().any(|id| id == others), "{windows}");
+    }
+
+    #[test]
+    fn a_projects_window_and_session_are_renamed_but_no_one_elses() {
+        let Some(ws) = Workstation::start() else {
+            return;
+        };
+        let invoking = ws.server.new_session("mine", ws.remote_root.path());
+        ws.tmux(&["rename-window", "-t", &invoking, "wm-old"]);
+        let scope = ws.scope("devbox", "api", &invoking);
+        let pane_id = pane(
+            ws.ask(
+                &scope,
+                MuxRequest::CreateSession {
+                    name: "wm-old-session".to_string(),
+                    initial_window_name: Some("wm-old".to_string()),
+                    pane: remote_pane(),
+                },
+            )
+            .unwrap(),
+        );
+        let other = ws.scope("other", "web", &invoking);
+
+        ws.ask(
+            &scope,
+            MuxRequest::RenameWindow {
+                old: "wm-old".to_string(),
+                new: "wm-new".to_string(),
+            },
+        )
+        .unwrap();
+        ws.ask(
+            &scope,
+            MuxRequest::RenameSession {
+                old: "wm-old-session".to_string(),
+                new: "wm-new-session".to_string(),
+            },
+        )
+        .unwrap();
+        let refused = [
+            ws.ask(
+                &other,
+                MuxRequest::RenameWindow {
+                    old: "wm-new".to_string(),
+                    new: "x".to_string(),
+                },
+            ),
+            ws.ask(
+                &other,
+                MuxRequest::RenameSession {
+                    old: "wm-new-session".to_string(),
+                    new: "x".to_string(),
+                },
+            ),
+            ws.ask(
+                &scope,
+                MuxRequest::RenameSession {
+                    old: "mine".to_string(),
+                    new: "x".to_string(),
+                },
+            ),
+        ];
+
+        assert_eq!(
+            ws.tmux(&[
+                "display-message",
+                "-p",
+                "-t",
+                &pane_id,
+                "#{session_name}:#{window_name}"
+            ]),
+            "wm-new-session:wm-new"
+        );
+        // The user's own window of the old name is left alone.
+        assert_eq!(
+            ws.tmux(&["display-message", "-p", "-t", &invoking, "#{window_name}"]),
+            "wm-old"
+        );
+        for refusal in refused {
+            assert!(
+                refusal
+                    .unwrap_err()
+                    .to_string()
+                    .contains("does not belong to a project on remote"),
+            );
+        }
+    }
+
+    #[test]
+    fn window_names_are_those_of_the_session_the_command_was_typed_in() {
+        let Some(ws) = Workstation::start() else {
+            return;
+        };
+        let invoking = ws.server.new_session("typed-in", ws.remote_root.path());
+        ws.tmux(&["rename-window", "-t", &invoking, "wm-here"]);
+        // Made last, this is the session a client-less tmux command picks.
+        let elsewhere = ws.server.new_session("elsewhere", ws.remote_root.path());
+        ws.tmux(&["rename-window", "-t", &elsewhere, "wm-there"]);
+        let scope = ws.scope("devbox", "api", &invoking);
+
+        assert_eq!(
+            ws.ask(&scope, MuxRequest::AllWindowNames).unwrap(),
+            json!(["wm-here"])
+        );
     }
 
     #[test]

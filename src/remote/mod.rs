@@ -1,6 +1,7 @@
 //! Remotes: project hosts other than the workstation, reached through a
 //! transport and spoken to over a control channel (ADR 0001).
 
+pub mod agents;
 pub mod attach;
 pub mod channel;
 pub mod channels;
@@ -9,6 +10,7 @@ pub mod forwarded;
 pub mod forwarding;
 pub mod handshake;
 pub mod pane;
+pub mod provision;
 pub mod registry;
 pub mod router;
 pub mod serve;
@@ -16,6 +18,7 @@ pub mod session;
 pub mod shell;
 pub mod shims;
 pub mod ssh;
+pub mod status;
 #[cfg(test)]
 pub mod testing;
 pub mod transport;
