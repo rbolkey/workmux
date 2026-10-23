@@ -20,6 +20,7 @@ mod naming;
 mod nerdfont;
 mod project;
 mod prompt;
+mod remote;
 mod sandbox;
 mod shell;
 mod skills;
