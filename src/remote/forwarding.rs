@@ -134,6 +134,14 @@ pub enum MuxRequest {
     KillWindow {
         name: String,
     },
+    RenameWindow {
+        old: String,
+        new: String,
+    },
+    RenameSession {
+        old: String,
+        new: String,
+    },
     KillSession {
         name: String,
     },
@@ -402,6 +410,20 @@ impl Multiplexer for ForwardingMux {
         })
     }
 
+    fn rename_window(&self, old_full_name: &str, new_full_name: &str) -> Result<()> {
+        self.act(MuxRequest::RenameWindow {
+            old: old_full_name.to_string(),
+            new: new_full_name.to_string(),
+        })
+    }
+
+    fn rename_session(&self, old_full_name: &str, new_full_name: &str) -> Result<()> {
+        self.act(MuxRequest::RenameSession {
+            old: old_full_name.to_string(),
+            new: new_full_name.to_string(),
+        })
+    }
+
     fn schedule_window_close(&self, _full_name: &str, _delay: Duration) -> Result<()> {
         Err(unsupported("scheduling a window close"))
     }
@@ -653,6 +675,7 @@ mod tests {
                 ),
             ]
             .to_vec(),
+            invoking_window_token: None,
         };
         let (env, received) = mpsc::channel();
         let session = std::thread::spawn(move || {

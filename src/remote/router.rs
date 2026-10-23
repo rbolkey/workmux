@@ -98,6 +98,35 @@ fn invoking_session_tag() -> Option<String> {
     Some(tag.trim().to_string()).filter(|tag| !tag.is_empty())
 }
 
+/// The ownership token of the window this command was typed in, when that
+/// window belongs to `project`, so the remote runs the command in its
+/// worktree.
+fn invoking_window_token(project: &RemoteProject) -> Option<String> {
+    if ServedProject::current().is_some() {
+        return None;
+    }
+    let invocation = InvocationContext::current();
+    let pane = invocation.pane_id.as_deref()?;
+    let tmux = TmuxBackend::for_socket(invocation.tmux_socket_path()?);
+    let window = tmux
+        .query(&[
+            "display-message",
+            "-p",
+            "-t",
+            pane,
+            &format!("#{{{}}}\t#{{@workmux_token}}", forwarded::WINDOW_TAG),
+        ])
+        .ok()?;
+    window_token_for(project, &window)
+}
+
+/// The token in a `<window tag>\t<token>` line, when the tag is `project`'s.
+fn window_token_for(project: &RemoteProject, window: &str) -> Option<String> {
+    let (tag, token) = window.trim_end_matches('\n').split_once('\t')?;
+    let own = forwarded::project_tag(&project.site.remote, &project.site.name);
+    (tag.trim() == own && !token.trim().is_empty()).then(|| token.trim().to_string())
+}
+
 /// The registered remote project `tag` names, if it still is one.
 fn project_tagged(config: &Config, tag: &str) -> Option<RemoteProject> {
     let (remote, name) = forwarded::parse_project_tag(tag)?;
@@ -135,6 +164,7 @@ fn session(
     let request = CommandRequest {
         project: project.site.clone(),
         argv: argv.iter().map(|arg| arg.to_string()).collect(),
+        invoking_window_token: invoking_window_token(project),
     };
     let Some(socket) = daemon_socket() else {
         return super::channels().run_command(
@@ -230,6 +260,19 @@ fn without_project(args: impl IntoIterator<Item = String>) -> Vec<String> {
     argv
 }
 
+/// Relay this command to remote workmux when it targets a remote project
+/// (see [`resolve`]), exiting with the remote command's exit code. Returns
+/// whether it was relayed; `false` leaves the command to run locally.
+pub fn relay(explicit: Option<&str>) -> Result<bool> {
+    let Some(project) = resolve(explicit)? else {
+        return Ok(false);
+    };
+    let argv = relayed_argv();
+    let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+    exit_with(run(&project, &argv)?)?;
+    Ok(true)
+}
+
 /// Finish a command relayed to a remote with the remote command's exit code.
 pub fn exit_with(code: i32) -> Result<()> {
     if code != 0 {
@@ -321,6 +364,19 @@ projects:
             ])),
             args(&["workmux", "add", "feature", "--", "--project"])
         );
+    }
+
+    #[test]
+    fn only_a_window_of_the_project_tells_the_remote_its_worktree() {
+        let api = remote_project(&config(REGISTERED), "api").unwrap();
+
+        assert_eq!(
+            window_token_for(&api, "devbox:api\tf00d\n").as_deref(),
+            Some("f00d")
+        );
+        assert_eq!(window_token_for(&api, "devbox:web\tf00d\n"), None);
+        assert_eq!(window_token_for(&api, "\tf00d\n"), None);
+        assert_eq!(window_token_for(&api, "devbox:api\t\n"), None);
     }
 
     #[test]

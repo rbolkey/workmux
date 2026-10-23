@@ -201,6 +201,15 @@ impl Workstation<'_> {
                 tmux.query(&["kill-window", "-t", &window])?;
                 Value::Null
             }
+            MuxRequest::RenameWindow { old, new } => {
+                let window = self.window_named(&old)?;
+                tmux.query(&["rename-window", "-t", &window, &new])?;
+                Value::Null
+            }
+            MuxRequest::RenameSession { old, new } => {
+                self.check_session(&old)?;
+                json!(tmux.rename_session(&old, &new)?)
+            }
             MuxRequest::SwitchToSession { name } => {
                 self.check_session(&name)?;
                 self.switch_invoking_clients(&name)?;
@@ -638,6 +647,92 @@ mod tests {
             ws.tmux(&["display-message", "-p", "-t", &others_pane, "#{pane_id}"]),
             others_pane
         );
+    }
+
+    #[test]
+    fn a_projects_window_and_session_are_renamed_but_no_one_elses() {
+        let Some(ws) = Workstation::start() else {
+            return;
+        };
+        let invoking = ws.server.new_session("mine", ws.remote_root.path());
+        ws.tmux(&["rename-window", "-t", &invoking, "wm-old"]);
+        let scope = ws.scope("devbox", "api", &invoking);
+        let pane_id = pane(
+            ws.ask(
+                &scope,
+                MuxRequest::CreateSession {
+                    name: "wm-old-session".to_string(),
+                    initial_window_name: Some("wm-old".to_string()),
+                    tty: ws.tty("exec sleep 30"),
+                },
+            )
+            .unwrap(),
+        );
+        let other = ws.scope("other", "web", &invoking);
+
+        ws.ask(
+            &scope,
+            MuxRequest::RenameWindow {
+                old: "wm-old".to_string(),
+                new: "wm-new".to_string(),
+            },
+        )
+        .unwrap();
+        ws.ask(
+            &scope,
+            MuxRequest::RenameSession {
+                old: "wm-old-session".to_string(),
+                new: "wm-new-session".to_string(),
+            },
+        )
+        .unwrap();
+        let refused = [
+            ws.ask(
+                &other,
+                MuxRequest::RenameWindow {
+                    old: "wm-new".to_string(),
+                    new: "x".to_string(),
+                },
+            ),
+            ws.ask(
+                &other,
+                MuxRequest::RenameSession {
+                    old: "wm-new-session".to_string(),
+                    new: "x".to_string(),
+                },
+            ),
+            ws.ask(
+                &scope,
+                MuxRequest::RenameSession {
+                    old: "mine".to_string(),
+                    new: "x".to_string(),
+                },
+            ),
+        ];
+
+        assert_eq!(
+            ws.tmux(&[
+                "display-message",
+                "-p",
+                "-t",
+                &pane_id,
+                "#{session_name}:#{window_name}"
+            ]),
+            "wm-new-session:wm-new"
+        );
+        // The user's own window of the old name is left alone.
+        assert_eq!(
+            ws.tmux(&["display-message", "-p", "-t", &invoking, "#{window_name}"]),
+            "wm-old"
+        );
+        for refusal in refused {
+            assert!(
+                refusal
+                    .unwrap_err()
+                    .to_string()
+                    .contains("does not belong to a project on remote"),
+            );
+        }
     }
 
     #[test]

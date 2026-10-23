@@ -61,6 +61,11 @@ pub struct ProjectSite {
 pub struct CommandRequest {
     pub project: ProjectSite,
     pub argv: Vec<String>,
+    /// Ownership token of the workstation window the command was typed in,
+    /// when that window belongs to the project: the command then runs in
+    /// that window's worktree, as it would locally.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invoking_window_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -334,9 +339,14 @@ pub fn run_on_remote(
     } else {
         Command::new(program)
     };
+    let workdir = request
+        .invoking_window_token
+        .as_deref()
+        .and_then(|token| worktree_with_window_token(&path, token))
+        .unwrap_or(path);
     command
         .args(args)
-        .current_dir(&path)
+        .current_dir(&workdir)
         .env(REMOTE_ENV, &request.project.remote)
         .env(PROJECT_ENV, &request.project.name);
     match &request.project.session {
@@ -349,6 +359,20 @@ pub fn run_on_remote(
             .env(forwarding::SESSION_ENV, forwarding.session.to_string());
     }
     Ok(exit_code(run_streamed(command, emit)?))
+}
+
+/// The worktree of the clone at `clone` whose window carries `token`.
+fn worktree_with_window_token(clone: &Path, token: &str) -> Option<PathBuf> {
+    crate::git::list_worktrees_in(Some(clone))
+        .ok()?
+        .into_iter()
+        .map(|(path, _)| path)
+        .find(|path| {
+            path.file_name()
+                .and_then(|handle| handle.to_str())
+                .and_then(|handle| crate::git::get_worktree_window_token_in(handle, Some(clone)))
+                .is_some_and(|candidate| candidate == token)
+        })
 }
 
 /// The remote project a command runs for, when remote workmux runs it in
@@ -408,6 +432,7 @@ mod tests {
                 session: None,
             },
             argv: ["sh", "-c", script].map(String::from).to_vec(),
+            invoking_window_token: None,
         }
     }
 
@@ -475,6 +500,34 @@ mod tests {
 
         assert_eq!(exit.unwrap(), 0);
         assert_eq!(captured.stdout, format!("{}\ndevbox api\n", path.display()));
+    }
+
+    #[test]
+    fn a_command_from_a_worktree_window_runs_in_that_worktree() {
+        let temp = tempfile::tempdir().unwrap();
+        let clone = temp.path().canonicalize().unwrap().join("api");
+        std::fs::create_dir(&clone).unwrap();
+        crate::test_support::init_repo(&clone);
+        let worktree = clone.with_file_name("api__worktrees").join("feature");
+        crate::test_support::run_git(
+            &clone,
+            &["worktree", "add", "-b", "feature", worktree.to_str().unwrap()],
+        );
+        crate::test_support::run_git(
+            &clone,
+            &["config", "workmux.worktree.feature.window-token", "f00d"],
+        );
+        let mut from_window = request(&clone, None, "pwd");
+        from_window.invoking_window_token = Some("f00d".to_string());
+        let mut from_elsewhere = from_window.clone();
+        from_elsewhere.invoking_window_token = Some("beef".to_string());
+
+        let (exit, captured) = run(&from_window, |_| {});
+        let (_, elsewhere) = run(&from_elsewhere, |_| {});
+
+        assert_eq!(exit.unwrap(), 0);
+        assert_eq!(captured.stdout, format!("{}\n", worktree.display()));
+        assert_eq!(elsewhere.stdout, format!("{}\n", clone.display()));
     }
 
     #[test]
