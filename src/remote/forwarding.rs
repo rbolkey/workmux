@@ -129,6 +129,14 @@ pub enum MuxRequest {
     KillWindow {
         name: String,
     },
+    RenameWindow {
+        old: String,
+        new: String,
+    },
+    RenameSession {
+        old: String,
+        new: String,
+    },
     OwnedWindowTargets {
         token: String,
     },
@@ -484,6 +492,20 @@ impl Multiplexer for ForwardingMux {
         })
     }
 
+    fn rename_window(&self, old_full_name: &str, new_full_name: &str) -> Result<()> {
+        self.act(MuxRequest::RenameWindow {
+            old: old_full_name.to_string(),
+            new: new_full_name.to_string(),
+        })
+    }
+
+    fn rename_session(&self, old_full_name: &str, new_full_name: &str) -> Result<()> {
+        self.act(MuxRequest::RenameSession {
+            old: old_full_name.to_string(),
+            new: new_full_name.to_string(),
+        })
+    }
+
     fn kill_window_target(&self, target: &WindowTarget) -> Result<()> {
         self.kill(MuxRequest::KillWindowTarget {
             target: target.clone(),
@@ -768,6 +790,7 @@ mod tests {
                 ),
             ]
             .to_vec(),
+            invoking_window_token: None,
         };
         let (env, received) = mpsc::channel();
         let session = std::thread::spawn(move || {
