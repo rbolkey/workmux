@@ -515,7 +515,8 @@ fn provision(
         );
         let mut command = remote_command(&step.argv)?;
         command.current_dir(path);
-        let status = run_streamed(command, tracked, emit)?;
+        // Its output is not the command's: keep the command's stdout clean.
+        let status = run_streamed(command, tracked, &|_, data| emit(Stream::Stderr, data))?;
         if !status.success() {
             emit(
                 Stream::Stderr,
