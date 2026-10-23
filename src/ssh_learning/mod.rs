@@ -21,7 +21,7 @@
 mod control_master;
 mod drops;
 mod errors;
-mod harness;
+pub(crate) mod harness;
 mod long_lived_stdio;
 mod stdout_pollution;
 mod tty_exec;

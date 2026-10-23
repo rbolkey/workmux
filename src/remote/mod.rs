@@ -7,6 +7,7 @@ pub mod connection;
 pub mod handshake;
 pub mod registry;
 pub mod serve;
+pub mod ssh;
 #[cfg(test)]
 pub mod testing;
 pub mod transport;

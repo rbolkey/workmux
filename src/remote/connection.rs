@@ -51,11 +51,26 @@ impl Connection {
             Ok(Err(error)) => {
                 // The transport's own error explains an early exit best.
                 let failure = process.failure(Duration::from_secs(1));
+                let code = process.exit_code();
                 process.kill();
-                return Err(if failure.starts_with("transport process") {
-                    anyhow!("{error} ({failure})")
-                } else {
-                    anyhow!(failure)
+                return Err(match code {
+                    // The remote shell found no workmux to run.
+                    Some(127) => anyhow!(
+                        "workmux is not installed on {remote}: install workmux {} there, \
+                         on the PATH of non-interactive shells ({failure})",
+                        env!("CARGO_PKG_VERSION")
+                    ),
+                    // Remote workmux ran but did not serve; 255 is the
+                    // transport's own failure.
+                    Some(code) if code != 0 && code != 255 => anyhow!(
+                        "workmux on {remote} exited before its hello: {failure}; if it is \
+                         older than {ours}, install workmux {ours} there",
+                        ours = env!("CARGO_PKG_VERSION")
+                    ),
+                    _ if failure.starts_with("transport process") => {
+                        anyhow!("{error} ({failure})")
+                    }
+                    _ => anyhow!(failure),
                 });
             }
             Err(_) => {
