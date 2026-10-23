@@ -120,8 +120,8 @@ struct Slot {
     config: RemoteConfig,
     connection: Option<Arc<Connection>>,
     last_used: Instant,
-    /// Command sessions running on this remote; the channel is wanted while
-    /// any is.
+    /// Command sessions running on this remote and workstation panes
+    /// attached to its remote panes; the channel is wanted while any is.
     holds: usize,
     /// Set while a background reconnect loop runs for this remote.
     reconnecting: bool,
@@ -135,6 +135,19 @@ struct Shared {
     /// channel per remote.
     connecting: Mutex<()>,
     sessions: Arc<Sessions>,
+}
+
+/// Keeps a remote's channel wanted while a workstation pane is attached to
+/// one of its remote panes.
+pub struct PaneHold {
+    channels: Channels,
+    remote: String,
+}
+
+impl Drop for PaneHold {
+    fn drop(&mut self) {
+        self.channels.hold(&self.remote, -1);
+    }
 }
 
 /// The workstation daemon's control channels.
@@ -372,6 +385,18 @@ impl Channels {
         exit
     }
 
+    /// Keep `name`'s channel open, and reconnecting after drops, while the
+    /// returned hold lives: a workstation pane is attached to one of its
+    /// remote panes.
+    pub fn hold_for_pane(&self, name: &str, config: &RemoteConfig) -> Result<PaneHold> {
+        self.channel(name, config)?;
+        self.hold(name, 1);
+        Ok(PaneHold {
+            channels: self.clone(),
+            remote: name.to_string(),
+        })
+    }
+
     fn hold(&self, name: &str, change: isize) {
         if let Some(slot) = self.shared.slots.lock().unwrap().get_mut(name) {
             slot.holds = slot.holds.saturating_add_signed(change);
@@ -580,5 +605,32 @@ mod tests {
         assert_eq!(channels.open_count(), 0);
         std::thread::sleep(Duration::from_millis(200));
         assert_eq!(transport.exec_count(), 1);
+    }
+
+    #[test]
+    fn a_channel_stays_open_and_reconnects_while_a_pane_is_attached() {
+        let transport = Arc::new(ServeTransport::default());
+        let channels = channels_over(
+            transport.clone(),
+            ChannelPolicy {
+                linger: Duration::from_millis(100),
+                ..fast_policy()
+            },
+        );
+
+        let hold = channels.hold_for_pane("devbox", &config()).unwrap();
+        std::thread::sleep(Duration::from_millis(150));
+        channels.close_idle();
+        assert_eq!(channels.open_count(), 1);
+
+        transport.kill_latest();
+        wait_until("a reconnect", || {
+            transport.exec_count() == 2 && channels.open_count() == 1
+        });
+
+        drop(hold);
+        std::thread::sleep(Duration::from_millis(150));
+        channels.close_idle();
+        assert_eq!(channels.open_count(), 0);
     }
 }

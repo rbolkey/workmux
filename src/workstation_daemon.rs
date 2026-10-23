@@ -146,28 +146,88 @@ fn write_message(writer: &mut impl Write, message: &impl Serialize) -> Result<()
 pub(crate) fn serve_requests(stream: UnixStream, first_line: Option<Vec<u8>>) -> Result<()> {
     let mut writer = stream.try_clone()?;
     let mut reader = BufReader::new(stream);
+    // Pane holds this client took; released when it disconnects.
+    let mut holds = Vec::new();
     if let Some(line) = first_line {
-        respond(&mut writer, &line)?;
+        respond(&mut writer, &line, &mut holds)?;
     }
     while let Some(line) = read_line(&mut reader)? {
         if line.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-        respond(&mut writer, &line)?;
+        respond(&mut writer, &line, &mut holds)?;
     }
     Ok(())
 }
 
 /// Answer one request line. A command session streams its output as
-/// notifications before the response.
-fn respond(writer: &mut impl Write, line: &[u8]) -> Result<()> {
+/// notifications before the response; a pane hold lasts as long as the
+/// client's connection.
+fn respond(
+    writer: &mut impl Write,
+    line: &[u8],
+    holds: &mut Vec<crate::remote::channels::PaneHold>,
+) -> Result<()> {
     match serde_json::from_slice::<Request>(line) {
         Ok(request) if request.method == COMMAND_SESSION_METHOD => {
             let response = command_session(&request, writer);
             write_message(writer, &response)
         }
+        Ok(request) if request.method == PANE_HOLD_METHOD => {
+            let response = match pane_hold(&request) {
+                Ok(hold) => {
+                    holds.push(hold);
+                    Response::ok(request.id, Value::Null)
+                }
+                Err(error) => Response::err(Some(request.id), format!("{error:#}")),
+            };
+            write_message(writer, &response)
+        }
         _ => write_message(writer, &answer(line)),
     }
+}
+
+/// Method a `remote attach` loop calls to keep its remote's control channel
+/// open while its connection stays open: `{remote}`.
+pub const PANE_HOLD_METHOD: &str = "remote.hold";
+
+fn pane_hold(request: &Request) -> Result<crate::remote::channels::PaneHold> {
+    let name = request
+        .params
+        .get("remote")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("remote.hold needs a remote"))?;
+    let remotes = crate::remote::registry::remotes()?;
+    let config = remotes
+        .get(name)
+        .ok_or_else(|| anyhow!("no remote named {name}"))?;
+    crate::remote::channels().hold_for_pane(name, config)
+}
+
+/// Keep `remote`'s control channel open for an attached pane until the
+/// returned connection is dropped.
+pub fn hold_for_pane(socket: &Path, remote: &str) -> Result<UnixStream> {
+    let stream = UnixStream::connect(socket)
+        .with_context(|| format!("connect to workstation daemon at {}", socket.display()))?;
+    stream.set_read_timeout(Some(Duration::from_secs(120)))?;
+    stream.set_write_timeout(Some(CALL_TIMEOUT))?;
+    let mut writer = stream.try_clone()?;
+    write_message(
+        &mut writer,
+        &Request {
+            id: 1,
+            method: PANE_HOLD_METHOD.to_string(),
+            params: serde_json::json!({ "remote": remote }),
+        },
+    )?;
+    let line = read_line(&mut BufReader::new(&stream))?
+        .ok_or_else(|| anyhow!("workstation daemon closed the connection without answering"))?;
+    let response: Response =
+        serde_json::from_slice(&line).context("workstation daemon sent an unreadable response")?;
+    if let Some(error) = response.error {
+        bail!("workstation daemon: {}", error.message);
+    }
+    Ok(stream)
 }
 
 /// Method that runs a command session on a remote: `{remote, request}`.

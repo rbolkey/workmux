@@ -135,7 +135,11 @@ impl Workstation<'_> {
                 self.tag_session(&name)?;
                 json!(self.claim_window(&pane_id, &pane)?)
             }
-            MuxRequest::CreateWindowInSession { session, name, pane } => {
+            MuxRequest::CreateWindowInSession {
+                session,
+                name,
+                pane,
+            } => {
                 self.adopt_session(&session)?;
                 let pane_id = tmux.create_window_in_session(CreateWindowInSessionParams {
                     session_name: &session,

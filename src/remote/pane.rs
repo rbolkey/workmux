@@ -242,20 +242,31 @@ impl SessionHolder {
                 let _ = std::fs::remove_file(self.pid_file(id));
                 Ok(PaneState::Ended)
             }
-            Err(error) => Err(anyhow::Error::from(error)
-                .context(format!("failed to check remote pane {id}"))),
+            Err(error) => {
+                Err(anyhow::Error::from(error).context(format!("failed to check remote pane {id}")))
+            }
         }
     }
 
     /// End remote pane `id`: hang up its process, as closing a terminal
     /// would, and kill it if it does not exit.
     pub fn kill(&self, id: &RemotePaneId) -> Result<()> {
-        let Some(pid) = std::fs::read_to_string(self.pid_file(id))
-            .ok()
-            .and_then(|pid| pid.trim().parse::<i32>().ok())
-            .filter(|pid| *pid > 0)
-        else {
-            return Ok(());
+        // A pane just created may not have recorded its pid yet.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let pid = loop {
+            let pid = std::fs::read_to_string(self.pid_file(id))
+                .ok()
+                .and_then(|pid| pid.trim().parse::<i32>().ok())
+                .filter(|pid| *pid > 0);
+            match pid {
+                Some(pid) => break pid,
+                None if Instant::now() < deadline
+                    && self.state(id)? == PaneState::Running =>
+                {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                None => return Ok(()),
+            }
         };
         unsafe { libc::kill(pid, libc::SIGHUP) };
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -328,7 +339,11 @@ pub mod tests {
             {
                 return text;
             }
-            assert!(Instant::now() < deadline, "{} never written", path.display());
+            assert!(
+                Instant::now() < deadline,
+                "{} never written",
+                path.display()
+            );
             std::thread::sleep(Duration::from_millis(20));
         }
     }
@@ -395,8 +410,9 @@ pub mod tests {
         holder.kill(&first).unwrap();
         assert_eq!(holder.state(&first).unwrap(), PaneState::Ended);
         assert_eq!(holder.state(&second).unwrap(), PaneState::Running);
-        assert_eq!(holder.create("api", &feature, &sleep).unwrap().slot, 0);
-        for id in [first, second, other] {
+        let reused = holder.create("api", &feature, &sleep).unwrap();
+        assert_eq!(reused.slot, 0);
+        for id in [reused, second, other] {
             holder.kill(&id).unwrap();
         }
     }
@@ -459,7 +475,14 @@ pub mod tests {
             }
         );
         assert_eq!(serde_json::to_value(&id).unwrap(), "api/feature-x/3");
-        for bad in ["api/feature", "../x/0", "api/../0", "api/x/y", "a/b/0/c", "/x/0"] {
+        for bad in [
+            "api/feature",
+            "../x/0",
+            "api/../0",
+            "api/x/y",
+            "a/b/0/c",
+            "/x/0",
+        ] {
             assert!(bad.parse::<RemotePaneId>().is_err(), "{bad}");
         }
     }

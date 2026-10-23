@@ -5,6 +5,7 @@ import shutil
 import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -21,6 +22,24 @@ def short_tmp():
     path = tempfile.mkdtemp(prefix="wm-", dir="/tmp")
     yield {"TMPDIR": path}
     shutil.rmtree(path, ignore_errors=True)
+
+
+@pytest.fixture
+def remote_root():
+    """A short loopback root: remote panes' dtach sockets live under its
+    HOME, and a Unix socket path holds only about 104 bytes."""
+    path = Path(tempfile.mkdtemp(prefix="wmr", dir="/tmp"))
+    (path / "home").mkdir()
+    yield path
+    # End the remote panes left running: their holders, then their shells.
+    subprocess.run(["pkill", "-f", f"dtach -n {path}/"], check=False)
+    shutil.rmtree(path, ignore_errors=True)
+
+
+requires_dtach = pytest.mark.skipif(
+    shutil.which("dtach") is None,
+    reason="remote panes need the session holder dtach on PATH",
+)
 
 
 def remote(env, exe, repo, command, tmp_env, expect_fail=False):
@@ -132,7 +151,7 @@ def local_sshd(workmux_exe_path: Path):
         "echo 'Welcome to the remote'; printf partial\n"
         f"export HOME={remote_home} XDG_CONFIG_HOME={remote_home}/.config\n"
         f"export XDG_STATE_HOME={remote_home}/.local/state\n"
-        "export PATH=/usr/bin:/bin\n"
+        f"export PATH={Path(shutil.which('dtach') or '/usr/bin/dtach').parent}:/usr/bin:/bin\n"
         '[ -n "$WMX_NO_WORKMUX" ] || '
         f"export PATH={workmux_exe_path.parent}:$PATH\n"
     )
@@ -421,12 +440,14 @@ def wait_for(path: Path, timeout=15.0) -> str:
     return path.read_text()
 
 
+@requires_dtach
 @pytest.mark.tmux_only
 def test_remote_add_places_windows_in_the_project_session(
     mux_server: MuxEnvironment,
     workmux_exe_path: Path,
     repo_path: Path,
     short_tmp: dict,
+    remote_root: Path,
 ):
     """`add` on a remote project creates the worktree on the remote, runs its
     post-create hooks there with output streamed back, and puts the window in
@@ -435,8 +456,7 @@ def test_remote_add_places_windows_in_the_project_session(
     override, current-session placement and session mode still work."""
     env = mux_server
     assert isinstance(env, TmuxEnvironment)
-    root = env.tmp_path / "remote-root"
-    (root / "home").mkdir(parents=True)
+    root = remote_root
     # The remote terminal is an interactive login shell in an empty HOME.
     (root / "home" / ".zshrc").write_text("")
     workmux_yaml = (
@@ -525,6 +545,7 @@ def test_remote_add_places_windows_in_the_project_session(
             os.kill(daemon_pid, signal.SIGTERM)
 
 
+@requires_dtach
 @pytest.mark.tmux_only
 def test_remote_add_over_ssh_to_localhost(
     mux_server: MuxEnvironment,
@@ -574,5 +595,173 @@ def test_remote_add_over_ssh_to_localhost(
             worktree.resolve()
         )
     finally:
+        if daemon_pid is not None:
+            os.kill(daemon_pid, signal.SIGTERM)
+
+
+# A stand-in for an agent's full-screen interface. Like Claude Code, it
+# repaints only on a real size change (or a key), so a plain reattach leaves
+# the screen blank; "q" ends it, and with it the remote pane.
+FAKE_TUI = r"""
+import os, signal, sys, tty
+
+size = None
+key = "none"
+
+
+def draw(force=False):
+    global size
+    now = os.get_terminal_size(0)
+    if now == size and not force:
+        return
+    size = now
+    sys.stdout.write(
+        "\x1b[?1049h\x1b[2J\x1b[H"
+        f"FAKE-TUI rows={now.lines} key={key}"
+        f"\x1b[{now.lines};1HFAKE-TUI-FOOTER"
+    )
+    sys.stdout.flush()
+
+
+signal.signal(signal.SIGWINCH, lambda *_: draw())
+tty.setraw(0)
+draw(force=True)
+while True:
+    try:
+        ch = os.read(0, 1)
+    except InterruptedError:
+        continue
+    if not ch or ch == b"q":
+        sys.exit(7)
+    key = ch.decode(errors="replace")
+    draw(force=True)
+"""
+
+
+def wait_until(predicate, what: str, timeout=15.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(0.05)
+    raise AssertionError(f"timed out waiting for {what}")
+
+
+def pids(pattern: str) -> list[str]:
+    return subprocess.run(
+        ["pgrep", "-f", pattern], capture_output=True, text=True
+    ).stdout.split()
+
+
+@requires_dtach
+@pytest.mark.tmux_only
+def test_remote_panes_survive_drops_and_reattach(
+    mux_server: MuxEnvironment,
+    workmux_exe_path: Path,
+    repo_path: Path,
+    short_tmp: dict,
+    remote_root: Path,
+):
+    """An agent pane runs on the remote inside the session holder. Killing the
+    transport's attach process leaves the agent running: the workstation pane
+    shows the reconnecting screen, reattaches on its own and redraws. "r"
+    retries at once, "q" closes the view but not the remote pane, and the pane
+    closes once the agent itself exits."""
+    env = mux_server
+    assert isinstance(env, TmuxEnvironment)
+    agent = remote_root / "fake_tui.py"
+    agent.write_text(FAKE_TUI)
+    agent_pattern = str(agent)
+    origin = make_origin(
+        env,
+        env.tmp_path / "origin",
+        f"panes:\n  - command: {shlex.quote(sys.executable)} {agent}\n",
+    )
+
+    def wm(command):
+        return run_workmux_command(
+            env,
+            workmux_exe_path,
+            repo_path,
+            command,
+            pre_run_env=short_tmp,
+            timeout=60.0,
+        )
+
+    wm(f"remote add lb --transport loopback --target {remote_root}")
+    wm(f"project add api --remote lb --repo {origin} --path code/api")
+    daemon_pid = None
+    try:
+        wm("add feature --project api")
+        daemon_pid = remote_daemon_ping(env, workmux_exe_path, repo_path, short_tmp)[
+            "pid"
+        ]
+        pane = tmux_value(env, "=api:wm-feature", "#{pane_id}")
+        rows = tmux_value(env, pane, "#{pane_height}")
+
+        def screen() -> str:
+            return env.tmux(["capture-pane", "-p", "-t", pane], check=False).stdout
+
+        def shows(text: str, timeout=15.0):
+            try:
+                wait_until(lambda: text in screen(), repr(text), timeout)
+            except AssertionError:
+                raise AssertionError(f"{text!r} not shown:\n{screen()}") from None
+
+        def closed(target: str) -> bool:
+            panes = env.tmux(["list-panes", "-a", "-F", "#{pane_id}"]).stdout
+            return target not in panes.split()
+
+        attach_pattern = "dtach -a .*/panes/api/feature/"
+
+        def drop():
+            clients = pids(attach_pattern)
+            assert clients, "no attach process"
+            for pid in clients:
+                os.kill(int(pid), signal.SIGKILL)
+            shows("reconnecting to lb")
+
+        shows(f"FAKE-TUI rows={rows} key=none")
+        env.tmux(["send-keys", "-t", pane, "-l", "x"])
+        shows(f"FAKE-TUI rows={rows} key=x")
+        agents = pids(agent_pattern)
+        assert len(agents) == 1
+
+        # A drop: the agent keeps running; the pane reattaches on its own
+        # and the interface is redrawn at the pane's size.
+        drop()
+        shows(f"FAKE-TUI rows={rows} key=x")
+        shows("FAKE-TUI-FOOTER")
+        assert pids(agent_pattern) == agents
+
+        # "r" retries without waiting out the (now longer) backoff.
+        drop()
+        env.tmux(["send-keys", "-t", pane, "r"])
+        shows(f"FAKE-TUI rows={rows} key=x", timeout=1.5)
+
+        # "q" closes the workstation pane; the remote pane keeps running.
+        drop()
+        env.tmux(["send-keys", "-t", pane, "q"])
+        wait_until(lambda: closed(pane), "the pane to close")
+        assert pids(agent_pattern) == agents
+
+        # When the remote pane's process exits, its pane closes as it would
+        # locally. Like a local pane, the agent's pane falls back to a shell.
+        wm("add second --project api")
+        second = tmux_value(env, "=api:wm-second", "#{pane_id}")
+        wait_until(
+            lambda: (
+                "FAKE-TUI"
+                in env.tmux(["capture-pane", "-p", "-t", second], check=False).stdout
+            ),
+            "the second agent",
+        )
+        env.tmux(["send-keys", "-t", second, "-l", "q"])
+        wait_until(lambda: pids(agent_pattern) == agents, "the agent to exit")
+        env.tmux(["send-keys", "-t", second, "exit", "Enter"])
+        wait_until(lambda: closed(second), "the ended pane to close")
+    finally:
+        for pid in pids(agent_pattern):
+            os.kill(int(pid), signal.SIGKILL)
         if daemon_pid is not None:
             os.kill(daemon_pid, signal.SIGTERM)

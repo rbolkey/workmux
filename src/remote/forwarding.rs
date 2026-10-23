@@ -379,12 +379,10 @@ impl Multiplexer for ForwardingMux {
     }
 
     fn create_window_in_session(&self, params: CreateWindowInSessionParams) -> Result<String> {
-        self.attach_new_pane(params.cwd, None, |pane| {
-            MuxRequest::CreateWindowInSession {
-                session: params.session_name.to_string(),
-                name: params.name.map(str::to_string),
-                pane,
-            }
+        self.attach_new_pane(params.cwd, None, |pane| MuxRequest::CreateWindowInSession {
+            session: params.session_name.to_string(),
+            name: params.name.map(str::to_string),
+            pane,
         })
     }
 
