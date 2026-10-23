@@ -1069,6 +1069,8 @@ pub struct OpenshellRemote {
     /// The project the sandbox belongs to.
     pub project: String,
     pub git_url: Option<String>,
+    /// Path of the project's clone in the sandbox.
+    pub path: String,
     pub settings: OpenshellProject,
 }
 
@@ -3214,6 +3216,7 @@ impl Config {
                     openshell: Some(OpenshellRemote {
                         project: name.clone(),
                         git_url: entry.git_url.clone(),
+                        path: entry.path.clone().unwrap_or_else(|| format!("~/{name}")),
                         settings: settings.clone(),
                     }),
                 },

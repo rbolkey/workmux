@@ -96,6 +96,8 @@ pub fn dockerfile(recipe: &Recipe) -> String {
 /// What a baked devshell was built from.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DevshellSource {
+    /// The project's clone in the sandbox.
+    pub clone: String,
     /// SHA-256 of the project's `flake.lock` (empty when it has none).
     pub flake_lock_sha256: String,
 }
@@ -118,7 +120,7 @@ pub fn flake_lock_digest(dir: &Path) -> String {
 /// Lay out the build context for `recipe` in `context`, and return the
 /// image tag for sandbox `sandbox`: it changes whenever what goes into the
 /// image does.
-pub fn prepare(recipe: &Recipe, sandbox: &str, context: &Path) -> Result<String> {
+pub fn prepare(recipe: &Recipe, sandbox: &str, clone: &str, context: &Path) -> Result<String> {
     let dockerfile = dockerfile(recipe);
     let mut digest = dockerfile.clone().into_bytes();
     std::fs::write(context.join("Dockerfile"), &dockerfile)?;
@@ -139,6 +141,7 @@ pub fn prepare(recipe: &Recipe, sandbox: &str, context: &Path) -> Result<String>
             digest.extend(std::fs::read(checkout.join(file)).unwrap_or_default());
         }
         let source = DevshellSource {
+            clone: clone.to_string(),
             flake_lock_sha256: flake_lock_digest(checkout),
         };
         std::fs::write(
@@ -227,10 +230,10 @@ mod tests {
             devshell: Some(project.clone()),
         };
 
-        let first = prepare(&recipe, "api", context.path()).unwrap();
-        let again = prepare(&recipe, "api", context.path()).unwrap();
+        let first = prepare(&recipe, "api", "/sandbox/api", context.path()).unwrap();
+        let again = prepare(&recipe, "api", "/sandbox/api", context.path()).unwrap();
         std::fs::write(project.join("flake.lock"), "v2").unwrap();
-        let bumped = prepare(&recipe, "api", context.path()).unwrap();
+        let bumped = prepare(&recipe, "api", "/sandbox/api", context.path()).unwrap();
 
         assert!(first.starts_with("workmux-openshell-api:"), "{first}");
         assert_eq!(first, again);
@@ -240,5 +243,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(source.flake_lock_sha256, sha256_hex(b"v2"));
+        assert_eq!(source.clone, "/sandbox/api");
     }
 }

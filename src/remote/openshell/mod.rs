@@ -204,7 +204,7 @@ impl OpenShell {
             workmux,
             devshell,
         };
-        let tag = image::prepare(&recipe, &self.sandbox, context)?;
+        let tag = image::prepare(&recipe, &self.sandbox, &sandbox_path(&origin.path), context)?;
         image::build(&self.docker, context, &tag)?;
         Ok(tag)
     }
@@ -295,6 +295,69 @@ impl OpenShell {
         } else {
             vec![format!("updated the policy of sandbox {}", self.sandbox)]
         })
+    }
+}
+
+/// The lines `workmux remote status` shows for a sandbox's effective
+/// policy.
+pub fn describe_policy(policy: &Value) -> Vec<String> {
+    let paths = |list: &str| -> String {
+        policy["filesystem_policy"][list]
+            .as_array()
+            .map(|paths| {
+                paths
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .filter(|paths| !paths.is_empty())
+            .unwrap_or_else(|| "none".to_string())
+    };
+    let rules = policy["network_policies"]
+        .as_object()
+        .map(|rules| rules.keys().cloned().collect::<Vec<_>>().join(", "))
+        .filter(|rules| !rules.is_empty())
+        .unwrap_or_else(|| "none".to_string());
+    vec![
+        format!("read-only:  {}", paths("read_only")),
+        format!("read-write: {}", paths("read_write")),
+        format!(
+            "workdir:    {}",
+            if policy["filesystem_policy"]["include_workdir"] == Value::Bool(false) {
+                "not included"
+            } else {
+                "read-write"
+            }
+        ),
+        format!("network:    {rules}"),
+    ]
+}
+
+impl OpenShell {
+    /// The sandbox's effective policy for `workmux remote status`, and
+    /// what differs from the project's settings.
+    pub fn policy_report(&self) -> Result<Option<(Vec<String>, Vec<String>)>> {
+        let Some(current) = self.current_policy()? else {
+            return Ok(None);
+        };
+        let mut warnings = Vec::new();
+        if self.origin.is_some() {
+            let desired = self.desired_policy()?;
+            if !same_policy(&current, &serde_json::to_value(&desired)?) {
+                let current_yaml: serde_yaml::Value = serde_json::from_value(current.clone())?;
+                let narrowed = policy::narrowed(&current_yaml, &desired);
+                warnings.push(if narrowed.is_empty() {
+                    "the project's policy has changed; the next command that needs the sandbox applies it".to_string()
+                } else {
+                    format!(
+                        "the project's policy no longer grants {}; run `workmux remote recreate` to apply it",
+                        narrowed.join(", ")
+                    )
+                });
+            }
+        }
+        Ok(Some((describe_policy(&current), warnings)))
     }
 }
 
@@ -424,6 +487,7 @@ mod tests {
         OpenshellRemote {
             project: "api".to_string(),
             git_url: None,
+            path: "~/api".to_string(),
             settings: OpenshellProject {
                 providers: vec!["github".to_string(), "anthropic".to_string()],
                 ..OpenshellProject::default()
@@ -609,6 +673,24 @@ mod tests {
     }
 
     #[test]
+    fn status_shows_the_effective_policy() {
+        let policy = serde_json::to_value(
+            policy::effective(Some("network_policies:\n  github: {endpoints: []}\n")).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            describe_policy(&policy),
+            [
+                "read-only:  /bin, /usr, /lib, /proc, /dev/urandom, /etc, /var/log, /nix",
+                "read-write: /tmp, /dev/null, /dev/pts, /dev/ptmx",
+                "workdir:    read-write",
+                "network:    github",
+            ]
+        );
+    }
+
+    #[test]
     fn a_policy_that_only_widens_is_applied_in_place() {
         let current = serde_json::to_value(policy::effective(None).unwrap()).unwrap();
         let widened = serde_json::to_value(
@@ -692,6 +774,7 @@ mod contract {
         let origin = OpenshellRemote {
             project: name.clone(),
             git_url: None,
+            path: "~/api".to_string(),
             settings: crate::config::OpenshellProject {
                 image: Some(fixture_image()),
                 ..Default::default()

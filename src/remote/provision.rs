@@ -153,7 +153,25 @@ pub fn warnings(has: impl Fn(&str) -> bool, agents: &[AgentCheck]) -> Vec<String
 
 /// [`warnings`] for this machine, the remote.
 pub fn current_warnings() -> Vec<String> {
-    warnings(has_command, &crate::agent_setup::check_all())
+    let mut warnings = warnings(has_command, &crate::agent_setup::check_all());
+    let source = Path::new(crate::remote::openshell::image::DEVSHELL_SOURCE);
+    warnings.extend(baked_devshell_warning(source));
+    warnings
+}
+
+/// A warning when the devshell baked into this sandbox was built from
+/// another `flake.lock` than the project's clone has now.
+fn baked_devshell_warning(source: &Path) -> Option<String> {
+    use crate::remote::openshell::image::{DevshellSource, flake_lock_digest};
+    let source: DevshellSource = serde_json::from_slice(&std::fs::read(source).ok()?).ok()?;
+    let clone = Path::new(&source.clone);
+    (clone.is_dir() && flake_lock_digest(clone) != source.flake_lock_sha256).then(|| {
+        format!(
+            "the devshell baked into this sandbox was built from another flake.lock than {}'s; \
+             run `workmux remote recreate` for the project to rebuild it",
+            source.clone
+        )
+    })
 }
 
 #[cfg(test)]
@@ -243,6 +261,30 @@ mod tests {
             wrap("claude", &DetectedToolchain::None, Devshell::Baked),
             "claude"
         );
+    }
+
+    #[test]
+    fn a_baked_devshell_older_than_the_clones_flake_lock_is_warned_about() {
+        let dir = tempfile::tempdir().unwrap();
+        let clone = dir.path().join("api");
+        std::fs::create_dir(&clone).unwrap();
+        std::fs::write(clone.join("flake.lock"), "v1").unwrap();
+        let source = dir.path().join("devshell-source.json");
+        std::fs::write(
+            &source,
+            format!(
+                r#"{{"clone":"{}","flake_lock_sha256":"{}"}}"#,
+                clone.display(),
+                crate::remote::openshell::image::sha256_hex(b"v1")
+            ),
+        )
+        .unwrap();
+        assert_eq!(baked_devshell_warning(&source), None);
+
+        std::fs::write(clone.join("flake.lock"), "v2").unwrap();
+
+        let warning = baked_devshell_warning(&source).expect("a warning");
+        assert!(warning.contains("workmux remote recreate"), "{warning}");
     }
 
     #[test]
