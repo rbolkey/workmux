@@ -7,6 +7,7 @@ pub mod agent;
 pub mod conversation;
 pub mod handle;
 pub mod handshake;
+pub mod invocation;
 pub mod kitty;
 pub mod tmux;
 pub mod types;
@@ -23,6 +24,7 @@ use std::time::Duration;
 
 pub use handle::MuxHandle;
 pub use handshake::PaneHandshake;
+pub use invocation::InvocationContext;
 pub use tmux::TmuxBackend;
 pub use types::*;
 
