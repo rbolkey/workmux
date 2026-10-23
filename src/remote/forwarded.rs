@@ -201,6 +201,35 @@ impl Workstation<'_> {
                 tmux.query(&["kill-window", "-t", &window])?;
                 Value::Null
             }
+            MuxRequest::OwnedWindowTargets { token } => {
+                let owned = tmux.owned_window_targets(&token)?;
+                json!(
+                    owned
+                        .into_iter()
+                        .filter(|owned| owned
+                            .target
+                            .window_id
+                            .as_deref()
+                            .is_some_and(|id| self.check_window(id).is_ok()))
+                        .collect::<Vec<_>>()
+                )
+            }
+            MuxRequest::KillWindowTarget { target } => {
+                let window = match &target.window_id {
+                    Some(id) => {
+                        self.check_window(id)?;
+                        id.clone()
+                    }
+                    None => self.window_named(&target.full_name)?,
+                };
+                tmux.query(&["kill-window", "-t", &window])?;
+                Value::Null
+            }
+            MuxRequest::WindowTargetExists { target } => json!(match &target.window_id {
+                // Another remote's windows are not even reported.
+                Some(id) => tmux.window_target_exists(&target)? && self.check_window(id).is_ok(),
+                None => self.window_named(&target.full_name).is_ok(),
+            }),
             MuxRequest::SwitchToSession { name } => {
                 self.check_session(&name)?;
                 self.switch_invoking_clients(&name)?;
@@ -424,6 +453,7 @@ fn command_line(command: &std::process::Command) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::multiplexer::types::{OwnedWindowTarget, WindowTarget};
     use crate::remote::transport::Loopback;
     use crate::test_support::PrivateTmuxServer;
     use std::time::{Duration, Instant};
@@ -638,6 +668,108 @@ mod tests {
             ws.tmux(&["display-message", "-p", "-t", &others_pane, "#{pane_id}"]),
             others_pane
         );
+    }
+
+    #[test]
+    fn a_remote_finds_and_kills_only_its_own_owned_windows() {
+        let Some(ws) = Workstation::start() else {
+            return;
+        };
+        let invoking = ws.server.new_session("mine", ws.remote_root.path());
+        let owned_window = |remote: &str, session: &str| {
+            let scope = ws.scope(remote, session, &invoking);
+            let pane_id = pane(
+                ws.ask(
+                    &scope,
+                    MuxRequest::CreateSession {
+                        name: session.to_string(),
+                        initial_window_name: Some("wm-feature".to_string()),
+                        tty: ws.tty("exec sleep 30"),
+                    },
+                )
+                .unwrap(),
+            );
+            ws.ask(
+                &scope,
+                MuxRequest::SetWindowOwnership {
+                    pane_id: pane_id.clone(),
+                    token: "token".to_string(),
+                    is_primary: true,
+                },
+            )
+            .unwrap();
+            ws.tmux(&["display-message", "-p", "-t", &pane_id, "#{window_id}"])
+        };
+        let others = owned_window("other", "web");
+        let ours = owned_window("devbox", "api");
+        let scope = ws.scope("devbox", "api", &invoking);
+
+        let owned: Vec<OwnedWindowTarget> = serde_json::from_value(
+            ws.ask(
+                &scope,
+                MuxRequest::OwnedWindowTargets {
+                    token: "token".to_string(),
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            owned,
+            vec![OwnedWindowTarget {
+                target: WindowTarget::with_id(
+                    "wm-feature".to_string(),
+                    Some("api".to_string()),
+                    ours.clone()
+                ),
+                is_primary: true,
+            }]
+        );
+        let exists = |target: &WindowTarget| {
+            ws.ask(
+                &scope,
+                MuxRequest::WindowTargetExists {
+                    target: target.clone(),
+                },
+            )
+            .unwrap()
+        };
+        let others_target = WindowTarget::with_id(
+            "wm-feature".to_string(),
+            Some("web".to_string()),
+            others.clone(),
+        );
+        assert_eq!(exists(&owned[0].target), json!(true));
+        assert_eq!(exists(&others_target), json!(false));
+        let error = ws
+            .ask(
+                &scope,
+                MuxRequest::KillWindowTarget {
+                    target: WindowTarget::with_id(
+                        "wm-feature".to_string(),
+                        Some("web".to_string()),
+                        others.clone(),
+                    ),
+                },
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("does not belong to a project on remote devbox"),
+            "{error}"
+        );
+        ws.ask(
+            &scope,
+            MuxRequest::KillWindowTarget {
+                target: owned[0].target.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(exists(&owned[0].target), json!(false));
+        let windows = ws.tmux(&["list-windows", "-a", "-F", "#{window_id}"]);
+        assert!(!windows.lines().any(|id| id == ours), "{windows}");
+        assert!(windows.lines().any(|id| id == others), "{windows}");
     }
 
     #[test]
