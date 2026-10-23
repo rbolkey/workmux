@@ -2129,6 +2129,31 @@ def test_dashboard_reviews_stages_and_closes_a_remote_worktree(
             timeout=30.0,
         )
         assert "api@lb" in dashboard_row(screen(), "feature"), screen()
+
+        # The sidebar has the same status from the remote, filed under the
+        # remote's key and never under the remote path, which on a loopback
+        # remote is also a workstation path.
+        feed = SidebarFeed(short_tmp["TMPDIR"])
+        try:
+            snapshot = feed.wait(
+                lambda s: any(
+                    key.startswith("remote/lb/api/")
+                    and status.get("uncommitted_added") == 2
+                    for key, status in s.get("git_statuses", {}).items()
+                ),
+                "the remote worktree's git status in the sidebar",
+            )
+            path = agent_in(snapshot, pane)["path"]
+            assert f"remote/lb/api/{path.lstrip('/')}" in snapshot["git_statuses"]
+            # Workstation git, which would file it under the path, never runs.
+            with pytest.raises(AssertionError, match="timed out"):
+                feed.wait(
+                    lambda s: path in s.get("git_statuses", {}),
+                    "workstation git status of the remote path",
+                    timeout=6.0,
+                )
+        finally:
+            feed.close()
         assert "local" not in screen(), screen()
 
         # The diff is the remote worktree's; stage its first hunk.

@@ -391,7 +391,7 @@ pub(crate) fn build_snapshot(input: SnapshotInputs) -> SidebarSnapshot {
         .cloned()
         .collect();
 
-    let live_paths: HashSet<&PathBuf> = agents.iter().map(|a| &a.path).collect();
+    let live_paths: HashSet<PathBuf> = agents.iter().map(AgentPane::git_key).collect();
     let pr_statuses = pr_statuses
         .into_iter()
         .filter_map(|(path, entry)| {

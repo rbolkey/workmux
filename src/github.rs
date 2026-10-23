@@ -118,10 +118,20 @@ pub struct BranchSummary {
     pub checks: Option<CheckSummary>,
 }
 
-/// One local repository's branches requested by the sidebar GitHub worker.
+/// Where to learn which GitHub repository to ask about.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum RepoSource {
+    /// A workstation checkout, whose remotes `gh` resolves.
+    Checkout(PathBuf),
+    /// A remote project's registered git URL: no checkout and no remote
+    /// needed, so it works while the remote is disconnected or stopped.
+    GitUrl(String),
+}
+
+/// One repository's branches requested by the sidebar GitHub worker.
 pub struct BranchQueryRequest {
     pub repo_key: PathBuf,
-    pub repo_root: PathBuf,
+    pub source: RepoSource,
     pub branches: Vec<String>,
 }
 
@@ -669,7 +679,7 @@ pub fn list_branch_summaries(
 /// Fetch GitHub state for branches of the repository at `git_url`, with no
 /// checkout to ask `gh` about: a remote project's registered URL. It works
 /// while the remote itself is disconnected or stopped.
-pub fn list_branch_summaries_for_url(
+fn list_branch_summaries_for_url(
     git_url: &str,
     branches: &[String],
 ) -> Result<HashMap<String, BranchSummary>> {
@@ -684,18 +694,11 @@ fn list_branch_summaries_for_url_with(
     if branches.is_empty() {
         return Ok(HashMap::new());
     }
-    let identity = crate::git::parse_repo_identity_from_git_url(git_url)
-        .ok_or_else(|| anyhow!("cannot tell the GitHub repository of {git_url}"))?;
+    let (owner, name, hostname) = url_repo_context(git_url)?;
     let remote = RemoteQuery {
-        // An ssh:// URL may carry a port; the API host never does.
-        hostname: identity
-            .host
-            .split(':')
-            .next()
-            .unwrap_or(&identity.host)
-            .to_string(),
-        owner: identity.owner,
-        name: identity.repo,
+        hostname,
+        owner,
+        name,
         branches: branches.to_vec(),
         locals: Vec::new(),
     };
@@ -703,6 +706,38 @@ fn list_branch_summaries_for_url_with(
         .pop()
         .flatten()
         .ok_or_else(|| anyhow!("GitHub has no answer for {git_url}"))
+}
+
+/// Owner, name and API hostname of the repository at `git_url`.
+fn url_repo_context(git_url: &str) -> Result<ResolvedRepoContext> {
+    let identity = crate::git::parse_repo_identity_from_git_url(git_url)
+        .ok_or_else(|| anyhow!("cannot tell the GitHub repository of {git_url}"))?;
+    // An ssh:// URL may carry a port; the API host never does.
+    let hostname = identity
+        .host
+        .split(':')
+        .next()
+        .unwrap_or(&identity.host)
+        .to_string();
+    Ok((identity.owner, identity.repo, hostname))
+}
+
+fn repo_context_of(source: &RepoSource) -> Result<ResolvedRepoContext> {
+    match source {
+        RepoSource::Checkout(path) => get_repo_context(path),
+        RepoSource::GitUrl(url) => url_repo_context(url),
+    }
+}
+
+/// Fetch GitHub state for branches of the repository `source` names.
+pub fn list_branch_summaries_from(
+    source: &RepoSource,
+    branches: &[String],
+) -> Result<HashMap<String, BranchSummary>> {
+    match source {
+        RepoSource::Checkout(path) => list_branch_summaries(path, branches),
+        RepoSource::GitUrl(url) => list_branch_summaries_for_url(url, branches),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -933,7 +968,7 @@ pub fn list_branch_summaries_batch(
 
     for request in requests {
         let requested: BTreeSet<String> = request.branches.into_iter().collect();
-        let Ok((owner, name, hostname)) = get_repo_context(&request.repo_root) else {
+        let Ok((owner, name, hostname)) = repo_context_of(&request.source) else {
             continue;
         };
         let key = (

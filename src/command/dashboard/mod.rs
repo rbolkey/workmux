@@ -34,7 +34,7 @@ mod layout;
 mod mouse;
 mod scope;
 mod settings;
-mod site;
+pub(crate) mod site;
 mod sort;
 pub mod spinner;
 pub mod ui;

@@ -126,9 +126,10 @@ impl<'a> RowContext<'a> {
             .unwrap_or_default();
 
         let pane_title = build_pane_title(agent, &primary, &secondary, &label_worktree, &project);
-        let git_status = app.git_statuses.get(&agent.path);
-        let pr_summary = app.pr_statuses.get(&agent.path);
-        let check_summary = app.check_statuses.get(&agent.path);
+        let git_key = agent.git_key();
+        let git_status = app.git_statuses.get(&git_key);
+        let pr_summary = app.pr_statuses.get(&git_key);
+        let check_summary = app.check_statuses.get(&git_key);
         let kind =
             effective_agent_kind(agent.agent_kind.as_deref(), agent.agent_command.as_deref());
         let agent_icon = resolve_agent_icon(kind, &app.agent_icons);

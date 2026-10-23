@@ -24,6 +24,36 @@ pub const DAEMON_METHOD: &str = "remote.dashboard";
 /// How long one dashboard operation may take on the remote.
 pub const TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Key of a remote worktree's git status and PR entries in the
+/// workstation's caches. It is relative and starts with the remote and
+/// project, so it never equals a workstation path or another remote's
+/// worktree, even when the remote path also exists on the workstation.
+pub fn worktree_key(remote: &str, project: &str, worktree: &Path) -> PathBuf {
+    Path::new("remote")
+        .join(remote)
+        .join(project)
+        .join(worktree.strip_prefix("/").unwrap_or(worktree))
+}
+
+/// Where to ask GitHub about `agent`'s branch: its workstation checkout,
+/// or for a remote agent its project's registered git URL, never its path.
+/// `None` for a remote agent whose project has no git URL.
+pub fn repo_source(
+    config: &crate::config::Config,
+    agent: &crate::multiplexer::AgentPane,
+) -> Option<crate::github::RepoSource> {
+    use crate::github::RepoSource;
+    match &agent.remote {
+        None => Some(RepoSource::Checkout(agent.path.clone())),
+        Some(remote) => {
+            let entry = config.projects.get(&remote.project)?;
+            (entry.remote.as_deref() == Some(remote.remote.as_str()))
+                .then(|| entry.git_url.clone().map(RepoSource::GitUrl))
+                .flatten()
+        }
+    }
+}
+
 /// One dashboard operation on a worktree or pane of a remote project.
 /// Worktree paths are paths on the remote.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -348,5 +378,33 @@ mod tests {
 
         assert_eq!(error.to_string(), "remote devbox is not connected");
         assert_eq!(transport.exec_count(), 0);
+    }
+
+    #[test]
+    fn a_remote_agents_pr_status_is_asked_by_its_registered_git_url() {
+        let config: crate::config::Config = serde_yaml::from_str(
+            "remotes:\n  devbox:\n    transport: ssh\n    target: devbox\n\
+             projects:\n  api:\n    remote: devbox\n    git_url: git@github.com:me/api.git\n",
+        )
+        .unwrap();
+        // The remote worktree's path is also a checkout on the workstation.
+        let temp = tempfile::tempdir().unwrap();
+        crate::test_support::init_repo(temp.path());
+        let agent = |remote| crate::command::dashboard::site::tests::agent(temp.path(), remote);
+
+        assert_eq!(
+            repo_source(&config, &agent(Some(("devbox", "api")))),
+            Some(crate::github::RepoSource::GitUrl(
+                "git@github.com:me/api.git".to_string()
+            ))
+        );
+        // A project registered on another remote is not this agent's.
+        assert_eq!(repo_source(&config, &agent(Some(("other", "api")))), None);
+        assert_eq!(
+            repo_source(&config, &agent(None)),
+            Some(crate::github::RepoSource::Checkout(
+                temp.path().to_path_buf()
+            ))
+        );
     }
 }

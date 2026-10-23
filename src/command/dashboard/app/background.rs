@@ -5,39 +5,13 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::config::Config;
-use crate::multiplexer::AgentPane;
+use crate::github::RepoSource as PrSource;
 use crate::project::Project;
+use crate::remote::dashboard::repo_source as pr_source;
 
 use super::super::site::WorktreeSite;
 use super::App;
 use super::types::AppEvent;
-
-/// Where GitHub is asked about a repository's branches.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum PrSource {
-    /// A workstation checkout, whose remotes `gh` resolves.
-    Checkout(PathBuf),
-    /// A remote project's registered git URL, so the answer never needs the
-    /// remote itself, which may be disconnected or stopped.
-    GitUrl(String),
-}
-
-/// Where to ask GitHub about `agent`'s branch, or `None` for a remote
-/// agent whose project has no registered git URL.
-fn pr_source(config: &Config, agent: &AgentPane) -> Option<PrSource> {
-    match WorktreeSite::of(agent) {
-        WorktreeSite::Workstation(path) => Some(PrSource::Checkout(path)),
-        WorktreeSite::Remote {
-            remote, project, ..
-        } => {
-            let entry = config.projects.get(&project)?;
-            (entry.remote.as_deref() == Some(remote.as_str()))
-                .then(|| entry.git_url.clone().map(PrSource::GitUrl))
-                .flatten()
-        }
-    }
-}
 
 /// Group branches by repository identity while retaining where to ask gh.
 fn group_pr_requests<'a>(
@@ -184,14 +158,8 @@ impl App {
                             else {
                                 break;
                             };
-                            let summaries = match &source {
-                                PrSource::Checkout(checkout) => {
-                                    crate::github::list_branch_summaries(checkout, &branches)
-                                }
-                                PrSource::GitUrl(url) => {
-                                    crate::github::list_branch_summaries_for_url(url, &branches)
-                                }
-                            };
+                            let summaries =
+                                crate::github::list_branch_summaries_from(&source, &branches);
                             match summaries {
                                 Ok(summaries) => {
                                     let _ = tx.send(AppEvent::GithubStatus(repo_key, summaries));
@@ -258,29 +226,5 @@ mod tests {
         assert_eq!(grouped.len(), 2);
         assert_eq!(grouped[&key_a].0, checkout(&checkout_a));
         assert_eq!(grouped[&key_b].0, checkout(&checkout_b));
-    }
-
-    #[test]
-    fn a_remote_agents_pr_status_is_asked_by_its_registered_git_url() {
-        let config: Config = serde_yaml::from_str(
-            "remotes:\n  devbox:\n    transport: ssh\n    target: devbox\n\
-             projects:\n  api:\n    remote: devbox\n    git_url: git@github.com:me/api.git\n",
-        )
-        .unwrap();
-        // The remote worktree's path is also a checkout on the workstation.
-        let temp = tempfile::tempdir().unwrap();
-        crate::test_support::init_repo(temp.path());
-        let agent = |remote| crate::command::dashboard::site::tests::agent(temp.path(), remote);
-
-        assert_eq!(
-            pr_source(&config, &agent(Some(("devbox", "api")))),
-            Some(PrSource::GitUrl("git@github.com:me/api.git".to_string()))
-        );
-        // A project registered on another remote is not this agent's.
-        assert_eq!(pr_source(&config, &agent(Some(("other", "api")))), None);
-        assert_eq!(
-            pr_source(&config, &agent(None)),
-            Some(PrSource::Checkout(temp.path().to_path_buf()))
-        );
     }
 }

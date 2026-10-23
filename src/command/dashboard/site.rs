@@ -60,9 +60,7 @@ impl WorktreeSite {
         }
     }
 
-    /// Key of the worktree's git status. A remote worktree's key is relative
-    /// and starts with its remote and project, so it never equals a
-    /// workstation path or another remote's worktree.
+    /// Key of the worktree's git status: `AgentPane::git_key`.
     pub fn status_key(&self) -> PathBuf {
         match self {
             Self::Workstation(path) => path.clone(),
@@ -70,10 +68,7 @@ impl WorktreeSite {
                 remote,
                 project,
                 worktree,
-            } => Path::new("remote")
-                .join(remote)
-                .join(project)
-                .join(worktree.strip_prefix("/").unwrap_or(worktree)),
+            } => crate::remote::dashboard::worktree_key(remote, project, worktree),
         }
     }
 
