@@ -641,7 +641,11 @@ pub fn run(
         options.target_session_name = target_name;
     } else {
         options.target_window_name = target_name;
-        options.window_session_name = parent_session;
+        // A remote project's windows go to its workstation session unless
+        // the command names another.
+        options.window_session_name = parent_session.or_else(|| {
+            crate::remote::session::ServedProject::current().and_then(|served| served.session)
+        });
     }
 
     // Validate multi-worktree arguments

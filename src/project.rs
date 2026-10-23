@@ -2,6 +2,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::remote::session::ServedProject;
+
 /// Where a project's repository, worktrees and agents live.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ProjectHost {
@@ -37,6 +39,20 @@ impl Project {
     /// its directory. `None` when the path has no final component.
     pub fn from_main_worktree_root(root: &Path) -> Option<Self> {
         Some(Self::workstation(root.file_name()?.to_string_lossy()))
+    }
+
+    /// The project whose main worktree is `root`: the remote project remote
+    /// workmux runs this command for, else the workstation project named
+    /// after the directory.
+    pub fn at_main_worktree_root(root: &Path) -> Option<Self> {
+        Self::at_main_worktree_root_served(root, ServedProject::current())
+    }
+
+    fn at_main_worktree_root_served(root: &Path, served: Option<ServedProject>) -> Option<Self> {
+        match served {
+            Some(served) => Some(Self::remote(served.remote, served.name)),
+            None => Self::from_main_worktree_root(root),
+        }
     }
 
     /// The workstation project a worktree or agent at `path` belongs to.
@@ -80,6 +96,22 @@ mod tests {
         let project = Project::from_main_worktree_root(Path::new("/src/api")).unwrap();
         assert_eq!(project.host, ProjectHost::Workstation);
         assert_eq!(project.name, "api");
+    }
+
+    #[test]
+    fn a_served_remote_project_is_named_by_its_registration_not_its_clone() {
+        let served = ServedProject {
+            remote: "devbox".to_string(),
+            name: "api".to_string(),
+            session: None,
+        };
+        let project = Project::at_main_worktree_root_served(
+            Path::new("/home/me/code/api-clone"),
+            Some(served),
+        )
+        .unwrap();
+        assert_eq!(project, Project::remote("devbox", "api"));
+        assert_eq!(project.expand_placeholder("wm-{project}-"), "wm-api-");
     }
 
     #[test]

@@ -47,8 +47,20 @@ impl Transport for ServeTransport {
         Ok(process)
     }
 
-    fn tty_command(&self, _exec: &TtyExec) -> Result<Command> {
-        unimplemented!()
+    /// Runs the remote terminal as a workstation process in its workdir.
+    fn tty_command(&self, exec: &TtyExec) -> Result<Command> {
+        let (program, args) = exec
+            .argv
+            .split_first()
+            .ok_or_else(|| anyhow!("no command"))?;
+        let mut command = Command::new(program);
+        command
+            .args(args)
+            .envs(exec.env.iter().map(|(k, v)| (k, v)));
+        if let Some(workdir) = &exec.workdir {
+            command.current_dir(workdir);
+        }
+        Ok(command)
     }
 }
 

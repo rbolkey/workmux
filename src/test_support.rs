@@ -119,3 +119,71 @@ pub(crate) fn clear_local_git_env(command: &mut Command) {
         command.env_remove(format!("GIT_CONFIG_VALUE_{i}"));
     }
 }
+
+/// A tmux server on its own socket, killed on drop.
+pub struct PrivateTmuxServer {
+    _temp: tempfile::TempDir,
+    pub socket: String,
+}
+
+impl PrivateTmuxServer {
+    pub fn start() -> Option<Self> {
+        which::which("tmux").ok()?;
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("tmux.sock").to_string_lossy().into_owned();
+        Some(Self {
+            _temp: temp,
+            socket,
+        })
+    }
+
+    pub fn query(&self, args: &[&str]) -> String {
+        crate::cmd::Cmd::new("tmux")
+            .args(&["-S", &self.socket])
+            .args(args)
+            .run_and_capture_stdout()
+            .unwrap()
+            .trim()
+            .to_string()
+    }
+
+    /// Starts a detached session and returns its first pane.
+    pub fn new_session(&self, name: &str, cwd: &Path) -> String {
+        let cwd = cwd.to_string_lossy();
+        self.query(&[
+            "new-session",
+            "-d",
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "-s",
+            name,
+            "-c",
+            &cwd,
+        ])
+    }
+
+    pub fn new_window(&self, session: &str) -> String {
+        self.query(&[
+            "new-window",
+            "-d",
+            "-P",
+            "-F",
+            "#{window_id}",
+            "-t",
+            &format!("{session}:"),
+        ])
+    }
+
+    pub fn window_of(&self, pane_id: &str) -> String {
+        self.query(&["display-message", "-p", "-t", pane_id, "#{window_id}"])
+    }
+}
+
+impl Drop for PrivateTmuxServer {
+    fn drop(&mut self) {
+        let _ = crate::cmd::Cmd::new("tmux")
+            .args(&["-S", &self.socket, "kill-server"])
+            .run();
+    }
+}

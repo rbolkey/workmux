@@ -411,10 +411,14 @@ impl TmuxBackend {
 
     /// Resolve placement and the current pane, window and session from
     /// `invocation` instead of this CLI invocation's own context.
-    #[allow(dead_code)] // Reserved for answering requests carried from remotes
     pub fn with_invocation_context(mut self, invocation: InvocationContext) -> Self {
         self.invocation = invocation;
         self
+    }
+
+    /// Run a tmux command on this backend's server, returning its stdout.
+    pub fn query(&self, args: &[&str]) -> Result<String> {
+        self.tmux_query(args)
     }
 
     fn tmux_command(&self) -> Cmd<'_> {
@@ -1711,76 +1715,9 @@ mod tests {
         assert!(!marker_exists);
     }
 
-    struct PrivateTmuxServer {
-        _temp: tempfile::TempDir,
-        socket: String,
-    }
-
-    impl PrivateTmuxServer {
-        fn start() -> Option<Self> {
-            which::which("tmux").ok()?;
-            let temp = tempfile::tempdir().unwrap();
-            let socket = temp.path().join("tmux.sock").to_string_lossy().into_owned();
-            Some(Self {
-                _temp: temp,
-                socket,
-            })
-        }
-
-        fn query(&self, args: &[&str]) -> String {
-            Cmd::new("tmux")
-                .args(&["-S", &self.socket])
-                .args(args)
-                .run_and_capture_stdout()
-                .unwrap()
-                .trim()
-                .to_string()
-        }
-
-        /// Starts a detached session and returns its first pane.
-        fn new_session(&self, name: &str, cwd: &Path) -> String {
-            let cwd = cwd.to_string_lossy();
-            self.query(&[
-                "new-session",
-                "-d",
-                "-P",
-                "-F",
-                "#{pane_id}",
-                "-s",
-                name,
-                "-c",
-                &cwd,
-            ])
-        }
-
-        fn new_window(&self, session: &str) -> String {
-            self.query(&[
-                "new-window",
-                "-d",
-                "-P",
-                "-F",
-                "#{window_id}",
-                "-t",
-                &format!("{session}:"),
-            ])
-        }
-
-        fn window_of(&self, pane_id: &str) -> String {
-            self.query(&["display-message", "-p", "-t", pane_id, "#{window_id}"])
-        }
-    }
-
-    impl Drop for PrivateTmuxServer {
-        fn drop(&mut self) {
-            let _ = Cmd::new("tmux")
-                .args(&["-S", &self.socket, "kill-server"])
-                .run();
-        }
-    }
-
     #[test]
     fn placement_resolves_from_supplied_invocation_context_pane() {
-        let Some(server) = PrivateTmuxServer::start() else {
+        let Some(server) = crate::test_support::PrivateTmuxServer::start() else {
             return;
         };
         let dir = tempfile::tempdir().unwrap();
@@ -1811,7 +1748,7 @@ mod tests {
 
     #[test]
     fn placement_resolves_from_supplied_invocation_context_cwd() {
-        let Some(server) = PrivateTmuxServer::start() else {
+        let Some(server) = crate::test_support::PrivateTmuxServer::start() else {
             return;
         };
         let first_dir = tempfile::tempdir().unwrap();

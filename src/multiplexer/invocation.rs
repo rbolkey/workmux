@@ -10,7 +10,7 @@ use std::sync::OnceLock;
 
 /// The pane, session, multiplexer instance and working directory a command
 /// was run from.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct InvocationContext {
     /// The invoking pane (`$TMUX_PANE`).
     pub pane_id: Option<String>,

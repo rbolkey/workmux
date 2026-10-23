@@ -20,6 +20,9 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
 
 use super::channel::Peer;
+use super::forwarded::SessionScope;
+use super::forwarding;
+use crate::multiplexer::InvocationContext;
 
 /// Request method that starts a command session on the remote.
 pub const RUN_METHOD: &str = "command.run";
@@ -34,6 +37,8 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(7 * 24 * 3600);
 /// project: the remote's name and the project's registered name.
 pub const REMOTE_ENV: &str = "WORKMUX_REMOTE_NAME";
 pub const PROJECT_ENV: &str = "WORKMUX_PROJECT_NAME";
+/// The workstation session for the project's windows, when it has one.
+pub const PROJECT_SESSION_ENV: &str = "WORKMUX_PROJECT_SESSION";
 
 /// A remote project as remote workmux needs it to run a command.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,6 +49,10 @@ pub struct ProjectSite {
     /// from the remote's home directory.
     pub path: String,
     pub git_url: Option<String>,
+    /// Workstation session for the project's windows in window mode; `None`
+    /// places them in the invoking session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
 }
 
 /// One command to run in a remote project. In `argv`, `workmux` means
@@ -100,19 +109,40 @@ enum Event {
     Exit(Result<Value>),
 }
 
+struct OpenSession {
+    events: Sender<Event>,
+    scope: SessionScope,
+}
+
 /// The workstation's open command sessions, by session id.
 #[derive(Default)]
 pub struct Sessions {
     next_id: AtomicU64,
-    open: Mutex<HashMap<u64, Sender<Event>>>,
+    open: Mutex<HashMap<u64, OpenSession>>,
 }
 
 impl Sessions {
-    fn open(&self) -> (u64, Sender<Event>, Receiver<Event>) {
+    fn open(&self, scope: SessionScope) -> (u64, Sender<Event>, Receiver<Event>) {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
         let (sender, receiver) = mpsc::channel();
-        self.open.lock().unwrap().insert(id, sender.clone());
+        self.open.lock().unwrap().insert(
+            id,
+            OpenSession {
+                events: sender.clone(),
+                scope,
+            },
+        );
         (id, sender, receiver)
+    }
+
+    /// The scope of open session `id`, for answering the requests its
+    /// command forwards.
+    pub fn scope(&self, id: u64) -> Option<SessionScope> {
+        self.open
+            .lock()
+            .unwrap()
+            .get(&id)
+            .map(|session| session.scope.clone())
     }
 
     fn close(&self, id: u64) {
@@ -129,7 +159,7 @@ impl Sessions {
                 let session = open
                     .get(&params.session)
                     .ok_or_else(|| anyhow!("no command session {}", params.session))?;
-                let _ = session.send(Event::Output(params.stream, data));
+                let _ = session.events.send(Event::Output(params.stream, data));
                 Ok(())
             });
         if let Err(error) = delivered {
@@ -138,14 +168,20 @@ impl Sessions {
     }
 
     /// Run `request` on the remote at the other end of `peer`, passing its
-    /// output to `sink` as it arrives. Returns the command's exit code.
+    /// output to `sink` as it arrives. Requests the command forwards are
+    /// answered from `invocation`. Returns the command's exit code.
     pub fn run(
         &self,
         peer: &Peer,
         request: &CommandRequest,
+        invocation: &InvocationContext,
         sink: &mut dyn FnMut(Stream, &[u8]),
     ) -> Result<i32> {
-        let (session, sender, events) = self.open();
+        let (session, sender, events) = self.open(SessionScope {
+            remote: request.project.remote.clone(),
+            project: request.project.name.clone(),
+            invocation: invocation.clone(),
+        });
         let params = serde_json::to_value(RunParams {
             session,
             request: request.clone(),
@@ -172,9 +208,10 @@ impl Sessions {
 
 /// Remote workmux's side of `command.run`: run the command, streaming its
 /// output over `peer`, and answer with its exit code.
-pub fn serve_run(peer: &Peer, params: Value) -> Result<Value> {
+pub fn serve_run(peer: &Peer, forwarding_socket: Option<&Path>, params: Value) -> Result<Value> {
     let RunParams { session, request } = serde_json::from_value(params)?;
-    let exit_code = run_on_remote(&request, &|stream, data| {
+    let forwarding = forwarding_socket.map(|socket| Forwarding { socket, session });
+    let exit_code = run_on_remote(&request, forwarding, &|stream, data| {
         let _ = peer.notify(
             OUTPUT_METHOD,
             serde_json::to_value(OutputParams::new(session, stream, data)).expect("serializes"),
@@ -271,10 +308,19 @@ fn ensure_cloned(
     Ok(())
 }
 
+/// Where a command run in a command session forwards its multiplexer
+/// requests.
+#[derive(Debug, Clone, Copy)]
+pub struct Forwarding<'a> {
+    pub socket: &'a Path,
+    pub session: u64,
+}
+
 /// Run `request` on this machine, the remote: clone the project on first
 /// use, then run the command in its clone.
 pub fn run_on_remote(
     request: &CommandRequest,
+    forwarding: Option<Forwarding>,
     emit: &(dyn Fn(Stream, &[u8]) + Sync),
 ) -> Result<i32> {
     let path = clone_path(&request.project.path)?;
@@ -293,6 +339,15 @@ pub fn run_on_remote(
         .current_dir(&path)
         .env(REMOTE_ENV, &request.project.remote)
         .env(PROJECT_ENV, &request.project.name);
+    match &request.project.session {
+        Some(session) => command.env(PROJECT_SESSION_ENV, session),
+        None => command.env_remove(PROJECT_SESSION_ENV),
+    };
+    if let Some(forwarding) = forwarding {
+        command
+            .env(forwarding::SOCKET_ENV, forwarding.socket)
+            .env(forwarding::SESSION_ENV, forwarding.session.to_string());
+    }
     Ok(exit_code(run_streamed(command, emit)?))
 }
 
@@ -302,13 +357,17 @@ pub fn run_on_remote(
 pub struct ServedProject {
     pub remote: String,
     pub name: String,
+    /// Workstation session for the project's windows in window mode.
+    pub session: Option<String>,
 }
 
 impl ServedProject {
     pub fn current() -> Option<Self> {
+        let var = |name| std::env::var(name).ok().filter(|v: &String| !v.is_empty());
         Some(Self {
-            remote: std::env::var(REMOTE_ENV).ok().filter(|v| !v.is_empty())?,
-            name: std::env::var(PROJECT_ENV).ok().filter(|v| !v.is_empty())?,
+            remote: var(REMOTE_ENV)?,
+            name: var(PROJECT_ENV)?,
+            session: var(PROJECT_SESSION_ENV),
         })
     }
 }
@@ -346,6 +405,7 @@ mod tests {
                 name: "api".to_string(),
                 path: path.display().to_string(),
                 git_url: git_url.map(|url| url.display().to_string()),
+                session: None,
             },
             argv: ["sh", "-c", script].map(String::from).to_vec(),
         }
@@ -359,16 +419,22 @@ mod tests {
 
     fn run(request: &CommandRequest, mut on_stdout: impl FnMut(&str)) -> (Result<i32>, Captured) {
         let mut captured = Captured::default();
-        let exit = channels().run_command("devbox", &remote(), request, &mut |stream, data| {
-            let text = String::from_utf8_lossy(data);
-            match stream {
-                Stream::Stdout => {
-                    captured.stdout.push_str(&text);
-                    on_stdout(&captured.stdout);
+        let exit = channels().run_command(
+            "devbox",
+            &remote(),
+            request,
+            &InvocationContext::default(),
+            &mut |stream, data| {
+                let text = String::from_utf8_lossy(data);
+                match stream {
+                    Stream::Stdout => {
+                        captured.stdout.push_str(&text);
+                        on_stdout(&captured.stdout);
+                    }
+                    Stream::Stderr => captured.stderr.push_str(&text),
                 }
-                Stream::Stderr => captured.stderr.push_str(&text),
-            }
-        });
+            },
+        );
         (exit, captured)
     }
 

@@ -13,9 +13,12 @@ use std::time::{Duration, Instant};
 
 use super::channel::Handler;
 use super::connection::{Connection, HELLO_TIMEOUT};
+use super::forwarded;
+use super::forwarding::{FORWARD_METHOD, Forwarded};
 use super::session::{self, CommandRequest, Sessions, Stream};
 use super::transport::{RemoteState, Transport};
 use crate::config::{RemoteConfig, TransportKind};
+use crate::multiplexer::InvocationContext;
 
 /// Builds the transport for a configured remote.
 pub type TransportFactory =
@@ -70,12 +73,35 @@ pub enum Reach {
 
 /// Answers requests remote workmux sends over its control channel.
 struct WorkstationHandler {
+    /// The remote at the other end, which every request is scoped to.
+    remote: String,
+    transport: Arc<dyn Transport>,
     sessions: Arc<Sessions>,
 }
 
+impl WorkstationHandler {
+    fn forwarded(&self, params: Value) -> Result<Value> {
+        let Forwarded { session, request } = serde_json::from_value(params)?;
+        let scope = self
+            .sessions
+            .scope(session)
+            .filter(|scope| scope.remote == self.remote)
+            .ok_or_else(|| {
+                anyhow!(
+                    "refused: no command session {session} on remote {}",
+                    self.remote
+                )
+            })?;
+        forwarded::answer(&scope, &scope.tmux(), self.transport.as_ref(), request)
+    }
+}
+
 impl Handler for WorkstationHandler {
-    fn request(&self, method: &str, _params: Value) -> Result<Value, String> {
-        Err(format!("unknown method: {method}"))
+    fn request(&self, method: &str, params: Value) -> Result<Value, String> {
+        match method {
+            FORWARD_METHOD => self.forwarded(params).map_err(|error| format!("{error:#}")),
+            method => Err(format!("unknown method: {method}")),
+        }
     }
 
     fn notification(&self, method: &str, params: Value) {
@@ -151,7 +177,7 @@ impl Channels {
                 Err(error) => return unreachable(error),
             }
         }
-        let connection = match self.channel_with(name, config, transport.as_ref(), true) {
+        let connection = match self.channel_with(name, config, transport, true) {
             Ok(connection) => connection,
             Err(error) => return unreachable(error),
         };
@@ -184,14 +210,14 @@ impl Channels {
         {
             return Err(anyhow!("remote {name} is stopped"));
         }
-        self.channel_with(name, config, transport.as_ref(), use_now)
+        self.channel_with(name, config, transport, use_now)
     }
 
     fn channel_with(
         &self,
         name: &str,
         config: &RemoteConfig,
-        transport: &dyn Transport,
+        transport: Arc<dyn Transport>,
         use_now: bool,
     ) -> Result<Arc<Connection>> {
         let _connecting = self.shared.connecting.lock().unwrap();
@@ -217,8 +243,10 @@ impl Channels {
 
         let connection = Arc::new(Connection::open(
             name,
-            transport,
+            transport.as_ref(),
             WorkstationHandler {
+                remote: name.to_string(),
+                transport: transport.clone(),
                 sessions: self.shared.sessions.clone(),
             },
             self.shared.policy.hello_timeout,
@@ -320,17 +348,22 @@ impl Channels {
     }
 
     /// Run a command session on `name`, passing its output to `sink` as it
-    /// arrives. Returns the command's exit code.
+    /// arrives. Multiplexer requests the command forwards are answered from
+    /// `invocation`. Returns the command's exit code.
     pub fn run_command(
         &self,
         name: &str,
         config: &RemoteConfig,
         request: &CommandRequest,
+        invocation: &InvocationContext,
         sink: &mut dyn FnMut(Stream, &[u8]),
     ) -> Result<i32> {
         let connection = self.channel(name, config)?;
         self.hold(name, 1);
-        let exit = self.shared.sessions.run(&connection.peer, request, sink);
+        let exit = self
+            .shared
+            .sessions
+            .run(&connection.peer, request, invocation, sink);
         self.hold(name, -1);
         exit
     }

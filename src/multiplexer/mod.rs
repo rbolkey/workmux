@@ -1069,7 +1069,13 @@ fn resolve_backend(tmux: bool, wezterm: bool, zellij: bool, kitty: bool) -> Back
 }
 
 /// Create a backend instance based on the backend type.
+///
+/// A command remote workmux runs in a command session always gets the
+/// forwarding multiplexer, which reaches the workstation's tmux.
 pub fn create_backend(backend_type: BackendType) -> Arc<dyn Multiplexer> {
+    if let Some(forwarding) = crate::remote::forwarding::ForwardingMux::from_env() {
+        return Arc::new(forwarding);
+    }
     match backend_type {
         BackendType::Tmux => Arc::new(TmuxBackend::new()),
         BackendType::WezTerm => Arc::new(wezterm::WezTermBackend::new()),

@@ -139,7 +139,7 @@ impl WorkflowContext {
     /// Return whether a path identifies the main worktree.
     /// The project this context operates on, named after its main worktree.
     pub fn project(&self) -> Option<Project> {
-        Project::from_main_worktree_root(&self.main_worktree_root)
+        Project::at_main_worktree_root(&self.main_worktree_root)
     }
 
     pub fn is_main_worktree(&self, path: &Path) -> bool {
