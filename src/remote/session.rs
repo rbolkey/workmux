@@ -381,7 +381,7 @@ pub fn serve_run(
 }
 
 /// Where `path` from a project registration lives on this machine.
-fn clone_path(path: &str) -> Result<PathBuf> {
+pub(crate) fn clone_path(path: &str) -> Result<PathBuf> {
     let home = home::home_dir().ok_or_else(|| anyhow!("remote has no home directory"))?;
     let expanded = crate::util::expand_tilde(path);
     Ok(if expanded.is_absolute() {

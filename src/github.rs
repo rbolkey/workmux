@@ -666,6 +666,45 @@ pub fn list_branch_summaries(
     }
 }
 
+/// Fetch GitHub state for branches of the repository at `git_url`, with no
+/// checkout to ask `gh` about: a remote project's registered URL. It works
+/// while the remote itself is disconnected or stopped.
+pub fn list_branch_summaries_for_url(
+    git_url: &str,
+    branches: &[String],
+) -> Result<HashMap<String, BranchSummary>> {
+    list_branch_summaries_for_url_with(git_url, branches, &mut run_graphql)
+}
+
+fn list_branch_summaries_for_url_with(
+    git_url: &str,
+    branches: &[String],
+    run: &mut impl FnMut(&str, &[u8]) -> Result<GraphqlCommandResponse>,
+) -> Result<HashMap<String, BranchSummary>> {
+    if branches.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let identity = crate::git::parse_repo_identity_from_git_url(git_url)
+        .ok_or_else(|| anyhow!("cannot tell the GitHub repository of {git_url}"))?;
+    let remote = RemoteQuery {
+        // An ssh:// URL may carry a port; the API host never does.
+        hostname: identity
+            .host
+            .split(':')
+            .next()
+            .unwrap_or(&identity.host)
+            .to_string(),
+        owner: identity.owner,
+        name: identity.repo,
+        branches: branches.to_vec(),
+        locals: Vec::new(),
+    };
+    execute_remote_chunk_with(std::slice::from_ref(&remote), run)
+        .pop()
+        .flatten()
+        .ok_or_else(|| anyhow!("GitHub has no answer for {git_url}"))
+}
+
 #[derive(Debug, Deserialize)]
 struct GraphqlError {
     message: String,
@@ -2056,6 +2095,47 @@ mod tests {
                 .into_iter()
                 .all(|outcome| { outcome.is_some_and(|outcome| outcome.contains_key("main")) })
         );
+    }
+
+    #[test]
+    fn a_registered_git_url_names_the_repository_without_a_checkout() {
+        let mut asked = Vec::new();
+        let summaries = list_branch_summaries_for_url_with(
+            "ssh://git@github.example.com:22/me/api.git",
+            &["feature".to_string()],
+            &mut |hostname, body| {
+                let request: serde_json::Value = serde_json::from_slice(body).unwrap();
+                asked.push((
+                    hostname.to_string(),
+                    request["variables"]["owner_0"].clone(),
+                    request["variables"]["name_0"].clone(),
+                ));
+                Ok(GraphqlCommandResponse {
+                    success: true,
+                    response: BatchGraphqlResponse {
+                        data: Some(HashMap::from([(
+                            "repo_0".to_string(),
+                            serde_json::json!({
+                                "pr_r0_b0": { "nodes": [] },
+                                "ref_r0_b0": null
+                            }),
+                        )])),
+                        errors: Vec::new(),
+                    },
+                })
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            asked,
+            [(
+                "github.example.com".to_string(),
+                serde_json::json!("me"),
+                serde_json::json!("api")
+            )]
+        );
+        assert!(summaries.contains_key("feature"));
     }
 
     #[test]

@@ -326,7 +326,7 @@ fn parse_owner_repo_path(path: &str) -> Option<(&str, &str)> {
 
 /// Parse full repository identity (host, owner, repo) from a git remote URL.
 /// Supports both HTTPS and SSH formats.
-fn parse_repo_identity_from_git_url(url: &str) -> Option<RepoIdentity> {
+pub fn parse_repo_identity_from_git_url(url: &str) -> Option<RepoIdentity> {
     let parsed = parse_git_remote_url(url)?;
     Some(RepoIdentity {
         host: parsed.host.to_string(),

@@ -14,9 +14,10 @@ use std::time::{Duration, Instant};
 
 use super::channel::Handler;
 use super::connection::{Connection, HELLO_TIMEOUT};
+use super::dashboard::{self, DashboardRequest};
 use super::forwarded;
 use super::forwarding::{FORWARD_METHOD, Forwarded};
-use super::session::{self, CommandRequest, SessionParams, Sessions, Terminal};
+use super::session::{self, CommandRequest, ProjectSite, SessionParams, Sessions, Terminal};
 use super::status::{self, StatusSink};
 use super::transport::{RemoteState, Transport};
 use crate::config::{RemoteConfig, TransportKind};
@@ -420,6 +421,41 @@ impl Channels {
             .run(&connection.peer, request, invocation, terminal);
         self.hold(name, -1);
         exit
+    }
+
+    /// Run a dashboard operation on `project`, a project of `name`. Without
+    /// `connect` only an already open channel is used.
+    pub fn dashboard(
+        &self,
+        name: &str,
+        config: &RemoteConfig,
+        project: &ProjectSite,
+        request: &DashboardRequest,
+        connect: bool,
+    ) -> Result<Value> {
+        let connection = if connect {
+            self.channel(name, config)?
+        } else {
+            self.open_channel(name)
+                .ok_or_else(|| anyhow!("remote {name} is not connected"))?
+        };
+        connection.peer.request(
+            dashboard::METHOD,
+            dashboard::params(project, request),
+            dashboard::TIMEOUT,
+        )
+    }
+
+    /// `name`'s channel, when it is open.
+    fn open_channel(&self, name: &str) -> Option<Arc<Connection>> {
+        self.shared
+            .slots
+            .lock()
+            .unwrap()
+            .get(name)?
+            .connection
+            .clone()
+            .filter(|connection| !connection.is_closed())
     }
 
     /// Keep `name`'s channel open, and reconnecting after drops, while the

@@ -6,14 +6,10 @@
 //! - Hunk manipulation (stage, skip, split, undo)
 //! - Sending commands to agents (commit, merge)
 
-use std::io::Write;
-
 use super::ansi::parse_ansi_to_lines;
 use super::app::{App, ViewMode};
-use super::diff::{
-    DiffView, extract_file_list, get_diff_content, get_file_list_numstat, map_file_offsets,
-    parse_hunk_header,
-};
+use super::diff::{DiffView, extract_file_list, map_file_offsets, parse_hunk_header};
+use super::site::WorktreeSite;
 
 /// Extension trait for diff and patch mode operations on App.
 pub trait DiffOps {
@@ -38,9 +34,9 @@ pub trait DiffOps {
 /// Reload diff showing only unstaged changes (for patch mode).
 /// Private helper - not part of the public trait.
 fn reload_unstaged_diff(app: &mut App) {
-    let (path, pane_id, worktree_name) = if let ViewMode::Diff(ref diff) = app.view_mode {
+    let (site, pane_id, worktree_name) = if let ViewMode::Diff(ref diff) = app.view_mode {
         (
-            diff.worktree_path.clone(),
+            diff.site.clone(),
             diff.pane_id.clone(),
             diff.title
                 .strip_prefix("WIP: ")
@@ -53,7 +49,7 @@ fn reload_unstaged_diff(app: &mut App) {
 
     // Use empty diff_arg for unstaged changes only (git diff without args)
     // Include untracked files, parse hunks for patch mode
-    match get_diff_content(&path, "", true, true) {
+    match site.diff_content("", true, true) {
         Ok((content, lines_added, lines_removed, hunks)) => {
             let (content, line_count) = if content.trim().is_empty() {
                 ("No uncommitted changes".to_string(), 1)
@@ -72,7 +68,7 @@ fn reload_unstaged_diff(app: &mut App) {
                 line_count,
                 viewport_height: 0,
                 title: format!("WIP: {}", worktree_name),
-                worktree_path: path,
+                site,
                 pane_id,
                 is_branch_diff: false,
                 lines_added,
@@ -96,7 +92,7 @@ fn reload_unstaged_diff(app: &mut App) {
                 line_count: 1,
                 viewport_height: 0,
                 title: "Error".to_string(),
-                worktree_path: path,
+                site,
                 pane_id,
                 is_branch_diff: false,
                 lines_added: 0,
@@ -150,31 +146,7 @@ impl DiffOps for App {
         // Hunks are clean (no ANSI codes) since we use --no-color for diff
         let patch_content = format!("{}\n{}\n", hunk.file_header, hunk.hunk_body);
 
-        let mut child = crate::git::pinned_git(&diff.worktree_path)
-            .map_err(|e| format!("Cannot validate Git metadata: {e}"))?
-            .args(["apply", "--cached", "--recount", "--3way", "-"])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("Failed to spawn git: {}", e))?;
-
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin
-                .write_all(patch_content.as_bytes())
-                .map_err(|e| format!("Failed to write to stdin: {}", e))?;
-        }
-
-        let output = child
-            .wait_with_output()
-            .map_err(|e| format!("Failed to wait on git: {}", e))?;
-
-        if !output.status.success() {
-            let err = String::from_utf8_lossy(&output.stderr);
-            return Err(format!("git apply failed: {}", err));
-        }
-
-        Ok(())
+        diff.site.apply_to_index(&patch_content, false)
     }
 
     /// Move to next hunk in patch mode, returns true if there are more hunks
@@ -314,26 +286,7 @@ impl DiffOps for App {
         // Unstage it using git apply --cached --reverse
         let patch_content = format!("{}\n{}\n", hunk.file_header, hunk.hunk_body);
 
-        let result = crate::git::pinned_git(&diff.worktree_path)
-            .and_then(|mut command| {
-                command
-                    .args(["apply", "--cached", "--reverse", "-"])
-                    .stdin(std::process::Stdio::piped())
-                    .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::piped())
-                    .spawn()
-                    .map_err(anyhow::Error::from)
-            })
-            .and_then(|mut child| {
-                if let Some(mut stdin) = child.stdin.take() {
-                    let _ = stdin.write_all(patch_content.as_bytes());
-                }
-                child.wait_with_output().map_err(anyhow::Error::from)
-            });
-
-        if let Ok(output) = result
-            && output.status.success()
-        {
+        if diff.site.apply_to_index(&patch_content, true).is_ok() {
             // Insert the hunk back at the current position
             diff.hunks.insert(diff.current_hunk, hunk);
             diff.hunks_processed = diff.hunks_processed.saturating_sub(1);
@@ -419,7 +372,7 @@ impl DiffOps for App {
             return;
         };
 
-        let path = &agent.path;
+        let site = WorktreeSite::of(agent);
         let pane_id = agent.pane_id.clone();
         let worktree_name = self.extract_worktree_name(agent).0;
 
@@ -427,7 +380,7 @@ impl DiffOps for App {
             // Get the base branch from git status if available, then config, then "main"
             let base = self
                 .git_statuses
-                .get(path)
+                .get(&site.status_key())
                 .map(|s| s.base_branch.as_str())
                 .filter(|b| !b.is_empty())
                 .or_else(|| self.config.main_branch.as_deref().filter(|s| !s.is_empty()))
@@ -445,7 +398,7 @@ impl DiffOps for App {
         // which reloads and parses them on demand via reload_unstaged_diff()
         let include_untracked = !branch_diff;
         let parse_hunks = false;
-        match get_diff_content(path, &diff_arg, include_untracked, parse_hunks) {
+        match site.diff_content(&diff_arg, include_untracked, parse_hunks) {
             Ok((content, lines_added, lines_removed, hunks)) => {
                 let (content, line_count) = if content.trim().is_empty() {
                     let msg = if branch_diff {
@@ -464,7 +417,7 @@ impl DiffOps for App {
                 let mut file_list = if !hunks.is_empty() {
                     extract_file_list(&hunks)
                 } else {
-                    get_file_list_numstat(path, &diff_arg, include_untracked)
+                    site.file_list(&diff_arg, include_untracked)
                 };
                 map_file_offsets(&mut file_list, &parsed_lines);
 
@@ -475,7 +428,7 @@ impl DiffOps for App {
                     line_count,
                     viewport_height: 0, // Will be set by UI
                     title,
-                    worktree_path: path.clone(),
+                    site: site.clone(),
                     pane_id,
                     is_branch_diff: branch_diff,
                     lines_added,
@@ -500,7 +453,7 @@ impl DiffOps for App {
                     line_count: 1,
                     viewport_height: 0,
                     title: "Error".to_string(),
-                    worktree_path: path.clone(),
+                    site: site.clone(),
                     pane_id,
                     is_branch_diff: branch_diff,
                     lines_added: 0,

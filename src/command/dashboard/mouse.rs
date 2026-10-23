@@ -687,7 +687,7 @@ mod tests {
             line_count: 0,
             viewport_height: 20,
             title: "Diff".into(),
-            worktree_path: PathBuf::new(),
+            site: crate::command::dashboard::site::WorktreeSite::Workstation(PathBuf::new()),
             pane_id: String::new(),
             is_branch_diff: false,
             lines_added: 0,

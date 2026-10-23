@@ -43,6 +43,9 @@ impl Handler for RemoteHandler {
                 params,
             )
             .map_err(|error| format!("{error:#}")),
+            super::dashboard::METHOD => {
+                super::dashboard::serve(params).map_err(|error| format!("{error:#}"))
+            }
             "ping" => {
                 let hello = Hello::current();
                 serde_json::to_value(Ping {

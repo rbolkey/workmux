@@ -27,13 +27,14 @@ mod actions;
 pub mod agent;
 mod ansi;
 mod app;
-mod diff;
+pub mod diff;
 mod diff_ops;
 mod keymap;
 mod layout;
 mod mouse;
 mod scope;
 mod settings;
+mod site;
 mod sort;
 pub mod spinner;
 pub mod ui;
@@ -166,7 +167,11 @@ pub fn run(
     // Open diff view for current worktree if requested
     if open_diff && let Some(ref current_path) = app.current_worktree {
         // Find the agent matching the current worktree path
-        if let Some(idx) = app.agents.iter().position(|a| &a.path == current_path) {
+        if let Some(idx) = app
+            .agents
+            .iter()
+            .position(|a| a.remote.is_none() && &a.path == current_path)
+        {
             app.table_state.select(Some(idx));
             app.load_diff(false); // WIP diff (uncommitted changes)
         }

@@ -28,6 +28,7 @@ use crate::state::StateStore;
 use crate::workflow::types::WorktreeInfo;
 
 use super::keymap::Context;
+use super::site::WorktreeSite;
 use super::ui::theme::ThemePalette;
 
 const PR_FETCH_INTERVAL: Duration = Duration::from_secs(30);
@@ -71,7 +72,7 @@ pub struct App {
     pub preview_line_count: u16,
     /// Height of the preview area (updated during rendering)
     pub preview_height: u16,
-    /// Git status for each worktree path
+    /// Git status for each worktree, by `WorktreeSite::status_key`
     pub git_statuses: HashMap<PathBuf, GitStatus>,
     /// Last time git status was fetched (to throttle background fetches)
     last_git_fetch: std::time::Instant,
@@ -89,7 +90,7 @@ pub struct App {
     pub event_tx: mpsc::Sender<AppEvent>,
     /// Cache of repo roots for agent paths
     repo_roots: HashMap<PathBuf, PathBuf>,
-    /// Common Git directory keys for agent paths, separate from checkout roots.
+    /// Repository keys by `WorktreeSite::status_key`, separate from checkout roots.
     repo_keys: HashMap<PathBuf, PathBuf>,
     /// Frame counter for spinner animation (increments each tick)
     pub spinner_frame: u8,
@@ -343,10 +344,23 @@ impl App {
             }
         }
 
+        // A remote agent's repository key needs no git, and its path is not
+        // a workstation path: it never has a workstation repo root.
+        for agent in &self.all_agents {
+            let site = WorktreeSite::of(agent);
+            if site.is_remote()
+                && !self.repo_keys.contains_key(&site.status_key())
+                && let Some(key) = site.repo_key()
+            {
+                self.repo_keys.insert(site.status_key(), key);
+            }
+        }
+
         // Cache repo roots for ALL agents before filtering (project picker needs all projects)
         let paths_to_resolve: Vec<PathBuf> = self
             .all_agents
             .iter()
+            .filter(|a| a.remote.is_none())
             .filter(|a| {
                 !self.repo_roots.contains_key(&a.path) || !self.repo_keys.contains_key(&a.path)
             })

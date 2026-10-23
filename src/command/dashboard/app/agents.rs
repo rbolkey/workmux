@@ -16,6 +16,7 @@ use super::DashboardTab;
 use super::super::agent;
 use super::super::ansi;
 use super::super::settings::{load_last_pane_id, save_hide_stale, save_last_pane_id};
+use super::super::site::WorktreeSite;
 use super::super::sort::SortMode;
 use super::super::spinner::SPINNER_FRAMES;
 use super::App;
@@ -395,9 +396,22 @@ impl App {
         }
     }
 
-    /// Kill a pane and remove it from the agent list.
+    /// Kill a pane and remove it from the agent list. A remote agent's
+    /// remote pane ends too, as closing its window would end it.
     fn do_kill(&mut self, pane_id: &str) {
+        let remote_pane = self
+            .all_agents
+            .iter()
+            .find(|a| a.pane_id == pane_id && a.remote.is_some())
+            .and_then(|agent| Some((WorktreeSite::of(agent), self.remote_pane_of(pane_id)?)));
         let _ = self.mux.kill_pane(pane_id);
+        if let Some((site, remote_pane)) = remote_pane {
+            std::thread::spawn(move || {
+                if let Err(error) = site.kill_remote_pane(remote_pane) {
+                    tracing::warn!(error, "could not end the remote pane");
+                }
+            });
+        }
 
         let selected = self.table_state.selected().unwrap_or(0);
 
@@ -418,6 +432,25 @@ impl App {
         // Force preview refresh for new selection
         self.preview_pane_id = None;
         self.update_preview();
+    }
+
+    /// The remote pane the workstation pane `pane_id` shows.
+    fn remote_pane_of(&self, pane_id: &str) -> Option<crate::remote::pane::RemotePaneId> {
+        if self.mux.name() != "tmux" {
+            return None;
+        }
+        crate::multiplexer::TmuxBackend::for_socket(&self.mux.instance_id())
+            .query(&[
+                "display-message",
+                "-p",
+                "-t",
+                pane_id,
+                &format!("#{{{}}}", crate::remote::forwarded::REMOTE_PANE_TAG),
+            ])
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
     }
 
     /// Send a key to the selected agent's pane
@@ -520,8 +553,9 @@ impl App {
 
     /// Get PR info for an agent by looking up its branch in PR statuses
     pub fn get_pr_for_agent(&self, agent: &AgentPane) -> Option<&PrSummary> {
-        let repo_root = self.repo_keys.get(&agent.path)?;
-        let git_status = self.git_statuses.get(&agent.path)?;
+        let key = WorktreeSite::of(agent).status_key();
+        let repo_root = self.repo_keys.get(&key)?;
+        let git_status = self.git_statuses.get(&key)?;
         let branch = git_status.branch.as_ref()?;
         // Don't show PRs for main/master - you merge INTO main, not FROM it
         if branch == "main" || branch == "master" {
@@ -531,8 +565,9 @@ impl App {
     }
 
     pub fn get_checks_for_agent(&self, agent: &AgentPane) -> Option<&CheckSummary> {
-        let repo_root = self.repo_keys.get(&agent.path)?;
-        let branch = self.git_statuses.get(&agent.path)?.branch.as_ref()?;
+        let key = WorktreeSite::of(agent).status_key();
+        let repo_root = self.repo_keys.get(&key)?;
+        let branch = self.git_statuses.get(&key)?.branch.as_ref()?;
         self.check_statuses
             .get(repo_root)?
             .get(branch)

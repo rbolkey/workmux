@@ -1,12 +1,12 @@
 //! Diff domain types and helper functions.
 
 use ratatui::text::Line;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use super::ansi::{parse_ansi_to_lines, strip_ansi_escapes};
 
 /// A file entry in the diff, used for the sidebar file list
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct FileEntry {
     /// The filename (relative path)
     pub filename: String,
@@ -211,7 +211,7 @@ pub struct DiffView {
     /// Title for the view (e.g., "WIP: fix-bug")
     pub title: String,
     /// Path to the worktree (for commit/merge actions)
-    pub worktree_path: PathBuf,
+    pub site: super::site::WorktreeSite,
     /// Pane ID for sending commands to agent
     pub pane_id: String,
     /// Whether this is a branch diff (true) or uncommitted diff (false)
@@ -652,14 +652,9 @@ pub fn map_file_offsets(file_list: &mut [FileEntry], parsed_lines: &[Line]) {
     file_list.sort_by_key(|f| f.start_line);
 }
 
-/// Get diff content, optionally piped through delta for syntax highlighting
-/// Returns (content, lines_added, lines_removed, hunks)
-pub fn get_diff_content(
-    path: &Path,
-    diff_arg: &str,
-    include_untracked: bool,
-    parse_hunks: bool,
-) -> Result<(String, usize, usize, Vec<DiffHunk>), String> {
+/// The uncolored text of `git diff <diff_arg>` in `path`, followed by the
+/// untracked files as new files when `include_untracked` is set.
+pub fn raw_diff(path: &Path, diff_arg: &str, include_untracked: bool) -> Result<String, String> {
     // Run git diff without color - delta will add syntax highlighting
     let mut cmd =
         crate::git::pinned_git(path).map_err(|e| format!("Cannot validate Git metadata: {e}"))?;
@@ -684,11 +679,21 @@ pub fn get_diff_content(
         }
     }
 
+    Ok(String::from_utf8_lossy(&diff_content).to_string())
+}
+
+/// Colour a raw diff for display, through delta when it is installed.
+/// Returns (content, lines_added, lines_removed, hunks)
+pub fn render_diff(
+    raw_diff: String,
+    parse_hunks: bool,
+) -> Result<(String, usize, usize, Vec<DiffHunk>), String> {
+    let diff_content = raw_diff.as_bytes().to_vec();
+
     // Count stats before any transformation
     let (lines_added, lines_removed) = count_diff_stats(&diff_content);
 
     // Parse hunks from raw diff (before delta processing)
-    let raw_diff = String::from_utf8_lossy(&diff_content).to_string();
     let hunks = if parse_hunks {
         parse_diff_into_hunks(&raw_diff)
     } else {
@@ -784,6 +789,43 @@ pub fn get_untracked_files_diff(path: &Path) -> Result<String, String> {
     }
 
     Ok(result)
+}
+
+/// Stage `patch` in the index of the worktree at `path`, as `git add -p`
+/// would; `reverse` unstages it again.
+pub fn apply_to_index(path: &Path, patch: &str, reverse: bool) -> Result<(), String> {
+    use std::io::Write;
+
+    let args: &[&str] = if reverse {
+        &["apply", "--cached", "--reverse", "-"]
+    } else {
+        &["apply", "--cached", "--recount", "--3way", "-"]
+    };
+    let mut child = crate::git::pinned_git(path)
+        .map_err(|e| format!("Cannot validate Git metadata: {e}"))?
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Failed to spawn git: {}", e))?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(patch.as_bytes())
+            .map_err(|e| format!("Failed to write to stdin: {}", e))?;
+    }
+
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("Failed to wait on git: {}", e))?;
+
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("git apply failed: {}", err));
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

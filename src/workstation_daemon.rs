@@ -95,8 +95,44 @@ fn dispatch(request: &Request) -> Response {
                 Err(error) => Response::err(Some(request.id), format!("{error:#}")),
             }
         }
+        crate::remote::dashboard::DAEMON_METHOD => match remote_dashboard(&request.params) {
+            Ok(result) => Response::ok(request.id, result),
+            Err(error) => Response::err(Some(request.id), format!("{error:#}")),
+        },
         method => Response::err(Some(request.id), format!("unknown method: {method}")),
     }
+}
+
+#[derive(Deserialize)]
+struct DashboardParams {
+    remote: String,
+    project: String,
+    request: crate::remote::dashboard::DashboardRequest,
+    #[serde(default)]
+    connect: bool,
+}
+
+/// Run a dashboard's operation on a remote project over its control channel.
+fn remote_dashboard(params: &Value) -> Result<Value> {
+    let params: DashboardParams = serde_json::from_value(params.clone())?;
+    let project = crate::remote::router::remote_project(
+        &crate::config::Config::load_global_only()?,
+        &params.project,
+    )?;
+    if project.site.remote != params.remote {
+        bail!(
+            "project {} is not on remote {}",
+            params.project,
+            params.remote
+        );
+    }
+    crate::remote::channels().dashboard(
+        &params.remote,
+        &project.remote,
+        &project.site,
+        &params.request,
+        params.connect,
+    )
 }
 
 fn answer(line: &[u8]) -> Response {

@@ -5,21 +5,49 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::git;
+use crate::config::Config;
+use crate::multiplexer::AgentPane;
 use crate::project::Project;
 
+use super::super::site::WorktreeSite;
 use super::App;
 use super::types::AppEvent;
 
-/// Group branches by repository identity while retaining a checkout for gh.
+/// Where GitHub is asked about a repository's branches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PrSource {
+    /// A workstation checkout, whose remotes `gh` resolves.
+    Checkout(PathBuf),
+    /// A remote project's registered git URL, so the answer never needs the
+    /// remote itself, which may be disconnected or stopped.
+    GitUrl(String),
+}
+
+/// Where to ask GitHub about `agent`'s branch, or `None` for a remote
+/// agent whose project has no registered git URL.
+fn pr_source(config: &Config, agent: &AgentPane) -> Option<PrSource> {
+    match WorktreeSite::of(agent) {
+        WorktreeSite::Workstation(path) => Some(PrSource::Checkout(path)),
+        WorktreeSite::Remote {
+            remote, project, ..
+        } => {
+            let entry = config.projects.get(&project)?;
+            (entry.remote.as_deref() == Some(remote.as_str()))
+                .then(|| entry.git_url.clone().map(PrSource::GitUrl))
+                .flatten()
+        }
+    }
+}
+
+/// Group branches by repository identity while retaining where to ask gh.
 fn group_pr_requests<'a>(
-    requests: impl IntoIterator<Item = (&'a PathBuf, &'a PathBuf, &'a str)>,
-) -> HashMap<PathBuf, (PathBuf, Vec<String>)> {
-    let mut grouped: HashMap<PathBuf, (PathBuf, Vec<String>)> = HashMap::new();
-    for (key, path, branch) in requests {
+    requests: impl IntoIterator<Item = (&'a PathBuf, PrSource, &'a str)>,
+) -> HashMap<PathBuf, (PrSource, Vec<String>)> {
+    let mut grouped: HashMap<PathBuf, (PrSource, Vec<String>)> = HashMap::new();
+    for (key, source, branch) in requests {
         let (_, branches) = grouped
             .entry(key.clone())
-            .or_insert_with(|| (path.clone(), Vec::new()));
+            .or_insert_with(|| (source, Vec::new()));
         branches.push(branch.to_string());
     }
     for (_, branches) in grouped.values_mut() {
@@ -44,11 +72,12 @@ impl App {
         let tx = self.event_tx.clone();
         let is_fetching = self.is_git_fetching.clone();
         let main_branch = self.config.main_branch.clone();
-        // Include both agent paths and worktree paths so the worktree view gets git status too
-        let mut paths: Vec<PathBuf> = self.all_agents.iter().map(|a| a.path.clone()).collect();
+        // Include both agent and worktree view worktrees so the worktree view gets git status too
+        let mut sites: Vec<WorktreeSite> = self.all_agents.iter().map(WorktreeSite::of).collect();
         for wt in &self.worktrees {
-            if !paths.contains(&wt.path) {
-                paths.push(wt.path.clone());
+            let site = WorktreeSite::Workstation(wt.path.clone());
+            if !sites.contains(&site) {
+                sites.push(site);
             }
         }
 
@@ -62,9 +91,14 @@ impl App {
             }
             let _reset = ResetFlag(is_fetching);
 
-            for path in paths {
-                let status = git::get_git_status(&path, main_branch.as_deref());
-                let _ = tx.send(AppEvent::GitStatus(path, status));
+            for site in sites {
+                // A remote worktree's own config names its main branch.
+                let main_branch = (!site.is_remote())
+                    .then_some(main_branch.as_deref())
+                    .flatten();
+                if let Some(status) = site.git_status(main_branch) {
+                    let _ = tx.send(AppEvent::GitStatus(site.status_key(), status));
+                }
             }
         });
     }
@@ -82,14 +116,18 @@ impl App {
         }
 
         // Use unfiltered snapshots so filtering cannot omit branches from a fetch.
-        let worktree_requests = self
-            .all_worktrees
-            .iter()
-            .map(|wt| (&wt.repo_key, &wt.path, wt.branch.as_str()));
+        let worktree_requests = self.all_worktrees.iter().map(|wt| {
+            (
+                &wt.repo_key,
+                PrSource::Checkout(wt.path.clone()),
+                wt.branch.as_str(),
+            )
+        });
         let agent_requests = self.all_agents.iter().filter_map(|agent| {
-            let branch = self.git_statuses.get(&agent.path)?.branch.as_deref()?;
-            let key = self.repo_keys.get(&agent.path)?;
-            Some((key, &agent.path, branch))
+            let site = WorktreeSite::of(agent).status_key();
+            let branch = self.git_statuses.get(&site)?.branch.as_deref()?;
+            let key = self.repo_keys.get(&site)?;
+            Some((key, pr_source(&self.config, agent)?, branch))
         });
         let repo_branches = group_pr_requests(worktree_requests.chain(agent_requests));
 
@@ -141,19 +179,27 @@ impl App {
                     let tx = tx.clone();
                     s.spawn(move || {
                         loop {
-                            let Some((repo_key, (checkout, branches))) =
+                            let Some((repo_key, (source, branches))) =
                                 queue.lock().unwrap().pop_front()
                             else {
                                 break;
                             };
-                            match crate::github::list_branch_summaries(&checkout, &branches) {
+                            let summaries = match &source {
+                                PrSource::Checkout(checkout) => {
+                                    crate::github::list_branch_summaries(checkout, &branches)
+                                }
+                                PrSource::GitUrl(url) => {
+                                    crate::github::list_branch_summaries_for_url(url, &branches)
+                                }
+                            };
+                            match summaries {
                                 Ok(summaries) => {
                                     let _ = tx.send(AppEvent::GithubStatus(repo_key, summaries));
                                 }
                                 Err(e) => {
                                     tracing::warn!(
                                         "Failed to fetch GitHub status for {:?}: {}",
-                                        checkout,
+                                        source,
                                         e
                                     );
                                 }
@@ -172,6 +218,10 @@ impl App {
 mod tests {
     use super::*;
 
+    fn checkout(path: &std::path::Path) -> PrSource {
+        PrSource::Checkout(path.to_path_buf())
+    }
+
     #[test]
     fn requests_use_stable_keys_and_checkout_paths_without_main_rows() {
         let key = PathBuf::from("/project/.git");
@@ -179,17 +229,20 @@ mod tests {
         let second = PathBuf::from("/project/worktrees/branch-2");
         let agent = second.join("src");
         let grouped = group_pr_requests([
-            (&key, &first, "branch-1"),
-            (&key, &second, "branch-2"),
-            (&key, &agent, "branch-2"),
+            (&key, checkout(&first), "branch-1"),
+            (&key, checkout(&second), "branch-2"),
+            (&key, checkout(&agent), "branch-2"),
         ]);
         assert_eq!(grouped.len(), 1);
         assert_eq!(
             grouped[&key],
-            (first, vec!["branch-1".into(), "branch-2".into()])
+            (checkout(&first), vec!["branch-1".into(), "branch-2".into()])
         );
-        let refreshed = group_pr_requests([(&key, &second, "branch-2")]);
-        assert_eq!(refreshed[&key], (second, vec!["branch-2".into()]));
+        let refreshed = group_pr_requests([(&key, checkout(&second), "branch-2")]);
+        assert_eq!(
+            refreshed[&key],
+            (checkout(&second), vec!["branch-2".into()])
+        );
     }
 
     #[test]
@@ -199,11 +252,35 @@ mod tests {
         let checkout_a = PathBuf::from("/a/project/worktrees/feature");
         let checkout_b = PathBuf::from("/b/project/worktrees/feature");
         let grouped = group_pr_requests([
-            (&key_a, &checkout_a, "feature"),
-            (&key_b, &checkout_b, "feature"),
+            (&key_a, checkout(&checkout_a), "feature"),
+            (&key_b, checkout(&checkout_b), "feature"),
         ]);
         assert_eq!(grouped.len(), 2);
-        assert_eq!(grouped[&key_a].0, checkout_a);
-        assert_eq!(grouped[&key_b].0, checkout_b);
+        assert_eq!(grouped[&key_a].0, checkout(&checkout_a));
+        assert_eq!(grouped[&key_b].0, checkout(&checkout_b));
+    }
+
+    #[test]
+    fn a_remote_agents_pr_status_is_asked_by_its_registered_git_url() {
+        let config: Config = serde_yaml::from_str(
+            "remotes:\n  devbox:\n    transport: ssh\n    target: devbox\n\
+             projects:\n  api:\n    remote: devbox\n    git_url: git@github.com:me/api.git\n",
+        )
+        .unwrap();
+        // The remote worktree's path is also a checkout on the workstation.
+        let temp = tempfile::tempdir().unwrap();
+        crate::test_support::init_repo(temp.path());
+        let agent = |remote| crate::command::dashboard::site::tests::agent(temp.path(), remote);
+
+        assert_eq!(
+            pr_source(&config, &agent(Some(("devbox", "api")))),
+            Some(PrSource::GitUrl("git@github.com:me/api.git".to_string()))
+        );
+        // A project registered on another remote is not this agent's.
+        assert_eq!(pr_source(&config, &agent(Some(("other", "api")))), None);
+        assert_eq!(
+            pr_source(&config, &agent(None)),
+            Some(PrSource::Checkout(temp.path().to_path_buf()))
+        );
     }
 }
