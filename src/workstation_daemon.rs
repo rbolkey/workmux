@@ -142,48 +142,42 @@ fn write_message(writer: &mut impl Write, message: &impl Serialize) -> Result<()
 /// Serve request/response calls on one client connection until it closes.
 ///
 /// `first_line` is a request already read off the stream while the daemon
-/// was deciding what kind of client connected.
+/// was deciding what kind of client connected. A command session takes the
+/// rest of the connection.
 pub(crate) fn serve_requests(stream: UnixStream, first_line: Option<Vec<u8>>) -> Result<()> {
     let mut writer = stream.try_clone()?;
     let mut reader = BufReader::new(stream);
     // Pane holds this client took; released when it disconnects.
     let mut holds = Vec::new();
-    if let Some(line) = first_line {
-        respond(&mut writer, &line, &mut holds)?;
-    }
-    while let Some(line) = read_line(&mut reader)? {
+    let mut next = first_line;
+    loop {
+        let line = match next.take() {
+            Some(line) => line,
+            None => match read_line(&mut reader)? {
+                Some(line) => line,
+                None => return Ok(()),
+            },
+        };
         if line.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-        respond(&mut writer, &line, &mut holds)?;
-    }
-    Ok(())
-}
-
-/// Answer one request line. A command session streams its output as
-/// notifications before the response; a pane hold lasts as long as the
-/// client's connection.
-fn respond(
-    writer: &mut impl Write,
-    line: &[u8],
-    holds: &mut Vec<crate::remote::channels::PaneHold>,
-) -> Result<()> {
-    match serde_json::from_slice::<Request>(line) {
-        Ok(request) if request.method == COMMAND_SESSION_METHOD => {
-            let response = command_session(&request, writer);
-            write_message(writer, &response)
+        match serde_json::from_slice::<Request>(&line) {
+            Ok(request) if request.method == COMMAND_SESSION_METHOD => {
+                let response = command_session(&request, reader, &mut writer);
+                return write_message(&mut writer, &response);
+            }
+            Ok(request) if request.method == PANE_HOLD_METHOD => {
+                let response = match pane_hold(&request) {
+                    Ok(hold) => {
+                        holds.push(hold);
+                        Response::ok(request.id, Value::Null)
+                    }
+                    Err(error) => Response::err(Some(request.id), format!("{error:#}")),
+                };
+                write_message(&mut writer, &response)?;
+            }
+            _ => write_message(&mut writer, &answer(&line))?,
         }
-        Ok(request) if request.method == PANE_HOLD_METHOD => {
-            let response = match pane_hold(&request) {
-                Ok(hold) => {
-                    holds.push(hold);
-                    Response::ok(request.id, Value::Null)
-                }
-                Err(error) => Response::err(Some(request.id), format!("{error:#}")),
-            };
-            write_message(writer, &response)
-        }
-        _ => write_message(writer, &answer(line)),
     }
 }
 
@@ -231,7 +225,15 @@ pub fn hold_for_pane(socket: &Path, remote: &str) -> Result<UnixStream> {
 }
 
 /// Method that runs a command session on a remote: `{remote, request}`.
+/// The daemon streams the command's output as `command.output`
+/// notifications and asks for a prompt's answer with a `command.prompt`
+/// notification, which the client answers with a `command.answer`
+/// notification `{line}`. The client closing the connection cancels the
+/// command.
 pub const COMMAND_SESSION_METHOD: &str = "command.session";
+
+/// Notification a command session's client sends with a prompt's answer.
+pub const ANSWER_METHOD: &str = "command.answer";
 
 /// A notification the daemon sends a client before its response.
 #[derive(Debug, Serialize, Deserialize)]
@@ -249,8 +251,79 @@ struct CommandSessionParams {
     invocation: crate::multiplexer::InvocationContext,
 }
 
-fn command_session(request: &Request, writer: &mut impl Write) -> Response {
-    let mut run = || -> Result<Value> {
+/// The terminal of a command session run for a client of the daemon.
+struct ClientTerminal<'a, W: Write> {
+    writer: &'a mut W,
+    answers: std::sync::mpsc::Receiver<Option<String>>,
+    /// Set once the client has gone away.
+    gone: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl<W: Write> ClientTerminal<'_, W> {
+    fn notify(&mut self, method: &str, params: Value) {
+        let notification = Notification {
+            method: method.to_string(),
+            params,
+        };
+        if write_message(self.writer, &notification).is_err() {
+            self.gone.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+impl<W: Write> crate::remote::session::Terminal for ClientTerminal<'_, W> {
+    fn output(&mut self, stream: crate::remote::session::Stream, data: &[u8]) {
+        if self.cancelled() {
+            return;
+        }
+        self.notify(
+            crate::remote::session::OUTPUT_METHOD,
+            serde_json::to_value(crate::remote::session::OutputParams::new(0, stream, data))
+                .expect("serializes"),
+        );
+    }
+
+    fn read_line(&mut self) -> Result<Option<String>> {
+        if self.cancelled() {
+            return Ok(None);
+        }
+        self.notify(crate::remote::session::PROMPT_METHOD, Value::Null);
+        Ok(self.answers.recv().unwrap_or(None))
+    }
+
+    fn cancelled(&self) -> bool {
+        self.gone.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// Read a command session client's answers until it closes the
+/// connection, which marks it `gone`.
+fn read_answers(
+    mut reader: BufReader<UnixStream>,
+    answers: std::sync::mpsc::Sender<Option<String>>,
+    gone: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    while let Ok(Some(line)) = read_line(&mut reader) {
+        match serde_json::from_slice::<Notification>(&line) {
+            Ok(notification) if notification.method == ANSWER_METHOD => {
+                let answer =
+                    serde_json::from_value::<crate::remote::session::Answer>(notification.params)
+                        .map(|answer| answer.line)
+                        .unwrap_or(None);
+                let _ = answers.send(answer);
+            }
+            _ => tracing::warn!("ignoring an unexpected line from a command session client"),
+        }
+    }
+    gone.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn command_session(
+    request: &Request,
+    reader: BufReader<UnixStream>,
+    writer: &mut impl Write,
+) -> Response {
+    let run = || -> Result<Value> {
         let params: CommandSessionParams = serde_json::from_value(request.params.clone())?;
         let project = crate::remote::router::remote_project(
             &crate::config::Config::load_global_only()?,
@@ -263,26 +336,22 @@ fn command_session(request: &Request, writer: &mut impl Write) -> Response {
                 params.remote
             );
         }
-        let mut client_gone = false;
+        let gone = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (answered, answers) = std::sync::mpsc::channel();
+        {
+            let gone = gone.clone();
+            std::thread::spawn(move || read_answers(reader, answered, gone));
+        }
+        // A client that has gone away cancels the command.
         let exit_code = crate::remote::channels().run_command(
             &params.remote,
             &project.remote,
             &params.request,
             &params.invocation,
-            &mut |stream, data| {
-                // A client that has gone away stops reading; the command
-                // still runs to completion.
-                if client_gone {
-                    return;
-                }
-                let notification = Notification {
-                    method: crate::remote::session::OUTPUT_METHOD.to_string(),
-                    params: serde_json::to_value(crate::remote::session::OutputParams::new(
-                        0, stream, data,
-                    ))
-                    .expect("serializes"),
-                };
-                client_gone = write_message(writer, &notification).is_err();
+            &mut ClientTerminal {
+                writer: &mut *writer,
+                answers,
+                gone,
             },
         )?;
         Ok(serde_json::json!({ "exit_code": exit_code }))
@@ -306,18 +375,19 @@ pub fn call_with_timeout(
     params: Value,
     timeout: Duration,
 ) -> Result<Value> {
-    call_streaming(socket, method, params, Some(timeout), &mut |_, _| {})
+    call_streaming(socket, method, params, Some(timeout), &mut |_, _| None)
 }
 
 /// Make one call, passing each notification the daemon sends before its
-/// response to `on_notification`. `timeout` bounds each wait for a line;
+/// response to `on_notification`; what it returns is sent back as an
+/// `ANSWER_METHOD` notification. `timeout` bounds each wait for a line;
 /// `None` waits as long as the call runs.
 pub fn call_streaming(
     socket: &Path,
     method: &str,
     params: Value,
     timeout: Option<Duration>,
-    on_notification: &mut dyn FnMut(&str, Value),
+    on_notification: &mut dyn FnMut(&str, Value) -> Option<Value>,
 ) -> Result<Value> {
     let stream = UnixStream::connect(socket)
         .with_context(|| format!("connect to workstation daemon at {}", socket.display()))?;
@@ -339,7 +409,15 @@ pub fn call_streaming(
         let line = read_line(&mut reader)?
             .ok_or_else(|| anyhow!("workstation daemon closed the connection without answering"))?;
         if let Ok(notification) = serde_json::from_slice::<Notification>(&line) {
-            on_notification(&notification.method, notification.params);
+            if let Some(answer) = on_notification(&notification.method, notification.params) {
+                write_message(
+                    &mut writer,
+                    &Notification {
+                        method: ANSWER_METHOD.to_string(),
+                        params: answer,
+                    },
+                )?;
+            }
             continue;
         }
         break serde_json::from_slice::<Response>(&line)

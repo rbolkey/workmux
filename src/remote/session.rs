@@ -1,10 +1,13 @@
 //! Command sessions: one command relayed to a remote, with its streamed
-//! output and exit code.
+//! output, confirmation prompts, cancellation and exit code.
 //!
 //! The workstation sends `command.run` over the control channel. Remote
 //! workmux clones the project on first use, runs the command in the
 //! project's clone and streams its stdout and stderr back as
 //! `command.output` notifications before answering with the exit code.
+//! When the command reads an answer to a prompt, it sends `command.prompt`
+//! through the forwarding socket and the workstation reads the line from
+//! the invoking terminal. `command.cancel` interrupts the command.
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
@@ -14,9 +17,9 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use super::channel::Peer;
@@ -29,6 +32,21 @@ pub const RUN_METHOD: &str = "command.run";
 
 /// Notification carrying a chunk of a command session's output.
 pub const OUTPUT_METHOD: &str = "command.output";
+
+/// Request from a command on the remote for one line the user types in
+/// the invoking terminal: `{session}`, answered with `{line}`, where a
+/// `null` line is the end of input.
+pub const PROMPT_METHOD: &str = "command.prompt";
+
+/// Notification asking remote workmux to interrupt a running command.
+pub const CANCEL_METHOD: &str = "command.cancel";
+
+/// How long a cancelled command has to exit after its interrupt before it
+/// is killed.
+const CANCEL_GRACE: Duration = Duration::from_secs(5);
+
+/// How often a running session checks whether it was cancelled.
+const CANCEL_POLL: Duration = Duration::from_millis(100);
 
 /// How long a command session may run.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(7 * 24 * 3600);
@@ -103,9 +121,46 @@ pub struct Exit {
     pub exit_code: i32,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SessionParams {
+    pub session: u64,
+}
+
+/// A line read in answer to a prompt; `None` at the end of input.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Answer {
+    pub line: Option<String>,
+}
+
+/// Where a command session's output goes, where its prompts are answered,
+/// and whether the user has cancelled it.
+pub trait Terminal {
+    fn output(&mut self, stream: Stream, data: &[u8]);
+
+    /// One line the user types in answer to a prompt; `None` at the end of
+    /// input.
+    fn read_line(&mut self) -> Result<Option<String>>;
+
+    fn cancelled(&self) -> bool {
+        false
+    }
+}
+
+/// An output-only terminal: prompts read the end of input.
+impl<F: FnMut(Stream, &[u8])> Terminal for F {
+    fn output(&mut self, stream: Stream, data: &[u8]) {
+        self(stream, data)
+    }
+
+    fn read_line(&mut self) -> Result<Option<String>> {
+        Ok(None)
+    }
+}
+
 /// What a running session hands back to the workstation caller.
 enum Event {
     Output(Stream, Vec<u8>),
+    Prompt(mpsc::SyncSender<Option<String>>),
     Exit(Result<Value>),
 }
 
@@ -167,15 +222,31 @@ impl Sessions {
         }
     }
 
+    /// Read one line from the terminal of open session `id`, for a prompt
+    /// of the command it runs.
+    pub fn prompt(&self, id: u64) -> Result<Option<String>> {
+        let (reply, answer) = mpsc::sync_channel(1);
+        self.open
+            .lock()
+            .unwrap()
+            .get(&id)
+            .ok_or_else(|| anyhow!("no command session {id}"))?
+            .events
+            .send(Event::Prompt(reply))
+            .map_err(|_| anyhow!("command session {id} has ended"))?;
+        Ok(answer.recv().unwrap_or(None))
+    }
+
     /// Run `request` on the remote at the other end of `peer`, passing its
-    /// output to `sink` as it arrives. Requests the command forwards are
-    /// answered from `invocation`. Returns the command's exit code.
+    /// output to `terminal` as it arrives and reading its prompts' answers
+    /// there. Requests the command forwards are answered from
+    /// `invocation`. Returns the command's exit code.
     pub fn run(
         &self,
         peer: &Peer,
         request: &CommandRequest,
         invocation: &InvocationContext,
-        sink: &mut dyn FnMut(Stream, &[u8]),
+        terminal: &mut dyn Terminal,
     ) -> Result<i32> {
         let (session, sender, events) = self.open(SessionScope {
             remote: request.project.remote.clone(),
@@ -186,18 +257,36 @@ impl Sessions {
             session,
             request: request.clone(),
         })?;
-        let peer = peer.clone();
+        let requester = peer.clone();
         // The answer follows every output notification on the channel, so
         // the exit arrives after the last chunk.
         std::thread::spawn(move || {
-            let answer = peer.request(RUN_METHOD, params, COMMAND_TIMEOUT);
+            let answer = requester.request(RUN_METHOD, params, COMMAND_TIMEOUT);
             let _ = sender.send(Event::Exit(answer));
         });
+        let mut cancel_sent = false;
         let answer = loop {
-            match events.recv() {
-                Ok(Event::Output(stream, data)) => sink(stream, &data),
+            if !cancel_sent && terminal.cancelled() {
+                cancel_sent = true;
+                let _ = peer.notify(
+                    CANCEL_METHOD,
+                    serde_json::to_value(SessionParams { session }).expect("serializes"),
+                );
+            }
+            match events.recv_timeout(CANCEL_POLL) {
+                Ok(Event::Output(stream, data)) => terminal.output(stream, &data),
+                Ok(Event::Prompt(reply)) => {
+                    let line = terminal.read_line().unwrap_or_else(|error| {
+                        tracing::warn!(error = %format!("{error:#}"), "reading a prompt answer");
+                        None
+                    });
+                    let _ = reply.send(line);
+                }
                 Ok(Event::Exit(answer)) => break answer,
-                Err(_) => break Err(anyhow!("command session ended without an exit code")),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    break Err(anyhow!("command session ended without an exit code"));
+                }
             }
         };
         self.close(session);
@@ -206,12 +295,78 @@ impl Sessions {
     }
 }
 
+/// The commands remote workmux is running, by command session, so they
+/// can be cancelled.
+#[derive(Clone, Default)]
+pub struct Running {
+    groups: Arc<Mutex<HashMap<u64, i32>>>,
+}
+
+impl Running {
+    /// Interrupt the command of `session` and everything it started, and
+    /// kill them if they are still running after a grace period.
+    pub fn cancel(&self, session: u64) {
+        let Some(group) = self.groups.lock().unwrap().get(&session).copied() else {
+            return;
+        };
+        tracing::info!(session, "cancelling command session");
+        signal_group(group, libc::SIGINT);
+        let groups = self.groups.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(CANCEL_GRACE);
+            if groups.lock().unwrap().get(&session) == Some(&group) {
+                signal_group(group, libc::SIGKILL);
+            }
+        });
+    }
+
+    /// Interrupt every running command, as when the control channel
+    /// closes, and kill what is left after the grace period.
+    pub fn shut_down(&self) {
+        let groups: Vec<i32> = self.groups.lock().unwrap().values().copied().collect();
+        if groups.is_empty() {
+            return;
+        }
+        tracing::info!(count = groups.len(), "cancelling running command sessions");
+        for &group in &groups {
+            signal_group(group, libc::SIGINT);
+        }
+        let deadline = std::time::Instant::now() + CANCEL_GRACE;
+        while std::time::Instant::now() < deadline && !self.groups.lock().unwrap().is_empty() {
+            std::thread::sleep(CANCEL_POLL);
+        }
+        for group in self.groups.lock().unwrap().values() {
+            signal_group(*group, libc::SIGKILL);
+        }
+    }
+
+    fn start(&self, session: u64, group: i32) {
+        self.groups.lock().unwrap().insert(session, group);
+    }
+
+    fn end(&self, session: u64) {
+        self.groups.lock().unwrap().remove(&session);
+    }
+}
+
+fn signal_group(group: i32, signal: i32) {
+    unsafe {
+        libc::killpg(group, signal);
+    }
+}
+
 /// Remote workmux's side of `command.run`: run the command, streaming its
 /// output over `peer`, and answer with its exit code.
-pub fn serve_run(peer: &Peer, forwarding_socket: Option<&Path>, params: Value) -> Result<Value> {
+pub fn serve_run(
+    peer: &Peer,
+    forwarding_socket: Option<&Path>,
+    running: &Running,
+    params: Value,
+) -> Result<Value> {
     let RunParams { session, request } = serde_json::from_value(params)?;
     let forwarding = forwarding_socket.map(|socket| Forwarding { socket, session });
-    let exit_code = run_on_remote(&request, forwarding, &|stream, data| {
+    let tracked = Tracked { running, session };
+    let exit_code = run_on_remote(&request, forwarding, Some(tracked), &|stream, data| {
         let _ = peer.notify(
             OUTPUT_METHOD,
             serde_json::to_value(OutputParams::new(session, stream, data)).expect("serializes"),
@@ -231,24 +386,42 @@ fn clone_path(path: &str) -> Result<PathBuf> {
     })
 }
 
+/// A command session whose command can be cancelled while it runs.
+#[derive(Clone, Copy)]
+pub struct Tracked<'a> {
+    pub running: &'a Running,
+    pub session: u64,
+}
+
 fn run_streamed(
     mut command: Command,
+    tracked: Option<Tracked>,
     emit: &(dyn Fn(Stream, &[u8]) + Sync),
 ) -> Result<std::process::ExitStatus> {
+    use std::os::unix::process::CommandExt;
     let program = command.get_program().to_string_lossy().into_owned();
+    // Its own process group, so cancelling reaches the hooks it runs too.
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .process_group(0)
         .spawn()
         .with_context(|| format!("failed to run {program}"))?;
+    if let Some(tracked) = tracked {
+        tracked.running.start(tracked.session, child.id() as i32);
+    }
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
     std::thread::scope(|scope| {
         scope.spawn(|| relay(stdout, Stream::Stdout, emit));
         scope.spawn(|| relay(stderr, Stream::Stderr, emit));
     });
-    Ok(child.wait()?)
+    let status = child.wait();
+    if let Some(tracked) = tracked {
+        tracked.running.end(tracked.session);
+    }
+    Ok(status?)
 }
 
 fn relay(mut from: impl Read, stream: Stream, emit: &(dyn Fn(Stream, &[u8]) + Sync)) {
@@ -273,6 +446,7 @@ fn exit_code(status: std::process::ExitStatus) -> i32 {
 fn ensure_cloned(
     project: &ProjectSite,
     path: &Path,
+    tracked: Option<Tracked>,
     emit: &(dyn Fn(Stream, &[u8]) + Sync),
 ) -> Result<()> {
     if path.exists() {
@@ -301,7 +475,7 @@ fn ensure_cloned(
     );
     let mut clone = crate::git::unattended_git(None)?;
     clone.arg("clone").arg("--quiet").arg(git_url).arg(path);
-    let status = run_streamed(clone, emit)?;
+    let status = run_streamed(clone, tracked, emit)?;
     if !status.success() {
         bail!("git clone of {git_url} into {} failed", path.display());
     }
@@ -321,10 +495,11 @@ pub struct Forwarding<'a> {
 pub fn run_on_remote(
     request: &CommandRequest,
     forwarding: Option<Forwarding>,
+    tracked: Option<Tracked>,
     emit: &(dyn Fn(Stream, &[u8]) + Sync),
 ) -> Result<i32> {
     let path = clone_path(&request.project.path)?;
-    ensure_cloned(&request.project, &path, emit)?;
+    ensure_cloned(&request.project, &path, tracked, emit)?;
     let (program, args) = request
         .argv
         .split_first()
@@ -348,7 +523,7 @@ pub fn run_on_remote(
             .env(forwarding::SOCKET_ENV, forwarding.socket)
             .env(forwarding::SESSION_ENV, forwarding.session.to_string());
     }
-    Ok(exit_code(run_streamed(command, emit)?))
+    Ok(exit_code(run_streamed(command, tracked, emit)?))
 }
 
 /// The remote project a command runs for, when remote workmux runs it in
@@ -424,7 +599,7 @@ mod tests {
             &remote(),
             request,
             &InvocationContext::default(),
-            &mut |stream, data| {
+            &mut |stream, data: &[u8]| {
                 let text = String::from_utf8_lossy(data);
                 match stream {
                     Stream::Stdout => {
@@ -457,6 +632,126 @@ mod tests {
         assert_eq!(exit.unwrap(), 3);
         assert_eq!(captured.stdout, "started\n");
         assert_eq!(captured.stderr, "failed\n");
+    }
+
+    /// A terminal whose user presses Ctrl-C once the command has printed
+    /// `started`.
+    #[derive(Default)]
+    struct Interrupting {
+        stdout: String,
+    }
+
+    impl Terminal for Interrupting {
+        fn output(&mut self, stream: Stream, data: &[u8]) {
+            if stream == Stream::Stdout {
+                self.stdout.push_str(&String::from_utf8_lossy(data));
+            }
+        }
+
+        fn read_line(&mut self) -> Result<Option<String>> {
+            Ok(None)
+        }
+
+        fn cancelled(&self) -> bool {
+            self.stdout.contains("started")
+        }
+    }
+
+    fn running(pid: &str) -> bool {
+        unsafe { libc::kill(pid.trim().parse().unwrap(), 0) == 0 }
+    }
+
+    #[test]
+    fn cancelling_interrupts_the_command_and_what_it_started() {
+        let project = tempfile::tempdir().unwrap();
+        let pid_file = project.path().join("hook.pid");
+        // A hook the command started, still running when the user cancels.
+        let script = "sleep 30 & echo $! > hook.pid; echo started; wait";
+        let started = std::time::Instant::now();
+
+        let exit = channels().run_command(
+            "devbox",
+            &remote(),
+            &request(project.path(), None, script),
+            &InvocationContext::default(),
+            &mut Interrupting::default(),
+        );
+
+        assert_eq!(exit.unwrap(), 130);
+        assert!(started.elapsed() < Duration::from_secs(10));
+        let hook = std::fs::read_to_string(&pid_file).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while running(&hook) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!running(&hook), "the hook outlived the cancelled command");
+    }
+
+    const PROMPT_CHILD: &str = "remote::session::tests::prompt_child";
+
+    #[test]
+    #[ignore = "runs as a command in a command session"]
+    fn prompt_child() {
+        if crate::test_support::is_isolated_child(PROMPT_CHILD) {
+            let answer = crate::ui::confirm::read_answer().unwrap();
+            println!("answer: {}", answer.trim());
+        }
+    }
+
+    /// A terminal whose user types `line` at every prompt.
+    struct Typing {
+        line: &'static str,
+        stdout: String,
+        prompts: usize,
+    }
+
+    impl Terminal for Typing {
+        fn output(&mut self, stream: Stream, data: &[u8]) {
+            if stream == Stream::Stdout {
+                self.stdout.push_str(&String::from_utf8_lossy(data));
+            }
+        }
+
+        fn read_line(&mut self) -> Result<Option<String>> {
+            self.prompts += 1;
+            Ok(Some(self.line.to_string()))
+        }
+    }
+
+    #[test]
+    fn a_prompt_of_the_remote_command_is_answered_in_the_invoking_terminal() {
+        let project = tempfile::tempdir().unwrap();
+        let mut request = request(project.path(), None, "");
+        request.argv = vec![
+            "env".to_string(),
+            format!("{}={PROMPT_CHILD}", crate::test_support::ISOLATED_TEST_ENV),
+            std::env::current_exe().unwrap().display().to_string(),
+            PROMPT_CHILD.to_string(),
+            "--exact".to_string(),
+            "--ignored".to_string(),
+            "--nocapture".to_string(),
+        ];
+        let mut terminal = Typing {
+            line: "y\n",
+            stdout: String::new(),
+            prompts: 0,
+        };
+
+        let exit = channels().run_command(
+            "devbox",
+            &remote(),
+            &request,
+            &InvocationContext::default(),
+            &mut terminal,
+        );
+
+        assert_eq!(exit.unwrap(), 0, "{}", terminal.stdout);
+        assert_eq!(terminal.prompts, 1);
+        assert!(
+            terminal.stdout.contains("answer: y\n"),
+            "{}",
+            terminal.stdout
+        );
     }
 
     #[test]

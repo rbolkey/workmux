@@ -23,10 +23,11 @@ use std::time::Duration;
 
 use super::channel::Peer;
 use super::pane::{RemotePaneId, SessionHolder};
+use super::session;
 use crate::config::SplitDirection;
 use crate::multiplexer::types::{
     CreateSessionParams, CreateWindowInSessionParams, CreateWindowParams, LivePaneInfo,
-    WindowTarget,
+    OwnedWindowTarget, WindowTarget,
 };
 use crate::multiplexer::{Multiplexer, util};
 
@@ -128,6 +129,15 @@ pub enum MuxRequest {
     KillWindow {
         name: String,
     },
+    OwnedWindowTargets {
+        token: String,
+    },
+    KillWindowTarget {
+        target: WindowTarget,
+    },
+    WindowTargetExists {
+        target: WindowTarget,
+    },
     KillSession {
         name: String,
     },
@@ -144,14 +154,25 @@ pub const SESSION_ENV: &str = "WORKMUX_COMMAND_SESSION";
 /// How long one forwarded request may take.
 const FORWARD_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// One line a command sends to `remote serve`'s forwarding socket.
+/// How long a prompt waits for the user's answer.
+const PROMPT_TIMEOUT: Duration = Duration::from_secs(24 * 3600);
+
+/// Params of a forwarded multiplexer request.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Forwarded {
     pub session: u64,
     pub request: MuxRequest,
 }
 
-/// `remote serve`'s answer to a [`Forwarded`] line.
+/// One line a command sends to `remote serve`'s forwarding socket: a
+/// request for the workstation.
+#[derive(Debug, Serialize, Deserialize)]
+struct SocketRequest {
+    method: String,
+    params: Value,
+}
+
+/// `remote serve`'s answer to a [`SocketRequest`] line.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum Reply {
@@ -197,9 +218,16 @@ fn relay(stream: UnixStream, peer: &Peer) {
     };
     for line in BufReader::new(stream).lines() {
         let Ok(line) = line else { break };
-        let reply = serde_json::from_str::<Value>(&line)
+        let reply = serde_json::from_str::<SocketRequest>(&line)
             .map_err(anyhow::Error::from)
-            .and_then(|params| peer.request(FORWARD_METHOD, params, FORWARD_TIMEOUT));
+            .and_then(|SocketRequest { method, params }| {
+                let timeout = match method.as_str() {
+                    FORWARD_METHOD => FORWARD_TIMEOUT,
+                    session::PROMPT_METHOD => PROMPT_TIMEOUT,
+                    method => bail!("unknown method: {method}"),
+                };
+                peer.request(&method, params, timeout)
+            });
         let reply = match reply {
             Ok(value) => Reply::Result(value),
             Err(error) => Reply::Error(format!("{error:#}")),
@@ -256,6 +284,28 @@ impl ForwardingMux {
     }
 
     fn call(&self, request: MuxRequest) -> Result<Value> {
+        self.request(
+            FORWARD_METHOD,
+            serde_json::to_value(Forwarded {
+                session: self.session,
+                request,
+            })?,
+        )
+    }
+
+    /// Read one line the user types in the terminal on the workstation the
+    /// command session was invoked from; `None` at the end of input.
+    pub fn read_line(&self) -> Result<Option<String>> {
+        let answer: session::Answer = serde_json::from_value(self.request(
+            session::PROMPT_METHOD,
+            serde_json::to_value(session::SessionParams {
+                session: self.session,
+            })?,
+        )?)?;
+        Ok(answer.line)
+    }
+
+    fn request(&self, method: &str, params: Value) -> Result<Value> {
         let mut connection = self.connection.lock().unwrap();
         if connection.is_none() {
             let stream = UnixStream::connect(&self.socket)
@@ -266,9 +316,9 @@ impl ForwardingMux {
             });
         }
         let open = connection.as_mut().expect("connected");
-        let mut line = serde_json::to_string(&Forwarded {
-            session: self.session,
-            request,
+        let mut line = serde_json::to_string(&SocketRequest {
+            method: method.to_string(),
+            params,
         })?;
         line.push('\n');
         let mut reply = String::new();
@@ -292,6 +342,18 @@ impl ForwardingMux {
 
     fn act(&self, request: MuxRequest) -> Result<()> {
         self.call(request).map(drop)
+    }
+
+    /// Forward a kill, then end the remote panes the killed workstation
+    /// panes showed.
+    fn kill(&self, request: MuxRequest) -> Result<()> {
+        let ended: Vec<RemotePaneId> = self.get(request)?;
+        for pane in ended {
+            if let Err(error) = self.holder.kill(&pane) {
+                tracing::warn!(%pane, error = %format!("{error:#}"), "failed to end remote pane");
+            }
+        }
+        Ok(())
     }
 
     /// Start `command` (else a login shell) in a new remote pane in
@@ -411,14 +473,32 @@ impl Multiplexer for ForwardingMux {
     }
 
     fn kill_session(&self, full_name: &str) -> Result<()> {
-        self.act(MuxRequest::KillSession {
+        self.kill(MuxRequest::KillSession {
             name: full_name.to_string(),
         })
     }
 
     fn kill_window(&self, full_name: &str) -> Result<()> {
-        self.act(MuxRequest::KillWindow {
+        self.kill(MuxRequest::KillWindow {
             name: full_name.to_string(),
+        })
+    }
+
+    fn kill_window_target(&self, target: &WindowTarget) -> Result<()> {
+        self.kill(MuxRequest::KillWindowTarget {
+            target: target.clone(),
+        })
+    }
+
+    fn window_target_exists(&self, target: &WindowTarget) -> Result<bool> {
+        self.get(MuxRequest::WindowTargetExists {
+            target: target.clone(),
+        })
+    }
+
+    fn owned_window_targets(&self, token: &str) -> Result<Vec<OwnedWindowTarget>> {
+        self.get(MuxRequest::OwnedWindowTargets {
+            token: token.to_string(),
         })
     }
 
@@ -511,7 +591,7 @@ impl Multiplexer for ForwardingMux {
     }
 
     fn kill_pane(&self, pane_id: &str) -> Result<()> {
-        self.act(MuxRequest::KillPane {
+        self.kill(MuxRequest::KillPane {
             pane_id: pane_id.to_string(),
         })
     }
@@ -696,7 +776,7 @@ mod tests {
                 &remote(),
                 &request,
                 &invocation,
-                &mut |stream, data| {
+                &mut |stream, data: &[u8]| {
                     if stream == Stream::Stdout {
                         let _ = env.send(String::from_utf8_lossy(data).into_owned());
                     }
@@ -793,7 +873,10 @@ mod tests {
         assert_eq!(holder.state(&shell).unwrap(), PaneState::Ended);
         let agent: RemotePaneId = "api/feature/1".parse().unwrap();
         assert_eq!(holder.state(&agent).unwrap(), PaneState::Running);
-        holder.kill(&agent).unwrap();
+
+        // Killing the window's session ends the remote panes it showed.
+        mux.kill_session("api").unwrap();
+        assert_eq!(holder.state(&agent).unwrap(), PaneState::Ended);
         std::fs::write(&release, "").unwrap();
         assert_eq!(session.join().unwrap().unwrap(), 0);
     }

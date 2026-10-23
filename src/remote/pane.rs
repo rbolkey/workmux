@@ -260,9 +260,7 @@ impl SessionHolder {
                 .filter(|pid| *pid > 0);
             match pid {
                 Some(pid) => break pid,
-                None if Instant::now() < deadline
-                    && self.state(id)? == PaneState::Running =>
-                {
+                None if Instant::now() < deadline && self.state(id)? == PaneState::Running => {
                     std::thread::sleep(Duration::from_millis(20));
                 }
                 None => return Ok(()),

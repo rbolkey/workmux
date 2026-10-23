@@ -25,6 +25,10 @@ pub const SESSION_TAG: &str = "@workmux_project";
 /// Window option naming the project a workstation window belongs to.
 pub const WINDOW_TAG: &str = "@workmux_project_window";
 
+/// Pane option naming the remote pane a workstation pane shows.
+pub const REMOTE_PANE_TAG: &str = "@workmux_remote_pane";
+const REMOTE_PANE_FORMAT: &str = "#{@workmux_remote_pane}";
+
 /// What the workstation knows about a command session that forwards
 /// multiplexer requests.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -160,14 +164,16 @@ impl Workstation<'_> {
                 pane,
             } => {
                 self.check_pane(&target_pane_id)?;
-                json!(tmux.split_pane(
+                let pane_id = tmux.split_pane(
                     &target_pane_id,
                     &direction,
                     &workstation_dir(),
                     size,
                     percentage,
-                    Some(&self.attach_line(&pane))
-                )?)
+                    Some(&self.attach_line(&pane)),
+                )?;
+                self.tag_remote_pane(&pane_id, &pane)?;
+                json!(pane_id)
             }
             MuxRequest::SetWindowOwnership {
                 pane_id,
@@ -201,9 +207,42 @@ impl Workstation<'_> {
             }
             MuxRequest::KillWindow { name } => {
                 let window = self.window_named(&name)?;
+                let ended =
+                    self.remote_panes(&["list-panes", "-t", &window, "-F", REMOTE_PANE_FORMAT])?;
                 tmux.query(&["kill-window", "-t", &window])?;
-                Value::Null
+                json!(ended)
             }
+            MuxRequest::OwnedWindowTargets { token } => {
+                let owned = tmux.owned_window_targets(&token)?;
+                json!(
+                    owned
+                        .into_iter()
+                        .filter(|owned| owned
+                            .target
+                            .window_id
+                            .as_deref()
+                            .is_some_and(|id| self.check_window(id).is_ok()))
+                        .collect::<Vec<_>>()
+                )
+            }
+            MuxRequest::KillWindowTarget { target } => {
+                let window = match &target.window_id {
+                    Some(id) => {
+                        self.check_window(id)?;
+                        id.clone()
+                    }
+                    None => self.window_named(&target.full_name)?,
+                };
+                let ended =
+                    self.remote_panes(&["list-panes", "-t", &window, "-F", REMOTE_PANE_FORMAT])?;
+                tmux.query(&["kill-window", "-t", &window])?;
+                json!(ended)
+            }
+            MuxRequest::WindowTargetExists { target } => json!(match &target.window_id {
+                // Another remote's windows are not even reported.
+                Some(id) => tmux.window_target_exists(&target)? && self.check_window(id).is_ok(),
+                None => self.window_named(&target.full_name).is_ok(),
+            }),
             MuxRequest::SwitchToSession { name } => {
                 self.check_session(&name)?;
                 self.switch_invoking_clients(&name)?;
@@ -211,7 +250,16 @@ impl Workstation<'_> {
             }
             MuxRequest::KillSession { name } => {
                 self.check_session(&name)?;
-                json!(tmux.kill_session(&name)?)
+                let ended = self.remote_panes(&[
+                    "list-panes",
+                    "-s",
+                    "-t",
+                    &name,
+                    "-F",
+                    REMOTE_PANE_FORMAT,
+                ])?;
+                tmux.kill_session(&name)?;
+                json!(ended)
             }
             MuxRequest::SendText { pane_id, text } => {
                 self.check_pane(&pane_id)?;
@@ -239,7 +287,15 @@ impl Workstation<'_> {
             }
             MuxRequest::KillPane { pane_id } => {
                 self.check_pane(&pane_id)?;
-                json!(tmux.kill_pane(&pane_id)?)
+                let ended = self.remote_panes(&[
+                    "display-message",
+                    "-p",
+                    "-t",
+                    &pane_id,
+                    REMOTE_PANE_FORMAT,
+                ])?;
+                tmux.kill_pane(&pane_id)?;
+                json!(ended)
             }
         })
     }
@@ -349,8 +405,34 @@ impl Workstation<'_> {
     }
 
     fn attach(&self, pane_id: &str, pane: &RemotePaneId) -> Result<String> {
-        self.tmux
-            .respawn_pane(pane_id, &workstation_dir(), Some(&self.attach_line(pane)))
+        let pane_id =
+            self.tmux
+                .respawn_pane(pane_id, &workstation_dir(), Some(&self.attach_line(pane)))?;
+        self.tag_remote_pane(&pane_id, pane)?;
+        Ok(pane_id)
+    }
+
+    fn tag_remote_pane(&self, pane_id: &str, pane: &RemotePaneId) -> Result<()> {
+        self.tmux.query(&[
+            "set-option",
+            "-pq",
+            "-t",
+            pane_id,
+            REMOTE_PANE_TAG,
+            &pane.to_string(),
+        ])?;
+        Ok(())
+    }
+
+    /// The remote panes shown in the panes `query` prints
+    /// [`REMOTE_PANE_FORMAT`] for: what a kill leaves for the remote to end.
+    fn remote_panes(&self, query: &[&str]) -> Result<Vec<RemotePaneId>> {
+        Ok(self
+            .tmux
+            .query(query)?
+            .lines()
+            .filter_map(|line| line.trim().parse().ok())
+            .collect())
     }
 
     /// The shell command line a workstation pane runs to show `pane`.
@@ -393,6 +475,7 @@ fn workstation_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::multiplexer::types::{OwnedWindowTarget, WindowTarget};
     use crate::test_support::PrivateTmuxServer;
     use std::os::unix::fs::PermissionsExt;
     use std::time::{Duration, Instant};
@@ -607,6 +690,108 @@ mod tests {
             ws.tmux(&["display-message", "-p", "-t", &others_pane, "#{pane_id}"]),
             others_pane
         );
+    }
+
+    #[test]
+    fn a_remote_finds_and_kills_only_its_own_owned_windows() {
+        let Some(ws) = Workstation::start() else {
+            return;
+        };
+        let invoking = ws.server.new_session("mine", ws.remote_root.path());
+        let owned_window = |remote: &str, session: &str| {
+            let scope = ws.scope(remote, session, &invoking);
+            let pane_id = pane(
+                ws.ask(
+                    &scope,
+                    MuxRequest::CreateSession {
+                        name: session.to_string(),
+                        initial_window_name: Some("wm-feature".to_string()),
+                        pane: remote_pane(),
+                    },
+                )
+                .unwrap(),
+            );
+            ws.ask(
+                &scope,
+                MuxRequest::SetWindowOwnership {
+                    pane_id: pane_id.clone(),
+                    token: "token".to_string(),
+                    is_primary: true,
+                },
+            )
+            .unwrap();
+            ws.tmux(&["display-message", "-p", "-t", &pane_id, "#{window_id}"])
+        };
+        let others = owned_window("other", "web");
+        let ours = owned_window("devbox", "api");
+        let scope = ws.scope("devbox", "api", &invoking);
+
+        let owned: Vec<OwnedWindowTarget> = serde_json::from_value(
+            ws.ask(
+                &scope,
+                MuxRequest::OwnedWindowTargets {
+                    token: "token".to_string(),
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            owned,
+            vec![OwnedWindowTarget {
+                target: WindowTarget::with_id(
+                    "wm-feature".to_string(),
+                    Some("api".to_string()),
+                    ours.clone()
+                ),
+                is_primary: true,
+            }]
+        );
+        let exists = |target: &WindowTarget| {
+            ws.ask(
+                &scope,
+                MuxRequest::WindowTargetExists {
+                    target: target.clone(),
+                },
+            )
+            .unwrap()
+        };
+        let others_target = WindowTarget::with_id(
+            "wm-feature".to_string(),
+            Some("web".to_string()),
+            others.clone(),
+        );
+        assert_eq!(exists(&owned[0].target), json!(true));
+        assert_eq!(exists(&others_target), json!(false));
+        let error = ws
+            .ask(
+                &scope,
+                MuxRequest::KillWindowTarget {
+                    target: WindowTarget::with_id(
+                        "wm-feature".to_string(),
+                        Some("web".to_string()),
+                        others.clone(),
+                    ),
+                },
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("does not belong to a project on remote devbox"),
+            "{error}"
+        );
+        ws.ask(
+            &scope,
+            MuxRequest::KillWindowTarget {
+                target: owned[0].target.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(exists(&owned[0].target), json!(false));
+        let windows = ws.tmux(&["list-windows", "-a", "-F", "#{window_id}"]);
+        assert!(!windows.lines().any(|id| id == ours), "{windows}");
+        assert!(windows.lines().any(|id| id == others), "{windows}");
     }
 
     #[test]
