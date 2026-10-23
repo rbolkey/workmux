@@ -336,7 +336,7 @@ impl App {
                 .unwrap_or_default()
                 .as_secs();
             // Ignore stale runtime state (daemon not running for >15s)
-            if now.saturating_sub(runtime.updated_ts) <= 15 {
+            if runtime.is_fresh(now) {
                 self.interrupted_pane_ids = runtime.interrupted_pane_ids;
             } else {
                 self.interrupted_pane_ids.clear();

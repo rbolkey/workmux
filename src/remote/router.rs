@@ -266,6 +266,12 @@ pub fn capture(project: &RemoteProject, argv: &[&str]) -> Result<(i32, Vec<u8>)>
     Ok((exit, stdout))
 }
 
+/// Run `argv` for `project` on its remote, discarding its output. Returns
+/// its exit code.
+pub fn quietly(project: &RemoteProject, argv: &[&str]) -> Result<i32> {
+    session(project, argv, &mut Invoking { output: |_, _: &[u8]| {} })
+}
+
 /// This command's own arguments, for relaying to remote workmux: `workmux`
 /// and the arguments it was run with, less `--project`.
 pub fn relayed_argv() -> Vec<String> {
