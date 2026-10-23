@@ -150,15 +150,13 @@ fn lima_version_gte(a: &str, b: &str) -> bool {
 
 /// Calculate the standard worktrees directory for a project.
 fn calc_worktrees_dir(project_root: &Path) -> Result<PathBuf> {
-    let project_name = project_root
-        .file_name()
-        .ok_or_else(|| anyhow::anyhow!("Invalid project path"))?
-        .to_string_lossy();
+    let project = crate::project::Project::from_main_worktree_root(project_root)
+        .ok_or_else(|| anyhow::anyhow!("Invalid project path"))?;
 
     let worktrees_dir = project_root
         .parent()
         .ok_or_else(|| anyhow::anyhow!("No parent directory"))?
-        .join(format!("{}__worktrees", project_name));
+        .join(format!("{}__worktrees", project.name));
 
     Ok(worktrees_dir)
 }

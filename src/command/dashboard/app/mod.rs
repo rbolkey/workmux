@@ -23,6 +23,7 @@ use crate::config::Config;
 use crate::git::{self, GitStatus};
 use crate::github::{CheckSummary, PrSummary};
 use crate::multiplexer::{AgentPane, Multiplexer};
+use crate::project::Project;
 use crate::state::StateStore;
 use crate::workflow::types::WorktreeInfo;
 
@@ -359,7 +360,7 @@ impl App {
                 .map(|path| {
                     std::thread::spawn(move || {
                         let root = git::get_repo_root_for(&path).ok();
-                        let key = git::get_repository_key_in(Some(&path)).ok();
+                        let key = Project::of_workstation_path(&path).cache_key(&path).ok();
                         (path, root, key)
                     })
                 })

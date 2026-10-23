@@ -9,6 +9,7 @@ use ratatui::style::Style;
 
 use crate::github::{CheckSummary, PrSummary};
 use crate::multiplexer::{AgentPane, AgentStatus};
+use crate::project::Project;
 
 use super::DashboardTab;
 
@@ -41,7 +42,7 @@ impl App {
             let filter_lower = self.filter_text.to_lowercase();
             let window_prefix = self.config.window_prefix();
             self.agents.retain(|a| {
-                let project = Self::extract_project_name(a).to_lowercase();
+                let project = Self::project(a).name.to_lowercase();
                 let (worktree, _) = agent::extract_worktree_name(
                     &a.session,
                     &a.window_name,
@@ -186,9 +187,8 @@ impl App {
             }
             SortMode::Project => {
                 // Sort by project name first, then by status priority within each project
-                self.agents.sort_by_cached_key(|a| {
-                    (Self::extract_project_name(a), get_priority(a), pane_num(a))
-                });
+                self.agents
+                    .sort_by_cached_key(|a| (Self::project(a), get_priority(a), pane_num(a)));
             }
             SortMode::Recency => {
                 self.agents
@@ -514,8 +514,8 @@ impl App {
         )
     }
 
-    pub fn extract_project_name(agent_pane: &AgentPane) -> String {
-        agent::extract_project_name(&agent_pane.path)
+    pub fn project(agent_pane: &AgentPane) -> Project {
+        Project::of_workstation_path(&agent_pane.path)
     }
 
     /// Get PR info for an agent by looking up its branch in PR statuses

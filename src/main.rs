@@ -18,6 +18,7 @@ mod markdown;
 mod multiplexer;
 mod naming;
 mod nerdfont;
+mod project;
 mod prompt;
 mod sandbox;
 mod shell;
@@ -41,13 +42,14 @@ use tracing::{error, info};
 
 fn main() -> Result<()> {
     logger::init()?;
-    let context = LogContext::current();
+    // Capture the invocation context before any command can change the cwd.
+    let context = multiplexer::InvocationContext::current();
     let args = std::env::args().collect::<Vec<_>>();
     let deferred_cleanup_worker = args.get(1).is_some_and(|arg| arg == "_deferred-cleanup");
     info!(
         args = ?args,
         cwd = ?context.cwd,
-        tmux_pane = ?context.tmux_pane,
+        tmux_pane = ?context.pane_id,
         "workmux start"
     );
 
@@ -55,7 +57,7 @@ fn main() -> Result<()> {
         Ok(result) => {
             info!(
                 cwd = ?context.cwd,
-                tmux_pane = ?context.tmux_pane,
+                tmux_pane = ?context.pane_id,
                 "workmux finished successfully"
             );
             Ok(result)
@@ -65,20 +67,6 @@ fn main() -> Result<()> {
                 error!(error = ?err, "workmux failed");
             }
             Err(err)
-        }
-    }
-}
-
-struct LogContext {
-    cwd: Option<std::path::PathBuf>,
-    tmux_pane: Option<String>,
-}
-
-impl LogContext {
-    fn current() -> Self {
-        Self {
-            cwd: std::env::current_dir().ok(),
-            tmux_pane: std::env::var("TMUX_PANE").ok(),
         }
     }
 }

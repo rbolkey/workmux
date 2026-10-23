@@ -930,7 +930,9 @@ fn github_fetch_due(branch_set_changed: bool, elapsed: Duration) -> bool {
 }
 
 fn github_repo_key(path: &Path) -> Option<PathBuf> {
-    crate::git::get_repository_key_in(Some(path)).ok()
+    crate::project::Project::of_workstation_path(path)
+        .cache_key(path)
+        .ok()
 }
 
 fn group_github_branches(
