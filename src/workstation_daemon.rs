@@ -4,7 +4,7 @@
 //! snapshot pushes; CLI commands make request/response calls in
 //! newline-delimited JSON with a JSON-RPC-shaped envelope (ADR 0001).
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Write};
@@ -184,20 +184,32 @@ struct Notification {
 struct CommandSessionParams {
     remote: String,
     request: crate::remote::session::CommandRequest,
+    /// Where the command was run from on the workstation.
+    #[serde(default)]
+    invocation: crate::multiplexer::InvocationContext,
 }
 
 fn command_session(request: &Request, writer: &mut impl Write) -> Response {
     let mut run = || -> Result<Value> {
         let params: CommandSessionParams = serde_json::from_value(request.params.clone())?;
-        let remotes = crate::remote::registry::remotes()?;
-        let remote = remotes
-            .get(&params.remote)
-            .ok_or_else(|| anyhow!("no remote named {}", params.remote))?;
+        let project = crate::remote::router::remote_project(
+            &crate::config::Config::load_global_only()?,
+            &params.request.project.name,
+        )?;
+        if project.site.remote != params.remote || params.request.project.remote != params.remote
+        {
+            bail!(
+                "project {} is not on remote {}",
+                params.request.project.name,
+                params.remote
+            );
+        }
         let mut client_gone = false;
         let exit_code = crate::remote::channels().run_command(
             &params.remote,
-            remote,
+            &project.remote,
             &params.request,
+            &params.invocation,
             &mut |stream, data| {
                 // A client that has gone away stops reading; the command
                 // still runs to completion.

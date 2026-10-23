@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 use super::session::{CommandRequest, OutputParams, ProjectSite, Stream};
 use crate::config::{Config, RemoteConfig};
-use crate::multiplexer::{create_backend, detect_backend};
+use crate::multiplexer::{InvocationContext, create_backend, detect_backend};
 use crate::project::Project;
 
 /// A project registered on a remote, resolved from global config.
@@ -101,6 +101,7 @@ fn session(
             &project.site.remote,
             &project.remote,
             &request,
+            InvocationContext::current(),
             sink,
         );
     };
@@ -108,7 +109,11 @@ fn session(
     let result = crate::workstation_daemon::call_streaming(
         &socket,
         crate::workstation_daemon::COMMAND_SESSION_METHOD,
-        serde_json::json!({ "remote": project.site.remote, "request": request }),
+        serde_json::json!({
+            "remote": project.site.remote,
+            "request": request,
+            "invocation": InvocationContext::current(),
+        }),
         None,
         &mut |method, params| {
             if method != super::session::OUTPUT_METHOD {

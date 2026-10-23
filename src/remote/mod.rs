@@ -4,6 +4,8 @@
 pub mod channel;
 pub mod channels;
 pub mod connection;
+pub mod forwarded;
+pub mod forwarding;
 pub mod handshake;
 pub mod registry;
 pub mod router;
