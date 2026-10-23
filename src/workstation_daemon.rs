@@ -105,12 +105,15 @@ fn answer(line: &[u8]) -> Response {
 /// Returns `Ok(None)` at a clean end of stream.
 pub(crate) fn read_line(reader: &mut impl BufRead) -> Result<Option<Vec<u8>>> {
     let mut line = Vec::new();
-    let read = std::io::Read::take(reader, MAX_LINE_BYTES as u64 + 1).read_until(b'\n', &mut line)?;
+    let read =
+        std::io::Read::take(reader, MAX_LINE_BYTES as u64 + 1).read_until(b'\n', &mut line)?;
     if read == 0 {
         return Ok(None);
     }
     if line.len() > MAX_LINE_BYTES {
-        return Err(anyhow!("workstation daemon line exceeds {MAX_LINE_BYTES} bytes"));
+        return Err(anyhow!(
+            "workstation daemon line exceeds {MAX_LINE_BYTES} bytes"
+        ));
     }
     if line.last() == Some(&b'\n') {
         line.pop();
@@ -165,8 +168,8 @@ pub fn call(socket: &Path, method: &str, params: Value) -> Result<Value> {
     )?;
     let line = read_line(&mut reader)?
         .ok_or_else(|| anyhow!("workstation daemon closed the connection without answering"))?;
-    let response: Response = serde_json::from_slice(&line)
-        .context("workstation daemon sent an unreadable response")?;
+    let response: Response =
+        serde_json::from_slice(&line).context("workstation daemon sent an unreadable response")?;
     if response.id != Some(id) {
         return Err(anyhow!(
             "workstation daemon answered request {:?}, expected {id}",
@@ -208,7 +211,9 @@ pub(crate) fn classify(stream: &UnixStream) -> Result<Connection> {
             Ok(0) => return Err(anyhow!("client closed before sending a request")),
             Ok(_) if byte[0] == b'\n' => break,
             Ok(_) if line.len() >= MAX_LINE_BYTES => {
-                return Err(anyhow!("workstation daemon line exceeds {MAX_LINE_BYTES} bytes"));
+                return Err(anyhow!(
+                    "workstation daemon line exceeds {MAX_LINE_BYTES} bytes"
+                ));
             }
             Ok(_) => line.push(byte[0]),
             Err(error)
@@ -390,10 +395,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("daemon.sock");
 
-        let error =
-            ensure_running_at(&socket, || Ok(()), Duration::from_millis(100)).unwrap_err();
+        let error = ensure_running_at(&socket, || Ok(()), Duration::from_millis(100)).unwrap_err();
 
-        assert!(error.to_string().contains("workstation daemon failed to start"));
+        assert!(
+            error
+                .to_string()
+                .contains("workstation daemon failed to start")
+        );
     }
 
     #[test]
