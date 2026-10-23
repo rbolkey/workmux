@@ -2300,6 +2300,7 @@ pub fn run() -> Result<()> {
     let mut scheduler = Scheduler::new(Instant::now());
     let mut inactivity_tracker = InactivityTracker::new(Duration::from_secs(10));
     let mut last_interrupted: HashSet<String> = HashSet::new();
+    let mut last_connected: HashSet<String> = HashSet::new();
     let backend_name = mux.name().to_string();
     let store = StateStore::new()?;
     let mut agent_state_cache = crate::state::AgentStateCache::default();
@@ -2467,6 +2468,7 @@ pub fn run() -> Result<()> {
                 },
                 &mut inactivity_tracker,
                 &last_interrupted,
+                &last_connected,
                 &status_icons,
                 false,
             );
@@ -2475,6 +2477,7 @@ pub fn run() -> Result<()> {
                 scheduler.finish_heartbeat(Instant::now(), true);
             }
             last_interrupted = output.next_interrupted;
+            last_connected = output.connected_remotes;
             output.snapshot.config_version = config_version.load(Ordering::Relaxed);
             server.broadcast(&output.snapshot);
 
@@ -2558,6 +2561,7 @@ pub fn run() -> Result<()> {
                         &instance_id,
                         &crate::state::RuntimeState {
                             interrupted_pane_ids: last_interrupted.clone(),
+                            connected_remotes: last_connected.clone(),
                             updated_ts: SystemTime::now()
                                 .duration_since(UNIX_EPOCH)
                                 .unwrap_or_default()
@@ -2655,6 +2659,8 @@ struct TickOutput {
     /// The new interrupted set. Caller should commit to `last_interrupted`
     /// only after side effects are applied successfully.
     next_interrupted: HashSet<String>,
+    /// Remotes whose agents are not stale: the daemon holds their channel.
+    connected_remotes: HashSet<String>,
 }
 
 /// Compute one daemon tick from in-memory inputs.
@@ -2667,6 +2673,7 @@ fn compute_tick(
     input: TickInput,
     tracker: &mut InactivityTracker,
     last_interrupted: &HashSet<String>,
+    last_connected: &HashSet<String>,
     status_icons: &crate::config::StatusIcons,
     heartbeat_due: bool,
 ) -> TickOutput {
@@ -2709,6 +2716,14 @@ fn compute_tick(
         }
     }
 
+    // Remotes whose agents are not stale, before the snapshot filters any.
+    let connected_remotes: HashSet<String> = agents
+        .iter()
+        .filter_map(|agent| agent.remote.as_ref())
+        .filter(|remote| !remote.stale)
+        .map(|remote| remote.remote.clone())
+        .collect();
+
     // Phase 3: Build snapshot from already-mutated agents. Interruption is
     // known from phase 1, so priority ordering sees the same state clients do.
     let snapshot = build_snapshot(SnapshotInputs {
@@ -2735,10 +2750,15 @@ fn compute_tick(
         interrupted_pane_ids: interrupted.clone(),
     });
 
-    // Phase 4: Determine runtime write side effect
-    let runtime_write = if interrupted != *last_interrupted || heartbeat_due {
+    // Phase 4: Determine runtime write side effect. Commands outside the
+    // daemon read the connected remotes from it to tell stale entries apart.
+    let runtime_write = if interrupted != *last_interrupted
+        || connected_remotes != *last_connected
+        || heartbeat_due
+    {
         Some(crate::state::RuntimeState {
             interrupted_pane_ids: interrupted.clone(),
+            connected_remotes: connected_remotes.clone(),
             updated_ts: now_ts,
         })
     } else {
@@ -2750,6 +2770,7 @@ fn compute_tick(
         agent_writes,
         runtime_write,
         next_interrupted: interrupted,
+        connected_remotes,
     }
 }
 
@@ -4789,6 +4810,48 @@ mod tests {
             store.upsert_agent(&state).unwrap();
         }
 
+        fn tick_input(
+            agents: Vec<crate::multiplexer::AgentPane>,
+            captures: HashMap<String, String>,
+            now: Instant,
+            now_ts: u64,
+        ) -> TickInput {
+            TickInput {
+                agents,
+                tmux_state: TmuxState {
+                    live_panes: HashMap::new(),
+                    window_statuses: HashMap::new(),
+                    active_windows: HashSet::new(),
+                    pane_window_ids: HashMap::new(),
+                    pane_window_indexes: HashMap::new(),
+                    active_pane_ids: HashSet::new(),
+                    window_pane_counts: HashMap::new(),
+                    server_boot_id: None,
+                    position: None,
+                    layout: None,
+                    filter: None,
+                    sleeping_panes: None,
+                    group_by: None,
+                    expanded_groups: None,
+                },
+                captured_panes: captures,
+                sort: crate::config::SidebarSort::default(),
+                group_by: None,
+                collapse_stale: false,
+                stale_threshold_secs: crate::command::sidebar::snapshot::STALE_THRESHOLD_SECS,
+                expanded_groups: Vec::new(),
+                now,
+                now_ts,
+                position: SidebarPosition::Left,
+                layout_mode: SidebarLayoutMode::default(),
+                filter_mode: SidebarFilterMode::default(),
+                git_statuses: HashMap::new(),
+                pr_statuses: HashMap::new(),
+                check_statuses: HashMap::new(),
+                sleeping_pane_ids: HashSet::new(),
+            }
+        }
+
         fn do_tick(
             tracker: &mut InactivityTracker,
             last: &mut HashSet<String>,
@@ -4798,42 +4861,10 @@ mod tests {
             now_ts: u64,
         ) -> TickOutput {
             let output = compute_tick(
-                TickInput {
-                    agents,
-                    tmux_state: TmuxState {
-                        live_panes: HashMap::new(),
-                        window_statuses: HashMap::new(),
-                        active_windows: HashSet::new(),
-                        pane_window_ids: HashMap::new(),
-                        pane_window_indexes: HashMap::new(),
-                        active_pane_ids: HashSet::new(),
-                        window_pane_counts: HashMap::new(),
-                        server_boot_id: None,
-                        position: None,
-                        layout: None,
-                        filter: None,
-                        sleeping_panes: None,
-                        group_by: None,
-                        expanded_groups: None,
-                    },
-                    captured_panes: captures,
-                    sort: crate::config::SidebarSort::default(),
-                    group_by: None,
-                    collapse_stale: false,
-                    stale_threshold_secs: crate::command::sidebar::snapshot::STALE_THRESHOLD_SECS,
-                    expanded_groups: Vec::new(),
-                    now,
-                    now_ts,
-                    position: SidebarPosition::Left,
-                    layout_mode: SidebarLayoutMode::default(),
-                    filter_mode: SidebarFilterMode::default(),
-                    git_statuses: HashMap::new(),
-                    pr_statuses: HashMap::new(),
-                    check_statuses: HashMap::new(),
-                    sleeping_pane_ids: HashSet::new(),
-                },
+                tick_input(agents, captures, now, now_ts),
                 tracker,
                 last,
+                &HashSet::new(),
                 &StatusIcons::default(),
                 false,
             );
@@ -4861,6 +4892,7 @@ mod tests {
             remote.remote = Some(crate::multiplexer::RemoteAgentPane {
                 remote: "devbox".to_string(),
                 project: "api".to_string(),
+                worktree: "feature".to_string(),
                 stale: true,
             });
             let agents = vec![working_agent("%1", 1), remote];
@@ -4887,6 +4919,67 @@ mod tests {
             assert!(output.snapshot.stale_pane_ids.contains("%2"));
             let shown = output.snapshot.agents.iter().find(|a| a.pane_id == "%2");
             assert_eq!(shown.unwrap().status, Some(AgentStatus::Working));
+        }
+
+        #[test]
+        fn the_runtime_file_records_which_remotes_are_connected() {
+            let mut tracker = InactivityTracker::new(Duration::from_secs(10));
+            let remote_agent = |pane: &str, remote: &str, stale: bool| {
+                let mut agent = working_agent(pane, 1);
+                agent.remote = Some(crate::multiplexer::RemoteAgentPane {
+                    remote: remote.to_string(),
+                    project: "api".to_string(),
+                    worktree: "feature".to_string(),
+                    stale,
+                });
+                agent
+            };
+            let connected = HashSet::from(["devbox".to_string()]);
+            let t0 = Instant::now();
+            let tick = |tracker: &mut InactivityTracker, stale: bool, last: &HashSet<String>| {
+                compute_tick(
+                    tick_input(
+                        vec![
+                            working_agent("%1", 1),
+                            remote_agent("%2", "devbox", stale),
+                            remote_agent("%3", "other", true),
+                        ],
+                        HashMap::new(),
+                        t0,
+                        100,
+                    ),
+                    tracker,
+                    &HashSet::new(),
+                    last,
+                    &StatusIcons::default(),
+                    false,
+                )
+            };
+
+            let output = tick(&mut tracker, false, &HashSet::new());
+            assert_eq!(output.connected_remotes, connected);
+            assert_eq!(
+                output
+                    .runtime_write
+                    .map(|runtime| runtime.connected_remotes),
+                Some(connected.clone())
+            );
+
+            // Unchanged, and no heartbeat due: nothing to write.
+            assert!(
+                tick(&mut tracker, false, &connected)
+                    .runtime_write
+                    .is_none()
+            );
+
+            // The channel drops: written at once, not at the next heartbeat.
+            let output = tick(&mut tracker, true, &connected);
+            assert_eq!(
+                output
+                    .runtime_write
+                    .map(|runtime| runtime.connected_remotes),
+                Some(HashSet::new())
+            );
         }
 
         #[test]

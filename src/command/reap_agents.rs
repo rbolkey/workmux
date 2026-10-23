@@ -317,6 +317,7 @@ mod tests {
         remote.remote = Some(crate::multiplexer::types::RemoteAgentPane {
             remote: "lb".to_string(),
             project: "api".to_string(),
+            worktree: "feature".to_string(),
             stale: false,
         });
         let agents = vec![agent("%1", Some(100), None), remote];

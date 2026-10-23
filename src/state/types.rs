@@ -192,6 +192,7 @@ impl AgentState {
             remote: self.remote.as_ref().map(|remote| RemoteAgentPane {
                 remote: remote.remote.clone(),
                 project: remote.pane.project.clone(),
+                worktree: remote.pane.worktree.clone(),
                 stale: false,
             }),
         }
@@ -285,9 +286,30 @@ pub struct RuntimeState {
     #[serde(default)]
     pub interrupted_pane_ids: std::collections::HashSet<String>,
 
+    /// Remotes whose control channel the daemon holds. A remote agent of any
+    /// other remote is stale.
+    #[serde(default)]
+    pub connected_remotes: std::collections::HashSet<String>,
+
     /// Unix timestamp when this file was last written.
     /// Consumers should ignore the file if this is too old (daemon not running).
     pub updated_ts: u64,
+}
+
+impl RuntimeState {
+    /// How long the file stays current without a write: the daemon rewrites
+    /// it on a 10 s heartbeat.
+    pub const FRESH_SECS: u64 = 15;
+
+    /// Whether a daemon wrote this file recently enough to still be running.
+    pub fn is_fresh(&self, now: u64) -> bool {
+        now.saturating_sub(self.updated_ts) <= Self::FRESH_SECS
+    }
+
+    /// Whether a running daemon holds `remote`'s control channel.
+    pub fn holds_channel(&self, remote: &str, now: u64) -> bool {
+        self.is_fresh(now) && self.connected_remotes.contains(remote)
+    }
 }
 
 #[cfg(test)]

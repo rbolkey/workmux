@@ -777,6 +777,7 @@ mod tests {
         remote.remote = Some(crate::multiplexer::RemoteAgentPane {
             remote: "devbox".to_string(),
             project: "api".to_string(),
+            worktree: "feature".to_string(),
             stale: false,
         });
 
