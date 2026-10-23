@@ -1651,10 +1651,11 @@ def test_reap_agents_reaps_aged_agents_on_the_remote(
     short_tmp: dict,
     remote_root: Path,
 ):
-    """`reap-agents` lists, and with --force exits, agents on a remote whose
-    terminal has been idle past the threshold, reporting them as it does
-    local ones. A recently active agent is left alone, and a reaped agent's
-    pane stays open."""
+    """`reap-agents` lists, and with --force exits, agents on a remote that
+    have been idle past the threshold, reporting them as it does local ones.
+    An agent's age comes from its status file (ticket 11) when its hooks
+    wrote one, else from its terminal's idle time. A recently active agent
+    is left alone, and a reaped agent's pane stays open."""
     env = mux_server
     assert isinstance(env, TmuxEnvironment)
     started = remote_root / "agent.pids"
@@ -1666,6 +1667,7 @@ def test_reap_agents_reaps_aged_agents_on_the_remote(
         env.tmp_path / "origin",
         f"agent: {agent}\npanes:\n  - command: <agent>\n",
     )
+    status_dir = remote_root / "home" / ".local" / "state" / "workmux" / "status"
 
     def wm(command):
         return run_workmux_command(
@@ -1677,45 +1679,77 @@ def test_reap_agents_reaps_aged_agents_on_the_remote(
             timeout=60.0,
         )
 
-    def agent_pids(count: int) -> list[int]:
+    def add_agent(name: str) -> int:
+        count = len(started.read_text().split()) if started.exists() else 0
+        wm(f"add {name} --project api")
         wait_until(
-            lambda: started.exists() and len(started.read_text().split()) == count,
-            f"{count} agent(s) to start",
+            lambda: started.exists() and len(started.read_text().split()) > count,
+            f"agent {name} to start",
         )
-        return [int(pid) for pid in started.read_text().split()]
+        return int(started.read_text().split()[-1])
+
+    def idle_terminal(pid: int, since: float):
+        tty = subprocess.run(
+            ["ps", "-o", "tty=", "-p", str(pid)], capture_output=True, text=True
+        ).stdout.strip()
+        os.utime(f"/dev/{tty}", (since, since))
+
+    def status_file(worktree: str, status: str, event_ts: float):
+        pane = tmux_value(env, f"=api:wm-{worktree}", "#{@workmux_remote_pane}")
+        slot = pane.rsplit("/", 1)[1]
+        path = status_dir / "api" / worktree / f"{slot}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "pane": pane,
+                    "status": status,
+                    "event_ts": int(event_ts),
+                    "work_gen": 1,
+                }
+            )
+        )
 
     wm(f"remote add lb --transport loopback --target {remote_root}")
     wm(f"project add api --remote lb --repo {origin} --path code/api")
     daemon_pid = None
     try:
-        wm("add old --project api")
+        busy = add_agent("busy")
         daemon_pid = remote_daemon_ping(env, workmux_exe_path, repo_path, short_tmp)[
             "pid"
         ]
-        [old] = agent_pids(1)
-        wm("add fresh --project api")
-        fresh = agent_pids(2)[1]
+        finished = add_agent("finished")
+        unhooked = add_agent("unhooked")
         env.tmux(["select-window", "-t", env.runner_pane_id or "test:0"])
-        # The old agent's terminal was last used two hours ago.
         time.sleep(0.5)
-        tty = subprocess.run(
-            ["ps", "-o", "tty=", "-p", str(old)], capture_output=True, text=True
-        ).stdout.strip()
-        two_hours_ago = time.time() - 2 * 3600
-        os.utime(f"/dev/{tty}", (two_hours_ago, two_hours_ago))
+        now = time.time()
+        two_hours_ago = now - 2 * 3600
+        # Its status is recent though its terminal is quiet: not reaped.
+        idle_terminal(busy, two_hours_ago)
+        status_file("busy", "working", now)
+        # Done two hours ago by its status, though its terminal is fresh.
+        status_file("finished", "done", two_hours_ago)
+        # No hooks: its terminal was last used two hours ago.
+        idle_terminal(unhooked, two_hours_ago)
 
         listed = wm("reap-agents --hours 1")
         assert "api (on lb):" in listed.stdout
-        assert "Would exit api/old/" in listed.stdout
-        assert "in old (2h" in listed.stdout and "fake-agent" in listed.stdout
-        assert "fresh" not in listed.stdout
-        assert pid_alive(old)
+        assert "Would exit api/finished/" in listed.stdout
+        assert "in finished (2h, done, fake-agent)" in listed.stdout
+        assert "Would exit api/unhooked/" in listed.stdout
+        assert "in unhooked (2h, unknown, fake-agent)" in listed.stdout
+        assert "busy" not in listed.stdout
+        assert pid_alive(finished) and pid_alive(unhooked)
 
         reaped = wm("reap-agents --hours 1 --force")
-        assert "Exited api/old/" in reaped.stdout
-        wait_until(lambda: not pid_alive(old), "the old agent to exit")
-        assert pid_alive(fresh)
-        assert tmux_value(env, "=api:wm-old", "#{window_name}") == "wm-old"
+        assert "Exited api/finished/" in reaped.stdout
+        assert "Exited api/unhooked/" in reaped.stdout
+        wait_until(
+            lambda: not pid_alive(finished) and not pid_alive(unhooked),
+            "the idle agents to exit",
+        )
+        assert pid_alive(busy)
+        assert tmux_value(env, "=api:wm-finished", "#{window_name}") == "wm-finished"
     finally:
         for pid in started.read_text().split() if started.exists() else []:
             try:

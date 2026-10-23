@@ -26,32 +26,35 @@ pub fn run(older_than_secs: u64, force: bool) -> Result<()> {
     Ok(())
 }
 
-/// Reap, on a remote, the served project's agents whose terminals have been
-/// idle for `older_than_secs`. Prints nothing when there are none.
+/// Reap, on a remote, the served project's agents idle for
+/// `older_than_secs`. Prints nothing when there are none.
 fn run_served(served: &ServedProject, older_than_secs: u64, force: bool) -> Result<()> {
     let config = crate::config::Config::load(None)?;
     let holder = SessionHolder::for_this_remote()?;
+    let status_files = holder.status_files();
     let now = now_secs();
-    let old_agents: Vec<RemoteAgent> = agents(&holder, &served.name, config.agent.as_deref())?
-        .into_iter()
-        .filter(|agent| {
-            agent
-                .last_activity()
-                .is_some_and(|ts| now.saturating_sub(ts) >= older_than_secs)
-        })
-        .collect();
+    let old_agents: Vec<(RemoteAgent, u64, Option<AgentStatus>)> =
+        agents(&holder, &served.name, config.agent.as_deref())?
+            .into_iter()
+            .filter_map(|agent| {
+                // An agent's hooks record when it entered its status; one
+                // without hooks is as old as its terminal's last use.
+                let (last_activity, status) = match status_files.read(&agent.pane) {
+                    Some(record) => (Some(record.event_ts), record.status),
+                    None => (agent.last_activity(), None),
+                };
+                let ts = last_activity?;
+                (now.saturating_sub(ts) >= older_than_secs).then_some((agent, ts, status))
+            })
+            .collect();
     if old_agents.is_empty() {
         return Ok(());
     }
 
     let mut failures = 0;
-    for agent in &old_agents {
-        let age = agent
-            .last_activity()
-            .map(|ts| util::format_elapsed_secs(now.saturating_sub(ts)))
-            .unwrap_or_else(|| "unknown".to_string());
-        // The remote does not know its agents' status; the workstation does.
-        let details = format!("{}, {}, {}", age, status_label(None), agent.name);
+    for (agent, ts, status) in &old_agents {
+        let age = util::format_elapsed_secs(now.saturating_sub(*ts));
+        let details = format!("{}, {}, {}", age, status_label(*status), agent.name);
         let (pane, worktree) = (&agent.pane, &agent.pane.worktree);
         if force {
             match agent.exit() {
