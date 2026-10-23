@@ -18,7 +18,8 @@ pub struct ServeTransport {
     pub pids: Mutex<Vec<u32>>,
     /// Extra environment for the remote, such as another state dir.
     pub env: Vec<(String, std::path::PathBuf)>,
-    state: tempfile::TempDir,
+    /// The remote's own state dir, unless `env` names another.
+    pub state: tempfile::TempDir,
 }
 
 impl Default for ServeTransport {

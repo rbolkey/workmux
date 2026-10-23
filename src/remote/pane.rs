@@ -316,13 +316,18 @@ impl SessionHolder {
         Ok(running.into_iter().map(|(_, id)| id).collect())
     }
 
-    /// End every remote pane of `project`'s `worktree`, whether or not a
-    /// workstation pane shows it.
-    pub fn end_worktree(&self, project: &str, worktree: &str) -> Result<()> {
+    /// End every remote pane of `project`'s `worktree` but `except`,
+    /// whether or not a workstation pane shows it.
+    pub fn end_worktree(
+        &self,
+        project: &str,
+        worktree: &str,
+        except: Option<&RemotePaneId>,
+    ) -> Result<()> {
         let panes: Vec<RemotePaneId> = self
             .running(project)?
             .into_iter()
-            .filter(|pane| pane.worktree == worktree)
+            .filter(|pane| pane.worktree == worktree && Some(pane) != except)
             .collect();
         std::thread::scope(|scope| {
             let ending: Vec<_> = panes
@@ -388,13 +393,19 @@ impl SessionHolder {
 /// On a remote, end every remote pane of the served project's worktree at
 /// `worktree_path`, including those no workstation pane shows (a view
 /// closed in tmux, the survivors of a window killed outside workmux).
-/// Elsewhere there are none.
+/// Elsewhere there are none. The remote pane this command was typed in is
+/// left to the deferred close of its window, which ends it once the
+/// command is done.
 pub fn end_served_worktree_panes(worktree_path: &Path) {
     let Some(served) = super::session::ServedProject::current() else {
         return;
     };
-    let ended = SessionHolder::for_this_remote()
-        .and_then(|holder| holder.end_worktree(&served.name, &worktree_name(worktree_path)));
+    let own = std::env::var(PANE_ENV)
+        .ok()
+        .and_then(|pane| pane.parse().ok());
+    let ended = SessionHolder::for_this_remote().and_then(|holder| {
+        holder.end_worktree(&served.name, &worktree_name(worktree_path), own.as_ref())
+    });
     if let Err(error) = ended {
         tracing::warn!(error = %format!("{error:#}"), "failed to end the worktree's remote panes");
     }
@@ -630,7 +641,7 @@ pub mod tests {
         let other_worktree = holder.create("api", &bugfix, &sleep).unwrap();
         let other_project = holder.create("web", &feature, &sleep).unwrap();
 
-        holder.end_worktree("api", "feature").unwrap();
+        holder.end_worktree("api", "feature", None).unwrap();
 
         for id in &ending {
             assert_eq!(holder.state(id).unwrap(), PaneState::Ended, "{id}");
