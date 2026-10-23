@@ -198,6 +198,7 @@ pub fn run(name: Option<&str>) -> Result<()> {
             mux.kill_session_to(&full_target_name, config.default_session())
                 .context("Failed to close target")?;
         }
+        crate::remote::pane::end_served_worktree_panes(&worktree_path);
         println!("✓ Closed {} '{}' (worktree kept)", kind, full_target_name);
     }
 

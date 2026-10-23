@@ -22,14 +22,14 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use super::channel::Peer;
-use super::pane::{RemotePaneId, SessionHolder};
+use super::pane::{RemotePaneId, SessionHolder, worktree_name};
 use super::session;
-use crate::config::SplitDirection;
+use crate::config::{Config, PaneConfig, SplitDirection};
 use crate::multiplexer::types::{
     CreateSessionParams, CreateWindowInSessionParams, CreateWindowParams, LivePaneInfo,
-    OwnedWindowTarget, WindowTarget,
+    OwnedWindowTarget, PaneSetupOptions, PaneSetupResult, WindowTarget,
 };
-use crate::multiplexer::{Multiplexer, util};
+use crate::multiplexer::{Multiplexer, setup_configured_panes, util};
 
 /// Control channel method carrying one forwarded multiplexer request.
 pub const FORWARD_METHOD: &str = "mux.call";
@@ -152,6 +152,9 @@ pub enum MuxRequest {
     KillPane {
         pane_id: String,
     },
+    /// The remote panes of the requesting project that workstation panes
+    /// show.
+    ShownRemotePanes,
 }
 
 /// Environment remote workmux sets on a command it runs in a command
@@ -379,19 +382,99 @@ impl ForwardingMux {
             None => vec![self.get_default_shell()?, "-l".to_string()],
         };
         let pane = self.holder.create(&self.project, workdir, &argv)?;
-        match self.get::<String>(request(pane.clone())) {
-            Ok(pane_id) => {
-                let replaced = self.panes.lock().unwrap().insert(pane_id.clone(), pane);
-                if let Some(replaced) = replaced {
-                    let _ = self.holder.kill(&replaced);
+        self.attach(pane.clone(), request).inspect_err(|_| {
+            let _ = self.holder.kill(&pane);
+        })
+    }
+
+    /// Forward the request that attaches a workstation pane to remote pane
+    /// `pane`, ending the remote pane a respawned workstation pane showed.
+    fn attach(
+        &self,
+        pane: RemotePaneId,
+        request: impl FnOnce(RemotePaneId) -> MuxRequest,
+    ) -> Result<String> {
+        let pane_id = self.get::<String>(request(pane.clone()))?;
+        let replaced = self.panes.lock().unwrap().insert(pane_id.clone(), pane);
+        if let Some(replaced) = replaced {
+            let _ = self.holder.kill(&replaced);
+        }
+        Ok(pane_id)
+    }
+
+    /// The project's remote panes that still run but no workstation pane
+    /// shows, in the order they were started: those of a window that was
+    /// closed outside workmux or lost with the workstation's tmux.
+    pub fn surviving_panes(&self) -> Result<Vec<RemotePaneId>> {
+        let shown: HashSet<RemotePaneId> = self.get(MuxRequest::ShownRemotePanes)?;
+        Ok(self
+            .holder
+            .running(&self.project)?
+            .into_iter()
+            .filter(|pane| !shown.contains(pane))
+            .collect())
+    }
+
+    /// Lay out `panes` as configured, each showing the next of `surviving`
+    /// instead of starting its command. A layout with fewer panes than
+    /// survive shows only as many.
+    fn show_surviving_panes(
+        &self,
+        initial_pane_id: &str,
+        panes: &[PaneConfig],
+        surviving: Vec<RemotePaneId>,
+    ) -> Result<PaneSetupResult> {
+        let single = [PaneConfig::default()];
+        let panes = if panes.is_empty() { &single[..] } else { panes };
+        let layout = panes
+            .iter()
+            .enumerate()
+            .filter(|(i, pane)| *i == 0 || pane.split.is_some())
+            .map(|(_, pane)| pane);
+        let mut pane_ids = vec![initial_pane_id.to_string()];
+        let mut focus_pane_id = None;
+        let mut zoom_pane_id = None;
+        for (i, (config, pane)) in layout.zip(surviving).enumerate() {
+            let pane_id = match &config.split {
+                Some(direction) if i > 0 => {
+                    let target_idx = config.target.unwrap_or(pane_ids.len() - 1);
+                    let target = pane_ids
+                        .get(target_idx)
+                        .ok_or_else(|| anyhow!("Invalid target pane index: {}", target_idx))?
+                        .clone();
+                    let pane_id = self.attach(pane, |pane| MuxRequest::SplitPane {
+                        target_pane_id: target,
+                        direction: direction.clone(),
+                        size: config.size,
+                        percentage: config.percentage,
+                        pane,
+                    })?;
+                    pane_ids.push(pane_id.clone());
+                    pane_id
                 }
-                Ok(pane_id)
+                _ => {
+                    let pane_id = self.attach(pane, |pane| MuxRequest::RespawnPane {
+                        pane_id: pane_ids[0].clone(),
+                        pane,
+                    })?;
+                    pane_ids[0] = pane_id.clone();
+                    pane_id
+                }
+            };
+            if let Some(name) = config.name.as_deref() {
+                self.set_pane_name(&pane_id, name)?;
             }
-            Err(error) => {
-                let _ = self.holder.kill(&pane);
-                Err(error)
+            if config.zoom || config.focus {
+                focus_pane_id = Some(pane_id.clone());
+            }
+            if config.zoom {
+                zoom_pane_id = Some(pane_id);
             }
         }
+        Ok(PaneSetupResult {
+            focus_pane_id: focus_pane_id.unwrap_or_else(|| pane_ids[0].clone()),
+            zoom_pane_id,
+        })
     }
 }
 
@@ -699,6 +782,37 @@ impl Multiplexer for ForwardingMux {
         })
     }
 
+    /// A worktree whose remote panes survive shows them; otherwise the
+    /// configured panes start as they would locally.
+    fn setup_panes(
+        &self,
+        initial_pane_id: &str,
+        panes: &[PaneConfig],
+        working_dir: &Path,
+        options: PaneSetupOptions<'_>,
+        config: &Config,
+        task_agent: Option<&str>,
+    ) -> Result<PaneSetupResult> {
+        let worktree = worktree_name(options.worktree_root.unwrap_or(working_dir));
+        let surviving: Vec<RemotePaneId> = self
+            .surviving_panes()?
+            .into_iter()
+            .filter(|pane| pane.worktree == worktree)
+            .collect();
+        if surviving.is_empty() {
+            return setup_configured_panes(
+                self,
+                initial_pane_id,
+                panes,
+                working_dir,
+                options,
+                config,
+                task_agent,
+            );
+        }
+        self.show_surviving_panes(initial_pane_id, panes, surviving)
+    }
+
     fn current_session(&self) -> Option<String> {
         self.get(MuxRequest::CurrentSession).ok().flatten()
     }
@@ -904,6 +1018,124 @@ mod tests {
         // Killing the window's session ends the remote panes it showed.
         mux.kill_session("api").unwrap();
         assert_eq!(holder.state(&agent).unwrap(), PaneState::Ended);
+        std::fs::write(&release, "").unwrap();
+        assert_eq!(session.join().unwrap().unwrap(), 0);
+    }
+
+    #[test]
+    fn a_new_window_shows_the_worktrees_surviving_remote_panes_instead_of_starting_its_commands() {
+        let Some(server) = PrivateTmuxServer::start() else {
+            return;
+        };
+        let Some((panes, holder)) = crate::remote::pane::tests::holder() else {
+            return;
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let worktree = panes.path().join("feature");
+        std::fs::create_dir_all(worktree.join(".git")).unwrap();
+        let invoking = server.new_session("mine", temp.path());
+        let release = temp.path().join("release");
+        let (mux, session) = command_session(
+            Arc::new(ServeTransport::default()),
+            InvocationContext {
+                pane_id: Some(invoking),
+                tmux: Some(format!("{},1,0", server.socket)),
+                cwd: None,
+            },
+            temp.path(),
+            &release,
+            SessionHolder::new(panes.path().join("panes")),
+        );
+        // One remote pane is shown in another window; two survive a window
+        // that is gone: the agent, then the shell split beside it.
+        let shown_window = mux
+            .create_session(CreateSessionParams {
+                prefix: "",
+                name: "api",
+                cwd: &worktree,
+                initial_window_name: Some("wm-other"),
+            })
+            .unwrap();
+        let shown: RemotePaneId = "api/feature/0".parse().unwrap();
+        let sleep = ["sleep", "30"].map(String::from).to_vec();
+        let agent = holder.create("api", &worktree, &sleep).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        let shell = holder.create("api", &worktree, &sleep).unwrap();
+        let window = mux
+            .create_window_in_session(CreateWindowInSessionParams {
+                session_name: "api",
+                name: Some("wm-feature"),
+                cwd: &worktree,
+            })
+            .unwrap();
+        let login_shell: RemotePaneId = "api/feature/3".parse().unwrap();
+        assert_eq!(holder.state(&login_shell).unwrap(), PaneState::Running);
+        let layout = vec![
+            crate::config::PaneConfig {
+                command: Some("touch started-an-agent".to_string()),
+                ..Default::default()
+            },
+            crate::config::PaneConfig {
+                command: Some("touch started-a-shell".to_string()),
+                split: Some(SplitDirection::Horizontal),
+                ..Default::default()
+            },
+        ];
+
+        let result = mux
+            .setup_panes(
+                &window,
+                &layout,
+                &worktree,
+                crate::multiplexer::types::PaneSetupOptions {
+                    run_commands: true,
+                    prompt_file_path: None,
+                    worktree_root: Some(&worktree),
+                    lima_vm_name: None,
+                    resume_mode: Default::default(),
+                },
+                &crate::config::Config::default(),
+                None,
+            )
+            .unwrap();
+
+        let window_panes =
+            server.query(&["list-panes", "-t", &window, "-F", "#{@workmux_remote_pane}"]);
+        assert_eq!(
+            window_panes.lines().collect::<Vec<_>>(),
+            vec![agent.to_string(), shell.to_string()],
+            "{window_panes}"
+        );
+        assert_eq!(
+            server.query(&[
+                "display-message",
+                "-p",
+                "-t",
+                &result.focus_pane_id,
+                "#{@workmux_remote_pane}"
+            ]),
+            agent.to_string()
+        );
+        assert!(!worktree.join("started-an-agent").exists());
+        assert!(!worktree.join("started-a-shell").exists());
+        assert_eq!(holder.state(&login_shell).unwrap(), PaneState::Ended);
+        assert_eq!(
+            holder.running("api").unwrap(),
+            vec![shown.clone(), agent.clone(), shell.clone()]
+        );
+        assert_eq!(
+            server.query(&[
+                "display-message",
+                "-p",
+                "-t",
+                &shown_window,
+                "#{@workmux_remote_pane}"
+            ]),
+            shown.to_string()
+        );
+
+        mux.kill_session("api").unwrap();
+        assert_eq!(holder.running("api").unwrap(), vec![]);
         std::fs::write(&release, "").unwrap();
         assert_eq!(session.join().unwrap().unwrap(), 0);
     }

@@ -2,15 +2,17 @@
 
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Seek, SeekFrom, Write};
+use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 
 use crate::config::SplitDirection;
-use crate::multiplexer::{create_backend, detect_backend};
+use crate::multiplexer::{Multiplexer, create_backend, detect_backend};
+use crate::remote::session::ServedProject;
 use crate::state::run::{RunSpec, cleanup_run, create_run, generate_run_id, read_result};
-use crate::workflow;
+use crate::{git, workflow};
 
 /// Escape a string for safe shell embedding.
 fn shell_escape(s: &str) -> String {
@@ -39,7 +41,12 @@ pub fn run(
     let mux = create_backend(detect_backend());
 
     // Resolve worktree to agent pane (consistent with send/capture)
-    let (worktree_path, agent) = workflow::resolve_worktree_agent(worktree_name, mux.as_ref())?;
+    let (worktree_path, target_pane) = if ServedProject::current().is_some() {
+        remote_worktree_window(worktree_name, mux.as_ref())?
+    } else {
+        let (path, agent) = workflow::resolve_worktree_agent(worktree_name, mux.as_ref())?;
+        (path, agent.pane_id)
+    };
 
     // Build command string (preserve argument boundaries via shell escaping)
     let command = command_parts
@@ -68,7 +75,7 @@ pub fn run(
         shell_escape(&run_dir.to_string_lossy())
     );
     let new_pane_id = mux.split_pane(
-        &agent.pane_id,
+        &target_pane,
         &SplitDirection::Vertical,
         &worktree_path,
         None,
@@ -150,6 +157,26 @@ pub fn run(
 
         thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// On a remote, worktree `name` and its window, whose active pane the
+/// command's pane splits: the remote does not track the agents it runs.
+fn remote_worktree_window(name: &str, mux: &dyn Multiplexer) -> Result<(PathBuf, String)> {
+    let (path, _branch) = git::find_worktree(name)?;
+    let handle = path
+        .file_name()
+        .map(|handle| handle.to_string_lossy().into_owned())
+        .ok_or_else(|| anyhow!("Invalid worktree path: no directory name"))?;
+    let mut windows = match git::get_worktree_window_token_in(&handle, None) {
+        Some(token) => mux.owned_window_targets(&token)?,
+        None => Vec::new(),
+    };
+    windows.sort_by_key(|owned| !owned.is_primary);
+    let window = windows
+        .into_iter()
+        .find_map(|owned| owned.target.window_id)
+        .ok_or_else(|| anyhow!("No window open for worktree '{}'", name))?;
+    Ok((path, window))
 }
 
 /// Stream new content from file starting at given position, return new position.
