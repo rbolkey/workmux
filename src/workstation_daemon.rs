@@ -706,8 +706,10 @@ mod tests {
             std::fs::remove_file(&socket).ok();
             let listener = UnixListener::bind(&socket)?;
             std::thread::spawn(move || {
-                for stream in listener.incoming() {
-                    serve_requests(stream.unwrap(), None).unwrap();
+                // Like the real daemon, one client's failure (a probe that
+                // hung up mid-read) must not take the listener down with it.
+                for stream in listener.incoming().flatten() {
+                    let _ = serve_requests(stream, None);
                 }
             });
             Ok(())
