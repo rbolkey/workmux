@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use super::channels::TransportFactory;
+use super::ssh::Ssh;
 use super::transport::{Loopback, Transport};
 use crate::config::{Config, RemoteConfig, TransportKind};
 
@@ -19,7 +20,8 @@ pub fn transport(_name: &str, remote: &RemoteConfig) -> Result<Arc<dyn Transport
         TransportKind::Loopback => Ok(Arc::new(Loopback::new(crate::util::expand_tilde(
             &remote.target,
         ))?)),
-        kind @ (TransportKind::Ssh | TransportKind::Openshell) => Err(anyhow!(
+        TransportKind::Ssh => Ok(Arc::new(Ssh::new(&remote.target))),
+        kind @ TransportKind::Openshell => Err(anyhow!(
             "the {kind} transport is not supported by this workmux yet"
         )),
     }
@@ -31,14 +33,23 @@ pub fn transport_factory() -> TransportFactory {
 
 /// Check that `name` can name a remote.
 pub fn validate_name(name: &str) -> Result<()> {
+    validate("remote", name)
+}
+
+/// Check that `name` can name a project registered in global config.
+pub fn validate_project_name(name: &str) -> Result<()> {
+    validate("project", name)
+}
+
+fn validate(noun: &str, name: &str) -> Result<()> {
     if name.is_empty() {
-        bail!("remote name must not be empty");
+        bail!("{noun} name must not be empty");
     }
     if !name
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
     {
-        bail!("remote name {name:?} may only contain letters, digits, '-', '_' and '.'");
+        bail!("{noun} name {name:?} may only contain letters, digits, '-', '_' and '.'");
     }
     Ok(())
 }

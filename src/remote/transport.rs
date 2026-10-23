@@ -134,6 +134,15 @@ impl StdioProcess {
         let _ = self.child.wait();
     }
 
+    /// The process's exit code, if it has exited with one.
+    pub fn exit_code(&mut self) -> Option<i32> {
+        self.child
+            .try_wait()
+            .ok()
+            .flatten()
+            .and_then(|status| status.code())
+    }
+
     /// The transport's own account of why the process failed: its stderr,
     /// or else its exit status. Waits up to `wait` for the process to exit.
     pub fn failure(&mut self, wait: Duration) -> String {
