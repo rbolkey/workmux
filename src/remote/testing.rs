@@ -9,7 +9,7 @@ use std::time::Instant;
 
 use super::transport::{Provisioning, RemoteState, StdioProcess, Transport, TtyExec};
 
-const SERVE_CHILD: &str = "remote::testing::serve_child";
+pub const SERVE_CHILD: &str = "remote::testing::serve_child";
 
 /// Runs `workmux remote serve` as a child of this test binary. Records each
 /// child's pid so a test can kill it to simulate a disconnect.

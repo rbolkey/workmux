@@ -27,7 +27,7 @@ macro_rules! ssh_harness {
         }
     };
 }
-pub(super) use ssh_harness;
+pub(crate) use ssh_harness;
 
 /// Yields the harness's [`LocalSshd`], or returns from the test when running
 /// against an external target whose server configuration we cannot control.
@@ -42,7 +42,7 @@ macro_rules! local_sshd {
         }
     };
 }
-pub(super) use local_sshd;
+pub(crate) use local_sshd;
 
 pub struct SshHarness {
     target: Target,
@@ -105,14 +105,18 @@ impl SshHarness {
         self.control_dir.path()
     }
 
+    /// The `ssh_config` the harness passes with `-F`, if any.
+    pub fn ssh_config(&self) -> Option<&Path> {
+        match &self.target {
+            Target::Local(sshd) => Some(sshd.ssh_config.as_path()),
+            Target::External { config, .. } => config.as_deref(),
+        }
+    }
+
     /// `ssh [-F config] <options>` with no host yet.
     pub fn ssh_base(&self, options: &[&str]) -> Command {
         let mut cmd = Command::new("ssh");
-        let config = match &self.target {
-            Target::Local(sshd) => Some(sshd.ssh_config.as_path()),
-            Target::External { config, .. } => config.as_deref(),
-        };
-        if let Some(config) = config {
+        if let Some(config) = self.ssh_config() {
             cmd.arg("-F").arg(config);
         }
         cmd.args(options);

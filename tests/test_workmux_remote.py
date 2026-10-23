@@ -2,8 +2,10 @@ import json
 import os
 import shutil
 import signal
+import socket
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 
 import pytest
@@ -98,6 +100,155 @@ def test_remote_add_list_status_rm_against_a_loopback_remote(
         assert "lb" in listing
         config = (env.home_path / ".config" / "workmux" / "config.yaml").read_text()
         assert "gone" not in config
+    finally:
+        if daemon_pid is not None:
+            os.kill(daemon_pid, signal.SIGTERM)
+
+
+@pytest.fixture
+def local_sshd(workmux_exe_path: Path):
+    """A user-mode sshd on a free localhost port, configured entirely from a
+    temp dir like the Rust SSH harness (never ~/.ssh or the system sshd).
+
+    Host `wmx-test` reaches a remote whose shell startup echoes noise and puts
+    workmux on PATH; `wmx-nowm` reaches the same server without workmux.
+    """
+    if os.environ.get("WORKMUX_TEST_SSH") != "1":
+        pytest.skip("set WORKMUX_TEST_SSH=1 to run SSH tests")
+    d = Path(tempfile.mkdtemp(prefix="wmx", dir="/tmp"))
+    for key in ["host_key", "client_key"]:
+        subprocess.run(
+            ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(d / key)],
+            check=True,
+        )
+    shutil.copy(d / "client_key.pub", d / "authorized_keys")
+    remote_home = d / "remote-home"
+    remote_home.mkdir()
+    rc = d / "rc"
+    rc.mkdir()
+    # A chatty shell startup must not break the control channel.
+    startup = (
+        "echo 'Welcome to the remote'; printf partial\n"
+        f"export HOME={remote_home} XDG_CONFIG_HOME={remote_home}/.config\n"
+        f"export XDG_STATE_HOME={remote_home}/.local/state\n"
+        "export PATH=/usr/bin:/bin\n"
+        '[ -n "$WMX_NO_WORKMUX" ] || '
+        f"export PATH={workmux_exe_path.parent}:$PATH\n"
+    )
+    (rc / ".zshenv").write_text(startup)
+    (rc / ".bashrc").write_text(startup)
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    (d / "sshd_config").write_text(
+        f"Port {port}\n"
+        "ListenAddress 127.0.0.1\n"
+        f"HostKey {d}/host_key\n"
+        f"AuthorizedKeysFile {d}/authorized_keys\n"
+        f"PidFile {d}/sshd.pid\n"
+        "PasswordAuthentication no\n"
+        "KbdInteractiveAuthentication no\n"
+        "UsePAM no\n"
+        "StrictModes no\n"
+        "AcceptEnv WMX_*\n"
+        f"SetEnv ZDOTDIR={rc} BASH_ENV={rc}/.bashrc\n"
+    )
+    user = os.environ["USER"]
+
+    def host(alias, extra=""):
+        return (
+            f"Host {alias}\n  HostName 127.0.0.1\n  Port {port}\n  User {user}\n"
+            f"  IdentityFile {d}/client_key\n  IdentitiesOnly yes\n"
+            "  IdentityAgent none\n  UserKnownHostsFile /dev/null\n"
+            "  StrictHostKeyChecking no\n  LogLevel ERROR\n" + extra
+        )
+
+    ssh_config = d / "ssh_config"
+    ssh_config.write_text(
+        host("wmx-test") + host("wmx-nowm", "  SetEnv WMX_NO_WORKMUX=1\n")
+    )
+    sshd = subprocess.Popen(
+        ["/usr/sbin/sshd", "-D", "-f", str(d / "sshd_config"), "-E", str(d / "log")]
+    )
+    deadline = time.monotonic() + 5
+    while True:
+        try:
+            socket.create_connection(("127.0.0.1", port), timeout=1).close()
+            break
+        except OSError:
+            assert time.monotonic() < deadline, (d / "log").read_text()
+            time.sleep(0.02)
+    yield ssh_config
+    sshd.kill()
+    sshd.wait()
+    shutil.rmtree(d, ignore_errors=True)
+
+
+@pytest.mark.tmux_only
+def test_remote_add_status_rm_against_ssh_to_localhost(
+    mux_server: MuxEnvironment,
+    workmux_exe_path: Path,
+    repo_path: Path,
+    short_tmp: dict,
+    local_sshd: Path,
+):
+    """An SSH remote is reachable through the workstation daemon; one without
+    workmux names the version to install."""
+    env = mux_server
+    version = env.run_command([str(workmux_exe_path), "--version"]).stdout.split()[-1]
+    # The daemon runs the system ssh from PATH; point it at the test config.
+    env.install_script(
+        env.fake_bin_dir / "ssh", f'#!/bin/sh\nexec /usr/bin/ssh -F {local_sshd} "$@"\n'
+    )
+
+    remote(
+        env,
+        workmux_exe_path,
+        repo_path,
+        "add box --transport ssh --target wmx-test",
+        short_tmp,
+    )
+    remote(
+        env,
+        workmux_exe_path,
+        repo_path,
+        "add nowm --transport ssh --target wmx-nowm",
+        short_tmp,
+    )
+    daemon_pid = None
+    try:
+        status = remote(
+            env, workmux_exe_path, repo_path, "status box", short_tmp
+        ).stdout
+        assert "status:   reachable" in status
+        assert f"workmux:  {version}" in status
+        assert "protocol: 1" in status
+
+        # The workstation daemon holds the channel through ssh.
+        daemon_pid = remote_daemon_ping(env, workmux_exe_path, repo_path, short_tmp)[
+            "pid"
+        ]
+        children = subprocess.run(
+            ["pgrep", "-P", str(daemon_pid), "-f", "wmx-test"],
+            capture_output=True,
+            text=True,
+        ).stdout.split()
+        assert len(children) == 1
+
+        failed = remote(
+            env, workmux_exe_path, repo_path, "status nowm", short_tmp, expect_fail=True
+        )
+        assert "status:   unreachable" in failed.stdout
+        assert (
+            f"workmux is not installed on nowm: install workmux {version}"
+            in failed.stdout
+        )
+
+        remote(env, workmux_exe_path, repo_path, "rm nowm", short_tmp)
+        remote(env, workmux_exe_path, repo_path, "rm box", short_tmp)
+        listing = remote(env, workmux_exe_path, repo_path, "list", short_tmp).stdout
+        assert "box" not in listing
+        assert "nowm" not in listing
     finally:
         if daemon_pid is not None:
             os.kill(daemon_pid, signal.SIGTERM)
