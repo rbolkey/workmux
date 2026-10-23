@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -1087,7 +1088,7 @@ def test_remote_panes_survive_drops_and_reattach(
             panes = env.tmux(["list-panes", "-a", "-F", "#{pane_id}"]).stdout
             return target not in panes.split()
 
-        attach_pattern = "dtach -a .*/panes/api/feature/"
+        attach_pattern = f"dtach -a {re.escape(str(remote_root))}/.*/panes/api/feature/"
 
         def drop():
             clients = pids(attach_pattern)
