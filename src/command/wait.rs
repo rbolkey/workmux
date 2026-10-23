@@ -60,8 +60,12 @@ fn resolve_target(name: &str, mux: &dyn crate::multiplexer::Multiplexer) -> Resu
         }
     }
 
-    // Fall back to global agent resolution
-    let (path, agents) = workflow::resolve_worktree_agents(name, mux)?;
+    // Fall back to global agent resolution, then to a remote project's
+    // worktree whose agent has not reported yet
+    let (path, agents) = match workflow::resolve_worktree_agents(name, mux) {
+        Ok(resolved) => resolved,
+        Err(error) => return unstarted_remote_target(name)?.ok_or(error),
+    };
     Ok(match agents.first().and_then(|agent| agent.remote.as_ref()) {
         Some(remote) => WaitTarget::Remote {
             remote: remote.remote.clone(),
@@ -70,6 +74,38 @@ fn resolve_target(name: &str, mux: &dyn crate::multiplexer::Multiplexer) -> Resu
         },
         None => WaitTarget::Path(path),
     })
+}
+
+/// A remote project's worktree that exists on its remote, for a target
+/// whose agent the state store does not know yet: `project:handle` naming a
+/// remote project (or `project@remote:handle`), or a plain handle typed in a
+/// remote project's session.
+fn unstarted_remote_target(name: &str) -> Result<Option<WaitTarget>> {
+    let (qualifier, handle) = match name.split_once(':') {
+        Some((project, handle)) if !project.is_empty() && !handle.is_empty() => {
+            (Some(project), handle)
+        }
+        _ => (None, name),
+    };
+    let project = match qualifier {
+        Some(qualifier) => crate::remote::router::remote_projects()?
+            .into_iter()
+            .find(|project| {
+                project.site.name == qualifier || project.project().group_label() == qualifier
+            }),
+        None => crate::remote::router::resolve(None)?,
+    };
+    let Some(project) = project else {
+        return Ok(None);
+    };
+    if crate::remote::router::quietly(&project, &["workmux", "path", handle])? != 0 {
+        return Ok(None);
+    }
+    Ok(Some(WaitTarget::Remote {
+        remote: project.site.remote.clone(),
+        project: project.site.name.clone(),
+        worktree: handle.to_string(),
+    }))
 }
 
 /// What one look at the state store says about a wait target.

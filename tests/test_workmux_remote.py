@@ -7,6 +7,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -1432,7 +1433,12 @@ def test_remote_agent_status_shows_live_turns_stale_and_catches_up_on_reconnect(
             "the remote agent working",
         )
         entry = agent_in(snapshot, pane)
-        assert entry["remote"] == {"remote": "lb", "project": "api", "stale": False}
+        assert entry["remote"] == {
+            "remote": "lb",
+            "project": "api",
+            "worktree": "feature",
+            "stale": False,
+        }
         assert entry["session"] == "api"
         assert pane not in snapshot["stale_pane_ids"]
         assert tmux_value(env, pane, "#{@workmux_pane_status}") != ""
@@ -1481,6 +1487,224 @@ def test_remote_agent_status_shows_live_turns_stale_and_catches_up_on_reconnect(
             ).stdout.strip()
             == ""
         )
+    finally:
+        if feed is not None:
+            feed.close()
+        (remote_root / "offline").unlink(missing_ok=True)
+        if daemon_pid is not None:
+            os.kill(daemon_pid, signal.SIGTERM)
+
+
+# A stand-in agent that also takes input: each line typed into its pane is
+# echoed back and recorded in `got`.
+INPUT_AGENT = (
+    "(\n"
+    + STATUS_AGENT
+    + """) &
+echo "agent ready"
+while IFS= read -r line; do
+  echo "$line" >> {got}
+  echo "got: $line"
+done
+"""
+)
+
+
+def drain(sock: socket.socket):
+    try:
+        while sock.recv(65536):
+            pass
+    except OSError:
+        pass
+
+
+def state_dir(env) -> Path:
+    base = env.env.get("XDG_STATE_HOME") or str(env.home_path / ".local/state")
+    return Path(base) / "workmux"
+
+
+@requires_dtach
+@pytest.mark.tmux_only
+def test_agent_commands_reach_remote_agents_from_the_workstation(
+    mux_server: MuxEnvironment,
+    workmux_exe_path: Path,
+    repo_path: Path,
+    short_tmp: dict,
+    remote_root: Path,
+):
+    """send, capture, status, wait, last-done and last-agent act on a remote
+    agent through its workstation view and the state store. While its remote
+    is unreachable the agent's status is stale: wait neither ends nor gives
+    up on it, send refuses it, and last-done orders the status it finally
+    delivers by the remote's time, among local agents."""
+    from .test_popup_navigation import attached_client
+
+    env = mux_server
+    assert isinstance(env, TmuxEnvironment)
+    control = Path(short_tmp["TMPDIR"])
+    next_status, done, got = control / "next", control / "done", control / "got"
+    agent = control / "agent.sh"
+    hook = (
+        f"env TMUX=/nonexistent/tmux,0,0 TMUX_TMPDIR={control} "
+        f"{shlex.quote(str(workmux_exe_path))}"
+    )
+    agent.write_text(
+        INPUT_AGENT.format(next=next_status, done=done, got=got, workmux=hook)
+    )
+    origin = make_origin(
+        env, env.tmp_path / "origin", f"panes:\n  - command: sh {agent}\n"
+    )
+
+    def wm(command, expect_fail=False, timeout=60.0):
+        return run_workmux_command(
+            env,
+            workmux_exe_path,
+            repo_path,
+            command,
+            pre_run_env=short_tmp,
+            expect_fail=expect_fail,
+            timeout=timeout,
+        )
+
+    def hook_runs(status: str):
+        count = len(done.read_text().split()) if done.exists() else 0
+        next_status.write_text(status)
+        wait_until(
+            lambda: done.exists() and len(done.read_text().split()) > count,
+            f"the {status} hook",
+        )
+
+    def remote_entry() -> dict:
+        report = json.loads(wm("status --all --json").stdout)
+        return next(a for a in report["agents"] if a.get("remote"))
+
+    def client_pane(client: str) -> str:
+        return env.tmux(
+            ["display-message", "-p", "-c", client, "#{pane_id}"]
+        ).stdout.strip()
+
+    wm(f"remote add lb --transport loopback --target {remote_root}")
+    wm(f"project add api --remote lb --repo {origin} --path code/api")
+    daemon_pid = None
+    feed = None
+    try:
+        wm("add feature --project api")
+        daemon_pid = remote_daemon_ping(env, workmux_exe_path, repo_path, short_tmp)[
+            "pid"
+        ]
+        # A sidebar keeps the workstation daemon running; read its feed so
+        # the daemon never drops it as a slow client.
+        feed = SidebarFeed(short_tmp["TMPDIR"])
+        threading.Thread(target=drain, args=(feed.sock,), daemon=True).start()
+        view = tmux_value(env, "=api:wm-feature", "#{pane_id}")
+        wait_until(lambda: "agent ready" in env.capture_pane(view), "the agent")
+
+        # status and wait read the state store; send and capture use the view.
+        hook_runs("working")
+        wm("wait api:feature --status working --timeout 20")
+        entry = remote_entry()
+        assert entry["pane_id"] == view
+        assert entry["worktree"] == "feature"
+        assert entry["project"] == "api@lb"
+        assert entry["status"] == "working"
+        assert entry["remote"] == {
+            "remote": "lb",
+            "project": "api",
+            "worktree": "feature",
+            "stale": False,
+        }
+        assert "working" in wm("status api:feature").stdout
+
+        wm("send feature 'hello from the workstation'")
+        wait_until(
+            lambda: got.exists() and "hello from the workstation" in got.read_text(),
+            "the sent prompt",
+        )
+        wait_until(
+            lambda: "got: hello from the workstation"
+            in wm("capture feature -n 20").stdout,
+            "the reply in the captured view",
+        )
+
+        hook_runs("done")
+        wm("wait feature --timeout 20")
+
+        # The remote becomes unreachable: its entry is stale, done as last seen.
+        (remote_root / "offline").write_text("")
+        for pid in subprocess.run(
+            ["pgrep", "-P", str(daemon_pid), "-f", "remote serve"],
+            capture_output=True,
+            text=True,
+        ).stdout.split():
+            os.kill(int(pid), signal.SIGKILL)
+        wait_until(lambda: remote_entry()["remote"]["stale"], "a stale entry")
+        assert remote_entry()["status"] == "done"
+        assert "done (stale)" in wm("status --all").stdout
+
+        result = wm("wait feature --timeout 3", expect_fail=True)
+        assert result.exit_code == 1, result.stderr
+        assert "feature: lb is disconnected; waiting for it to reconnect" in (
+            result.stderr
+        )
+        assert "Timeout waiting for: feature" in result.stderr
+        result = wm("send feature 'lost'", expect_fail=True)
+        assert "lb is disconnected; cannot send to feature" in result.stderr
+
+        # Work restarts and finishes on the remote, before a local agent
+        # finishes; the remote's status arrives last, on reconnect.
+        hook_runs("working")
+        time.sleep(1.1)
+        hook_runs("done")
+        time.sleep(1.1)
+        # A local agent, whose hooks run on the workstation.
+        local_next, local_done = control / "local-next", control / "local-done"
+        local_agent = control / "local-agent.sh"
+        local_agent.write_text(
+            STATUS_AGENT.format(
+                next=local_next,
+                done=local_done,
+                workmux=f"env TMPDIR={control} {shlex.quote(str(workmux_exe_path))}",
+            )
+        )
+        # In a session of its own: switching to it leaves the test window
+        # current in the test session.
+        local = env.tmux(
+            ["new-session", "-d", "-P", "-F", "#{pane_id}", "-s", "local"]
+            + [f"sh {local_agent}"]
+        ).stdout.strip()
+
+        def set_local_status(status: str):
+            count = len(local_done.read_text().split()) if local_done.exists() else 0
+            local_next.write_text(status)
+            wait_until(
+                lambda: local_done.exists()
+                and len(local_done.read_text().split()) > count,
+                f"the local {status} hook",
+            )
+
+        set_local_status("done")
+        (remote_root / "offline").unlink()
+        wm("wait feature --timeout 60", timeout=75.0)
+        assert not remote_entry()["remote"]["stale"]
+
+        with attached_client(env) as (_, client):
+            # The local agent finished last by the clock, though the
+            # remote's status arrived later.
+            wm("last-done")
+            assert client_pane(client) == local
+            set_local_status("working")
+            wm("last-done")
+            assert client_pane(client) == view
+
+            # last-agent switches to the pane remembered last, and remembers
+            # the pane it ran from.
+            invoking = tmux_value(env, "test:", "#{pane_id}")
+            settings = state_dir(env) / "settings.json"
+            current = json.loads(settings.read_text()) if settings.exists() else {}
+            settings.write_text(json.dumps({**current, "last_pane_id": local}))
+            wm("last-agent")
+            assert client_pane(client) == local
+            assert json.loads(settings.read_text())["last_pane_id"] == invoking
     finally:
         if feed is not None:
             feed.close()
