@@ -1307,3 +1307,183 @@ def test_provisioning_installs_agent_hooks_and_status_warns_without_them(
     finally:
         if daemon_pid is not None:
             os.kill(daemon_pid, signal.SIGTERM)
+
+
+# A stand-in agent: runs each status hook the test drops into `next`.
+STATUS_AGENT = """\
+while :; do
+  if [ -e {next} ]; then
+    status=$(cat {next}); rm {next}
+    {workmux} set-window-status "$status"
+    echo "$status" >> {done}
+  fi
+  sleep 0.05
+done
+"""
+
+
+class SidebarFeed:
+    """The workstation daemon's sidebar snapshots, as a sidebar receives them."""
+
+    def __init__(self, tmpdir: str):
+        sockets = list(Path(tmpdir).glob("workmux-sidebar-*.sock"))
+        assert len(sockets) == 1, sockets
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.connect(str(sockets[0]))
+        self.sock.sendall(b'{"method":"subscribe"}\n')
+        self.latest: dict = {}
+
+    def _read(self, n: int) -> bytes:
+        data = b""
+        while len(data) < n:
+            chunk = self.sock.recv(n - len(data))
+            assert chunk, "the workstation daemon closed the sidebar feed"
+            data += chunk
+        return data
+
+    def wait(self, predicate, what: str, timeout=20.0) -> dict:
+        deadline = time.monotonic() + timeout
+        while not predicate(self.latest):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise AssertionError(f"timed out waiting for {what}: {self.latest}")
+            self.sock.settimeout(remaining)
+            try:
+                size = int.from_bytes(self._read(4), "big")
+                self.latest = json.loads(self._read(size))
+            except socket.timeout:
+                continue
+        return self.latest
+
+    def close(self):
+        self.sock.close()
+
+
+def agent_in(snapshot: dict, pane: str) -> dict:
+    return next((a for a in snapshot.get("agents", []) if a["pane_id"] == pane), {})
+
+
+@requires_dtach
+@pytest.mark.tmux_only
+def test_remote_agent_status_shows_live_turns_stale_and_catches_up_on_reconnect(
+    mux_server: MuxEnvironment,
+    workmux_exe_path: Path,
+    repo_path: Path,
+    short_tmp: dict,
+    remote_root: Path,
+):
+    """A remote agent's hooks reach the workstation sidebar, tagged with its
+    remote. While the remote is unreachable its entry stays, stale, with its
+    last status; work that started and finished meanwhile arrives on
+    reconnect with the remote's times and wakes the snoozed agent."""
+    env = mux_server
+    assert isinstance(env, TmuxEnvironment)
+    control = Path(short_tmp["TMPDIR"])
+    next_status, done = control / "next", control / "done"
+    agent = control / "agent.sh"
+    # The hook never needs a multiplexer; point it at none, so a mistake
+    # could never reach a real tmux server.
+    hook = (
+        f"env TMUX=/nonexistent/tmux,0,0 TMUX_TMPDIR={control} "
+        f"{shlex.quote(str(workmux_exe_path))}"
+    )
+    agent.write_text(STATUS_AGENT.format(next=next_status, done=done, workmux=hook))
+    origin = make_origin(
+        env, env.tmp_path / "origin", f"panes:\n  - command: sh {agent}\n"
+    )
+
+    def wm(command):
+        return run_workmux_command(
+            env,
+            workmux_exe_path,
+            repo_path,
+            command,
+            pre_run_env=short_tmp,
+            timeout=60.0,
+        )
+
+    def hook_runs(status: str):
+        count = len(done.read_text().split()) if done.exists() else 0
+        next_status.write_text(status)
+        wait_until(
+            lambda: done.exists() and len(done.read_text().split()) > count,
+            f"the {status} hook",
+        )
+
+    wm(f"remote add lb --transport loopback --target {remote_root}")
+    wm(f"project add api --remote lb --repo {origin} --path code/api")
+    daemon_pid = None
+    feed = None
+    try:
+        wm("add feature --project api")
+        daemon_pid = remote_daemon_ping(env, workmux_exe_path, repo_path, short_tmp)[
+            "pid"
+        ]
+        pane = tmux_value(env, "=api:wm-feature", "#{pane_id}")
+        feed = SidebarFeed(short_tmp["TMPDIR"])
+        remote_pane = tmux_value(env, pane, "#{@workmux_remote_pane}")
+        status_file = (
+            remote_root / f"home/.local/state/workmux/status/{remote_pane}.json"
+        )
+
+        hook_runs("working")
+        snapshot = feed.wait(
+            lambda s: agent_in(s, pane).get("status") == "working",
+            "the remote agent working",
+        )
+        entry = agent_in(snapshot, pane)
+        assert entry["remote"] == {"remote": "lb", "project": "api", "stale": False}
+        assert entry["session"] == "api"
+        assert pane not in snapshot["stale_pane_ids"]
+        assert tmux_value(env, pane, "#{@workmux_pane_status}") != ""
+
+        # Snoozed on the workstation, then the remote becomes unreachable.
+        env.tmux(["set-option", "-g", "@workmux_sleeping_panes", pane])
+        (remote_root / "offline").write_text("")
+        serves = subprocess.run(
+            ["pgrep", "-P", str(daemon_pid), "-f", "remote serve"],
+            capture_output=True,
+            text=True,
+        ).stdout.split()
+        assert serves, "the daemon holds no control channel"
+        for pid in serves:
+            os.kill(int(pid), signal.SIGKILL)
+        snapshot = feed.wait(
+            lambda s: agent_in(s, pane).get("remote", {}).get("stale"),
+            "the entry to turn stale",
+        )
+        assert agent_in(snapshot, pane)["status"] == "working"
+        assert pane in snapshot["stale_pane_ids"]
+
+        # Work finishes and starts again on the remote while it is
+        # unreachable; it ends waiting for input.
+        hook_runs("done")
+        hook_runs("working")
+        time.sleep(1.1)
+        hook_runs("waiting")
+        waiting_since = json.loads(status_file.read_text())["event_ts"]
+        time.sleep(1.1)
+        (remote_root / "offline").unlink()
+
+        snapshot = feed.wait(
+            lambda s: (
+                agent_in(s, pane).get("status") == "waiting"
+                and not agent_in(s, pane)["remote"]["stale"]
+            ),
+            "the reconnected remote's status",
+            timeout=45.0,
+        )
+        assert agent_in(snapshot, pane)["status_ts"] == waiting_since
+        assert pane not in snapshot["stale_pane_ids"]
+        assert (
+            env.tmux(
+                ["show-option", "-gqv", "@workmux_sleeping_panes"], check=False
+            ).stdout.strip()
+            == ""
+        )
+    finally:
+        if feed is not None:
+            feed.close()
+        (remote_root / "offline").unlink(missing_ok=True)
+        if daemon_pid is not None:
+            os.kill(daemon_pid, signal.SIGTERM)

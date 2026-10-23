@@ -140,6 +140,11 @@ impl SessionHolder {
             .join(format!("{}.pid", id.slot))
     }
 
+    /// The status files of these panes, kept beside the panes directory.
+    pub fn status_files(&self) -> super::status::StatusFiles {
+        super::status::StatusFiles::new(self.dir.with_file_name("status"))
+    }
+
     fn worktree_dir(&self, project: &str, worktree: &str) -> PathBuf {
         self.dir.join(project).join(worktree)
     }
@@ -215,7 +220,10 @@ impl SessionHolder {
                 .mode(0o600)
                 .open(self.pid_file(&id))
             {
-                Ok(_) => return Ok(id),
+                Ok(_) => {
+                    self.status_files().remove(&id);
+                    return Ok(id);
+                }
                 Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
                 Err(error) => {
                     return Err(anyhow::Error::from(error)
@@ -408,8 +416,14 @@ pub mod tests {
         holder.kill(&first).unwrap();
         assert_eq!(holder.state(&first).unwrap(), PaneState::Ended);
         assert_eq!(holder.state(&second).unwrap(), PaneState::Running);
+        let status = holder.status_files();
+        status
+            .write(&first, Some(crate::multiplexer::AgentStatus::Done), None, 1)
+            .unwrap();
         let reused = holder.create("api", &feature, &sleep).unwrap();
         assert_eq!(reused.slot, 0);
+        // The ended pane's status does not carry over to the new one.
+        assert_eq!(status.read(&reused), None);
         for id in [reused, second, other] {
             holder.kill(&id).unwrap();
         }

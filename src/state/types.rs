@@ -9,7 +9,7 @@ use std::path::PathBuf;
 pub(crate) const FILENAME_ENCODE_SET: &AsciiSet =
     &CONTROLS.add(b'/').add(b'\\').add(b':').add(b'%');
 
-use crate::multiplexer::types::{AgentPane, AgentStatus};
+use crate::multiplexer::types::{AgentPane, AgentStatus, RemoteAgentPane};
 
 /// Composite pane identifier for unique state file naming.
 ///
@@ -144,6 +144,20 @@ pub struct AgentState {
     /// configuration displays prompts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,
+
+    /// Set for an agent on a remote: the workstation pane shows its remote
+    /// pane. `None` means the project host is the workstation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<RemoteAgent>,
+}
+
+/// A remote agent's project host and remote pane.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct RemoteAgent {
+    pub remote: String,
+    pub pane: crate::remote::pane::RemotePaneId,
+    /// Work generation of the last status applied (ADR 0002).
+    pub work_gen: u64,
 }
 
 impl AgentState {
@@ -175,6 +189,11 @@ impl AgentState {
             agent_command: Some(self.command.clone()),
             agent_kind: self.agent_kind.clone(),
             prompt: self.prompt.clone(),
+            remote: self.remote.as_ref().map(|remote| RemoteAgentPane {
+                remote: remote.remote.clone(),
+                project: remote.pane.project.clone(),
+                stale: false,
+            }),
         }
     }
 }

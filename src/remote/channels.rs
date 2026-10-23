@@ -17,6 +17,7 @@ use super::connection::{Connection, HELLO_TIMEOUT};
 use super::forwarded;
 use super::forwarding::{FORWARD_METHOD, Forwarded};
 use super::session::{self, CommandRequest, SessionParams, Sessions, Terminal};
+use super::status::{self, StatusSink};
 use super::transport::{RemoteState, Transport};
 use crate::config::{RemoteConfig, TransportKind};
 use crate::multiplexer::InvocationContext;
@@ -84,6 +85,7 @@ struct WorkstationHandler {
     remote: String,
     workmux: PathBuf,
     sessions: Arc<Sessions>,
+    status: Arc<Mutex<Option<StatusSink>>>,
 }
 
 impl WorkstationHandler {
@@ -126,6 +128,15 @@ impl Handler for WorkstationHandler {
     fn notification(&self, method: &str, params: Value) {
         match method {
             session::OUTPUT_METHOD => self.sessions.output(params),
+            status::RECORDS_METHOD => match serde_json::from_value::<status::Records>(params) {
+                Ok(status::Records { records }) => {
+                    let sink = self.status.lock().unwrap().clone();
+                    if let Some(sink) = sink {
+                        sink(&self.remote, records);
+                    }
+                }
+                Err(error) => tracing::warn!(%error, "ignoring unreadable status records"),
+            },
             method => tracing::warn!(method, "ignoring unknown notification"),
         }
     }
@@ -150,6 +161,8 @@ struct Shared {
     /// channel per remote.
     connecting: Mutex<()>,
     sessions: Arc<Sessions>,
+    /// Receives the status records remotes send.
+    status: Arc<Mutex<Option<StatusSink>>>,
 }
 
 /// Keeps a remote's channel wanted while a workstation pane is attached to
@@ -180,8 +193,14 @@ impl Channels {
                 slots: Mutex::new(HashMap::new()),
                 connecting: Mutex::new(()),
                 sessions: Arc::new(Sessions::default()),
+                status: Arc::new(Mutex::new(None)),
             }),
         }
+    }
+
+    /// Hand the status records every remote sends to `sink`.
+    pub fn set_status_sink(&self, sink: StatusSink) {
+        *self.shared.status.lock().unwrap() = Some(sink);
     }
 
     /// Report `name`'s reachability, opening its channel if needed.
@@ -281,6 +300,7 @@ impl Channels {
                 remote: name.to_string(),
                 workmux: self.shared.policy.workmux.clone(),
                 sessions: self.shared.sessions.clone(),
+                status: self.shared.status.clone(),
             },
             self.shared.policy.hello_timeout,
         )?);
@@ -430,6 +450,19 @@ impl Channels {
                 slot.connection = None;
             }
         }
+    }
+
+    /// Remotes whose control channel is open. Every other remote's agents
+    /// are stale.
+    pub fn connected_remotes(&self) -> std::collections::HashSet<String> {
+        self.shared
+            .slots
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, slot)| slot.connection.as_ref().is_some_and(|c| !c.is_closed()))
+            .map(|(name, _)| name.clone())
+            .collect()
     }
 
     /// Number of open channels.
@@ -654,5 +687,74 @@ mod tests {
         std::thread::sleep(Duration::from_millis(150));
         channels.close_idle();
         assert_eq!(channels.open_count(), 0);
+    }
+
+    #[test]
+    fn status_files_arrive_on_connect_as_they_change_and_again_after_a_drop() {
+        use crate::multiplexer::AgentStatus;
+        use crate::remote::status::{StatusFiles, StatusRecord};
+
+        let state = tempfile::tempdir().unwrap();
+        let files = StatusFiles::new(state.path().join("workmux/status"));
+        let pane = "api/feature/0".parse().unwrap();
+        files
+            .write(&pane, Some(AgentStatus::Working), None, 100)
+            .unwrap();
+        let transport = Arc::new(ServeTransport {
+            env: vec![("XDG_STATE_HOME".to_string(), state.path().to_path_buf())],
+            ..ServeTransport::default()
+        });
+        let channels = channels_over(
+            transport.clone(),
+            ChannelPolicy {
+                backoff_initial: Duration::from_millis(500),
+                ..fast_policy()
+            },
+        );
+        let (sent, received) = std::sync::mpsc::channel::<(String, StatusRecord)>();
+        let sent = Mutex::new(sent);
+        channels.set_status_sink(Arc::new(move |remote: &str, records: Vec<StatusRecord>| {
+            for record in records {
+                let _ = sent.lock().unwrap().send((remote.to_string(), record));
+            }
+        }));
+        let next = || {
+            received
+                .recv_timeout(Duration::from_secs(10))
+                .expect("a status record")
+        };
+
+        let _hold = channels.hold_for_pane("devbox", &config()).unwrap();
+        assert!(channels.connected_remotes().contains("devbox"));
+        let (remote, first) = next();
+        assert_eq!(remote, "devbox");
+        assert_eq!(
+            (first.status, first.event_ts),
+            (Some(AgentStatus::Working), 100)
+        );
+
+        files
+            .write(&pane, Some(AgentStatus::Waiting), None, 110)
+            .unwrap();
+        let (_, waiting) = next();
+        assert_eq!(
+            (waiting.status, waiting.event_ts),
+            (Some(AgentStatus::Waiting), 110)
+        );
+
+        // Disconnected: work starts and finishes on the remote meanwhile.
+        transport.kill_latest();
+        wait_until("the drop", || channels.open_count() == 0);
+        assert!(channels.connected_remotes().is_empty());
+        files
+            .write(&pane, Some(AgentStatus::Working), None, 120)
+            .unwrap();
+        files
+            .write(&pane, Some(AgentStatus::Done), None, 130)
+            .unwrap();
+        let (_, replayed) = next();
+        assert_eq!(transport.exec_count(), 2);
+        assert_eq!(replayed.status, Some(AgentStatus::Done));
+        assert_eq!((replayed.event_ts, replayed.work_gen), (130, 2));
     }
 }

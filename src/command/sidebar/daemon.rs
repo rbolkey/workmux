@@ -2029,10 +2029,12 @@ impl InactivityTracker {
     ) -> HashSet<String> {
         use std::hash::{Hash, Hasher};
 
-        // Build lookup of working agents
+        // Build lookup of working agents. A stale remote agent's pane shows
+        // the reconnecting screen, not the agent, so it cannot be judged.
         let working: HashMap<&str, &crate::multiplexer::AgentPane> = agents
             .iter()
             .filter(|a| a.status == Some(crate::multiplexer::AgentStatus::Working))
+            .filter(|a| !a.is_remote_stale())
             .map(|a| (a.pane_id.as_str(), a))
             .collect();
 
@@ -2279,6 +2281,17 @@ pub fn run() -> Result<()> {
     let (pr_cache, check_cache, github_path_tx) =
         spawn_github_worker(term.clone(), publication_dirty.clone(), wake_tx);
 
+    // Remote agents' status arrives over the control channels this daemon
+    // holds (ADR 0002).
+    match crate::remote::status::StatusApplier::for_tmux(&instance_id, &config.lock().unwrap()) {
+        Ok(applier) => crate::remote::channels().set_status_sink(Arc::new(
+            move |remote: &str, records: Vec<crate::remote::status::StatusRecord>| {
+                applier.apply(remote, &records)
+            },
+        )),
+        Err(error) => tracing::warn!(%error, "remote agent status unavailable"),
+    }
+
     tmux.set_global_option(
         "@workmux_sidebar_daemon_pid",
         &std::process::id().to_string(),
@@ -2342,7 +2355,11 @@ pub fn run() -> Result<()> {
                         &tmux_state.live_panes,
                         tmux_state.server_boot_id.as_deref(),
                     ) {
-                        Ok((agents, stats)) => {
+                        Ok((mut agents, stats)) => {
+                            mark_stale_remote_agents(
+                                &mut agents,
+                                &crate::remote::channels().connected_remotes(),
+                            );
                             tracing::trace!(
                                 listed = stats.listed,
                                 metadata = stats.metadata,
@@ -2617,6 +2634,17 @@ struct TickInput {
 struct AgentWrite {
     pane_id: String,
     resumed_ts: u64,
+}
+
+/// Mark the agents of remotes whose control channel is down stale: shown
+/// with their last known status.
+fn mark_stale_remote_agents(
+    agents: &mut [crate::multiplexer::AgentPane],
+    connected: &HashSet<String>,
+) {
+    for remote in agents.iter_mut().filter_map(|agent| agent.remote.as_mut()) {
+        remote.stale = !connected.contains(&remote.remote);
+    }
 }
 
 /// Output of a single tick computation.
@@ -3096,6 +3124,7 @@ mod tests {
             agent_command: None,
             agent_kind: None,
             prompt: None,
+            remote: None,
         }
     }
 
@@ -4755,6 +4784,7 @@ mod tests {
                 agent_kind: None,
                 agent_session_id: None,
                 prompt: None,
+                remote: None,
             };
             store.upsert_agent(&state).unwrap();
         }
@@ -4821,6 +4851,42 @@ mod tests {
                 ("%1".to_string(), content.to_string()),
                 ("%2".to_string(), content.to_string()),
             ])
+        }
+
+        #[test]
+        fn a_disconnected_remotes_agents_are_stale_and_never_interrupted() {
+            let mut tracker = InactivityTracker::new(Duration::from_secs(10));
+            let mut last = HashSet::new();
+            let mut remote = working_agent("%2", 1);
+            remote.remote = Some(crate::multiplexer::RemoteAgentPane {
+                remote: "devbox".to_string(),
+                project: "api".to_string(),
+                stale: true,
+            });
+            let agents = vec![working_agent("%1", 1), remote];
+            let t0 = Instant::now();
+
+            do_tick(
+                &mut tracker,
+                &mut last,
+                agents.clone(),
+                cap2("same"),
+                t0,
+                100,
+            );
+            let output = do_tick(
+                &mut tracker,
+                &mut last,
+                agents,
+                cap2("same"),
+                t0 + Duration::from_secs(11),
+                111,
+            );
+
+            assert_eq!(output.next_interrupted, HashSet::from(["%1".to_string()]));
+            assert!(output.snapshot.stale_pane_ids.contains("%2"));
+            let shown = output.snapshot.agents.iter().find(|a| a.pane_id == "%2");
+            assert_eq!(shown.unwrap().status, Some(AgentStatus::Working));
         }
 
         #[test]
