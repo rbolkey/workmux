@@ -198,9 +198,12 @@ fn last_activity_ts(agent: &AgentPane) -> Option<u64> {
     agent.updated_ts.or(agent.status_ts)
 }
 
+/// The local agents idle for `older_than_secs`. A remote agent's process
+/// lives on its remote, whose workmux reaps it.
 fn old_agents(agents: &[AgentPane], now: u64, older_than_secs: u64) -> Vec<&AgentPane> {
     agents
         .iter()
+        .filter(|agent| agent.remote.is_none())
         .filter(|agent| {
             last_activity_ts(agent).is_some_and(|ts| now.saturating_sub(ts) >= older_than_secs)
         })
@@ -297,5 +300,23 @@ mod tests {
         let agents = vec![agent("%1", Some(400), None)];
 
         assert!(old_agents(&agents, 300, 100).is_empty());
+    }
+
+    #[test]
+    fn old_agents_leaves_remote_agents_to_their_remote() {
+        let mut remote = agent("%2", Some(100), None);
+        remote.remote = Some(crate::multiplexer::types::RemoteAgentPane {
+            remote: "lb".to_string(),
+            project: "api".to_string(),
+            stale: false,
+        });
+        let agents = vec![agent("%1", Some(100), None), remote];
+
+        let selected: Vec<&str> = old_agents(&agents, 300, 100)
+            .into_iter()
+            .map(|agent| agent.pane_id.as_str())
+            .collect();
+
+        assert_eq!(selected, vec!["%1"]);
     }
 }
