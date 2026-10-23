@@ -733,8 +733,11 @@ mod tests {
     fn ensure_running_starts_an_absent_daemon_once() {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("daemon.sock");
-        // A stale socket file left by a crashed daemon.
-        drop(UnixListener::bind(&socket).unwrap());
+        // A stale file left by a crashed daemon. A plain file stands in for
+        // the dead socket: binding and dropping a real listener races with
+        // other tests' child processes, which can briefly inherit its fd
+        // between fork and exec and keep it accepting connections.
+        std::fs::write(&socket, b"").unwrap();
         let starts = std::sync::atomic::AtomicUsize::new(0);
 
         let start = || {
