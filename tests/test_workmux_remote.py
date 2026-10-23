@@ -200,6 +200,8 @@ def local_sshd(workmux_exe_path: Path):
             time.sleep(0.02)
     yield ssh_config
     sshd.kill()
+    # End the remote panes left running on the "remote".
+    subprocess.run(["pkill", "-f", f"dtach -n {d}/"], check=False)
     sshd.wait()
     shutil.rmtree(d, ignore_errors=True)
 
