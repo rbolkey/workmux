@@ -8,7 +8,6 @@ use crate::git::GitStatus;
 use crate::github::{CheckSummary, PrSummary};
 use crate::multiplexer::agent::resolve_profile_for_display;
 use crate::multiplexer::{AgentPane, AgentStatus};
-use crate::project::Project;
 use crate::ui::theme::ThemePalette;
 
 use super::super::app::{ResolvedAgentIcons, SidebarApp};
@@ -72,7 +71,8 @@ impl<'a> RowContext<'a> {
         now_secs: u64,
         selected_idx: Option<usize>,
     ) -> Self {
-        let project = Project::of_workstation_path(&agent.path).name;
+        // A remote agent's project names its remote, which tags the row.
+        let project = agent.project().group_label();
         let (label_worktree, _) = extract_worktree_name(
             &agent.session,
             &agent.window_name,
@@ -439,14 +439,15 @@ pub(crate) fn agent_is_stale(
     is_sleeping: bool,
     is_interrupted: bool,
 ) -> bool {
-    is_agent_stale(
-        agent.activity_ts(),
-        agent.status,
-        now_secs,
-        stale_threshold_secs,
-        is_sleeping,
-        is_interrupted,
-    )
+    agent.is_remote_stale()
+        || is_agent_stale(
+            agent.activity_ts(),
+            agent.status,
+            now_secs,
+            stale_threshold_secs,
+            is_sleeping,
+            is_interrupted,
+        )
 }
 
 fn is_agent_stale(
@@ -662,6 +663,7 @@ mod tests {
             agent_command: None,
             agent_kind: None,
             prompt: None,
+            remote: None,
         }
     }
 
@@ -747,6 +749,39 @@ mod tests {
         let ctx = RowContext::build(&app, &agent, 0, &pane_suffixes, 100, None);
         assert_eq!(ctx.resolve(TokenId::Project), "x");
         assert_eq!(ctx.pane_title, None);
+    }
+
+    #[test]
+    fn a_remote_agents_row_is_tagged_with_its_remote_and_dims_while_stale() {
+        let app = SidebarApp::test_with_template_error(TemplateError {
+            location: String::new(),
+            message: String::new(),
+        });
+        let mut agent = test_agent();
+        agent.session = "api".to_string();
+        agent.window_name = "wm-feature".to_string();
+        agent.path = PathBuf::from("/home/me/api-clone__worktrees/feature");
+        agent.status = Some(AgentStatus::Working);
+        agent.activity_ts = Some(100);
+        agent.remote = Some(crate::multiplexer::RemoteAgentPane {
+            remote: "devbox".to_string(),
+            project: "api".to_string(),
+            stale: false,
+        });
+        let pane_suffixes = vec![String::new()];
+
+        let ctx = RowContext::build(&app, &agent, 0, &pane_suffixes, 100, None);
+        assert_eq!(
+            (ctx.primary.as_str(), ctx.secondary.as_str()),
+            ("feature", "api@devbox")
+        );
+        assert_eq!(ctx.resolve(TokenId::Project), "api@devbox");
+        assert!(!ctx.is_stale);
+
+        agent.remote.as_mut().unwrap().stale = true;
+        let ctx = RowContext::build(&app, &agent, 0, &pane_suffixes, 100, None);
+        assert!(ctx.is_stale);
+        assert!(!ctx.status_icon_spans.is_empty());
     }
 
     #[test]

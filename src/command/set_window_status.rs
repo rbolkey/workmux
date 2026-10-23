@@ -747,11 +747,11 @@ mod tests {
             agent_kind: Some("claude".to_string()),
             agent_session_id: Some(agent_session_id.to_string()),
             prompt: None,
+            remote: None,
         }
     }
 
-    const REMOTE_STATUS_CHILD: &str =
-        "command::set_window_status::tests::remote_status_child";
+    const REMOTE_STATUS_CHILD: &str = "command::set_window_status::tests::remote_status_child";
 
     #[test]
     #[ignore = "runs as a hook on a remote"]

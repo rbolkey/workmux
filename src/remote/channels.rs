@@ -448,6 +448,19 @@ impl Channels {
         }
     }
 
+    /// Remotes whose control channel is open. Every other remote's agents
+    /// are stale.
+    pub fn connected_remotes(&self) -> std::collections::HashSet<String> {
+        self.shared
+            .slots
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, slot)| slot.connection.as_ref().is_some_and(|c| !c.is_closed()))
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
     /// Number of open channels.
     pub fn open_count(&self) -> usize {
         self.shared
@@ -703,19 +716,27 @@ mod tests {
         };
 
         let _hold = channels.hold_for_pane("devbox", &config()).unwrap();
+        assert!(channels.connected_remotes().contains("devbox"));
         let (remote, first) = next();
         assert_eq!(remote, "devbox");
-        assert_eq!((first.status, first.event_ts), (Some(AgentStatus::Working), 100));
+        assert_eq!(
+            (first.status, first.event_ts),
+            (Some(AgentStatus::Working), 100)
+        );
 
         files
             .write(&pane, Some(AgentStatus::Waiting), None, 110)
             .unwrap();
         let (_, waiting) = next();
-        assert_eq!((waiting.status, waiting.event_ts), (Some(AgentStatus::Waiting), 110));
+        assert_eq!(
+            (waiting.status, waiting.event_ts),
+            (Some(AgentStatus::Waiting), 110)
+        );
 
         // Disconnected: work starts and finishes on the remote meanwhile.
         transport.kill_latest();
         wait_until("the drop", || channels.open_count() == 0);
+        assert!(channels.connected_remotes().is_empty());
         files
             .write(&pane, Some(AgentStatus::Working), None, 120)
             .unwrap();

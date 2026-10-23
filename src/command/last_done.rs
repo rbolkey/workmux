@@ -124,7 +124,7 @@ fn pick_target(current_idx: Option<usize>, len: usize, is_cycling: bool) -> usiz
 
 /// Sort agents by recency: most recent status change first, with updated_ts
 /// as tiebreaker for deterministic ordering.
-fn sort_by_recency(agents: &mut [AgentState]) {
+pub(crate) fn sort_by_recency(agents: &mut [AgentState]) {
     agents.sort_by_key(|a| {
         (
             Reverse(a.status_ts),
@@ -176,6 +176,7 @@ mod tests {
             agent_kind: None,
             agent_session_id: None,
             prompt: None,
+            remote: None,
         }
     }
 

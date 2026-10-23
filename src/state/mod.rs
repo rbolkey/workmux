@@ -18,7 +18,7 @@ use crate::multiplexer::{AgentStatus, Multiplexer};
 
 pub use store::StateStore;
 pub(crate) use store::{AgentStateCache, AgentStateSource, ResurrectionAgentState};
-pub use types::{AgentState, LastDoneCycleState, PaneKey, RuntimeState};
+pub use types::{AgentState, LastDoneCycleState, PaneKey, RemoteAgent, RuntimeState};
 
 /// How a state write changes the agent's latest user prompt.
 #[derive(Debug, PartialEq, Eq)]
@@ -291,6 +291,7 @@ fn persist_agent_snapshot_locked(
         agent_kind,
         agent_session_id,
         prompt,
+        remote: None,
     };
 
     if let Err(error) = store.upsert_agent_locked(&state) {

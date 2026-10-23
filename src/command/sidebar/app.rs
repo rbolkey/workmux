@@ -2284,6 +2284,7 @@ mod tests {
             agent_command: None,
             agent_kind: None,
             prompt: None,
+            remote: None,
         }
     }
 
@@ -2504,6 +2505,7 @@ mod grouping_tests {
             agent_command: None,
             agent_kind: None,
             prompt: None,
+            remote: None,
         }
     }
 
@@ -3214,6 +3216,7 @@ mod filter_tests {
                 agent_command: None,
                 agent_kind: None,
                 prompt: None,
+                remote: None,
             },
             AgentPane {
                 session: "s".to_string(),
@@ -3231,6 +3234,7 @@ mod filter_tests {
                 agent_command: None,
                 agent_kind: None,
                 prompt: None,
+                remote: None,
             },
         ];
         let active_panes = std::collections::HashSet::from(["%2".to_string()]);
