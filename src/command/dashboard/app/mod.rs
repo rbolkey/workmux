@@ -28,7 +28,7 @@ use crate::state::StateStore;
 use crate::workflow::types::WorktreeInfo;
 
 use super::keymap::Context;
-use super::site::WorktreeSite;
+use super::site::{ProjectScope, WorktreeSite};
 use super::ui::theme::ThemePalette;
 
 const PR_FETCH_INTERVAL: Duration = Duration::from_secs(30);
@@ -149,8 +149,8 @@ pub struct App {
     pub pending_add_worktree: Option<AddWorktreeState>,
     /// Active sweep progress overlay (blocks input while removing worktrees)
     pub sweep_progress: Option<SweepProgress>,
-    /// Override which repo's worktrees are shown (name, git root path)
-    pub worktree_project_override: Option<(String, PathBuf)>,
+    /// Override which project's worktrees are shown
+    pub worktree_project_override: Option<ProjectScope>,
     /// Flag to prevent concurrent worktree fetches
     is_worktree_fetching: Arc<AtomicBool>,
     /// Last time worktree list was fetched

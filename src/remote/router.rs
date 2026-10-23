@@ -278,6 +278,48 @@ pub fn quietly(project: &RemoteProject, argv: &[&str]) -> Result<i32> {
     )
 }
 
+/// What a command run with [`captured`] printed.
+#[derive(Debug, Default)]
+pub struct Captured {
+    pub exit_code: i32,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
+/// A terminal that keeps everything and answers every prompt with end of
+/// input, as a closed stdin would: for callers that own the real terminal,
+/// such as the dashboard.
+#[derive(Default)]
+struct Collecting {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+impl Terminal for Collecting {
+    fn output(&mut self, stream: Stream, data: &[u8]) {
+        match stream {
+            Stream::Stdout => self.stdout.extend_from_slice(data),
+            Stream::Stderr => self.stderr.extend_from_slice(data),
+        }
+    }
+
+    fn read_line(&mut self) -> Result<Option<String>> {
+        Ok(None)
+    }
+}
+
+/// Run `argv` for `project` on its remote without touching this process's
+/// terminal: output is kept and prompts read end of input.
+pub fn captured(project: &RemoteProject, argv: &[&str]) -> Result<Captured> {
+    let mut terminal = Collecting::default();
+    let exit_code = session(project, argv, &mut terminal)?;
+    Ok(Captured {
+        exit_code,
+        stdout: terminal.stdout,
+        stderr: terminal.stderr,
+    })
+}
+
 /// This command's own arguments, for relaying to remote workmux: `workmux`
 /// and the arguments it was run with, less `--project`.
 pub fn relayed_argv() -> Vec<String> {

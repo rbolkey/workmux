@@ -49,7 +49,7 @@ impl App {
         // Include both agent and worktree view worktrees so the worktree view gets git status too
         let mut sites: Vec<WorktreeSite> = self.all_agents.iter().map(WorktreeSite::of).collect();
         for wt in &self.worktrees {
-            let site = WorktreeSite::Workstation(wt.path.clone());
+            let site = self.worktree_site(&wt.path);
             if !sites.contains(&site) {
                 sites.push(site);
             }
@@ -90,12 +90,12 @@ impl App {
         }
 
         // Use unfiltered snapshots so filtering cannot omit branches from a fetch.
-        let worktree_requests = self.all_worktrees.iter().map(|wt| {
-            (
-                &wt.repo_key,
-                PrSource::Checkout(wt.path.clone()),
-                wt.branch.as_str(),
-            )
+        let worktree_requests = self.all_worktrees.iter().filter_map(|wt| {
+            let source = match &self.worktree_project_override {
+                Some(scope) => scope.repo_source(&self.config, &wt.path)?,
+                None => PrSource::Checkout(wt.path.clone()),
+            };
+            Some((&wt.repo_key, source, wt.branch.as_str()))
         });
         let agent_requests = self.all_agents.iter().filter_map(|agent| {
             let site = WorktreeSite::of(agent).status_key();
@@ -116,11 +116,11 @@ impl App {
         let tx = self.event_tx.clone();
         let is_fetching = self.is_pr_fetching.clone();
 
-        let priority_path = self
-            .worktree_project_override
-            .as_ref()
-            .map(|(_, p)| p.clone())
-            .or_else(|| self.current_worktree.clone());
+        let priority_path = match &self.worktree_project_override {
+            Some(super::super::site::ProjectScope::Workstation(path)) => Some(path.clone()),
+            Some(super::super::site::ProjectScope::Remote { .. }) => None,
+            None => self.current_worktree.clone(),
+        };
 
         std::thread::spawn(move || {
             struct ResetFlag(Arc<AtomicBool>);

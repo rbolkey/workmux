@@ -162,6 +162,8 @@ struct JsonWorktree {
     /// Sent by remote workmux, so the workstation can show the column.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     has_unmerged: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    base_branch: Option<String>,
 }
 
 struct ProjectWorktree {
@@ -195,7 +197,7 @@ impl ProjectWorktree {
                 pr_info: None,
                 agent_status: (!statuses.is_empty()).then_some(AgentStatusSummary { statuses }),
                 created_at: entry.created_at,
-                base_branch: None,
+                base_branch: entry.base_branch,
             },
             has_uncommitted_changes: Some(entry.has_uncommitted_changes),
         }
@@ -254,12 +256,38 @@ fn list_remote_project(remote: &RemoteProject, filter: &[String]) -> Result<Vec<
     if exit != 0 {
         bail!("workmux list exited with {exit}");
     }
+    remote_entries(remote, &stdout)
+}
+
+fn remote_entries(remote: &RemoteProject, stdout: &[u8]) -> Result<Vec<ProjectWorktree>> {
     let entries: Vec<JsonWorktree> =
-        serde_json::from_slice(&stdout).context("remote workmux sent an unreadable list")?;
+        serde_json::from_slice(stdout).context("remote workmux sent an unreadable list")?;
     let project = remote.project();
     Ok(entries
         .into_iter()
         .map(|entry| ProjectWorktree::from_remote(&project, entry))
+        .collect())
+}
+
+/// A remote project's worktrees, listed by remote workmux without writing
+/// to this terminal. Each carries the project's cache key as its repo key.
+pub fn remote_worktrees(remote: &RemoteProject) -> Result<Vec<workflow::types::WorktreeInfo>> {
+    let listed = router::captured(remote, &["workmux", "list", "--json"])?;
+    if listed.exit_code != 0 {
+        bail!(
+            "workmux list exited with {}: {}",
+            listed.exit_code,
+            String::from_utf8_lossy(&listed.stderr).trim()
+        );
+    }
+    let project = remote.project();
+    let repo_key = project.cache_key(Path::new(""))?;
+    Ok(remote_entries(remote, &listed.stdout)?
+        .into_iter()
+        .map(|entry| workflow::types::WorktreeInfo {
+            repo_key: repo_key.clone(),
+            ..entry.worktree
+        })
         .collect())
 }
 
@@ -334,6 +362,7 @@ pub fn run(
                 };
                 JsonWorktree {
                     has_unmerged: remote.is_some().then_some(wt.has_unmerged),
+                    base_branch: wt.base_branch.filter(|_| remote.is_some()),
                     remote,
                     project: entry.project.name,
                     project_path: entry.project_path.to_string_lossy().into_owned(),

@@ -72,6 +72,19 @@ impl WorktreeSite {
         matches!(self, Self::Remote { .. })
     }
 
+    /// The project this worktree belongs to.
+    pub fn scope(&self) -> ProjectScope {
+        match self {
+            Self::Workstation(path) => ProjectScope::Workstation(path.clone()),
+            Self::Remote {
+                remote, project, ..
+            } => ProjectScope::Remote {
+                remote: remote.clone(),
+                project: project.clone(),
+            },
+        }
+    }
+
     /// The worktree's path where it lives.
     pub fn path(&self) -> &Path {
         match self {
@@ -154,6 +167,23 @@ impl WorktreeSite {
         }
     }
 
+    /// Whether the worktree has uncommitted changes; `true` when unknown.
+    pub fn is_dirty(&self) -> bool {
+        match self.remote_project() {
+            Ok(None) => crate::git::has_uncommitted_changes(self.path()).unwrap_or(true),
+            Ok(Some(project)) => Self::ask::<GitStatus>(
+                &project,
+                DashboardRequest::GitStatus {
+                    worktree: self.path().to_path_buf(),
+                },
+                true,
+            )
+            .map(|status| status.is_dirty)
+            .unwrap_or(true),
+            Err(_) => true,
+        }
+    }
+
     /// The raw text of `git diff <diff_arg>`, with untracked files as new.
     pub fn raw_diff(&self, diff_arg: &str, include_untracked: bool) -> Result<String, String> {
         match self.remote_project()? {
@@ -197,6 +227,38 @@ impl WorktreeSite {
         }
     }
 
+    /// The worktree's recent commits, as `%h\t%ar\t%s` lines.
+    pub fn recent_commits(&self) -> Result<String, String> {
+        match self.remote_project()? {
+            None => recent_commits(self.path()).map_err(|error| format!("{error:#}")),
+            Some(project) => Self::ask(
+                &project,
+                DashboardRequest::Log {
+                    worktree: self.path().to_path_buf(),
+                },
+                true,
+            ),
+        }
+    }
+
+    /// Record `base` as the base branch of `branch`, checked out here.
+    pub fn set_base(&self, branch: &str, base: &str) -> Result<(), String> {
+        match self.remote_project()? {
+            None => crate::git::set_branch_base_in(branch, base, Some(self.path()))
+                .map_err(|error| format!("{error:#}")),
+            Some(project) => Self::ask::<serde_json::Value>(
+                &project,
+                DashboardRequest::SetBase {
+                    worktree: self.path().to_path_buf(),
+                    branch: branch.to_string(),
+                    base: base.to_string(),
+                },
+                true,
+            )
+            .map(drop),
+        }
+    }
+
     /// End `pane`, a remote pane of this remote worktree's project.
     pub fn kill_remote_pane(&self, pane: crate::remote::pane::RemotePaneId) -> Result<(), String> {
         match self.remote_project()? {
@@ -223,6 +285,226 @@ impl WorktreeSite {
             )
             .map(drop),
         }
+    }
+}
+
+/// The project whose worktrees the Worktrees tab shows: a workstation
+/// repository, or a project registered on a remote, whose worktrees remote
+/// workmux lists and changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProjectScope {
+    /// A path inside the repository.
+    Workstation(PathBuf),
+    Remote {
+        remote: String,
+        project: String,
+    },
+}
+
+impl ProjectScope {
+    pub fn project(&self) -> Project {
+        match self {
+            Self::Workstation(path) => Project::of_workstation_path(path),
+            Self::Remote { remote, project } => Project::remote(remote, project),
+        }
+    }
+
+    pub fn is_remote(&self) -> bool {
+        matches!(self, Self::Remote { .. })
+    }
+
+    /// Where the worktree at `path`, one of this project's, lives.
+    pub fn site_of(&self, path: &Path) -> WorktreeSite {
+        match self {
+            Self::Workstation(_) => WorktreeSite::Workstation(path.to_path_buf()),
+            Self::Remote { remote, project } => WorktreeSite::Remote {
+                remote: remote.clone(),
+                project: project.clone(),
+                worktree: path.to_path_buf(),
+            },
+        }
+    }
+
+    /// Where to ask GitHub about the worktree at `path`, never a remote
+    /// path: a remote project is asked about by its registered git URL.
+    pub fn repo_source(
+        &self,
+        config: &crate::config::Config,
+        path: &Path,
+    ) -> Option<crate::github::RepoSource> {
+        match self {
+            Self::Workstation(_) => Some(crate::github::RepoSource::Checkout(path.to_path_buf())),
+            Self::Remote { remote, project } => {
+                let entry = config.projects.get(project)?;
+                (entry.remote.as_deref() == Some(remote.as_str()))
+                    .then(|| entry.git_url.clone().map(crate::github::RepoSource::GitUrl))
+                    .flatten()
+            }
+        }
+    }
+
+    fn remote_project(&self) -> anyhow::Result<Option<RemoteProject>> {
+        match self {
+            Self::Workstation(_) => Ok(None),
+            Self::Remote { remote, project } => {
+                let resolved = crate::remote::router::remote_project(
+                    &crate::config::Config::load_global_only()?,
+                    project,
+                )?;
+                if resolved.site.remote != *remote {
+                    anyhow::bail!("project {project} is no longer on remote {remote}");
+                }
+                Ok(Some(resolved))
+            }
+        }
+    }
+
+    fn ask<T: serde::de::DeserializeOwned>(
+        project: &RemoteProject,
+        request: DashboardRequest,
+    ) -> anyhow::Result<T> {
+        crate::remote::dashboard::request(project, &request, true)
+    }
+
+    /// Run `workmux <args>` for a remote project on its remote, as typed
+    /// there, without touching the dashboard's terminal.
+    fn relay(project: &RemoteProject, args: &[&str]) -> anyhow::Result<()> {
+        let argv: Vec<&str> = std::iter::once("workmux")
+            .chain(args.iter().copied())
+            .collect();
+        let ran = crate::remote::router::captured(project, &argv)?;
+        if ran.exit_code != 0 {
+            let stderr = String::from_utf8_lossy(&ran.stderr);
+            anyhow::bail!(
+                "{}",
+                stderr
+                    .lines()
+                    .rfind(|line| !line.trim().is_empty())
+                    .unwrap_or("remote workmux failed")
+                    .trim()
+            );
+        }
+        Ok(())
+    }
+
+    /// The project's worktrees.
+    pub fn list(
+        &self,
+        config: &crate::config::Config,
+        mux: &dyn crate::multiplexer::Multiplexer,
+    ) -> anyhow::Result<Vec<crate::workflow::types::WorktreeInfo>> {
+        match self.remote_project()? {
+            // fetch_pr_status=false: the dashboard fetches PR status separately,
+            // and workflow::list's spinner would corrupt the TUI output
+            None => {
+                let Self::Workstation(path) = self else {
+                    unreachable!()
+                };
+                crate::workflow::list_in(config, mux, false, &[], Some(path))
+            }
+            Some(project) => crate::command::list::remote_worktrees(&project),
+        }
+    }
+
+    /// The repository's local branches.
+    pub fn branches(&self) -> anyhow::Result<Vec<String>> {
+        match (self, self.remote_project()?) {
+            (Self::Workstation(path), _) => crate::git::list_local_branches_in(Some(path)),
+            (_, Some(project)) => Self::ask(&project, DashboardRequest::Branches),
+            _ => unreachable!(),
+        }
+    }
+
+    /// The branch a new worktree starts from by default.
+    pub fn default_base(&self) -> String {
+        match (self, self.remote_project()) {
+            (Self::Workstation(path), _) => default_add_worktree_base(path),
+            (_, Ok(Some(project))) => Self::ask(&project, DashboardRequest::DefaultBase)
+                .unwrap_or_else(|_| "main".to_string()),
+            _ => "main".to_string(),
+        }
+    }
+
+    /// Branches whose upstream branch was deleted.
+    pub fn gone_branches(&self) -> std::collections::HashSet<String> {
+        match (self, self.remote_project()) {
+            (Self::Workstation(path), _) => {
+                crate::git::get_gone_branches_in(Some(path)).unwrap_or_default()
+            }
+            (_, Ok(Some(project))) => {
+                Self::ask::<Vec<String>>(&project, DashboardRequest::GoneBranches)
+                    .map(|gone| gone.into_iter().collect())
+                    .unwrap_or_default()
+            }
+            _ => Default::default(),
+        }
+    }
+
+    /// Open pull requests of the project's repository.
+    pub fn open_prs(
+        &self,
+        config: &crate::config::Config,
+    ) -> anyhow::Result<Vec<crate::github::PrListEntry>> {
+        let path = match self {
+            Self::Workstation(path) => path.as_path(),
+            Self::Remote { .. } => Path::new(""),
+        };
+        let source = self
+            .repo_source(config, path)
+            .ok_or_else(|| anyhow::anyhow!("project {} has no git URL", self.project().name))?;
+        crate::github::list_open_prs_from(&source)
+    }
+
+    /// Remove a remote project's worktree `handle` as `workmux remove`
+    /// does. The dashboard has already confirmed it.
+    pub fn remove_remote(&self, handle: &str, keep_branch: bool) -> anyhow::Result<()> {
+        let project = self
+            .remote_project()?
+            .ok_or_else(|| anyhow::anyhow!("not a remote project"))?;
+        let mut args = vec!["remove", handle, "--force"];
+        if keep_branch {
+            args.push("--keep-branch");
+        }
+        Self::relay(&project, &args)
+    }
+
+    /// Create a remote project's worktree for `branch`, from `base` when
+    /// given, or for pull request `pr`, without switching to its window.
+    pub fn add_remote(
+        &self,
+        branch: Option<&str>,
+        base: Option<&str>,
+        pr: Option<u32>,
+    ) -> anyhow::Result<()> {
+        let project = self
+            .remote_project()?
+            .ok_or_else(|| anyhow::anyhow!("not a remote project"))?;
+        let pr = pr.map(|pr| pr.to_string());
+        let mut args = vec!["add", "--background"];
+        args.extend(branch);
+        if let Some(base) = base {
+            args.extend(["--base", base]);
+        }
+        if let Some(pr) = &pr {
+            args.extend(["--pr", pr]);
+        }
+        Self::relay(&project, &args)
+    }
+
+    /// Close a remote project's worktree window, keeping the worktree.
+    pub fn close_remote(&self, handle: &str) -> anyhow::Result<()> {
+        let project = self
+            .remote_project()?
+            .ok_or_else(|| anyhow::anyhow!("not a remote project"))?;
+        Self::relay(&project, &["close", handle])
+    }
+
+    /// Open (or switch to) a remote project's worktree window.
+    pub fn open_remote(&self, handle: &str) -> anyhow::Result<()> {
+        let project = self
+            .remote_project()?
+            .ok_or_else(|| anyhow::anyhow!("not a remote project"))?;
+        Self::relay(&project, &["open", handle])
     }
 }
 
@@ -272,5 +554,46 @@ pub(crate) mod tests {
         assert_ne!(devbox.status_key(), other.status_key());
         assert_eq!(devbox.repo_key(), Some(PathBuf::from("remote/devbox/api")));
         assert_ne!(local.repo_key(), devbox.repo_key());
+    }
+
+    #[test]
+    fn a_remote_projects_worktree_rows_are_keyed_and_asked_about_by_remote_and_project() {
+        let temp = tempfile::tempdir().unwrap();
+        crate::test_support::init_repo(temp.path());
+        let config: crate::config::Config = serde_yaml::from_str(
+            "projects:\n  api:\n    remote: devbox\n    git_url: git@github.com:me/api.git\n",
+        )
+        .unwrap();
+        let remote = ProjectScope::Remote {
+            remote: "devbox".to_string(),
+            project: "api".to_string(),
+        };
+        let local = ProjectScope::Workstation(temp.path().to_path_buf());
+
+        let row = remote.site_of(temp.path());
+
+        assert_eq!(
+            row,
+            WorktreeSite::of(&agent(temp.path(), Some(("devbox", "api"))))
+        );
+        assert_eq!(row.scope(), remote);
+        assert_eq!(remote.project().group_label(), "api@devbox");
+        assert_eq!(
+            remote.repo_source(&config, temp.path()),
+            Some(crate::github::RepoSource::GitUrl(
+                "git@github.com:me/api.git".to_string()
+            ))
+        );
+        assert_eq!(
+            local.repo_source(&config, temp.path()),
+            Some(crate::github::RepoSource::Checkout(
+                temp.path().to_path_buf()
+            ))
+        );
+        let elsewhere = ProjectScope::Remote {
+            remote: "other".to_string(),
+            project: "api".to_string(),
+        };
+        assert_eq!(elsewhere.repo_source(&config, temp.path()), None);
     }
 }

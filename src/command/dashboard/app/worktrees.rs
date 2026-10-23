@@ -13,6 +13,7 @@ use crate::multiplexer::Multiplexer;
 use crate::project::Project;
 use crate::workflow;
 
+use super::super::site::{ProjectScope, WorktreeSite};
 use super::super::sort::WorktreeSortMode;
 use super::App;
 use super::types::*;
@@ -48,8 +49,8 @@ fn delete_word_backward(s: &mut String) {
     }
 }
 
-fn list_branches_for_status(app: &mut App, repo_path: &Path) -> Option<Vec<String>> {
-    match git::list_local_branches_in(Some(repo_path)) {
+fn list_branches_for_status(app: &mut App, scope: &ProjectScope) -> Option<Vec<String>> {
+    match scope.branches() {
         Ok(branches) => Some(branches),
         Err(_) => {
             app.status_message = Some((
@@ -63,9 +64,23 @@ fn list_branches_for_status(app: &mut App, repo_path: &Path) -> Option<Vec<Strin
 
 fn run_add_worktree_job(
     job: AddWorktreeJob,
-    repo_path: PathBuf,
+    scope: ProjectScope,
     mux: Arc<dyn Multiplexer>,
 ) -> anyhow::Result<String> {
+    let repo_path = match scope {
+        ProjectScope::Workstation(path) => path,
+        // Remote workmux creates it, placing its window on the workstation.
+        ProjectScope::Remote { .. } => {
+            return match job {
+                AddWorktreeJob::CreateBranch { name, base_branch } => scope
+                    .add_remote(Some(&name), base_branch.as_deref(), None)
+                    .map(|()| name),
+                AddWorktreeJob::CheckoutPr { pr_number } => scope
+                    .add_remote(None, None, Some(pr_number))
+                    .map(|()| format!("PR #{pr_number}")),
+            };
+        }
+    };
     match job {
         AddWorktreeJob::CreateBranch { name, base_branch } => {
             let (config, config_location) =
@@ -165,11 +180,19 @@ fn run_add_worktree_job(
 }
 
 fn remove_worktree(
+    scope: &ProjectScope,
     handle: &str,
     path: &Path,
     keep_branch: bool,
     mux: Arc<dyn Multiplexer>,
 ) -> anyhow::Result<workflow::types::RemoveResult> {
+    if scope.is_remote() {
+        scope.remove_remote(handle, keep_branch)?;
+        return Ok(workflow::types::RemoveResult {
+            branch_removed: String::new(),
+            cleanup_scheduled: false,
+        });
+    }
     let (config, config_location) = crate::config::Config::load_with_location_from(path, None)?;
     let ctx = workflow::WorkflowContext::new_in(path, config, mux, config_location)?;
     workflow::remove_quiet(handle, true, keep_branch, &ctx)
@@ -177,17 +200,35 @@ fn remove_worktree(
 
 fn spawn_add_worktree_job(
     job: AddWorktreeJob,
-    repo_path: PathBuf,
+    scope: ProjectScope,
     mux: Arc<dyn Multiplexer>,
     tx: mpsc::Sender<AppEvent>,
 ) {
     std::thread::spawn(move || {
-        let result = run_add_worktree_job(job, repo_path, mux).map_err(|e| e.to_string());
+        let result = run_add_worktree_job(job, scope, mux).map_err(|e| e.to_string());
         let _ = tx.send(AppEvent::AddWorktreeResult(result));
     });
 }
 
 impl App {
+    /// Where the Worktrees tab's worktree at `path` lives.
+    pub(crate) fn worktree_site(&self, path: &Path) -> WorktreeSite {
+        match &self.worktree_project_override {
+            Some(scope) => scope.site_of(path),
+            None => WorktreeSite::Workstation(path.to_path_buf()),
+        }
+    }
+
+    /// The project the Worktrees tab shows, when it can tell.
+    fn worktree_scope(&self) -> Option<ProjectScope> {
+        self.worktree_project_override.clone().or_else(|| {
+            self.current_worktree
+                .clone()
+                .or_else(|| self.worktrees.first().map(|w| w.path.clone()))
+                .map(ProjectScope::Workstation)
+        })
+    }
+
     /// Reset the worktree fetch timer to trigger an immediate refetch
     pub fn trigger_worktree_refetch(&mut self) {
         self.last_worktree_fetch = std::time::Instant::now() - Duration::from_secs(60);
@@ -220,10 +261,7 @@ impl App {
         let is_fetching = self.is_worktree_fetching.clone();
         let config = self.config.clone();
         let mux = self.mux.clone();
-        let repo_override = self
-            .worktree_project_override
-            .as_ref()
-            .map(|(_, p)| p.clone());
+        let scope = self.worktree_project_override.clone();
 
         std::thread::spawn(move || {
             struct ResetFlag(Arc<AtomicBool>);
@@ -236,10 +274,17 @@ impl App {
 
             // fetch_pr_status=false: the dashboard fetches PR status separately,
             // and workflow::list's spinner would corrupt the TUI output
-            if let Ok(worktrees) =
-                workflow::list_in(&config, mux.as_ref(), false, &[], repo_override.as_deref())
-            {
-                let _ = tx.send(AppEvent::WorktreeList(worktrees));
+            let worktrees = match scope {
+                Some(scope) => scope.list(&config, mux.as_ref()),
+                None => workflow::list_in(&config, mux.as_ref(), false, &[], None),
+            };
+            match worktrees {
+                Ok(worktrees) => {
+                    let _ = tx.send(AppEvent::WorktreeList(worktrees));
+                }
+                Err(error) => {
+                    tracing::debug!(error = %format!("{error:#}"), "worktree list unavailable")
+                }
             }
         });
     }
@@ -368,10 +413,10 @@ impl App {
                 let Some(agent) = self.agents.get(selected) else {
                     return;
                 };
-                let agent_path = &agent.path;
+                let agent_site = WorktreeSite::of(agent);
                 self.worktrees
                     .iter()
-                    .find(|w| w.path == *agent_path)
+                    .find(|w| self.worktree_site(&w.path) == agent_site)
                     .cloned()
             }
         };
@@ -385,11 +430,15 @@ impl App {
             return;
         }
 
-        let is_dirty = git::has_uncommitted_changes(&worktree.path).unwrap_or(true);
+        let is_dirty = self.worktree_site(&worktree.path).is_dirty();
+        let Some(scope) = self.worktree_scope() else {
+            return;
+        };
 
         self.pending_remove = Some(RemovePlan {
             handle: worktree.handle.clone(),
             path: worktree.path.clone(),
+            scope,
             is_dirty,
             is_unmerged: worktree.has_unmerged,
             keep_branch: false,
@@ -431,8 +480,9 @@ impl App {
         let mux = self.mux.clone();
         let tx = self.event_tx.clone();
         std::thread::spawn(move || {
-            let result = remove_worktree(&plan.handle, &plan.path, plan.keep_branch, mux)
-                .map_err(|error| format!("{error:#}"));
+            let result =
+                remove_worktree(&plan.scope, &plan.handle, &plan.path, plan.keep_branch, mux)
+                    .map_err(|error| format!("{error:#}"));
             let _ = tx.send(AppEvent::RemoveWorktreeResult(plan.path, result));
         });
     }
@@ -478,6 +528,22 @@ impl App {
         };
 
         if worktree.is_main || !worktree.has_mux_window || self.removals.contains(&worktree.path) {
+            return;
+        }
+
+        if let Some(scope) = self
+            .worktree_project_override
+            .clone()
+            .filter(ProjectScope::is_remote)
+        {
+            // Remote workmux finds the window by its ownership token.
+            let handle = worktree.handle.clone();
+            std::thread::spawn(move || {
+                if let Err(error) = scope.close_remote(&handle) {
+                    tracing::warn!(error = %format!("{error:#}"), "could not close the remote worktree's window");
+                }
+            });
+            self.trigger_worktree_refetch();
             return;
         }
 
@@ -538,7 +604,10 @@ impl App {
             self.spawn_worktree_fetch();
         }
 
-        let gone = git::get_gone_branches().unwrap_or_default();
+        let gone = match &self.worktree_project_override {
+            Some(scope) => scope.gone_branches(),
+            None => git::get_gone_branches().unwrap_or_default(),
+        };
 
         let mut candidates: Vec<SweepCandidate> = Vec::new();
 
@@ -547,7 +616,9 @@ impl App {
                 continue;
             }
 
-            let status = self.git_statuses.get(&wt.path);
+            let status = self
+                .git_statuses
+                .get(&self.worktree_site(&wt.path).status_key());
             let is_dirty = status.is_some_and(|s| s.is_dirty);
             let has_upstream = status.is_some_and(|s| s.has_upstream);
 
@@ -633,6 +704,9 @@ impl App {
         }
 
         let total = paths_to_remove.len();
+        let Some(scope) = self.worktree_scope() else {
+            return;
+        };
         let mux = self.mux.clone();
         let tx = self.event_tx.clone();
 
@@ -651,7 +725,7 @@ impl App {
             for (i, (handle, path)) in paths_to_remove.iter().enumerate() {
                 let _ = tx.send(AppEvent::SweepProgressUpdate(i + 1, total, handle.clone()));
 
-                match remove_worktree(handle, path, false, mux.clone()) {
+                match remove_worktree(&scope, handle, path, false, mux.clone()) {
                     Ok(result) if result.cleanup_scheduled => outcome.scheduled += 1,
                     Ok(_) => outcome.completed += 1,
                     Err(_) => failures += 1,
@@ -673,24 +747,36 @@ impl App {
 
     /// Discover projects from cached repo roots and open the picker modal.
     pub fn show_project_picker(&mut self) {
-        // Deduplicate by project name, keeping one representative path per project
-        let mut by_name: std::collections::BTreeMap<String, PathBuf> =
+        // Deduplicate by project label, keeping one representative path per project
+        let mut by_name: std::collections::BTreeMap<String, ProjectScope> =
             std::collections::BTreeMap::new();
 
         for root in self.repo_roots.values() {
             let name = Project::of_workstation_path(root).name;
-            by_name.entry(name).or_insert_with(|| root.clone());
+            by_name
+                .entry(name)
+                .or_insert_with(|| ProjectScope::Workstation(root.clone()));
+        }
+        // Projects registered on a remote, whether or not an agent runs there.
+        for (name, entry) in &self.config.projects {
+            if let Some(remote) = &entry.remote {
+                let scope = ProjectScope::Remote {
+                    remote: remote.clone(),
+                    project: name.clone(),
+                };
+                by_name.insert(scope.project().group_label(), scope);
+            }
         }
 
         let projects: Vec<ProjectEntry> = by_name
             .into_iter()
-            .map(|(name, path)| ProjectEntry { name, path })
+            .map(|(name, scope)| ProjectEntry { name, scope })
             .collect();
 
         let current_name = self
             .worktree_project_override
             .as_ref()
-            .map(|(name, _)| name.clone())
+            .map(|scope| scope.project().group_label())
             .or_else(|| {
                 self.current_worktree
                     .as_deref()
@@ -754,7 +840,7 @@ impl App {
         };
         let selected = &picker.projects[idx];
 
-        self.worktree_project_override = Some((selected.name.clone(), selected.path.clone()));
+        self.worktree_project_override = Some(selected.scope.clone());
         self.worktrees.clear();
         self.all_worktrees.clear();
         self.last_worktree_fetch = std::time::Instant::now();
@@ -771,7 +857,7 @@ impl App {
     /// Open the base branch picker for the selected worktree (works from both tabs).
     pub fn show_base_branch_picker(&mut self) {
         // Resolve repo path, branch, and current base from whichever tab is active
-        let (repo_path, worktree_branch, current_base) = match self.active_tab {
+        let (site, worktree_branch, current_base) = match self.active_tab {
             DashboardTab::Worktrees => {
                 let Some(selected) = self.worktree_table_state.selected() else {
                     return;
@@ -783,7 +869,7 @@ impl App {
                     return;
                 }
                 (
-                    worktree.path.clone(),
+                    self.worktree_site(&worktree.path),
                     worktree.branch.clone(),
                     worktree.base_branch.clone(),
                 )
@@ -795,18 +881,31 @@ impl App {
                 let Some(agent) = self.agents.get(selected) else {
                     return;
                 };
-                let path = agent.path.clone();
-                let branch = match git::get_current_branch_in(&path) {
-                    Ok(b) if !b.is_empty() && b != "(detached)" => b,
-                    _ => return,
+                let site = WorktreeSite::of(agent);
+                let (branch, base) = if site.is_remote() {
+                    // The remote's last reported git status.
+                    let Some(status) = self.git_statuses.get(&site.status_key()) else {
+                        return;
+                    };
+                    let Some(branch) = status.branch.clone() else {
+                        return;
+                    };
+                    let base = Some(status.base_branch.clone()).filter(|b| !b.is_empty());
+                    (branch, base)
+                } else {
+                    let branch = match git::get_current_branch_in(site.path()) {
+                        Ok(b) if !b.is_empty() && b != "(detached)" => b,
+                        _ => return,
+                    };
+                    let base = git::get_branch_base_in(&branch, Some(site.path())).ok();
+                    (branch, base)
                 };
-                let base = git::get_branch_base_in(&branch, Some(&path)).ok();
-                (path, branch, base)
+                (site, branch, base)
             }
         };
 
         // List local branches, excluding the worktree's own branch
-        let Some(branches) = list_branches_for_status(self, &repo_path) else {
+        let Some(branches) = list_branches_for_status(self, &site.scope()) else {
             return;
         };
         let mut branches: Vec<_> = branches
@@ -830,7 +929,7 @@ impl App {
             filter: String::new(),
             current_base,
             worktree_branch,
-            repo_path,
+            site,
         });
     }
 
@@ -878,9 +977,7 @@ impl App {
         };
         let new_base = &picker.branches[idx];
 
-        if let Err(e) =
-            git::set_branch_base_in(&picker.worktree_branch, new_base, Some(&picker.repo_path))
-        {
+        if let Err(e) = picker.site.set_base(&picker.worktree_branch, new_base) {
             self.status_message = Some((
                 format!("Failed to set base: {}", e),
                 std::time::Instant::now(),
@@ -900,7 +997,7 @@ impl App {
             }
         }
         // Also update the cached GitStatus so the Git column and detail panel refresh
-        if let Some(status) = self.git_statuses.get_mut(&picker.repo_path) {
+        if let Some(status) = self.git_statuses.get_mut(&picker.site.status_key()) {
             status.base_branch = new_base_owned.clone();
         }
 
@@ -929,6 +1026,24 @@ impl App {
         }
 
         let handle = worktree.handle.clone();
+
+        if let Some(scope) = self
+            .worktree_project_override
+            .clone()
+            .filter(ProjectScope::is_remote)
+        {
+            match scope.open_remote(&handle) {
+                Ok(()) if self.should_close_after_jump() => self.should_jump = true,
+                Ok(()) => {}
+                Err(error) => {
+                    self.status_message = Some((
+                        format!("Failed to open '{handle}': {error:#}"),
+                        std::time::Instant::now(),
+                    ));
+                }
+            }
+            return;
+        }
 
         let Ok(ctx) = workflow::WorkflowContext::new(self.config.clone(), self.mux.clone(), None)
         else {
@@ -960,7 +1075,8 @@ impl App {
         }
 
         // Try agent pane first for direct pane targeting
-        if let Some(agent) = self.all_agents.iter().find(|a| a.path == worktree.path) {
+        let key = self.worktree_site(&worktree.path).status_key();
+        if let Some(agent) = self.all_agents.iter().find(|a| a.git_key() == key) {
             let target = agent.pane_id.clone();
             self.switch_to_pane_and_track(&target);
             return;
@@ -972,18 +1088,9 @@ impl App {
 
     // ── Add worktree methods ───────────────────────────────────────
 
-    /// Get the repo path for the current worktree view context.
-    fn worktree_repo_path(&self) -> Option<PathBuf> {
-        self.worktree_project_override
-            .as_ref()
-            .map(|(_, p)| p.clone())
-            .or_else(|| self.current_worktree.clone())
-            .or_else(|| self.worktrees.first().map(|w| w.path.clone()))
-    }
-
     /// Open the add-worktree modal with unified picker (branches pre-fetched).
     pub fn show_add_worktree(&mut self) {
-        let Some(repo_path) = self.worktree_repo_path() else {
+        let Some(scope) = self.worktree_scope() else {
             self.status_message = Some((
                 "No project context available".to_string(),
                 std::time::Instant::now(),
@@ -991,11 +1098,11 @@ impl App {
             return;
         };
 
-        let Some(branches) = list_branches_for_status(self, &repo_path) else {
+        let Some(branches) = list_branches_for_status(self, &scope) else {
             return;
         };
 
-        let default_branch = super::super::site::default_add_worktree_base(&repo_path);
+        let default_branch = scope.default_base();
 
         // Collect branches that already have worktrees
         let occupied_branches: std::collections::HashSet<String> =
@@ -1011,7 +1118,7 @@ impl App {
             editing_base: false,
             base_filter: String::new(),
             base_tab_prefix: None,
-            repo_path,
+            scope,
             mode: AddWorktreeMode::Branch,
             pr_list: None,
             pr_request_counter: 0,
@@ -1122,9 +1229,10 @@ impl App {
                     let request_id = state.pr_request_counter;
                     state.pr_list = Some(PrListState::Loading);
                     let tx = self.event_tx.clone();
-                    let repo_path = state.repo_path.clone();
+                    let scope = state.scope.clone();
+                    let config = self.config.clone();
                     std::thread::spawn(move || {
-                        let result = crate::github::list_open_prs(&repo_path);
+                        let result = scope.open_prs(&config);
                         match result {
                             Ok(prs) => {
                                 let _ = tx.send(AppEvent::AddWorktreePrList(request_id, Ok(prs)));
@@ -1235,9 +1343,9 @@ impl App {
                 if state.cursor == 0 {
                     // Check for PR number detection (e.g. "#123" or "123")
                     if let Some(pr_number) = state.detected_pr_number() {
-                        let repo_path = state.repo_path.clone();
+                        let scope = state.scope.clone();
                         self.pending_add_worktree = None;
-                        self.do_checkout_pr(pr_number, repo_path);
+                        self.do_checkout_pr(pr_number, scope);
                         return;
                     }
 
@@ -1247,9 +1355,9 @@ impl App {
                         return;
                     }
                     let base = state.base_branch.clone();
-                    let repo_path = state.repo_path.clone();
+                    let scope = state.scope.clone();
                     self.pending_add_worktree = None;
-                    self.do_create_worktree(name, Some(base), repo_path);
+                    self.do_create_worktree(name, Some(base), scope);
                 } else {
                     // Existing branch selected
                     let filtered = state.filtered();
@@ -1257,9 +1365,9 @@ impl App {
                         return;
                     };
                     let branch = state.branches[idx].clone();
-                    let repo_path = state.repo_path.clone();
+                    let scope = state.scope.clone();
                     self.pending_add_worktree = None;
-                    self.do_create_worktree(branch, None, repo_path);
+                    self.do_create_worktree(branch, None, scope);
                 }
             }
             AddWorktreeMode::Pr => {
@@ -1272,18 +1380,18 @@ impl App {
                     _ => return,
                 };
                 let pr_number = prs[idx].number;
-                let repo_path = state.repo_path.clone();
+                let scope = state.scope.clone();
                 self.pending_add_worktree = None;
-                self.do_checkout_pr(pr_number, repo_path);
+                self.do_checkout_pr(pr_number, scope);
             }
         }
     }
 
     /// Checkout a PR in a background thread (quiet, no stdout/spinner).
-    fn do_checkout_pr(&mut self, pr_number: u32, repo_path: PathBuf) {
+    fn do_checkout_pr(&mut self, pr_number: u32, scope: ProjectScope) {
         spawn_add_worktree_job(
             AddWorktreeJob::CheckoutPr { pr_number },
-            repo_path,
+            scope,
             self.mux.clone(),
             self.event_tx.clone(),
         );
@@ -1299,12 +1407,12 @@ impl App {
         &mut self,
         name: String,
         base_branch: Option<String>,
-        repo_path: PathBuf,
+        scope: ProjectScope,
     ) {
         let status_name = name.clone();
         spawn_add_worktree_job(
             AddWorktreeJob::CreateBranch { name, base_branch },
-            repo_path,
+            scope,
             self.mux.clone(),
             self.event_tx.clone(),
         );
@@ -1348,15 +1456,9 @@ impl App {
 
             if let Some(path) = current_path {
                 let tx = self.event_tx.clone();
+                let site = self.worktree_site(&path);
                 std::thread::spawn(move || {
-                    let output = crate::git::unattended_git(Some(&path)).and_then(|mut command| {
-                        command
-                            .args(["log", "--format=%h\t%ar\t%s", "-n", "20"])
-                            .output()
-                            .map_err(anyhow::Error::from)
-                    });
-                    if let Ok(out) = output {
-                        let log = String::from_utf8_lossy(&out.stdout).to_string();
+                    if let Ok(log) = site.recent_commits() {
                         let _ = tx.send(AppEvent::WorktreeLog(path, log));
                     }
                 });

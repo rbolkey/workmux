@@ -401,8 +401,20 @@ pub struct PrListEntry {
     pub is_draft: bool,
 }
 
-/// List open PRs for a repository using the GitHub CLI.
-pub fn list_open_prs(repo_root: &Path) -> Result<Vec<PrListEntry>> {
+/// The `gh` arguments that pick the repository `source` names: none for a
+/// checkout, which `gh` reads from its working directory.
+fn repo_args(source: &RepoSource) -> Result<Vec<String>> {
+    Ok(match source {
+        RepoSource::Checkout(_) => Vec::new(),
+        RepoSource::GitUrl(url) => {
+            let (owner, name, hostname) = url_repo_context(url)?;
+            vec!["--repo".to_string(), format!("{hostname}/{owner}/{name}")]
+        }
+    })
+}
+
+/// List open PRs of the repository `source` names.
+pub fn list_open_prs_from(source: &RepoSource) -> Result<Vec<PrListEntry>> {
     #[derive(Deserialize)]
     struct RawPr {
         number: u32,
@@ -414,8 +426,11 @@ pub fn list_open_prs(repo_root: &Path) -> Result<Vec<PrListEntry>> {
         author: Author,
     }
 
-    let output = Command::new("gh")
-        .current_dir(repo_root)
+    let mut command = Command::new("gh");
+    if let RepoSource::Checkout(repo_root) = source {
+        command.current_dir(repo_root);
+    }
+    let output = command
         .args([
             "pr",
             "list",
@@ -426,6 +441,7 @@ pub fn list_open_prs(repo_root: &Path) -> Result<Vec<PrListEntry>> {
             "--limit",
             "100",
         ])
+        .args(repo_args(source)?)
         .output();
 
     let output = match output {
@@ -2129,6 +2145,19 @@ mod tests {
             outcomes
                 .into_iter()
                 .all(|outcome| { outcome.is_some_and(|outcome| outcome.contains_key("main")) })
+        );
+    }
+
+    #[test]
+    fn gh_is_pointed_at_a_registered_git_urls_repository() {
+        assert_eq!(
+            repo_args(&RepoSource::GitUrl("git@github.com:me/api.git".to_string())).unwrap(),
+            ["--repo", "github.com/me/api"]
+        );
+        assert!(
+            repo_args(&RepoSource::Checkout(PathBuf::from("/src/api")))
+                .unwrap()
+                .is_empty()
         );
     }
 
