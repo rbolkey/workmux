@@ -68,6 +68,9 @@ pub enum Reach {
         protocol: u32,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         warning: Option<String>,
+        /// Problems remote workmux reports with the remote's setup.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        warnings: Vec<String>,
     },
     /// The transport reports the remote stopped or missing; not started.
     Stopped,
@@ -234,6 +237,7 @@ impl Channels {
                 workmux: ping.workmux,
                 protocol: ping.protocol,
                 warning: connection.warning.clone(),
+                warnings: ping.warnings,
             },
             Err(error) => unreachable(error),
         }
@@ -526,7 +530,11 @@ mod tests {
         let transport = Arc::new(ServeTransport::default());
         let channels = channels_over(transport.clone(), fast_policy());
 
-        let status = channels.status("devbox", &config());
+        let mut status = channels.status("devbox", &config());
+        // Setup warnings depend on this machine's agents and dtach.
+        if let Reach::Reachable { warnings, .. } = &mut status.reach {
+            warnings.clear();
+        }
 
         assert_eq!(
             status,
@@ -538,6 +546,7 @@ mod tests {
                     workmux: env!("CARGO_PKG_VERSION").to_string(),
                     protocol: PROTOCOL_VERSION,
                     warning: None,
+                    warnings: Vec::new(),
                 },
             }
         );
