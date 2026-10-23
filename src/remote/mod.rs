@@ -7,6 +7,7 @@ pub mod connection;
 pub mod forwarded;
 pub mod forwarding;
 pub mod handshake;
+pub mod pane;
 pub mod registry;
 pub mod router;
 pub mod serve;

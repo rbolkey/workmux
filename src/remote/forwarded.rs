@@ -2,18 +2,18 @@
 //! multiplexer requests a remote forwards for one command session.
 //!
 //! Requests act on the workstation's tmux. Context questions are answered
-//! from the session's invocation context. Panes run the remote's terminal
-//! through the transport's TTY exec, never a workstation command. Every
+//! from the session's invocation context. Panes only ever run
+//! `workmux remote attach`, a view onto a remote pane the remote started. Every
 //! request that targets a window or pane is refused unless that window
 //! belongs to a project on the requesting remote, which workmux records by
 //! tagging the windows it creates for remote projects.
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use super::forwarding::{MuxRequest, RemoteTty};
-use super::transport::{Transport, TtyExec};
+use super::forwarding::MuxRequest;
+use super::pane::RemotePaneId;
 use crate::multiplexer::types::{
     CreateSessionParams, CreateWindowInSessionParams, CreateWindowParams,
 };
@@ -60,18 +60,18 @@ pub fn parse_project_tag(tag: &str) -> Option<(&str, &str)> {
         .filter(|(remote, name)| !remote.is_empty() && !name.is_empty())
 }
 
-/// Answer `request` from `scope`'s remote, against `tmux`, running pane
-/// terminals through `transport`.
+/// Answer `request` from `scope`'s remote, against `tmux`. Panes attach to
+/// remote panes by running `workmux`'s `remote attach`.
 pub fn answer(
     scope: &SessionScope,
     tmux: &TmuxBackend,
-    transport: &dyn Transport,
+    workmux: &Path,
     request: MuxRequest,
 ) -> Result<Value> {
     let workstation = Workstation {
         scope,
         tmux,
-        transport,
+        workmux,
     };
     workstation.answer(request)
 }
@@ -79,7 +79,7 @@ pub fn answer(
 struct Workstation<'a> {
     scope: &'a SessionScope,
     tmux: &'a TmuxBackend,
-    transport: &'a dyn Transport,
+    workmux: &'a Path,
 }
 
 impl Workstation<'_> {
@@ -105,7 +105,7 @@ impl Workstation<'_> {
             MuxRequest::CreateWindow {
                 name,
                 after_window,
-                tty,
+                pane,
             } => {
                 if let Some(after) = after_window.as_deref()
                     && tmux.current_window_id()?.as_deref() != Some(after)
@@ -119,12 +119,12 @@ impl Workstation<'_> {
                     cwd: &workstation_dir(),
                     after_window: after_window.as_deref(),
                 })?;
-                json!(self.claim_window(&pane_id, &tty)?)
+                json!(self.claim_window(&pane_id, &pane)?)
             }
             MuxRequest::CreateSession {
                 name,
                 initial_window_name,
-                tty,
+                pane,
             } => {
                 let pane_id = tmux.create_session(CreateSessionParams {
                     prefix: "",
@@ -133,37 +133,36 @@ impl Workstation<'_> {
                     initial_window_name: initial_window_name.as_deref(),
                 })?;
                 self.tag_session(&name)?;
-                json!(self.claim_window(&pane_id, &tty)?)
+                json!(self.claim_window(&pane_id, &pane)?)
             }
-            MuxRequest::CreateWindowInSession { session, name, tty } => {
+            MuxRequest::CreateWindowInSession { session, name, pane } => {
                 self.adopt_session(&session)?;
                 let pane_id = tmux.create_window_in_session(CreateWindowInSessionParams {
                     session_name: &session,
                     name: name.as_deref(),
                     cwd: &workstation_dir(),
                 })?;
-                json!(self.claim_window(&pane_id, &tty)?)
+                json!(self.claim_window(&pane_id, &pane)?)
             }
-            MuxRequest::RespawnPane { pane_id, tty } => {
+            MuxRequest::RespawnPane { pane_id, pane } => {
                 self.check_pane(&pane_id)?;
-                json!(self.run_tty(&pane_id, &tty)?)
+                json!(self.attach(&pane_id, &pane)?)
             }
             MuxRequest::SplitPane {
                 target_pane_id,
                 direction,
                 size,
                 percentage,
-                tty,
+                pane,
             } => {
                 self.check_pane(&target_pane_id)?;
-                let (dir, line) = self.tty_command_line(&tty)?;
                 json!(tmux.split_pane(
                     &target_pane_id,
                     &direction,
-                    &dir,
+                    &workstation_dir(),
                     size,
                     percentage,
-                    Some(&line)
+                    Some(&self.attach_line(&pane))
                 )?)
             }
             MuxRequest::SetWindowOwnership {
@@ -331,9 +330,9 @@ impl Workstation<'_> {
         Ok(())
     }
 
-    /// Tag the new window holding `pane_id` and start the remote's
-    /// terminal in it.
-    fn claim_window(&self, pane_id: &str, tty: &RemoteTty) -> Result<String> {
+    /// Tag the new window holding `pane_id` and attach it to remote pane
+    /// `pane`.
+    fn claim_window(&self, pane_id: &str, pane: &RemotePaneId) -> Result<String> {
         self.tmux.query(&[
             "set-option",
             "-wq",
@@ -342,12 +341,23 @@ impl Workstation<'_> {
             WINDOW_TAG,
             &self.scope.tag(),
         ])?;
-        self.run_tty(pane_id, tty)
+        self.attach(pane_id, pane)
     }
 
-    fn run_tty(&self, pane_id: &str, tty: &RemoteTty) -> Result<String> {
-        let (dir, line) = self.tty_command_line(tty)?;
-        self.tmux.respawn_pane(pane_id, &dir, Some(&line))
+    fn attach(&self, pane_id: &str, pane: &RemotePaneId) -> Result<String> {
+        self.tmux
+            .respawn_pane(pane_id, &workstation_dir(), Some(&self.attach_line(pane)))
+    }
+
+    /// The shell command line a workstation pane runs to show `pane`.
+    fn attach_line(&self, pane: &RemotePaneId) -> String {
+        use crate::shell::shell_quote;
+        format!(
+            "exec {} remote attach {} {}",
+            shell_quote(&self.workmux.to_string_lossy()),
+            shell_quote(&self.scope.remote),
+            shell_quote(&pane.to_string())
+        )
     }
 
     /// The window id of this remote's window named `name`.
@@ -368,26 +378,6 @@ impl Workstation<'_> {
             .map(|(id, _, _)| id.to_string())
             .ok_or_else(|| self.refusal(&format!("window {name}")))
     }
-
-    /// The workstation directory and shell command line that run `tty` on
-    /// the remote.
-    fn tty_command_line(&self, tty: &RemoteTty) -> Result<(PathBuf, String)> {
-        if tty.argv.is_empty() {
-            bail!("no command for the remote terminal");
-        }
-        let command = self.transport.tty_command(&TtyExec {
-            argv: tty.argv.clone(),
-            workdir: Some(tty.workdir.clone()),
-            env: Vec::new(),
-        })?;
-        Ok((
-            command
-                .get_current_dir()
-                .map(PathBuf::from)
-                .unwrap_or_else(workstation_dir),
-            command_line(&command),
-        ))
-    }
 }
 
 /// Where workstation panes for remote terminals start: they never use the
@@ -396,53 +386,39 @@ fn workstation_dir() -> PathBuf {
     home::home_dir().unwrap_or_else(|| PathBuf::from("/"))
 }
 
-/// `command` as a POSIX shell command line: its environment changes, then
-/// its program and arguments.
-fn command_line(command: &std::process::Command) -> String {
-    use crate::shell::shell_quote;
-    let mut unset = Vec::new();
-    let mut set = Vec::new();
-    for (name, value) in command.get_envs() {
-        let name = name.to_string_lossy();
-        match value {
-            Some(value) => set.push(shell_quote(&format!("{name}={}", value.to_string_lossy()))),
-            None => unset.push(format!("-u {}", shell_quote(&name))),
-        }
-    }
-    let mut parts = vec!["exec".to_string(), "env".to_string()];
-    parts.extend(unset);
-    parts.extend(set);
-    parts.push(shell_quote(&command.get_program().to_string_lossy()));
-    parts.extend(
-        command
-            .get_args()
-            .map(|arg| shell_quote(&arg.to_string_lossy())),
-    );
-    parts.join(" ")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::remote::transport::Loopback;
     use crate::test_support::PrivateTmuxServer;
+    use std::os::unix::fs::PermissionsExt;
     use std::time::{Duration, Instant};
 
     struct Workstation {
         server: PrivateTmuxServer,
         remote_root: tempfile::TempDir,
-        transport: Loopback,
+        /// Stands in for workstation workmux: records its arguments in
+        /// `attached`, then stays attached.
+        workmux: PathBuf,
     }
 
     impl Workstation {
         fn start() -> Option<Self> {
             let server = PrivateTmuxServer::start()?;
             let remote_root = tempfile::tempdir().unwrap();
-            let transport = Loopback::new(remote_root.path().canonicalize().unwrap()).unwrap();
+            let workmux = remote_root.path().join("workmux");
+            std::fs::write(
+                &workmux,
+                format!(
+                    "#!/bin/sh\necho \"$@\" > '{}'\nexec sleep 30\n",
+                    remote_root.path().join("attached").display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&workmux, std::fs::Permissions::from_mode(0o755)).unwrap();
             Some(Self {
                 server,
                 remote_root,
-                transport,
+                workmux,
             })
         }
 
@@ -461,19 +437,16 @@ mod tests {
         }
 
         fn ask(&self, scope: &SessionScope, request: MuxRequest) -> Result<Value> {
-            answer(scope, &scope.tmux(), &self.transport, request)
-        }
-
-        fn tty(&self, script: &str) -> RemoteTty {
-            RemoteTty {
-                argv: ["sh", "-c", script].map(String::from).to_vec(),
-                workdir: self.remote_root.path().display().to_string(),
-            }
+            answer(scope, &scope.tmux(), &self.workmux, request)
         }
 
         fn tmux(&self, args: &[&str]) -> String {
             self.server.query(args)
         }
+    }
+
+    fn remote_pane() -> RemotePaneId {
+        "api/feature/0".parse().unwrap()
     }
 
     fn pane(value: Value) -> String {
@@ -498,7 +471,7 @@ mod tests {
     }
 
     #[test]
-    fn a_new_project_session_is_tagged_and_its_window_runs_the_remote_terminal() {
+    fn a_new_project_session_is_tagged_and_its_window_attaches_to_the_remote_pane() {
         let Some(ws) = Workstation::start() else {
             return;
         };
@@ -511,7 +484,7 @@ mod tests {
                 MuxRequest::CreateSession {
                     name: "api".to_string(),
                     initial_window_name: Some("wm-feature".to_string()),
-                    tty: ws.tty("pwd -P > ran; exec sleep 30"),
+                    pane: remote_pane(),
                 },
             )
             .unwrap(),
@@ -535,16 +508,8 @@ mod tests {
             ws.tmux(&["show-options", "-wqv", "-t", &pane_id, WINDOW_TAG]),
             "devbox:api"
         );
-        let ran = wait_for_file(&ws.remote_root.path().join("ran"));
-        assert_eq!(
-            ran.trim(),
-            ws.remote_root
-                .path()
-                .canonicalize()
-                .unwrap()
-                .display()
-                .to_string()
-        );
+        let attached = wait_for_file(&ws.remote_root.path().join("attached"));
+        assert_eq!(attached.trim(), "remote attach devbox api/feature/0");
     }
 
     #[test]
@@ -562,7 +527,7 @@ mod tests {
                 MuxRequest::CreateWindowInSession {
                     session: "api".to_string(),
                     name: Some("wm-feature".to_string()),
-                    tty: ws.tty("exec sleep 30"),
+                    pane: remote_pane(),
                 },
             )
             .unwrap(),
@@ -591,7 +556,7 @@ mod tests {
                 MuxRequest::CreateSession {
                     name: "web".to_string(),
                     initial_window_name: Some("wm-x".to_string()),
-                    tty: ws.tty("exec sleep 30"),
+                    pane: remote_pane(),
                 },
             )
             .unwrap(),
@@ -605,7 +570,7 @@ mod tests {
             },
             MuxRequest::RespawnPane {
                 pane_id: others_pane.clone(),
-                tty: ws.tty("true"),
+                pane: remote_pane(),
             },
             MuxRequest::KillPane {
                 pane_id: others_pane.clone(),
@@ -619,7 +584,7 @@ mod tests {
             MuxRequest::CreateWindowInSession {
                 session: "web".to_string(),
                 name: None,
-                tty: ws.tty("true"),
+                pane: remote_pane(),
             },
             // The invoking user's own pane belongs to no project.
             MuxRequest::SendText {

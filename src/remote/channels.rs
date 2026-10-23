@@ -8,6 +8,7 @@ use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
@@ -32,6 +33,8 @@ pub struct ChannelPolicy {
     pub backoff_max: Duration,
     /// How long an unused channel stays open (and is reconnected).
     pub linger: Duration,
+    /// The workstation workmux that panes run `remote attach` with.
+    pub workmux: PathBuf,
 }
 
 impl Default for ChannelPolicy {
@@ -41,6 +44,7 @@ impl Default for ChannelPolicy {
             backoff_initial: Duration::from_secs(1),
             backoff_max: Duration::from_secs(30),
             linger: Duration::from_secs(60),
+            workmux: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("workmux")),
         }
     }
 }
@@ -75,7 +79,7 @@ pub enum Reach {
 struct WorkstationHandler {
     /// The remote at the other end, which every request is scoped to.
     remote: String,
-    transport: Arc<dyn Transport>,
+    workmux: PathBuf,
     sessions: Arc<Sessions>,
 }
 
@@ -92,7 +96,7 @@ impl WorkstationHandler {
                     self.remote
                 )
             })?;
-        forwarded::answer(&scope, &scope.tmux(), self.transport.as_ref(), request)
+        forwarded::answer(&scope, &scope.tmux(), &self.workmux, request)
     }
 }
 
@@ -246,7 +250,7 @@ impl Channels {
             transport.as_ref(),
             WorkstationHandler {
                 remote: name.to_string(),
-                transport: transport.clone(),
+                workmux: self.shared.policy.workmux.clone(),
                 sessions: self.shared.sessions.clone(),
             },
             self.shared.policy.hello_timeout,
@@ -427,6 +431,7 @@ mod tests {
             backoff_initial: Duration::from_millis(50),
             backoff_max: Duration::from_millis(400),
             linger: Duration::from_secs(60),
+            ..ChannelPolicy::default()
         }
     }
 
