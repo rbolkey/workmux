@@ -44,6 +44,12 @@ pub trait Provisioning: Send + Sync {
     fn start(&self) -> Result<()>;
     fn stop(&self) -> Result<()>;
     fn delete(&self) -> Result<()>;
+
+    /// Bring a running remote's settings in line with its configuration,
+    /// returning what the user should be told.
+    fn reconcile(&self) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
 }
 
 #[allow(dead_code)] // Captured and TTY exec are used by later remote commands and panes

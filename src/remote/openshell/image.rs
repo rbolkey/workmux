@@ -154,8 +154,8 @@ pub fn prepare(recipe: &Recipe, sandbox: &str, context: &Path) -> Result<String>
 }
 
 /// Build `tag` from the context, streaming docker's output to stderr.
-pub fn build(context: &Path, tag: &str) -> Result<()> {
-    let status = Command::new("docker")
+pub fn build(docker: &Path, context: &Path, tag: &str) -> Result<()> {
+    let status = Command::new(docker)
         .env("DOCKER_BUILDKIT", "1")
         .env("DOCKER_CLI_HINTS", "false")
         .args(["build", "-t", tag, "."])
