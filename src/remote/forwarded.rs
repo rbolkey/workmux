@@ -822,7 +822,7 @@ mod tests {
                 MuxRequest::CreateSession {
                     name: "wm-old-session".to_string(),
                     initial_window_name: Some("wm-old".to_string()),
-                    tty: ws.tty("exec sleep 30"),
+                    pane: remote_pane(),
                 },
             )
             .unwrap(),
