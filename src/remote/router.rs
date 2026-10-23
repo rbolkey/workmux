@@ -156,7 +156,15 @@ pub fn daemon_socket() -> Option<PathBuf> {
 
 /// Run a command session for `project`, through the workstation daemon,
 /// which holds the control channels, or directly when no daemon can run.
-fn session(project: &RemoteProject, argv: &[&str], terminal: &mut dyn Terminal) -> Result<i32> {
+fn session(
+    project: &RemoteProject,
+    argv: &[&str],
+    terminal: &mut dyn Terminal,
+    start: bool,
+) -> Result<i32> {
+    if start {
+        ready(project, true)?;
+    }
     let request = CommandRequest {
         project: project.site.clone(),
         argv: argv.iter().map(|arg| arg.to_string()).collect(),
@@ -246,7 +254,17 @@ fn write_to(stream: Stream, data: &[u8]) {
 /// Run `argv` for `project` on its remote, streaming its output to this
 /// terminal. Returns the command's exit code.
 pub fn run(project: &RemoteProject, argv: &[&str]) -> Result<i32> {
-    session(project, argv, &mut Invoking { output: write_to })
+    session(project, argv, &mut Invoking { output: write_to }, true)
+}
+
+/// Make `project`'s remote ready in this process, so creating or starting
+/// it reports to this terminal: with `start`, a missing remote is created
+/// and a stopped one started. Returns whether it is running.
+pub fn ready(project: &RemoteProject, start: bool) -> Result<bool> {
+    let transport = super::registry::transport(&project.site.remote, &project.remote)?;
+    super::transport::ensure_running(&project.site.remote, transport.as_ref(), start, &mut |notice| {
+        eprintln!("{notice}")
+    })
 }
 
 /// Run `argv` for `project` on its remote, streaming its stderr to this
@@ -262,12 +280,13 @@ pub fn capture(project: &RemoteProject, argv: &[&str]) -> Result<(i32, Vec<u8>)>
                 Stream::Stderr => write_to(stream, data),
             },
         },
+        true,
     )?;
     Ok((exit, stdout))
 }
 
-/// Run `argv` for `project` on its remote, discarding its output. Returns
-/// its exit code.
+/// Run `argv` for `project` on its remote, discarding its output, without
+/// starting a stopped remote: for polls. Returns its exit code.
 pub fn quietly(project: &RemoteProject, argv: &[&str]) -> Result<i32> {
     session(
         project,
@@ -275,6 +294,7 @@ pub fn quietly(project: &RemoteProject, argv: &[&str]) -> Result<i32> {
         &mut Invoking {
             output: |_, _: &[u8]| {},
         },
+        false,
     )
 }
 
@@ -312,7 +332,7 @@ impl Terminal for Collecting {
 /// terminal: output is kept and prompts read end of input.
 pub fn captured(project: &RemoteProject, argv: &[&str]) -> Result<Captured> {
     let mut terminal = Collecting::default();
-    let exit_code = session(project, argv, &mut terminal)?;
+    let exit_code = session(project, argv, &mut terminal, false)?;
     Ok(Captured {
         exit_code,
         stdout: terminal.stdout,
@@ -361,6 +381,21 @@ pub fn relay_to_every_project() -> Result<usize> {
     let mut failures = 0;
     for project in remote_projects()? {
         let (name, remote) = (&project.site.name, &project.site.remote);
+        // A stopped sandbox is never started just to visit it.
+        match ready(&project, false) {
+            Ok(true) => {}
+            Ok(false) => {
+                eprintln!(
+                    "Skipping remote project '{name}': remote {remote} is stopped (start it with: workmux remote start {remote})"
+                );
+                continue;
+            }
+            Err(error) => {
+                eprintln!("Failed to reach remote project '{name}' on {remote}: {error:#}");
+                failures += 1;
+                continue;
+            }
+        }
         match capture(&project, &argv) {
             Ok((code, stdout)) => {
                 if !stdout.is_empty() {

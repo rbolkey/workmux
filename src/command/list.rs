@@ -319,6 +319,14 @@ pub fn run(
             worktrees.extend(list_project(&root, mux.as_ref(), show_pr && !json, filter)?);
         }
         for remote in router::remote_projects()? {
+            // A stopped sandbox is never started just to list it.
+            if !router::ready(&remote, false).unwrap_or(true) {
+                eprintln!(
+                    "warning: project {} is not listed: remote {} is stopped",
+                    remote.site.name, remote.site.remote
+                );
+                continue;
+            }
             match list_remote_project(&remote, filter) {
                 Ok(entries) => worktrees.extend(entries),
                 Err(error) => eprintln!(
