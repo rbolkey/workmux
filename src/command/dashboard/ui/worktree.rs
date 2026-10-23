@@ -9,6 +9,7 @@ use ratatui::{
 };
 
 use crate::config::WorktreeColumn;
+use crate::project::Project;
 
 use super::super::agent;
 use super::super::app::App;
@@ -51,7 +52,7 @@ pub fn render_worktree_table(f: &mut Frame, app: &mut App, area: Rect) {
                 String::new()
             };
 
-            let project = agent::extract_project_name(&wt.path);
+            let project = Project::of_workstation_path(&wt.path).name;
 
             // Main worktree: show branch name (handle is just the repo dir name)
             // Other worktrees: show branch inline when it differs from the handle

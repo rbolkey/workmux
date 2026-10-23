@@ -10,9 +10,9 @@ use anyhow::Context as _;
 
 use crate::git;
 use crate::multiplexer::Multiplexer;
+use crate::project::Project;
 use crate::workflow;
 
-use super::super::agent;
 use super::super::sort::WorktreeSortMode;
 use super::App;
 use super::types::*;
@@ -696,7 +696,7 @@ impl App {
             std::collections::BTreeMap::new();
 
         for root in self.repo_roots.values() {
-            let name = agent::extract_project_name(root);
+            let name = Project::of_workstation_path(root).name;
             by_name.entry(name).or_insert_with(|| root.clone());
         }
 
@@ -712,7 +712,7 @@ impl App {
             .or_else(|| {
                 self.current_worktree
                     .as_deref()
-                    .map(agent::extract_project_name)
+                    .map(|path| Project::of_workstation_path(path).name)
             });
 
         let initial_cursor = current_name

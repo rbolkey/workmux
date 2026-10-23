@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use crate::config::MuxMode;
 use crate::multiplexer::{Multiplexer, util};
+use crate::project::Project;
 use crate::state::StateStore;
 use crate::util::canon_or_self;
 use crate::{config, git, github, spinner};
@@ -80,7 +81,11 @@ pub fn list_in(
         return Ok(Vec::new());
     }
 
-    let repo_key = git::get_repository_key_in(repo)?;
+    let repo_dir = match repo {
+        Some(repo) => repo.to_path_buf(),
+        None => std::env::current_dir()?,
+    };
+    let repo_key = Project::of_workstation_path(&main_worktree_path).cache_key(&repo_dir)?;
 
     // Apply filter early before expensive operations
     let worktrees_data = filter_worktrees(worktrees_data, filter);

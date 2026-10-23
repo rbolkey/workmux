@@ -146,16 +146,14 @@ pub const PROJECT_PLACEHOLDER: &str = "{project}";
 
 /// Replace `{project}` in a template with `project_root`'s directory name.
 pub fn expand_project_placeholder(template: &str, project_root: &Path) -> Result<String> {
-    let project_name = project_root
-        .file_name()
-        .ok_or_else(|| {
+    let project =
+        crate::project::Project::from_main_worktree_root(project_root).ok_or_else(|| {
             anyhow!(
                 "Could not determine project name from path: {}",
                 project_root.display()
             )
-        })?
-        .to_string_lossy();
-    Ok(template.replace(PROJECT_PLACEHOLDER, &project_name))
+        })?;
+    Ok(project.expand_placeholder(template))
 }
 
 /// Expand a `worktree_dir` template against a project root.
