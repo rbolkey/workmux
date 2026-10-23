@@ -93,6 +93,7 @@ pub fn run(args: RemoteArgs) -> Result<()> {
                 target,
                 builtin_shims: no_builtin_shims.then_some(false),
                 host_commands,
+                openshell: None,
             },
         ),
         RemoteCommand::List => list(),
@@ -130,6 +131,13 @@ pub fn run(args: RemoteArgs) -> Result<()> {
 fn add(name: &str, remote: RemoteConfig) -> Result<()> {
     registry::validate_name(name)?;
     let (path, content) = global_config::read()?;
+    if global_config::parse(&content)?
+        .projects
+        .get(name)
+        .is_some_and(|project| project.openshell.is_some())
+    {
+        bail!("project {name} is in an OpenShell sandbox, which is already its remote {name}");
+    }
     let updated = global_config::add_entry(&content, &REMOTES, name, &remote)?;
     global_config::write(&path, &updated)?;
     println!(
@@ -313,6 +321,7 @@ mod tests {
             target: target.to_string(),
             builtin_shims: None,
             host_commands: vec![],
+            openshell: None,
         }
     }
 
@@ -357,6 +366,7 @@ nerdfont: true
             &RemoteConfig {
                 builtin_shims: Some(false),
                 host_commands: vec!["just".to_string()],
+                openshell: None,
                 ..ssh("gpu-box")
             },
         )

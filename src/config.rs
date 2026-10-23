@@ -1056,6 +1056,77 @@ pub struct RemoteConfig {
     /// Host commands this remote may run on the workstation.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub host_commands: Vec<String>,
+
+    /// For an OpenShell project's implicit remote: what its sandbox is
+    /// created from. Never written to config.
+    #[serde(skip)]
+    pub openshell: Option<OpenshellRemote>,
+}
+
+/// What an OpenShell project's implicit remote creates its sandbox from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenshellRemote {
+    /// The project the sandbox belongs to.
+    pub project: String,
+    pub git_url: Option<String>,
+    pub settings: OpenshellProject,
+}
+
+/// OpenShell settings of a project whose remote is its own sandbox.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, Default)]
+pub struct OpenshellProject {
+    /// Sandbox name (default: derived from the project name).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<String>,
+
+    /// Image the sandbox runs (default: workmux's OpenShell image).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+
+    /// Policy file merged on top of workmux's base policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<String>,
+
+    /// OpenShell providers attached to the sandbox, for credentials.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub providers: Vec<String>,
+}
+
+/// OpenShell's limit on sandbox name length.
+const SANDBOX_NAME_MAX: usize = 19;
+
+/// The sandbox name for OpenShell project `project`: the name itself when
+/// OpenShell accepts it (lowercase letters, digits and hyphens, at most 19
+/// characters), else a readable prefix and a hash of the name.
+pub fn openshell_sandbox_name(project: &str) -> String {
+    let fits = project.len() <= SANDBOX_NAME_MAX
+        && !project.starts_with('-')
+        && project
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+    if fits {
+        return project.to_string();
+    }
+    use sha2::Digest;
+    let hash = sha2::Sha256::digest(project.as_bytes());
+    let suffix: String = hash[..3].iter().map(|b| format!("{b:02x}")).collect();
+    let prefix: String = project
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .take(SANDBOX_NAME_MAX - suffix.len() - 1)
+        .collect();
+    let prefix = prefix.trim_matches('-');
+    if prefix.is_empty() {
+        format!("wm-{suffix}")
+    } else {
+        format!("{prefix}-{suffix}")
+    }
 }
 
 impl RemoteConfig {
@@ -1086,6 +1157,11 @@ pub struct ProjectEntry {
     /// (default) or the session the command was run from.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placement: Option<ProjectPlacement>,
+
+    /// Set for a project in its own OpenShell sandbox, which is its
+    /// implicit remote, named after the project.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub openshell: Option<OpenshellProject>,
 }
 
 /// Workstation placement of a remote project's windows in window mode.
@@ -3106,7 +3182,45 @@ impl Config {
     /// For workstation-wide settings such as remotes, which no project
     /// config may set.
     pub fn load_global_only() -> anyhow::Result<Self> {
-        Ok(Self::load_global()?.unwrap_or_default())
+        Ok(Self::load_global()?.unwrap_or_default().with_implicit_remotes())
+    }
+
+    /// This config with each OpenShell project's implicit remote: a remote
+    /// named after the project, reaching its sandbox. A registered remote
+    /// of the same name wins, with a warning.
+    pub fn with_implicit_remotes(mut self) -> Self {
+        for (name, entry) in &mut self.projects {
+            let Some(settings) = &entry.openshell else {
+                continue;
+            };
+            if self.remotes.contains_key(name) {
+                tracing::warn!(
+                    project = %name,
+                    "a registered remote has the OpenShell project's name; using that remote"
+                );
+                entry.remote = Some(name.clone());
+                continue;
+            }
+            self.remotes.insert(
+                name.clone(),
+                RemoteConfig {
+                    transport: TransportKind::Openshell,
+                    target: settings
+                        .sandbox
+                        .clone()
+                        .unwrap_or_else(|| openshell_sandbox_name(name)),
+                    builtin_shims: None,
+                    host_commands: Vec::new(),
+                    openshell: Some(OpenshellRemote {
+                        project: name.clone(),
+                        git_url: entry.git_url.clone(),
+                        settings: settings.clone(),
+                    }),
+                },
+            );
+            entry.remote = Some(name.clone());
+        }
+        self
     }
 
     /// Load the global configuration file.
@@ -4136,6 +4250,75 @@ projects:
         assert_eq!(api.git_url.as_deref(), Some("git@github.com:me/api.git"));
         assert_eq!(api.path.as_deref(), Some("~/src/api"));
         assert_eq!(api.session.as_deref(), Some("api-work"));
+    }
+
+    #[test]
+    fn an_openshell_project_owns_an_implicit_remote_named_after_it() {
+        let global: Config = serde_yaml::from_str(
+            "\
+projects:
+  api:
+    git_url: https://github.com/me/api.git
+    openshell:
+      image: ghcr.io/me/api-dev:1
+      policy: ~/policies/api.yaml
+      providers: [github, anthropic]
+",
+        )
+        .expect("config parses");
+
+        let config = global.with_implicit_remotes();
+
+        let remote = &config.remotes["api"];
+        assert_eq!(remote.transport, super::TransportKind::Openshell);
+        assert_eq!(remote.target, "api");
+        let openshell = remote.openshell.as_ref().expect("openshell settings");
+        assert_eq!(openshell.project, "api");
+        assert_eq!(
+            openshell.git_url.as_deref(),
+            Some("https://github.com/me/api.git")
+        );
+        assert_eq!(openshell.settings.image.as_deref(), Some("ghcr.io/me/api-dev:1"));
+        assert_eq!(openshell.settings.providers, ["github", "anthropic"]);
+        assert_eq!(config.projects["api"].remote.as_deref(), Some("api"));
+    }
+
+    #[test]
+    fn an_openshell_sandbox_name_fits_openshells_rules() {
+        let name = |project: &str| {
+            let global: Config = serde_yaml::from_str(&format!(
+                "projects:\n  {project}:\n    openshell: {{}}\n"
+            ))
+            .unwrap();
+            global.with_implicit_remotes().remotes[project].target.clone()
+        };
+
+        assert_eq!(name("api"), "api");
+        assert_eq!(name("web-app-2"), "web-app-2");
+        // Too long, upper case, or with characters OpenShell refuses: a
+        // readable prefix and a hash that keeps distinct projects apart.
+        let long = name("a-very-long-project-name");
+        assert!(long.len() <= 19, "{long}");
+        assert!(long.starts_with("a-very-long-"), "{long}");
+        assert_ne!(long, name("a-very-long-project-name2"));
+        let odd = name("My_App.v2");
+        assert!(odd.starts_with("my-app-v2-"), "{odd}");
+        assert!(
+            odd.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
+            "{odd}"
+        );
+        assert_ne!(odd, name("my-app-v2"));
+    }
+
+    #[test]
+    fn an_openshell_project_may_name_its_sandbox() {
+        let global: Config = serde_yaml::from_str(
+            "projects:\n  api:\n    openshell:\n      sandbox: wm-api-dev\n",
+        )
+        .unwrap();
+
+        assert_eq!(global.with_implicit_remotes().remotes["api"].target, "wm-api-dev");
     }
 
     #[test]
