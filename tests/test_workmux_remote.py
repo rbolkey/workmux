@@ -1070,9 +1070,7 @@ def test_open_and_resurrect_reattach_to_surviving_remote_panes(
         ).stdout.split()
 
     def window_gone(window: str) -> bool:
-        return (
-            env.tmux(["list-panes", "-t", window], check=False).returncode != 0
-        )
+        return env.tmux(["list-panes", "-t", window], check=False).returncode != 0
 
     wm(f"remote add lb --transport loopback --target {remote_root}")
     wm(f"project add api --remote lb --repo {origin} --path code/api")
@@ -1259,7 +1257,7 @@ def test_reap_agents_reaps_aged_agents_on_the_remote(
         assert pid_alive(fresh)
         assert tmux_value(env, "=api:wm-old", "#{window_name}") == "wm-old"
     finally:
-        for pid in (started.read_text().split() if started.exists() else []):
+        for pid in started.read_text().split() if started.exists() else []:
             try:
                 os.kill(int(pid), signal.SIGKILL)
             except ProcessLookupError:
