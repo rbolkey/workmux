@@ -70,6 +70,16 @@ pub enum RemoteCommand {
     /// Print whether a remote pane on this machine is running or ended
     #[command(hide = true)]
     PaneState { pane: RemotePaneId },
+    /// Carry a project's committed work across a recreate (run through transports)
+    #[command(hide = true)]
+    Carry {
+        /// at-risk, manifest, bundle or restore
+        action: String,
+        /// The project's clone
+        path: String,
+        /// For restore: the manifest, as JSON
+        manifest: Option<String>,
+    },
     /// Forward one multiplexer request from a remote shell to the workstation (run by deferred scripts)
     #[command(hide = true)]
     Forward {
@@ -120,6 +130,11 @@ pub fn run(args: RemoteArgs) -> Result<()> {
             );
             Ok(())
         }
+        RemoteCommand::Carry {
+            action,
+            path,
+            manifest,
+        } => crate::remote::carry::serve(&action, &path, manifest.as_deref()),
         RemoteCommand::Forward { request } => {
             let mux = crate::remote::forwarding::ForwardingMux::from_env()
                 .context("remote forward runs only in a remote shell")?;

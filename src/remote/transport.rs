@@ -93,6 +93,12 @@ pub trait Transport: Send + Sync {
     /// Start a long-lived command with piped stdin and stdout.
     fn exec_stdio(&self, argv: &[String]) -> Result<StdioProcess>;
 
+    /// Run a command to completion with `input` on its stdin, capturing
+    /// its output.
+    fn exec_with_input(&self, argv: &[String], input: Vec<u8>) -> Result<Output> {
+        self.exec_stdio(argv)?.finish(input)
+    }
+
     /// Build the workstation command that runs `exec` on the remote with a
     /// TTY. The caller runs it on a terminal.
     fn tty_command(&self, exec: &TtyExec) -> Result<Command>;
@@ -166,6 +172,36 @@ impl StdioProcess {
     #[allow(dead_code)] // Used by tests that kill a remote
     pub fn id(&self) -> u32 {
         self.child.id()
+    }
+
+    /// Write `input` to the process, close its stdin, and wait for it to
+    /// exit, capturing its stdout and the tail of its stderr.
+    pub fn finish(mut self, input: Vec<u8>) -> Result<Output> {
+        let (mut stdin, mut stdout) = self.take_stdio();
+        let writer = std::thread::spawn(move || {
+            use std::io::Write;
+            stdin.write_all(&input)
+        });
+        let mut out = Vec::new();
+        stdout
+            .read_to_end(&mut out)
+            .context("failed to read the remote command's output")?;
+        let written = writer.join().expect("stdin writer panicked");
+        let status = self.child.wait().context("failed to wait for the remote command")?;
+        while !self.stderr_done.load(Ordering::Acquire) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if let Err(error) = written
+            && status.success()
+        {
+            return Err(error).context("failed to send input to the remote command");
+        }
+        let stderr = self.stderr_tail.lock().unwrap().clone();
+        Ok(Output {
+            status,
+            stdout: out,
+            stderr,
+        })
     }
 
     pub fn kill(&mut self) {
@@ -556,6 +592,23 @@ mod tests {
             process.failure(Duration::from_secs(5)),
             "ssh: connect to host devbox port 22: Connection refused"
         );
+    }
+
+    #[test]
+    fn input_reaches_a_command_and_its_output_comes_back() {
+        let root = tempfile::tempdir().unwrap();
+        let loopback = Loopback::with_workmux(root.path(), "/bin/echo");
+
+        let output = loopback
+            .exec_with_input(
+                &argv(&["sh", "-c", "wc -c; echo done >&2; exit 4"]),
+                vec![b'x'; 300_000],
+            )
+            .unwrap();
+
+        assert_eq!(stdout(&output), "300000");
+        assert_eq!(String::from_utf8_lossy(&output.stderr).trim(), "done");
+        assert_eq!(output.status.code(), Some(4));
     }
 
     #[test]

@@ -3,6 +3,7 @@
 
 pub mod agents;
 pub mod attach;
+pub mod carry;
 pub mod channel;
 pub mod channels;
 pub mod connection;
