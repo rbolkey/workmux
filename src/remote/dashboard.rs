@@ -81,6 +81,20 @@ pub enum DashboardRequest {
     },
     /// End a remote pane of the project.
     KillPane { pane: RemotePaneId },
+    /// The clone's local branches.
+    Branches,
+    /// The branch a new worktree starts from by default.
+    DefaultBase,
+    /// Branches whose upstream branch was deleted.
+    GoneBranches,
+    /// The worktree's recent commits: `%h\t%ar\t%s` lines.
+    Log { worktree: PathBuf },
+    /// Record `base` as `branch`'s base branch.
+    SetBase {
+        worktree: PathBuf,
+        branch: String,
+        base: String,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -140,6 +154,32 @@ pub fn serve(params: Value) -> Result<Value> {
             let worktree = project_worktree(&project, &clone, &worktree)?;
             crate::command::dashboard::diff::apply_to_index(&worktree, &patch, reverse)
                 .map_err(|error| anyhow!(error))?;
+            Value::Null
+        }
+        DashboardRequest::Branches => {
+            serde_json::to_value(crate::git::list_local_branches_in(Some(&clone))?)?
+        }
+        DashboardRequest::DefaultBase => Value::String(
+            crate::command::dashboard::site::default_add_worktree_base(&clone),
+        ),
+        DashboardRequest::GoneBranches => {
+            let mut gone: Vec<String> = crate::git::get_gone_branches_in(Some(&clone))?
+                .into_iter()
+                .collect();
+            gone.sort();
+            serde_json::to_value(gone)?
+        }
+        DashboardRequest::Log { worktree } => {
+            let worktree = project_worktree(&project, &clone, &worktree)?;
+            Value::String(crate::command::dashboard::site::recent_commits(&worktree)?)
+        }
+        DashboardRequest::SetBase {
+            worktree,
+            branch,
+            base,
+        } => {
+            let worktree = project_worktree(&project, &clone, &worktree)?;
+            crate::git::set_branch_base_in(&branch, &base, Some(&worktree))?;
             Value::Null
         }
         DashboardRequest::KillPane { pane } => {
@@ -336,6 +376,44 @@ mod tests {
         assert!(staged.contains("+line two"), "{staged}");
         assert!(!staged.contains("nineteen"), "{staged}");
         assert_eq!(unstaged, "");
+    }
+
+    #[test]
+    fn the_worktrees_tab_reads_and_sets_branch_state_on_the_remote() {
+        let (_temp, clone, worktree) = project_with_feature();
+        run_git(&clone, &["branch", "other"]);
+        let channels = channels();
+
+        let branches: Vec<String> = ask(&channels, &clone, DashboardRequest::Branches).unwrap();
+        let base: String = ask(&channels, &clone, DashboardRequest::DefaultBase).unwrap();
+        let gone: Vec<String> = ask(&channels, &clone, DashboardRequest::GoneBranches).unwrap();
+        ask::<Value>(
+            &channels,
+            &clone,
+            DashboardRequest::SetBase {
+                worktree: worktree.clone(),
+                branch: "feature".to_string(),
+                base: "other".to_string(),
+            },
+        )
+        .unwrap();
+        let log: String = ask(
+            &channels,
+            &clone,
+            DashboardRequest::Log {
+                worktree: worktree.clone(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(branches, ["feature", "main", "other"]);
+        assert_eq!(base, "main");
+        assert!(gone.is_empty());
+        assert_eq!(
+            run_git_output(&clone, &["config", "branch.feature.workmux-base"]),
+            "other"
+        );
+        assert!(log.contains("\ttwenty lines\n"), "{log}");
     }
 
     #[test]

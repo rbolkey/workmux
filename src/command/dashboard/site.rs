@@ -16,6 +16,35 @@ use crate::remote::router::RemoteProject;
 
 use super::diff::{self, FileEntry};
 
+/// The branch a new worktree of the repository at `repo_path` starts from
+/// by default: the configured base, else the current branch, else the
+/// default branch.
+pub fn default_add_worktree_base(repo_path: &Path) -> String {
+    crate::config::Config::load_with_location_from(repo_path, None)
+        .ok()
+        .and_then(|(config, _)| {
+            crate::workflow::resolve_configured_base_branch(&config, repo_path)
+                .ok()
+                .flatten()
+        })
+        .or_else(|| {
+            crate::git::get_current_branch_in(repo_path)
+                .ok()
+                .map(|branch| branch.trim().to_string())
+                .filter(|branch| !branch.is_empty())
+        })
+        .or_else(|| crate::git::get_default_branch_in(Some(repo_path)).ok())
+        .unwrap_or_else(|| "main".to_string())
+}
+
+/// The worktree's 20 most recent commits, as `%h\t%ar\t%s` lines.
+pub fn recent_commits(worktree: &Path) -> anyhow::Result<String> {
+    let output = crate::git::unattended_git(Some(worktree))?
+        .args(["log", "--format=%h\t%ar\t%s", "-n", "20"])
+        .output()?;
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorktreeSite {
     Workstation(PathBuf),

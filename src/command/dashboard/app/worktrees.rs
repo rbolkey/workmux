@@ -48,24 +48,6 @@ fn delete_word_backward(s: &mut String) {
     }
 }
 
-fn default_add_worktree_base(repo_path: &Path) -> String {
-    crate::config::Config::load_with_location_from(repo_path, None)
-        .ok()
-        .and_then(|(config, _)| {
-            workflow::resolve_configured_base_branch(&config, repo_path)
-                .ok()
-                .flatten()
-        })
-        .or_else(|| {
-            git::get_current_branch_in(repo_path)
-                .ok()
-                .map(|branch| branch.trim().to_string())
-                .filter(|branch| !branch.is_empty())
-        })
-        .or_else(|| git::get_default_branch_in(Some(repo_path)).ok())
-        .unwrap_or_else(|| "main".to_string())
-}
-
 fn list_branches_for_status(app: &mut App, repo_path: &Path) -> Option<Vec<String>> {
     match git::list_local_branches_in(Some(repo_path)) {
         Ok(branches) => Some(branches),
@@ -1013,7 +995,7 @@ impl App {
             return;
         };
 
-        let default_branch = default_add_worktree_base(&repo_path);
+        let default_branch = super::super::site::default_add_worktree_base(&repo_path);
 
         // Collect branches that already have worktrees
         let occupied_branches: std::collections::HashSet<String> =
