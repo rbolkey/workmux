@@ -511,7 +511,13 @@ mod tests {
         let worktree = clone.with_file_name("api__worktrees").join("feature");
         crate::test_support::run_git(
             &clone,
-            &["worktree", "add", "-b", "feature", worktree.to_str().unwrap()],
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature",
+                worktree.to_str().unwrap(),
+            ],
         );
         crate::test_support::run_git(
             &clone,

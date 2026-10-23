@@ -629,9 +629,7 @@ def test_remote_git_commands_act_on_the_remote_repository(
         (clone / ".workmux.yaml").unlink()
         created = wm("init --project api")
         assert "✓ Created .workmux.yaml" in created.stdout
-        assert "workmux project configuration" in (
-            clone / ".workmux.yaml"
-        ).read_text()
+        assert "workmux project configuration" in (clone / ".workmux.yaml").read_text()
         assert not (repo_path / ".workmux.yaml").exists()
     finally:
         if daemon_pid is not None:
