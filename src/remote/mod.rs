@@ -14,6 +14,7 @@ pub mod router;
 pub mod serve;
 pub mod session;
 pub mod ssh;
+pub mod status;
 #[cfg(test)]
 pub mod testing;
 pub mod transport;

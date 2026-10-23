@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use super::channel::{Handler, Peer};
 use super::handshake::{Hello, write_hello};
-use super::{forwarding, session};
+use super::{forwarding, session, status};
 
 /// Answer to a `ping` health check.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,6 +84,13 @@ pub fn serve(
     let _ = handler
         .forwarding
         .set(socket.as_ref().map(|socket| socket.path.clone()));
+    match status::StatusFiles::for_this_remote() {
+        Ok(files) => {
+            let peer = peer.clone();
+            std::thread::spawn(move || status::send_until_closed(&peer, &files));
+        }
+        Err(error) => tracing::warn!(error = %format!("{error:#}"), "no status files"),
+    }
     while !peer.wait_closed(Duration::from_secs(3600)) {}
     tracing::info!(reason = ?peer.closed_reason(), "control channel closed");
     // Nothing can read their output or answer their prompts any more.

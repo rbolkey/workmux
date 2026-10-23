@@ -83,6 +83,17 @@ pub fn run(cmd: SetWindowStatusCommand) -> Result<()> {
         return Ok(());
     }
 
+    // In a remote pane, status goes to its status file (ADR 0002).
+    if let Some(pane) = crate::remote::status::this_remote_pane() {
+        let status = match cmd {
+            SetWindowStatusCommand::Working => Some(AgentStatus::Working),
+            SetWindowStatusCommand::Waiting => Some(AgentStatus::Waiting),
+            SetWindowStatusCommand::Done => Some(AgentStatus::Done),
+            SetWindowStatusCommand::Clear => None,
+        };
+        return crate::remote::status::record(&pane, status);
+    }
+
     // Inside a sandbox guest, route through RPC to the host supervisor
     if crate::sandbox::guest::is_sandbox_guest() {
         return run_via_rpc(cmd);
@@ -105,6 +116,11 @@ pub fn run(cmd: SetWindowStatusCommand) -> Result<()> {
 pub fn register_agent() -> Result<()> {
     if status_tracking_disabled() {
         return Ok(());
+    }
+
+    // A remote pane's agent registers with no status yet.
+    if let Some(pane) = crate::remote::status::this_remote_pane() {
+        return crate::remote::status::record(&pane, None);
     }
 
     if crate::sandbox::guest::is_sandbox_guest() {
@@ -732,6 +748,46 @@ mod tests {
             agent_session_id: Some(agent_session_id.to_string()),
             prompt: None,
         }
+    }
+
+    const REMOTE_STATUS_CHILD: &str =
+        "command::set_window_status::tests::remote_status_child";
+
+    #[test]
+    #[ignore = "runs as a hook on a remote"]
+    fn remote_status_child() {
+        if crate::test_support::is_isolated_child(REMOTE_STATUS_CHILD) {
+            run(SetWindowStatusCommand::Working).unwrap();
+            run(SetWindowStatusCommand::Done).unwrap();
+        }
+    }
+
+    #[test]
+    fn on_a_remote_status_goes_to_the_remote_panes_status_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("state");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([REMOTE_STATUS_CHILD, "--exact", "--nocapture", "--ignored"])
+            .current_dir(temp.path())
+            .env(crate::test_support::ISOLATED_TEST_ENV, REMOTE_STATUS_CHILD)
+            .env(crate::remote::pane::PANE_ENV, "api/feature/0")
+            .env("XDG_STATE_HOME", &state)
+            // A remote has no workstation multiplexer to fall back to.
+            .env("TMUX", "/nonexistent/tmux,1,0")
+            .env("TMUX_PANE", "%999")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+
+        let record = crate::remote::status::StatusFiles::new(state.join("workmux/status"))
+            .read(&"api/feature/0".parse().unwrap())
+            .expect("a status file");
+        assert_eq!(record.status, Some(AgentStatus::Done));
+        assert_eq!(record.work_gen, 1);
+        assert_eq!(
+            record.workdir.unwrap().canonicalize().unwrap(),
+            temp.path().canonicalize().unwrap()
+        );
     }
 
     fn no_backend_signals() -> StatusBackendSignals {
