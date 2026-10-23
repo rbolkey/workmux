@@ -118,10 +118,20 @@ pub struct BranchSummary {
     pub checks: Option<CheckSummary>,
 }
 
-/// One local repository's branches requested by the sidebar GitHub worker.
+/// Where to learn which GitHub repository to ask about.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum RepoSource {
+    /// A workstation checkout, whose remotes `gh` resolves.
+    Checkout(PathBuf),
+    /// A remote project's registered git URL: no checkout and no remote
+    /// needed, so it works while the remote is disconnected or stopped.
+    GitUrl(String),
+}
+
+/// One repository's branches requested by the sidebar GitHub worker.
 pub struct BranchQueryRequest {
     pub repo_key: PathBuf,
-    pub repo_root: PathBuf,
+    pub source: RepoSource,
     pub branches: Vec<String>,
 }
 
@@ -391,8 +401,20 @@ pub struct PrListEntry {
     pub is_draft: bool,
 }
 
-/// List open PRs for a repository using the GitHub CLI.
-pub fn list_open_prs(repo_root: &Path) -> Result<Vec<PrListEntry>> {
+/// The `gh` arguments that pick the repository `source` names: none for a
+/// checkout, which `gh` reads from its working directory.
+fn repo_args(source: &RepoSource) -> Result<Vec<String>> {
+    Ok(match source {
+        RepoSource::Checkout(_) => Vec::new(),
+        RepoSource::GitUrl(url) => {
+            let (owner, name, hostname) = url_repo_context(url)?;
+            vec!["--repo".to_string(), format!("{hostname}/{owner}/{name}")]
+        }
+    })
+}
+
+/// List open PRs of the repository `source` names.
+pub fn list_open_prs_from(source: &RepoSource) -> Result<Vec<PrListEntry>> {
     #[derive(Deserialize)]
     struct RawPr {
         number: u32,
@@ -404,8 +426,11 @@ pub fn list_open_prs(repo_root: &Path) -> Result<Vec<PrListEntry>> {
         author: Author,
     }
 
-    let output = Command::new("gh")
-        .current_dir(repo_root)
+    let mut command = Command::new("gh");
+    if let RepoSource::Checkout(repo_root) = source {
+        command.current_dir(repo_root);
+    }
+    let output = command
         .args([
             "pr",
             "list",
@@ -416,6 +441,7 @@ pub fn list_open_prs(repo_root: &Path) -> Result<Vec<PrListEntry>> {
             "--limit",
             "100",
         ])
+        .args(repo_args(source)?)
         .output();
 
     let output = match output {
@@ -666,6 +692,70 @@ pub fn list_branch_summaries(
     }
 }
 
+/// Fetch GitHub state for branches of the repository at `git_url`, with no
+/// checkout to ask `gh` about: a remote project's registered URL. It works
+/// while the remote itself is disconnected or stopped.
+fn list_branch_summaries_for_url(
+    git_url: &str,
+    branches: &[String],
+) -> Result<HashMap<String, BranchSummary>> {
+    list_branch_summaries_for_url_with(git_url, branches, &mut run_graphql)
+}
+
+fn list_branch_summaries_for_url_with(
+    git_url: &str,
+    branches: &[String],
+    run: &mut impl FnMut(&str, &[u8]) -> Result<GraphqlCommandResponse>,
+) -> Result<HashMap<String, BranchSummary>> {
+    if branches.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let (owner, name, hostname) = url_repo_context(git_url)?;
+    let remote = RemoteQuery {
+        hostname,
+        owner,
+        name,
+        branches: branches.to_vec(),
+        locals: Vec::new(),
+    };
+    execute_remote_chunk_with(std::slice::from_ref(&remote), run)
+        .pop()
+        .flatten()
+        .ok_or_else(|| anyhow!("GitHub has no answer for {git_url}"))
+}
+
+/// Owner, name and API hostname of the repository at `git_url`.
+fn url_repo_context(git_url: &str) -> Result<ResolvedRepoContext> {
+    let identity = crate::git::parse_repo_identity_from_git_url(git_url)
+        .ok_or_else(|| anyhow!("cannot tell the GitHub repository of {git_url}"))?;
+    // An ssh:// URL may carry a port; the API host never does.
+    let hostname = identity
+        .host
+        .split(':')
+        .next()
+        .unwrap_or(&identity.host)
+        .to_string();
+    Ok((identity.owner, identity.repo, hostname))
+}
+
+fn repo_context_of(source: &RepoSource) -> Result<ResolvedRepoContext> {
+    match source {
+        RepoSource::Checkout(path) => get_repo_context(path),
+        RepoSource::GitUrl(url) => url_repo_context(url),
+    }
+}
+
+/// Fetch GitHub state for branches of the repository `source` names.
+pub fn list_branch_summaries_from(
+    source: &RepoSource,
+    branches: &[String],
+) -> Result<HashMap<String, BranchSummary>> {
+    match source {
+        RepoSource::Checkout(path) => list_branch_summaries(path, branches),
+        RepoSource::GitUrl(url) => list_branch_summaries_for_url(url, branches),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct GraphqlError {
     message: String,
@@ -894,7 +984,7 @@ pub fn list_branch_summaries_batch(
 
     for request in requests {
         let requested: BTreeSet<String> = request.branches.into_iter().collect();
-        let Ok((owner, name, hostname)) = get_repo_context(&request.repo_root) else {
+        let Ok((owner, name, hostname)) = repo_context_of(&request.source) else {
             continue;
         };
         let key = (
@@ -2056,6 +2146,60 @@ mod tests {
                 .into_iter()
                 .all(|outcome| { outcome.is_some_and(|outcome| outcome.contains_key("main")) })
         );
+    }
+
+    #[test]
+    fn gh_is_pointed_at_a_registered_git_urls_repository() {
+        assert_eq!(
+            repo_args(&RepoSource::GitUrl("git@github.com:me/api.git".to_string())).unwrap(),
+            ["--repo", "github.com/me/api"]
+        );
+        assert!(
+            repo_args(&RepoSource::Checkout(PathBuf::from("/src/api")))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_registered_git_url_names_the_repository_without_a_checkout() {
+        let mut asked = Vec::new();
+        let summaries = list_branch_summaries_for_url_with(
+            "ssh://git@github.example.com:22/me/api.git",
+            &["feature".to_string()],
+            &mut |hostname, body| {
+                let request: serde_json::Value = serde_json::from_slice(body).unwrap();
+                asked.push((
+                    hostname.to_string(),
+                    request["variables"]["owner_0"].clone(),
+                    request["variables"]["name_0"].clone(),
+                ));
+                Ok(GraphqlCommandResponse {
+                    success: true,
+                    response: BatchGraphqlResponse {
+                        data: Some(HashMap::from([(
+                            "repo_0".to_string(),
+                            serde_json::json!({
+                                "pr_r0_b0": { "nodes": [] },
+                                "ref_r0_b0": null
+                            }),
+                        )])),
+                        errors: Vec::new(),
+                    },
+                })
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            asked,
+            [(
+                "github.example.com".to_string(),
+                serde_json::json!("me"),
+                serde_json::json!("api")
+            )]
+        );
+        assert!(summaries.contains_key("feature"));
     }
 
     #[test]

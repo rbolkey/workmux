@@ -119,8 +119,9 @@ pub struct SweepProgress {
 
 /// An entry in the project picker.
 pub struct ProjectEntry {
+    /// The project's group label, such as `api` or `api@devbox`.
     pub name: String,
-    pub path: PathBuf,
+    pub scope: crate::command::dashboard::site::ProjectScope,
 }
 
 /// State for the project picker modal.
@@ -156,8 +157,8 @@ pub struct BaseBranchPicker {
     pub current_base: Option<String>,
     /// Branch name of the worktree being edited
     pub worktree_branch: String,
-    /// Path to the worktree's repo (for running git commands)
-    pub repo_path: PathBuf,
+    /// The worktree whose branch's base is being set.
+    pub site: crate::command::dashboard::site::WorktreeSite,
 }
 
 impl BaseBranchPicker {
@@ -211,7 +212,8 @@ pub struct AddWorktreeState {
     pub base_filter: String,
     /// Tab prefix for base branch cycling.
     pub base_tab_prefix: Option<String>,
-    pub repo_path: PathBuf,
+    /// The project the worktree is added to.
+    pub scope: crate::command::dashboard::site::ProjectScope,
     /// Current mode: Branch picker or PR list.
     pub mode: AddWorktreeMode,
     /// PR list state (loaded async when switching to PR mode).
@@ -580,6 +582,8 @@ fn fuzzy_score(query: &str, target: &str) -> Option<i32> {
 pub struct RemovePlan {
     pub handle: String,
     pub path: PathBuf,
+    /// The project the worktree belongs to.
+    pub scope: crate::command::dashboard::site::ProjectScope,
     pub is_dirty: bool,
     pub is_unmerged: bool,
     pub keep_branch: bool,

@@ -16,6 +16,7 @@ use super::DashboardTab;
 use super::super::agent;
 use super::super::ansi;
 use super::super::settings::{load_last_pane_id, save_hide_stale, save_last_pane_id};
+use super::super::site::WorktreeSite;
 use super::super::sort::SortMode;
 use super::super::spinner::SPINNER_FRAMES;
 use super::App;
@@ -42,7 +43,7 @@ impl App {
             let filter_lower = self.filter_text.to_lowercase();
             let window_prefix = self.config.window_prefix();
             self.agents.retain(|a| {
-                let project = Self::project(a).name.to_lowercase();
+                let project = Self::project(a).group_label().to_lowercase();
                 let (worktree, _) = agent::extract_worktree_name(
                     &a.session,
                     &a.window_name,
@@ -64,9 +65,8 @@ impl App {
             let sleeping = &self.sleeping_pane_ids;
             let interrupted = &self.interrupted_pane_ids;
             self.agents.retain(|agent| {
-                !crate::agent_staleness::is_stale(
-                    agent.activity_ts(),
-                    agent.status,
+                !crate::agent_staleness::agent_is_stale(
+                    agent,
                     now,
                     threshold,
                     sleeping.contains(&agent.pane_id),
@@ -145,9 +145,8 @@ impl App {
 
         // Helper closure to get status priority (lower = higher priority)
         let get_priority = |agent: &AgentPane| -> u8 {
-            let is_stale = crate::agent_staleness::is_stale(
-                agent.activity_ts(),
-                agent.status,
+            let is_stale = crate::agent_staleness::agent_is_stale(
+                agent,
                 now,
                 stale_threshold,
                 sleeping.contains(&agent.pane_id),
@@ -395,9 +394,22 @@ impl App {
         }
     }
 
-    /// Kill a pane and remove it from the agent list.
+    /// Kill a pane and remove it from the agent list. A remote agent's
+    /// remote pane ends too, as closing its window would end it.
     fn do_kill(&mut self, pane_id: &str) {
+        let remote_pane = self
+            .all_agents
+            .iter()
+            .find(|a| a.pane_id == pane_id && a.remote.is_some())
+            .and_then(|agent| Some((WorktreeSite::of(agent), self.remote_pane_of(pane_id)?)));
         let _ = self.mux.kill_pane(pane_id);
+        if let Some((site, remote_pane)) = remote_pane {
+            std::thread::spawn(move || {
+                if let Err(error) = site.kill_remote_pane(remote_pane) {
+                    tracing::warn!(error, "could not end the remote pane");
+                }
+            });
+        }
 
         let selected = self.table_state.selected().unwrap_or(0);
 
@@ -418,6 +430,25 @@ impl App {
         // Force preview refresh for new selection
         self.preview_pane_id = None;
         self.update_preview();
+    }
+
+    /// The remote pane the workstation pane `pane_id` shows.
+    fn remote_pane_of(&self, pane_id: &str) -> Option<crate::remote::pane::RemotePaneId> {
+        if self.mux.name() != "tmux" {
+            return None;
+        }
+        crate::multiplexer::TmuxBackend::for_socket(&self.mux.instance_id())
+            .query(&[
+                "display-message",
+                "-p",
+                "-t",
+                pane_id,
+                &format!("#{{{}}}", crate::remote::forwarded::REMOTE_PANE_TAG),
+            ])
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
     }
 
     /// Send a key to the selected agent's pane
@@ -447,9 +478,8 @@ impl App {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        crate::agent_staleness::is_stale(
-            agent.activity_ts(),
-            agent.status,
+        crate::agent_staleness::agent_is_stale(
+            agent,
             now,
             self.stale_threshold_secs,
             self.sleeping_pane_ids.contains(&agent.pane_id),
@@ -520,8 +550,9 @@ impl App {
 
     /// Get PR info for an agent by looking up its branch in PR statuses
     pub fn get_pr_for_agent(&self, agent: &AgentPane) -> Option<&PrSummary> {
-        let repo_root = self.repo_keys.get(&agent.path)?;
-        let git_status = self.git_statuses.get(&agent.path)?;
+        let key = WorktreeSite::of(agent).status_key();
+        let repo_root = self.repo_keys.get(&key)?;
+        let git_status = self.git_statuses.get(&key)?;
         let branch = git_status.branch.as_ref()?;
         // Don't show PRs for main/master - you merge INTO main, not FROM it
         if branch == "main" || branch == "master" {
@@ -531,8 +562,9 @@ impl App {
     }
 
     pub fn get_checks_for_agent(&self, agent: &AgentPane) -> Option<&CheckSummary> {
-        let repo_root = self.repo_keys.get(&agent.path)?;
-        let branch = self.git_statuses.get(&agent.path)?.branch.as_ref()?;
+        let key = WorktreeSite::of(agent).status_key();
+        let repo_root = self.repo_keys.get(&key)?;
+        let branch = self.git_statuses.get(&key)?.branch.as_ref()?;
         self.check_statuses
             .get(repo_root)?
             .get(branch)

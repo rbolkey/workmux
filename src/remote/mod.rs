@@ -6,6 +6,7 @@ pub mod attach;
 pub mod channel;
 pub mod channels;
 pub mod connection;
+pub mod dashboard;
 pub mod forwarded;
 pub mod forwarding;
 pub mod handshake;

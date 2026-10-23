@@ -154,6 +154,18 @@ impl AgentPane {
         }
     }
 
+    /// Key of this agent's worktree in git status and PR caches: its path on
+    /// the workstation, or a key naming its remote and project for a remote
+    /// agent, whose path is a path on the remote.
+    pub fn git_key(&self) -> PathBuf {
+        match &self.remote {
+            Some(remote) => {
+                crate::remote::dashboard::worktree_key(&remote.remote, &remote.project, &self.path)
+            }
+            None => self.path.clone(),
+        }
+    }
+
     /// Whether this is a remote agent whose control channel is down.
     pub fn is_remote_stale(&self) -> bool {
         self.remote.as_ref().is_some_and(|remote| remote.stale)

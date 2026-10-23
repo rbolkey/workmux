@@ -126,9 +126,10 @@ impl<'a> RowContext<'a> {
             .unwrap_or_default();
 
         let pane_title = build_pane_title(agent, &primary, &secondary, &label_worktree, &project);
-        let git_status = app.git_statuses.get(&agent.path);
-        let pr_summary = app.pr_statuses.get(&agent.path);
-        let check_summary = app.check_statuses.get(&agent.path);
+        let git_key = agent.git_key();
+        let git_status = app.git_statuses.get(&git_key);
+        let pr_summary = app.pr_statuses.get(&git_key);
+        let check_summary = app.check_statuses.get(&git_key);
         let kind =
             effective_agent_kind(agent.agent_kind.as_deref(), agent.agent_command.as_deref());
         let agent_icon = resolve_agent_icon(kind, &app.agent_icons);
@@ -439,28 +440,8 @@ pub(crate) fn agent_is_stale(
     is_sleeping: bool,
     is_interrupted: bool,
 ) -> bool {
-    agent.is_remote_stale()
-        || is_agent_stale(
-            agent.activity_ts(),
-            agent.status,
-            now_secs,
-            stale_threshold_secs,
-            is_sleeping,
-            is_interrupted,
-        )
-}
-
-fn is_agent_stale(
-    activity_ts: Option<u64>,
-    status: Option<AgentStatus>,
-    now_secs: u64,
-    stale_threshold_secs: u64,
-    is_sleeping: bool,
-    is_interrupted: bool,
-) -> bool {
-    crate::agent_staleness::is_stale(
-        activity_ts,
-        status,
+    crate::agent_staleness::agent_is_stale(
+        agent,
         now_secs,
         stale_threshold_secs,
         is_sleeping,
@@ -522,12 +503,14 @@ mod tests {
 
     #[test]
     fn missing_activity_timestamp_is_stale() {
-        assert!(is_agent_stale(None, None, 100, 60, false, false));
+        assert!(crate::agent_staleness::is_stale(
+            None, None, 100, 60, false, false
+        ));
     }
 
     #[test]
     fn active_statuses_are_not_stale_without_activity_timestamp() {
-        assert!(!is_agent_stale(
+        assert!(!crate::agent_staleness::is_stale(
             None,
             Some(AgentStatus::Working),
             100,
@@ -535,7 +518,7 @@ mod tests {
             false,
             false
         ));
-        assert!(!is_agent_stale(
+        assert!(!crate::agent_staleness::is_stale(
             None,
             Some(AgentStatus::Waiting),
             100,
@@ -554,7 +537,7 @@ mod tests {
 
     #[test]
     fn sleeping_agent_is_stale_even_with_active_status() {
-        assert!(is_agent_stale(
+        assert!(crate::agent_staleness::is_stale(
             Some(100),
             Some(AgentStatus::Working),
             100,
@@ -846,7 +829,7 @@ mod tests {
 
     #[test]
     fn interrupted_active_agent_can_become_stale() {
-        assert!(is_agent_stale(
+        assert!(crate::agent_staleness::is_stale(
             Some(100),
             Some(AgentStatus::Working),
             500,
@@ -854,7 +837,7 @@ mod tests {
             false,
             true
         ));
-        assert!(!is_agent_stale(
+        assert!(!crate::agent_staleness::is_stale(
             Some(480),
             Some(AgentStatus::Working),
             500,

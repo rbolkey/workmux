@@ -394,21 +394,23 @@ fn render_table(f: &mut Frame, app: &mut App, area: Rect) {
                 String::new()
             };
 
-            let project = App::project(agent).name;
+            let project = App::project(agent).group_label();
             let (worktree_name, is_main) = app.extract_worktree_name(agent);
             // Check if this agent corresponds to the current working directory.
             // Try canonicalized comparison first (handles symlinks), fall back to direct comparison.
-            let is_current = app.current_worktree.as_ref().is_some_and(|cwd| {
-                // Try canonical comparison first (resolves symlinks like /var -> /private/var on macOS)
-                if let (Ok(cwd_canonical), Ok(agent_canonical)) =
-                    (cwd.canonicalize(), agent.path.canonicalize())
-                {
-                    cwd_canonical == agent_canonical
-                } else {
-                    // Fall back to direct comparison
-                    agent.path == *cwd
-                }
-            });
+            // A remote worktree is never the workstation directory.
+            let is_current = agent.remote.is_none()
+                && app.current_worktree.as_ref().is_some_and(|cwd| {
+                    // Try canonical comparison first (resolves symlinks like /var -> /private/var on macOS)
+                    if let (Ok(cwd_canonical), Ok(agent_canonical)) =
+                        (cwd.canonicalize(), agent.path.canonicalize())
+                    {
+                        cwd_canonical == agent_canonical
+                    } else {
+                        // Fall back to direct comparison
+                        agent.path == *cwd
+                    }
+                });
             let worktree_display = format!("{}{}", worktree_name, pane_suffix);
             let worktree_base = truncate(
                 &worktree_name,
@@ -431,7 +433,9 @@ fn render_table(f: &mut Frame, app: &mut App, area: Rect) {
             let duration_line = format::elapsed_time_line(duration, elapsed, &app.palette);
 
             // Get git status for this worktree (may be None if not yet fetched)
-            let git_status = app.git_statuses.get(&agent.path);
+            let git_status = app
+                .git_statuses
+                .get(&crate::command::dashboard::site::WorktreeSite::of(agent).status_key());
             let git_spans = format_git_status(git_status, app.spinner_frame, &app.palette);
 
             let pr = app.get_pr_for_agent(agent);

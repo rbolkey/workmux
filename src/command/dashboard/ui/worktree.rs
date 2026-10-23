@@ -9,7 +9,6 @@ use ratatui::{
 };
 
 use crate::config::WorktreeColumn;
-use crate::project::Project;
 
 use super::super::agent;
 use super::super::app::App;
@@ -52,7 +51,7 @@ pub fn render_worktree_table(f: &mut Frame, app: &mut App, area: Rect) {
                 String::new()
             };
 
-            let project = Project::of_workstation_path(&wt.path).name;
+            let project = app.worktree_site(&wt.path).project().group_label();
 
             // Main worktree: show branch name (handle is just the repo dir name)
             // Other worktrees: show branch inline when it differs from the handle
@@ -75,7 +74,9 @@ pub fn render_worktree_table(f: &mut Frame, app: &mut App, area: Rect) {
             };
 
             // Git status
-            let git_status = app.git_statuses.get(&wt.path);
+            let git_status = app
+                .git_statuses
+                .get(&app.worktree_site(&wt.path).status_key());
             let git_spans = format_git_status(git_status, app.spinner_frame, &app.palette);
 
             let pr_title = wt
@@ -107,15 +108,17 @@ pub fn render_worktree_table(f: &mut Frame, app: &mut App, area: Rect) {
                 AgentStatusFormat::TableCell,
             );
 
-            let is_current = app.current_worktree.as_ref().is_some_and(|cwd| {
-                if let (Ok(cwd_canonical), Ok(wt_canonical)) =
-                    (cwd.canonicalize(), wt.path.canonicalize())
-                {
-                    cwd_canonical == wt_canonical
-                } else {
-                    wt.path == *cwd
-                }
-            });
+            // A remote worktree is never the workstation directory.
+            let is_current = !app.worktree_site(&wt.path).is_remote()
+                && app.current_worktree.as_ref().is_some_and(|cwd| {
+                    if let (Ok(cwd_canonical), Ok(wt_canonical)) =
+                        (cwd.canonicalize(), wt.path.canonicalize())
+                    {
+                        cwd_canonical == wt_canonical
+                    } else {
+                        wt.path == *cwd
+                    }
+                });
 
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -395,7 +398,9 @@ fn render_info_panel(
     ]));
 
     // Git status details (base branch, ahead/behind, diff stats)
-    let git_status = app.git_statuses.get(&wt.path);
+    let git_status = app
+        .git_statuses
+        .get(&app.worktree_site(&wt.path).status_key());
     if let Some(status) = git_status {
         // Base branch + ahead/behind
         let mut base_spans = vec![Span::styled("Base    ", label_style)];

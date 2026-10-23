@@ -46,6 +46,9 @@ impl Handler for RemoteHandler {
                 params,
             )
             .map_err(|error| format!("{error:#}")),
+            super::dashboard::METHOD => {
+                super::dashboard::serve(params).map_err(|error| format!("{error:#}"))
+            }
             shims::INSTALL_METHOD => {
                 shims::serve_install(params).map_err(|error| format!("{error:#}"))
             }
