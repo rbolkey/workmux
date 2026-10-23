@@ -950,7 +950,11 @@ pub fn setup_configured_panes<M: Multiplexer + ?Sized>(
                     &config.sandbox.toolchain(),
                     options.worktree_root.unwrap_or(working_dir),
                 );
-                crate::sandbox::toolchain::wrap_command(&final_command, &toolchain)
+                crate::remote::provision::wrap(
+                    &final_command,
+                    &toolchain,
+                    crate::remote::provision::devshell_here(),
+                )
             } else {
                 final_command
             };
