@@ -6,13 +6,15 @@ use std::path::{Path, PathBuf};
 use crate::config;
 use crate::config::MuxMode;
 use crate::multiplexer::{AgentStatus, create_backend, detect_backend};
-use crate::project::Project;
+use crate::project::{Project, ProjectHost};
+use crate::remote::router::{self, RemoteProject};
+use crate::remote::session::ServedProject;
 use crate::util::format_compact_age;
 use crate::workflow::types::AgentStatusSummary;
 use crate::{git, nerdfont, workflow};
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use pathdiff::diff_paths;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tabled::{
     Table, Tabled,
     settings::{Padding, Style, disable::Remove, location::ByColumnName, object::Columns},
@@ -141,7 +143,7 @@ fn format_agent_status(
     }
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct JsonWorktree {
     project: String,
     project_path: String,
@@ -154,15 +156,62 @@ struct JsonWorktree {
     is_open: bool,
     agent_statuses: Vec<AgentStatus>,
     created_at: Option<u64>,
+    /// The remote a remote project's worktree lives on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    remote: Option<String>,
+    /// Sent by remote workmux, so the workstation can show the column.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    has_unmerged: Option<bool>,
 }
 
 struct ProjectWorktree {
     project: Project,
     project_path: PathBuf,
     worktree: workflow::types::WorktreeInfo,
+    /// Known already for a remote worktree, whose files aren't here.
+    has_uncommitted_changes: Option<bool>,
 }
 
+impl ProjectWorktree {
+    /// A worktree of `project` as remote workmux listed it.
+    fn from_remote(project: &Project, entry: JsonWorktree) -> Self {
+        let statuses = entry.agent_statuses;
+        Self {
+            project: project.clone(),
+            project_path: PathBuf::from(entry.project_path),
+            worktree: workflow::types::WorktreeInfo {
+                repo_key: PathBuf::new(),
+                handle: entry.handle,
+                branch: entry.branch,
+                path: PathBuf::from(entry.path),
+                is_main: entry.is_main,
+                mode: if entry.mode == "session" {
+                    MuxMode::Session
+                } else {
+                    MuxMode::Window
+                },
+                has_mux_window: entry.is_open,
+                has_unmerged: entry.has_unmerged.unwrap_or(false),
+                pr_info: None,
+                agent_status: (!statuses.is_empty()).then_some(AgentStatusSummary { statuses }),
+                created_at: entry.created_at,
+                base_branch: None,
+            },
+            has_uncommitted_changes: Some(entry.has_uncommitted_changes),
+        }
+    }
+}
+
+/// The project this process lists: the remote project remote workmux runs
+/// it for, else the workstation project at `root`.
 fn project(root: &Path) -> Project {
+    match ServedProject::current() {
+        Some(served) => Project::remote(served.remote, served.name),
+        None => workstation_project(root),
+    }
+}
+
+fn workstation_project(root: &Path) -> Project {
     Project::from_main_worktree_root(root)
         .unwrap_or_else(|| Project::workstation(root.to_string_lossy()))
 }
@@ -184,7 +233,7 @@ fn list_project(
     filter: &[String],
 ) -> Result<Vec<ProjectWorktree>> {
     let (config, _) = config::Config::load_with_location_from(root, None)?;
-    let project = project(root);
+    let project = workstation_project(root);
     let worktrees = workflow::list_in(&config, mux, show_pr, filter, Some(root))?;
     Ok(worktrees
         .into_iter()
@@ -192,17 +241,66 @@ fn list_project(
             project: project.clone(),
             project_path: root.to_path_buf(),
             worktree,
+            has_uncommitted_changes: None,
         })
         .collect())
 }
 
-pub fn run(show_pr: bool, json: bool, all: bool, filter: &[String]) -> Result<()> {
+/// List a remote project's worktrees through remote workmux.
+fn list_remote_project(
+    remote: &RemoteProject,
+    filter: &[String],
+) -> Result<Vec<ProjectWorktree>> {
+    let mut argv = vec!["workmux", "list", "--json"];
+    argv.extend(filter.iter().map(String::as_str));
+    let (exit, stdout) = router::capture(remote, &argv)?;
+    if exit != 0 {
+        bail!("workmux list exited with {exit}");
+    }
+    let entries: Vec<JsonWorktree> =
+        serde_json::from_slice(&stdout).context("remote workmux sent an unreadable list")?;
+    let project = remote.project();
+    Ok(entries
+        .into_iter()
+        .map(|entry| ProjectWorktree::from_remote(&project, entry))
+        .collect())
+}
+
+pub fn run(
+    show_pr: bool,
+    json: bool,
+    all: bool,
+    remote_project: Option<&str>,
+    filter: &[String],
+) -> Result<()> {
+    if let Some(remote) = router::resolve(remote_project)? {
+        let mut argv = vec!["workmux", "list"];
+        if show_pr {
+            argv.push("--pr");
+        }
+        if json {
+            argv.push("--json");
+        }
+        argv.extend(filter.iter().map(String::as_str));
+        return router::exit_with(router::run(&remote, &argv)?);
+    }
+
     let display_config = config::Config::load(None)?;
     let mux = create_backend(detect_backend());
+    let served = ServedProject::current();
     let mut worktrees = Vec::new();
     if all {
         for root in discover_project_roots(mux.as_ref())? {
             worktrees.extend(list_project(&root, mux.as_ref(), show_pr && !json, filter)?);
+        }
+        for remote in router::remote_projects()? {
+            match list_remote_project(&remote, filter) {
+                Ok(entries) => worktrees.extend(entries),
+                Err(error) => eprintln!(
+                    "warning: could not list project {} on {}: {error:#}",
+                    remote.site.name, remote.site.remote
+                ),
+            }
         }
     } else {
         let root = git::get_main_worktree_root()?;
@@ -214,6 +312,7 @@ pub fn run(show_pr: bool, json: bool, all: bool, filter: &[String]) -> Result<()
                     project: project.clone(),
                     project_path: root.clone(),
                     worktree,
+                    has_uncommitted_changes: None,
                 }),
         );
     }
@@ -232,7 +331,13 @@ pub fn run(show_pr: bool, json: bool, all: bool, filter: &[String]) -> Result<()
             .into_iter()
             .map(|entry| {
                 let wt = entry.worktree;
+                let remote = match entry.project.host {
+                    ProjectHost::Workstation => None,
+                    ProjectHost::Remote(remote) => Some(remote),
+                };
                 JsonWorktree {
+                    has_unmerged: remote.is_some().then_some(wt.has_unmerged),
+                    remote,
                     project: entry.project.name,
                     project_path: entry.project_path.to_string_lossy().into_owned(),
                     handle: wt.handle,
@@ -243,7 +348,9 @@ pub fn run(show_pr: bool, json: bool, all: bool, filter: &[String]) -> Result<()
                         MuxMode::Window => "window".to_string(),
                         MuxMode::Session => "session".to_string(),
                     },
-                    has_uncommitted_changes: git::has_uncommitted_changes(&wt.path).unwrap_or(true),
+                    has_uncommitted_changes: entry.has_uncommitted_changes.unwrap_or_else(|| {
+                        git::has_uncommitted_changes(&wt.path).unwrap_or(true)
+                    }),
                     is_open: wt.has_mux_window,
                     agent_statuses: wt
                         .agent_status
@@ -269,7 +376,11 @@ pub fn run(show_pr: bool, json: bool, all: bool, filter: &[String]) -> Result<()
         .into_iter()
         .map(|entry| {
             let wt = entry.worktree;
+            // A remote worktree's path is shown in full: it isn't relative
+            // to anywhere on the workstation.
+            let remote = matches!(entry.project.host, ProjectHost::Remote(_));
             let path_str = diff_paths(&wt.path, &current_dir)
+                .filter(|_| !remote)
                 .map(|p| {
                     let s = p.display().to_string();
                     if s.is_empty() || s == "." {
@@ -289,7 +400,8 @@ pub fn run(show_pr: bool, json: bool, all: bool, filter: &[String]) -> Result<()
             };
 
             WorktreeRow {
-                project: entry.project.name,
+                // A remote project's label names its remote.
+                project: entry.project.group_label(),
                 branch: wt.branch,
                 age,
                 pr_status: format_pr_status(wt.pr_info),
@@ -318,7 +430,7 @@ pub fn run(show_pr: bool, json: bool, all: bool, filter: &[String]) -> Result<()
         .with(Style::blank())
         .modify(Columns::new(0..8), Padding::new(0, 1, 0, 0));
 
-    if !all {
+    if !all && served.is_none() {
         table.with(Remove::column(ByColumnName::new("PROJECT")));
     }
     if !show_pr {

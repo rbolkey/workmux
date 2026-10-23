@@ -4,10 +4,12 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::io::{BufRead, Write};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use super::channel::{Handler, Peer};
 use super::handshake::{Hello, write_hello};
+use super::session;
 
 /// Answer to a `ping` health check.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -17,11 +19,19 @@ pub struct Ping {
     pub pid: u32,
 }
 
-struct RemoteHandler;
+/// Answers the workstation's requests. Holds this side's peer, set once the
+/// channel starts, so a command session can stream output back.
+#[derive(Clone, Default)]
+struct RemoteHandler {
+    peer: Arc<OnceLock<Peer>>,
+}
 
 impl Handler for RemoteHandler {
-    fn request(&self, method: &str, _params: Value) -> Result<Value, String> {
+    fn request(&self, method: &str, params: Value) -> Result<Value, String> {
         match method {
+            session::RUN_METHOD => {
+                session::serve_run(self.peer.wait(), params).map_err(|error| format!("{error:#}"))
+            }
             "ping" => {
                 let hello = Hello::current();
                 serde_json::to_value(Ping {
@@ -43,7 +53,9 @@ pub fn serve(
     mut writer: impl Write + Send + 'static,
 ) -> Result<()> {
     write_hello(&mut writer, &Hello::current())?;
-    let peer = Peer::start(reader, writer, RemoteHandler);
+    let handler = RemoteHandler::default();
+    let peer = Peer::start(reader, writer, handler.clone());
+    let _ = handler.peer.set(peer.clone());
     while !peer.wait_closed(Duration::from_secs(3600)) {}
     tracing::info!(reason = ?peer.closed_reason(), "control channel closed");
     Ok(())

@@ -147,15 +147,79 @@ pub(crate) fn serve_requests(stream: UnixStream, first_line: Option<Vec<u8>>) ->
     let mut writer = stream.try_clone()?;
     let mut reader = BufReader::new(stream);
     if let Some(line) = first_line {
-        write_message(&mut writer, &answer(&line))?;
+        respond(&mut writer, &line)?;
     }
     while let Some(line) = read_line(&mut reader)? {
         if line.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-        write_message(&mut writer, &answer(&line))?;
+        respond(&mut writer, &line)?;
     }
     Ok(())
+}
+
+/// Answer one request line. A command session streams its output as
+/// notifications before the response.
+fn respond(writer: &mut impl Write, line: &[u8]) -> Result<()> {
+    match serde_json::from_slice::<Request>(line) {
+        Ok(request) if request.method == COMMAND_SESSION_METHOD => {
+            let response = command_session(&request, writer);
+            write_message(writer, &response)
+        }
+        _ => write_message(writer, &answer(line)),
+    }
+}
+
+/// Method that runs a command session on a remote: `{remote, request}`.
+pub const COMMAND_SESSION_METHOD: &str = "command.session";
+
+/// A notification the daemon sends a client before its response.
+#[derive(Debug, Serialize, Deserialize)]
+struct Notification {
+    method: String,
+    params: Value,
+}
+
+#[derive(Deserialize)]
+struct CommandSessionParams {
+    remote: String,
+    request: crate::remote::session::CommandRequest,
+}
+
+fn command_session(request: &Request, writer: &mut impl Write) -> Response {
+    let mut run = || -> Result<Value> {
+        let params: CommandSessionParams = serde_json::from_value(request.params.clone())?;
+        let remotes = crate::remote::registry::remotes()?;
+        let remote = remotes
+            .get(&params.remote)
+            .ok_or_else(|| anyhow!("no remote named {}", params.remote))?;
+        let mut client_gone = false;
+        let exit_code = crate::remote::channels().run_command(
+            &params.remote,
+            remote,
+            &params.request,
+            &mut |stream, data| {
+                // A client that has gone away stops reading; the command
+                // still runs to completion.
+                if client_gone {
+                    return;
+                }
+                let notification = Notification {
+                    method: crate::remote::session::OUTPUT_METHOD.to_string(),
+                    params: serde_json::to_value(crate::remote::session::OutputParams::new(
+                        0, stream, data,
+                    ))
+                    .expect("serializes"),
+                };
+                client_gone = write_message(writer, &notification).is_err();
+            },
+        )?;
+        Ok(serde_json::json!({ "exit_code": exit_code }))
+    };
+    match run() {
+        Ok(result) => Response::ok(request.id, result),
+        Err(error) => Response::err(Some(request.id), format!("{error:#}")),
+    }
 }
 
 /// Make one request/response call to the workstation daemon at `socket`.
@@ -171,9 +235,22 @@ pub fn call_with_timeout(
     params: Value,
     timeout: Duration,
 ) -> Result<Value> {
+    call_streaming(socket, method, params, Some(timeout), &mut |_, _| {})
+}
+
+/// Make one call, passing each notification the daemon sends before its
+/// response to `on_notification`. `timeout` bounds each wait for a line;
+/// `None` waits as long as the call runs.
+pub fn call_streaming(
+    socket: &Path,
+    method: &str,
+    params: Value,
+    timeout: Option<Duration>,
+    on_notification: &mut dyn FnMut(&str, Value),
+) -> Result<Value> {
     let stream = UnixStream::connect(socket)
         .with_context(|| format!("connect to workstation daemon at {}", socket.display()))?;
-    stream.set_read_timeout(Some(timeout))?;
+    stream.set_read_timeout(timeout)?;
     stream.set_write_timeout(Some(CALL_TIMEOUT))?;
     let mut writer = stream.try_clone()?;
     let mut reader = BufReader::new(stream);
@@ -187,10 +264,17 @@ pub fn call_with_timeout(
             params,
         },
     )?;
-    let line = read_line(&mut reader)?
-        .ok_or_else(|| anyhow!("workstation daemon closed the connection without answering"))?;
-    let response: Response =
-        serde_json::from_slice(&line).context("workstation daemon sent an unreadable response")?;
+    let response = loop {
+        let line = read_line(&mut reader)?.ok_or_else(|| {
+            anyhow!("workstation daemon closed the connection without answering")
+        })?;
+        if let Ok(notification) = serde_json::from_slice::<Notification>(&line) {
+            on_notification(&notification.method, notification.params);
+            continue;
+        }
+        break serde_json::from_slice::<Response>(&line)
+            .context("workstation daemon sent an unreadable response")?;
+    };
     if response.id != Some(id) {
         return Err(anyhow!(
             "workstation daemon answered request {:?}, expected {id}",

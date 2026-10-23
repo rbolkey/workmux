@@ -8,7 +8,6 @@ pub enum ProjectHost {
     /// The machine running the user's multiplexer.
     Workstation,
     /// A named project host reached through a transport.
-    #[allow(dead_code)] // Constructed once remote projects are registered
     Remote(String),
 }
 
@@ -27,7 +26,6 @@ impl Project {
         }
     }
 
-    #[allow(dead_code)] // Constructed once remote projects are registered
     pub fn remote(remote: impl Into<String>, name: impl Into<String>) -> Self {
         Self {
             host: ProjectHost::Remote(remote.into()),
