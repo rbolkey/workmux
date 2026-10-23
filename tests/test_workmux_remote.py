@@ -459,7 +459,9 @@ def test_remote_add_places_windows_in_the_project_session(
 
     wm(f"remote add lb --transport loopback --target {root}")
     wm(f"project add api --remote lb --repo {origin} --path code/api")
-    wm(f"project add web --remote lb --repo {origin} --path code/web --session frontend")
+    wm(
+        f"project add web --remote lb --repo {origin} --path code/web --session frontend"
+    )
     wm(
         f"project add docs --remote lb --repo {origin} --path code/docs"
         " --placement current-session"
