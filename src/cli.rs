@@ -436,6 +436,10 @@ enum Commands {
         /// Worktree name (defaults to current directory if omitted)
         #[arg(value_parser = WorktreeHandleParser::new())]
         name: Option<String>,
+
+        /// Close a worktree of a project registered on a remote
+        #[arg(long)]
+        project: Option<String>,
     },
 
     /// Restore worktree windows after a tmux or computer crash
@@ -489,6 +493,10 @@ enum Commands {
         /// Show a system notification on successful merge
         #[arg(long)]
         notification: bool,
+
+        /// Merge in a project registered on a remote
+        #[arg(long)]
+        project: Option<String>,
     },
 
     /// Rebase a worktree branch onto its base branch
@@ -531,6 +539,10 @@ enum Commands {
         /// Keep the local branch (only remove worktree and tmux window)
         #[arg(short = 'k', long)]
         keep_branch: bool,
+
+        /// Remove worktrees of a project registered on a remote
+        #[arg(long)]
+        project: Option<String>,
     },
 
     /// List all worktrees
@@ -1116,11 +1128,7 @@ pub fn run() -> Result<()> {
             project,
         } => {
             if let Some(project) = crate::remote::router::resolve(project.as_deref())? {
-                let argv = crate::remote::router::relayed_argv();
-                let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
-                return crate::remote::router::exit_with(crate::remote::router::run(
-                    &project, &argv,
-                )?);
+                return crate::remote::router::relay(&project);
             }
             let mode_override = mode
                 .map(MuxMode::from)
@@ -1178,7 +1186,12 @@ pub fn run() -> Result<()> {
                 config.as_deref(),
             )
         }
-        Commands::Close { name } => command::close::run(name.as_deref()),
+        Commands::Close { name, project } => {
+            if let Some(project) = crate::remote::router::resolve(project.as_deref())? {
+                return crate::remote::router::relay(&project);
+            }
+            command::close::run(name.as_deref())
+        }
         Commands::Resurrect { dry_run } => command::resurrect::run(dry_run),
         Commands::Merge {
             name,
@@ -1191,18 +1204,24 @@ pub fn run() -> Result<()> {
             no_verify,
             no_hooks,
             notification,
-        } => command::merge::run(
-            name.as_deref(),
-            into.as_deref(),
-            ignore_uncommitted,
-            rebase,
-            squash,
-            keep,
-            cleanup,
-            no_verify,
-            no_hooks,
-            notification,
-        ),
+            project,
+        } => {
+            if let Some(project) = crate::remote::router::resolve(project.as_deref())? {
+                return crate::remote::router::relay(&project);
+            }
+            command::merge::run(
+                name.as_deref(),
+                into.as_deref(),
+                ignore_uncommitted,
+                rebase,
+                squash,
+                keep,
+                cleanup,
+                no_verify,
+                no_hooks,
+                notification,
+            )
+        }
         Commands::Rebase { name } => command::rebase::run(name.as_deref()),
         Commands::Remove {
             names,
@@ -1210,7 +1229,13 @@ pub fn run() -> Result<()> {
             all,
             force,
             keep_branch,
-        } => command::remove::run(names, gone, all, force, keep_branch),
+            project,
+        } => {
+            if let Some(project) = crate::remote::router::resolve(project.as_deref())? {
+                return crate::remote::router::relay(&project);
+            }
+            command::remove::run(names, gone, all, force, keep_branch)
+        }
         Commands::Rename { names, branch } => command::rename::run(names, branch),
         Commands::List {
             pr,

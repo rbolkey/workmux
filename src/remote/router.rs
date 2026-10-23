@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 use super::forwarded;
 use super::session::ServedProject;
-use super::session::{CommandRequest, OutputParams, ProjectSite, Stream};
+use super::session::{Answer, CommandRequest, OutputParams, ProjectSite, Stream, Terminal};
 use crate::config::{Config, ProjectPlacement, RemoteConfig};
 use crate::multiplexer::{InvocationContext, TmuxBackend, create_backend, detect_backend};
 use crate::project::Project;
@@ -127,11 +127,7 @@ pub fn daemon_socket() -> Option<PathBuf> {
 
 /// Run a command session for `project`, through the workstation daemon,
 /// which holds the control channels, or directly when no daemon can run.
-fn session(
-    project: &RemoteProject,
-    argv: &[&str],
-    sink: &mut dyn FnMut(Stream, &[u8]),
-) -> Result<i32> {
+fn session(project: &RemoteProject, argv: &[&str], terminal: &mut dyn Terminal) -> Result<i32> {
     let request = CommandRequest {
         project: project.site.clone(),
         argv: argv.iter().map(|arg| arg.to_string()).collect(),
@@ -142,7 +138,7 @@ fn session(
             &project.remote,
             &request,
             InvocationContext::current(),
-            sink,
+            terminal,
         );
     };
     let mut undelivered = None;
@@ -155,17 +151,25 @@ fn session(
             "invocation": InvocationContext::current(),
         }),
         None,
-        &mut |method, params| {
-            if method != super::session::OUTPUT_METHOD {
-                return;
+        &mut |method, params| match method {
+            super::session::OUTPUT_METHOD => {
+                match serde_json::from_value::<OutputParams>(params)
+                    .map_err(anyhow::Error::from)
+                    .and_then(|output| Ok((output.stream, output.bytes()?)))
+                {
+                    Ok((stream, data)) => terminal.output(stream, &data),
+                    Err(error) => undelivered = Some(error),
+                }
+                None
             }
-            match serde_json::from_value::<OutputParams>(params)
-                .map_err(anyhow::Error::from)
-                .and_then(|output| Ok((output.stream, output.bytes()?)))
-            {
-                Ok((stream, data)) => sink(stream, &data),
-                Err(error) => undelivered = Some(error),
+            super::session::PROMPT_METHOD => {
+                let line = terminal.read_line().unwrap_or_else(|error| {
+                    tracing::warn!(error = %format!("{error:#}"), "reading a prompt answer");
+                    None
+                });
+                Some(serde_json::to_value(Answer { line }).expect("serializes"))
             }
+            _ => None,
         },
     )?;
     if let Some(error) = undelivered {
@@ -174,6 +178,26 @@ fn session(
     let exit: super::session::Exit =
         serde_json::from_value(result).context("workstation daemon sent no exit code")?;
     Ok(exit.exit_code)
+}
+
+/// This process's terminal: output to stdout and stderr, prompts answered
+/// from stdin.
+struct Invoking<F> {
+    output: F,
+}
+
+impl<F: FnMut(Stream, &[u8])> Terminal for Invoking<F> {
+    fn output(&mut self, stream: Stream, data: &[u8]) {
+        (self.output)(stream, data)
+    }
+
+    fn read_line(&mut self) -> Result<Option<String>> {
+        let mut line = String::new();
+        Ok(match std::io::stdin().read_line(&mut line)? {
+            0 => None,
+            _ => Some(line),
+        })
+    }
 }
 
 fn write_to(stream: Stream, data: &[u8]) {
@@ -192,17 +216,23 @@ fn write_to(stream: Stream, data: &[u8]) {
 /// Run `argv` for `project` on its remote, streaming its output to this
 /// terminal. Returns the command's exit code.
 pub fn run(project: &RemoteProject, argv: &[&str]) -> Result<i32> {
-    session(project, argv, &mut write_to)
+    session(project, argv, &mut Invoking { output: write_to })
 }
 
 /// Run `argv` for `project` on its remote, streaming its stderr to this
 /// terminal and returning its exit code and stdout.
 pub fn capture(project: &RemoteProject, argv: &[&str]) -> Result<(i32, Vec<u8>)> {
     let mut stdout = Vec::new();
-    let exit = session(project, argv, &mut |stream, data| match stream {
-        Stream::Stdout => stdout.extend_from_slice(data),
-        Stream::Stderr => write_to(stream, data),
-    })?;
+    let exit = session(
+        project,
+        argv,
+        &mut Invoking {
+            output: |stream, data: &[u8]| match stream {
+                Stream::Stdout => stdout.extend_from_slice(data),
+                Stream::Stderr => write_to(stream, data),
+            },
+        },
+    )?;
     Ok((exit, stdout))
 }
 
@@ -228,6 +258,14 @@ fn without_project(args: impl IntoIterator<Item = String>) -> Vec<String> {
         }
     }
     argv
+}
+
+/// Relay this command, as it was typed, to `project`'s remote and exit
+/// with the remote command's exit code.
+pub fn relay(project: &RemoteProject) -> Result<()> {
+    let argv = relayed_argv();
+    let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+    exit_with(run(project, &argv)?)
 }
 
 /// Finish a command relayed to a remote with the remote command's exit code.

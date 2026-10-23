@@ -15,7 +15,7 @@ use super::channel::Handler;
 use super::connection::{Connection, HELLO_TIMEOUT};
 use super::forwarded;
 use super::forwarding::{FORWARD_METHOD, Forwarded};
-use super::session::{self, CommandRequest, Sessions, Stream};
+use super::session::{self, CommandRequest, SessionParams, Sessions, Terminal};
 use super::transport::{RemoteState, Transport};
 use crate::config::{RemoteConfig, TransportKind};
 use crate::multiplexer::InvocationContext;
@@ -80,10 +80,9 @@ struct WorkstationHandler {
 }
 
 impl WorkstationHandler {
-    fn forwarded(&self, params: Value) -> Result<Value> {
-        let Forwarded { session, request } = serde_json::from_value(params)?;
-        let scope = self
-            .sessions
+    /// The scope of `session`, which must be open on this remote.
+    fn scope(&self, session: u64) -> Result<forwarded::SessionScope> {
+        self.sessions
             .scope(session)
             .filter(|scope| scope.remote == self.remote)
             .ok_or_else(|| {
@@ -91,8 +90,20 @@ impl WorkstationHandler {
                     "refused: no command session {session} on remote {}",
                     self.remote
                 )
-            })?;
+            })
+    }
+
+    fn forwarded(&self, params: Value) -> Result<Value> {
+        let Forwarded { session, request } = serde_json::from_value(params)?;
+        let scope = self.scope(session)?;
         forwarded::answer(&scope, &scope.tmux(), self.transport.as_ref(), request)
+    }
+
+    fn prompt(&self, params: Value) -> Result<Value> {
+        let SessionParams { session } = serde_json::from_value(params)?;
+        self.scope(session)?;
+        let line = self.sessions.prompt(session)?;
+        Ok(serde_json::to_value(session::Answer { line })?)
     }
 }
 
@@ -100,6 +111,7 @@ impl Handler for WorkstationHandler {
     fn request(&self, method: &str, params: Value) -> Result<Value, String> {
         match method {
             FORWARD_METHOD => self.forwarded(params).map_err(|error| format!("{error:#}")),
+            session::PROMPT_METHOD => self.prompt(params).map_err(|error| format!("{error:#}")),
             method => Err(format!("unknown method: {method}")),
         }
     }
@@ -347,23 +359,24 @@ impl Channels {
         slot.holds > 0 || slot.last_used.elapsed() < self.shared.policy.linger
     }
 
-    /// Run a command session on `name`, passing its output to `sink` as it
-    /// arrives. Multiplexer requests the command forwards are answered from
-    /// `invocation`. Returns the command's exit code.
+    /// Run a command session on `name`, passing its output to `terminal` as
+    /// it arrives and reading its prompts' answers there. Multiplexer
+    /// requests the command forwards are answered from `invocation`.
+    /// Returns the command's exit code.
     pub fn run_command(
         &self,
         name: &str,
         config: &RemoteConfig,
         request: &CommandRequest,
         invocation: &InvocationContext,
-        sink: &mut dyn FnMut(Stream, &[u8]),
+        terminal: &mut dyn Terminal,
     ) -> Result<i32> {
         let connection = self.channel(name, config)?;
         self.hold(name, 1);
         let exit = self
             .shared
             .sessions
-            .run(&connection.peer, request, invocation, sink);
+            .run(&connection.peer, request, invocation, terminal);
         self.hold(name, -1);
         exit
     }

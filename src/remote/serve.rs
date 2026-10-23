@@ -27,15 +27,19 @@ struct RemoteHandler {
     peer: Arc<OnceLock<Peer>>,
     /// The socket commands forward multiplexer requests through.
     forwarding: Arc<OnceLock<Option<PathBuf>>>,
+    running: session::Running,
 }
 
 impl Handler for RemoteHandler {
     fn request(&self, method: &str, params: Value) -> Result<Value, String> {
         match method {
-            session::RUN_METHOD => {
-                session::serve_run(self.peer.wait(), self.forwarding.wait().as_deref(), params)
-                    .map_err(|error| format!("{error:#}"))
-            }
+            session::RUN_METHOD => session::serve_run(
+                self.peer.wait(),
+                self.forwarding.wait().as_deref(),
+                &self.running,
+                params,
+            )
+            .map_err(|error| format!("{error:#}")),
             "ping" => {
                 let hello = Hello::current();
                 serde_json::to_value(Ping {
@@ -46,6 +50,18 @@ impl Handler for RemoteHandler {
                 .map_err(|e| e.to_string())
             }
             method => Err(format!("unknown method: {method}")),
+        }
+    }
+
+    fn notification(&self, method: &str, params: Value) {
+        match method {
+            session::CANCEL_METHOD => {
+                match serde_json::from_value::<session::SessionParams>(params) {
+                    Ok(params) => self.running.cancel(params.session),
+                    Err(error) => tracing::warn!(%error, "ignoring an unreadable cancellation"),
+                }
+            }
+            method => tracing::warn!(method, "ignoring unknown notification"),
         }
     }
 }
@@ -70,10 +86,19 @@ pub fn serve(
         .set(socket.as_ref().map(|socket| socket.path.clone()));
     while !peer.wait_closed(Duration::from_secs(3600)) {}
     tracing::info!(reason = ?peer.closed_reason(), "control channel closed");
+    // Nothing can read their output or answer their prompts any more.
+    handler.running.shut_down();
     Ok(())
 }
 
 /// Run `workmux remote serve` on this process's stdin and stdout.
 pub fn run() -> Result<()> {
+    // A Ctrl-C meant for the workstation command reaches a loopback remote
+    // in the same process group. Outlive it, so the commands it runs are
+    // cancelled once the workstation goes away.
+    signal_hook::flag::register(
+        signal_hook::consts::SIGINT,
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )?;
     serve(std::io::BufReader::new(std::io::stdin()), std::io::stdout())
 }
