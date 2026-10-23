@@ -1,0 +1,21 @@
+# Default policy plus what a single-user nix install needs: /nix writable, "/"
+# readable (OpenShell accepts it but Landlock still denies it) and HTTPS egress
+# to the nix installer, binary cache and release hosts.
+version: 1
+filesystem_policy:
+  include_workdir: true
+  read_only: [/, /bin, /usr, /lib, /proc, /dev/urandom, /etc, /var/log]
+  read_write: [/tmp, /dev/null, /nix]
+landlock:
+  compatibility: best_effort
+network_policies:
+  nix:
+    endpoints:
+      - { host: nixos.org, port: 443 }
+      - { host: releases.nixos.org, port: 443 }
+      - { host: cache.nixos.org, port: 443 }
+      - { host: channels.nixos.org, port: 443 }
+      - { host: install.determinate.systems, port: 443 }
+    binaries:
+      - path: /usr/bin/curl
+      - path: /nix/store/*/bin/*
