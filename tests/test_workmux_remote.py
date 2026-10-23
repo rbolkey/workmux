@@ -637,7 +637,7 @@ def test_remote_git_commands_act_on_the_remote_repository(
 
 
 @pytest.mark.tmux_only
-def test_remote_add_over_ssh_to_localhost(
+def test_remote_add_and_remove_over_ssh_to_localhost(
     mux_server: MuxEnvironment,
     workmux_exe_path: Path,
     repo_path: Path,
@@ -645,8 +645,11 @@ def test_remote_add_over_ssh_to_localhost(
     local_sshd: Path,
 ):
     """`add` over the SSH transport creates the worktree on the remote and a
-    window in the project's session whose pane runs there."""
+    window in the project's session whose pane runs there; `remove` takes
+    the worktree, its branch and the window away again, after the
+    unmerged-branch confirmation is answered in the invoking terminal."""
     env = mux_server
+    assert isinstance(env, TmuxEnvironment)
     env.install_script(
         env.fake_bin_dir / "ssh", f'#!/bin/sh\nexec /usr/bin/ssh -F {local_sshd} "$@"\n'
     )
@@ -658,13 +661,14 @@ def test_remote_add_over_ssh_to_localhost(
         "panes:\n  - command: pwd -P > pane-ran.txt\n",
     )
 
-    def wm(command):
+    def wm(command, stdin_input=None):
         return run_workmux_command(
             env,
             workmux_exe_path,
             repo_path,
             command,
             pre_run_env=short_tmp,
+            stdin_input=stdin_input,
             timeout=60.0,
         )
 
@@ -684,6 +688,252 @@ def test_remote_add_over_ssh_to_localhost(
         assert wait_for(worktree / "pane-ran.txt", timeout=30).strip() == str(
             worktree.resolve()
         )
+
+        env.tmux(["select-window", "-t", env.runner_pane_id or "test:0"])
+        env.run_command(["git", "add", "pane-ran.txt"], cwd=worktree)
+        env.run_command(
+            ["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q"]
+            + ["-m", "unmerged work"],
+            cwd=worktree,
+        )
+        removed = wm("remove feature --project api", stdin_input="y\n")
+        assert "Are you sure you want to continue? [y/N]" in removed.stdout
+        assert not worktree.exists()
+        branches = env.run_command(
+            ["git", "branch", "--list", "feature"], cwd=remote_home / "code" / "api"
+        ).stdout
+        assert branches.strip() == ""
+        windows = env.tmux(["list-windows", "-a", "-F", "#{window_name}"]).stdout
+        assert "wm-feature" not in windows.split()
+    finally:
+        if daemon_pid is not None:
+            os.kill(daemon_pid, signal.SIGTERM)
+
+
+@pytest.mark.tmux_only
+def test_remote_remove_cleans_up_the_remote_worktree_branch_and_window(
+    mux_server: MuxEnvironment,
+    workmux_exe_path: Path,
+    repo_path: Path,
+    short_tmp: dict,
+):
+    """`close` on a remote project closes its window and keeps the worktree;
+    `remove` removes the worktree and its branch in the remote's clone and
+    the window on the workstation. The unmerged-branch confirmation is
+    answered in the invoking terminal."""
+    env = mux_server
+    assert isinstance(env, TmuxEnvironment)
+    root = env.tmp_path / "remote-root"
+    (root / "home").mkdir(parents=True)
+    (root / "home" / ".zshrc").write_text("")
+    origin = make_origin(env, env.tmp_path / "origin", "panes:\n  - command: sh\n")
+    clone = root / "home" / "code" / "api"
+    worktrees = root / "home" / "code" / "api__worktrees"
+
+    def wm(command, expect_fail=False, stdin_input=None):
+        return run_workmux_command(
+            env,
+            workmux_exe_path,
+            repo_path,
+            command,
+            pre_run_env=short_tmp,
+            expect_fail=expect_fail,
+            stdin_input=stdin_input,
+            timeout=60.0,
+        )
+
+    def branches():
+        return env.run_command(
+            ["git", "branch", "--format=%(refname:short)"], cwd=clone
+        ).stdout.split()
+
+    def windows():
+        return env.tmux(["list-windows", "-a", "-F", "#{window_name}"]).stdout.split()
+
+    wm(f"remote add lb --transport loopback --target {root}")
+    wm(f"project add api --remote lb --repo {origin} --path code/api")
+    daemon_pid = None
+    try:
+        wm("add feature --project api")
+        daemon_pid = remote_daemon_ping(env, workmux_exe_path, repo_path, short_tmp)[
+            "pid"
+        ]
+        env.tmux(["select-window", "-t", env.runner_pane_id or "test:0"])
+        assert "wm-feature" in windows()
+
+        # `close` closes the window and keeps the worktree.
+        wm("close feature --project api")
+        assert "wm-feature" not in windows()
+        assert (worktrees / "feature").is_dir()
+
+        wm("remove feature --project api")
+        assert not (worktrees / "feature").exists()
+        assert "feature" not in branches()
+        assert "wm-feature" not in windows()
+
+        # An unmerged branch asks first; the answer comes from this terminal.
+        wm("add risky --project api")
+        env.tmux(["select-window", "-t", env.runner_pane_id or "test:0"])
+        env.run_command(
+            ["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q"]
+            + ["--allow-empty", "-m", "unmerged work"],
+            cwd=worktrees / "risky",
+        )
+        declined = wm("remove risky --project api", stdin_input="n\n")
+        assert "risky (base: main)" in declined.stdout
+        assert "Are you sure you want to continue? [y/N]" in declined.stdout
+        assert "Aborted." in declined.stdout
+        assert (worktrees / "risky").is_dir()
+        assert "risky" in branches()
+
+        wm("remove risky --project api", stdin_input="y\n")
+        assert not (worktrees / "risky").exists()
+        assert "risky" not in branches()
+        assert "wm-risky" not in windows()
+    finally:
+        if daemon_pid is not None:
+            os.kill(daemon_pid, signal.SIGTERM)
+
+
+@pytest.mark.tmux_only
+def test_remote_merge_merges_in_the_remotes_clone_without_pushing(
+    mux_server: MuxEnvironment,
+    workmux_exe_path: Path,
+    repo_path: Path,
+    short_tmp: dict,
+):
+    """`merge` on a remote project merges the branch into main in the
+    remote's clone, cleans up the worktree and window, and pushes nothing:
+    the origin and the workstation repository are untouched."""
+    env = mux_server
+    assert isinstance(env, TmuxEnvironment)
+    root = env.tmp_path / "remote-root"
+    (root / "home").mkdir(parents=True)
+    (root / "home" / ".zshrc").write_text("")
+    origin = make_origin(env, env.tmp_path / "origin", "panes:\n  - command: sh\n")
+    clone = root / "home" / "code" / "api"
+    worktree = root / "home" / "code" / "api__worktrees" / "feature"
+
+    def wm(command):
+        return run_workmux_command(
+            env,
+            workmux_exe_path,
+            repo_path,
+            command,
+            pre_run_env=short_tmp,
+            timeout=60.0,
+        )
+
+    def head(repo: Path) -> str:
+        return env.run_command(["git", "rev-parse", "main"], cwd=repo).stdout.strip()
+
+    wm(f"remote add lb --transport loopback --target {root}")
+    wm(f"project add api --remote lb --repo {origin} --path code/api")
+    workstation_head = head(repo_path)
+    daemon_pid = None
+    try:
+        wm("add feature --project api")
+        daemon_pid = remote_daemon_ping(env, workmux_exe_path, repo_path, short_tmp)[
+            "pid"
+        ]
+        env.tmux(["select-window", "-t", env.runner_pane_id or "test:0"])
+        origin_head = head(origin)
+        (worktree / "work.txt").write_text("done\n")
+        env.run_command(["git", "add", "work.txt"], cwd=worktree)
+        env.run_command(
+            ["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q"]
+            + ["-m", "remote work"],
+            cwd=worktree,
+        )
+
+        wm("merge feature --project api")
+
+        log = env.run_command(
+            ["git", "log", "--format=%s", "main"], cwd=clone
+        ).stdout.split("\n")
+        assert "remote work" in log
+        assert not worktree.exists()
+        windows = env.tmux(["list-windows", "-a", "-F", "#{window_name}"]).stdout
+        assert "wm-feature" not in windows.split()
+        assert head(origin) == origin_head
+        assert head(repo_path) == workstation_head
+    finally:
+        if daemon_pid is not None:
+            os.kill(daemon_pid, signal.SIGTERM)
+
+
+def pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+@pytest.mark.tmux_only
+def test_ctrl_c_cancels_a_remote_command_during_a_long_hook(
+    mux_server: MuxEnvironment,
+    workmux_exe_path: Path,
+    repo_path: Path,
+    short_tmp: dict,
+):
+    """Ctrl-C in the invoking terminal while a remote post-create hook runs
+    cancels the command on the remote, hook included, and the workstation
+    command exits non-zero."""
+    env = mux_server
+    assert isinstance(env, TmuxEnvironment)
+    root = env.tmp_path / "remote-root"
+    (root / "home").mkdir(parents=True)
+    out = env.tmp_path / "ctrl-c"
+    out.mkdir()
+    origin = make_origin(
+        env,
+        env.tmp_path / "origin",
+        f"post_create:\n  - echo $$ > {out}/hook.pid; exec sleep 60\n",
+    )
+
+    def wm(command):
+        return run_workmux_command(
+            env,
+            workmux_exe_path,
+            repo_path,
+            command,
+            pre_run_env=short_tmp,
+            timeout=60.0,
+        )
+
+    wm(f"remote add lb --transport loopback --target {root}")
+    wm(f"project add api --remote lb --repo {origin} --path code/api")
+    daemon_pid = None
+    try:
+        daemon_pid = remote_daemon_ping(env, workmux_exe_path, repo_path, short_tmp)[
+            "pid"
+        ]
+        # The script outlives Ctrl-C (a handler, which workmux does not
+        # inherit) to record workmux's exit code.
+        script = out / "run.sh"
+        script.write_text(
+            "trap true INT\n"
+            f"export PATH={shlex.quote(env.env['PATH'])}"
+            f" HOME={shlex.quote(str(env.home_path))}"
+            f" TMPDIR={short_tmp['TMPDIR']} WORKMUX_TEST=1\n"
+            f"cd {repo_path}\n"
+            f"{workmux_exe_path} add slow --project api > {out}/out 2> {out}/err\n"
+            f"echo $? > {out}/code\n"
+        )
+        pane = env.runner_pane_id or "test:0"
+        env.send_keys(pane, f"/bin/sh {script}", enter=True)
+        hook = int(wait_for(out / "hook.pid", timeout=30).strip())
+        assert pid_alive(hook)
+
+        env.tmux(["send-keys", "-t", pane, "C-c"])
+
+        code = int(wait_for(out / "code", timeout=15).strip())
+        assert code != 0
+        deadline = time.monotonic() + 10
+        while pid_alive(hook):
+            assert time.monotonic() < deadline, "the remote hook was not cancelled"
+            time.sleep(0.05)
     finally:
         if daemon_pid is not None:
             os.kill(daemon_pid, signal.SIGTERM)

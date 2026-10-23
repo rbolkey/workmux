@@ -29,8 +29,7 @@ pub fn confirm(prompt: &str, default: ConfirmDefault) -> Result<bool> {
         print!("{full_prompt}");
         io::stdout().flush()?;
 
-        let mut input = String::new();
-        io::stdin().read_line(&mut input)?;
+        let input = read_answer()?;
         let answer = input.trim().to_lowercase();
 
         match answer.as_str() {
@@ -40,4 +39,16 @@ pub fn confirm(prompt: &str, default: ConfirmDefault) -> Result<bool> {
             _ => println!("    {}", style("Please enter y or n").dim()),
         }
     }
+}
+
+/// Read one line the user types in answer to a prompt; empty at the end of
+/// input. A command remote workmux runs in a command session reads it from
+/// the workstation terminal the command was invoked in.
+pub fn read_answer() -> Result<String> {
+    if let Some(mux) = crate::remote::forwarding::ForwardingMux::from_env() {
+        return Ok(mux.read_line()?.unwrap_or_default());
+    }
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    Ok(input)
 }

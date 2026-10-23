@@ -156,10 +156,7 @@ fn run_specified(
         print!("Are you sure you want to continue? [y/N] ");
         io::stdout().flush().context("Failed to flush stdout")?;
 
-        let mut input = String::new();
-        io::stdin()
-            .read_line(&mut input)
-            .context("Failed to read input")?;
+        let input = crate::ui::confirm::read_answer().context("Failed to read input")?;
 
         if input.trim().to_lowercase() != "y" {
             println!("Aborted.");
@@ -259,10 +256,7 @@ fn prompt_removal_confirmation(
         );
         io::stdout().flush().context("Failed to flush stdout")?;
 
-        let mut input = String::new();
-        io::stdin()
-            .read_line(&mut input)
-            .context("Failed to read user input")?;
+        let input = crate::ui::confirm::read_answer().context("Failed to read user input")?;
 
         if input.trim().to_lowercase() != "y" {
             println!("Aborted.");
