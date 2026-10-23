@@ -192,6 +192,7 @@ impl AgentState {
             remote: self.remote.as_ref().map(|remote| RemoteAgentPane {
                 remote: remote.remote.clone(),
                 project: remote.pane.project.clone(),
+                worktree: remote.pane.worktree.clone(),
                 stale: false,
             }),
         }
