@@ -96,7 +96,12 @@ impl Workstation<'_> {
             MuxRequest::CurrentSession => json!(tmux.current_session()),
             MuxRequest::ClientSession => json!(tmux.client_session()),
             MuxRequest::SessionExists { name } => json!(tmux.session_exists(&name)?),
-            MuxRequest::AllWindowNames => json!(tmux.get_all_window_names()?),
+            // "The current session" is the one the command was typed in, not
+            // whichever session tmux picks for the client-less daemon.
+            MuxRequest::AllWindowNames => match tmux.current_session_id()? {
+                Some(session) => json!(tmux.get_window_names_in_session(&session)?),
+                None => json!(tmux.get_all_window_names()?),
+            },
             MuxRequest::WindowNamesInSession { session } => {
                 json!(tmux.get_window_names_in_session(&session)?)
             }
@@ -733,6 +738,24 @@ mod tests {
                     .contains("does not belong to a project on remote"),
             );
         }
+    }
+
+    #[test]
+    fn window_names_are_those_of_the_session_the_command_was_typed_in() {
+        let Some(ws) = Workstation::start() else {
+            return;
+        };
+        let invoking = ws.server.new_session("typed-in", ws.remote_root.path());
+        ws.tmux(&["rename-window", "-t", &invoking, "wm-here"]);
+        // Made last, this is the session a client-less tmux command picks.
+        let elsewhere = ws.server.new_session("elsewhere", ws.remote_root.path());
+        ws.tmux(&["rename-window", "-t", &elsewhere, "wm-there"]);
+        let scope = ws.scope("devbox", "api", &invoking);
+
+        assert_eq!(
+            ws.ask(&scope, MuxRequest::AllWindowNames).unwrap(),
+            json!(["wm-here"])
+        );
     }
 
     #[test]
