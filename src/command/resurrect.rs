@@ -12,7 +12,7 @@ pub fn run(dry_run: bool) -> Result<()> {
         return run_served(dry_run);
     }
     let local = run_local(dry_run);
-    let remote_failures = resurrect_remote_projects(dry_run)?;
+    let remote_failures = crate::remote::router::relay_to_every_project()?;
     local?;
     if remote_failures > 0 {
         return Err(anyhow!(
@@ -21,35 +21,6 @@ pub fn run(dry_run: bool) -> Result<()> {
         ));
     }
     Ok(())
-}
-
-/// Resurrect each remote project's worktrees on its remote, printing what
-/// it restored under the project's name. Returns how many failed.
-fn resurrect_remote_projects(dry_run: bool) -> Result<usize> {
-    let mut failures = 0;
-    for project in crate::remote::router::remote_projects()? {
-        let mut argv = vec!["workmux", "resurrect"];
-        if dry_run {
-            argv.push("--dry-run");
-        }
-        let (name, remote) = (&project.site.name, &project.site.remote);
-        match crate::remote::router::capture(&project, &argv) {
-            Ok((code, stdout)) => {
-                if !stdout.is_empty() {
-                    println!("\n{name} (on {remote}):");
-                    print!("{}", String::from_utf8_lossy(&stdout));
-                }
-                if code != 0 {
-                    failures += 1;
-                }
-            }
-            Err(error) => {
-                eprintln!("  Failed to reach remote project '{name}' on {remote}: {error:#}");
-                failures += 1;
-            }
-        }
-    }
-    Ok(failures)
 }
 
 /// Resurrect, on a remote, the windows of the served project's worktrees

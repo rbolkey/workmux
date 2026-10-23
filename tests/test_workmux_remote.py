@@ -1182,3 +1182,87 @@ def test_remote_run_executes_in_the_remote_worktree(
     finally:
         if daemon_pid is not None:
             os.kill(daemon_pid, signal.SIGTERM)
+
+
+@requires_dtach
+@pytest.mark.tmux_only
+def test_reap_agents_reaps_aged_agents_on_the_remote(
+    mux_server: MuxEnvironment,
+    workmux_exe_path: Path,
+    repo_path: Path,
+    short_tmp: dict,
+    remote_root: Path,
+):
+    """`reap-agents` lists, and with --force exits, agents on a remote whose
+    terminal has been idle past the threshold, reporting them as it does
+    local ones. A recently active agent is left alone, and a reaped agent's
+    pane stays open."""
+    env = mux_server
+    assert isinstance(env, TmuxEnvironment)
+    started = remote_root / "agent.pids"
+    agent = remote_root / "fake-agent"
+    agent.write_text(f"#!/bin/sh\necho $$ >> {started}\nwhile :; do sleep 1; done\n")
+    agent.chmod(0o755)
+    origin = make_origin(
+        env,
+        env.tmp_path / "origin",
+        f"agent: {agent}\npanes:\n  - command: <agent>\n",
+    )
+
+    def wm(command):
+        return run_workmux_command(
+            env,
+            workmux_exe_path,
+            repo_path,
+            command,
+            pre_run_env=short_tmp,
+            timeout=60.0,
+        )
+
+    def agent_pids(count: int) -> list[int]:
+        wait_until(
+            lambda: started.exists() and len(started.read_text().split()) == count,
+            f"{count} agent(s) to start",
+        )
+        return [int(pid) for pid in started.read_text().split()]
+
+    wm(f"remote add lb --transport loopback --target {remote_root}")
+    wm(f"project add api --remote lb --repo {origin} --path code/api")
+    daemon_pid = None
+    try:
+        wm("add old --project api")
+        daemon_pid = remote_daemon_ping(env, workmux_exe_path, repo_path, short_tmp)[
+            "pid"
+        ]
+        [old] = agent_pids(1)
+        wm("add fresh --project api")
+        fresh = agent_pids(2)[1]
+        env.tmux(["select-window", "-t", env.runner_pane_id or "test:0"])
+        # The old agent's terminal was last used two hours ago.
+        time.sleep(0.5)
+        tty = subprocess.run(
+            ["ps", "-o", "tty=", "-p", str(old)], capture_output=True, text=True
+        ).stdout.strip()
+        two_hours_ago = time.time() - 2 * 3600
+        os.utime(f"/dev/{tty}", (two_hours_ago, two_hours_ago))
+
+        listed = wm("reap-agents --hours 1")
+        assert "api (on lb):" in listed.stdout
+        assert "Would exit api/old/" in listed.stdout
+        assert "in old (2h" in listed.stdout and "fake-agent" in listed.stdout
+        assert "fresh" not in listed.stdout
+        assert pid_alive(old)
+
+        reaped = wm("reap-agents --hours 1 --force")
+        assert "Exited api/old/" in reaped.stdout
+        wait_until(lambda: not pid_alive(old), "the old agent to exit")
+        assert pid_alive(fresh)
+        assert tmux_value(env, "=api:wm-old", "#{window_name}") == "wm-old"
+    finally:
+        for pid in (started.read_text().split() if started.exists() else []):
+            try:
+                os.kill(int(pid), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        if daemon_pid is not None:
+            os.kill(daemon_pid, signal.SIGTERM)

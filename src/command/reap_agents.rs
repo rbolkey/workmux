@@ -4,10 +4,79 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Result, anyhow};
 
 use crate::multiplexer::{AgentPane, AgentStatus, Multiplexer, create_backend, detect_backend};
+use crate::remote::agents::{RemoteAgent, agents};
+use crate::remote::pane::SessionHolder;
+use crate::remote::session::ServedProject;
 use crate::state::{PaneKey, StateStore};
 use crate::util;
 
 pub fn run(older_than_secs: u64, force: bool) -> Result<()> {
+    if let Some(served) = ServedProject::current() {
+        return run_served(&served, older_than_secs, force);
+    }
+    let local = run_local(older_than_secs, force);
+    let remote_failures = crate::remote::router::relay_to_every_project()?;
+    local?;
+    if remote_failures > 0 {
+        return Err(anyhow!(
+            "failed to reap agents in {} remote project(s)",
+            remote_failures
+        ));
+    }
+    Ok(())
+}
+
+/// Reap, on a remote, the served project's agents whose terminals have been
+/// idle for `older_than_secs`. Prints nothing when there are none.
+fn run_served(served: &ServedProject, older_than_secs: u64, force: bool) -> Result<()> {
+    let config = crate::config::Config::load(None)?;
+    let holder = SessionHolder::for_this_remote()?;
+    let now = now_secs();
+    let old_agents: Vec<RemoteAgent> = agents(&holder, &served.name, config.agent.as_deref())?
+        .into_iter()
+        .filter(|agent| {
+            agent
+                .last_activity()
+                .is_some_and(|ts| now.saturating_sub(ts) >= older_than_secs)
+        })
+        .collect();
+    if old_agents.is_empty() {
+        return Ok(());
+    }
+
+    let mut failures = 0;
+    for agent in &old_agents {
+        let age = agent
+            .last_activity()
+            .map(|ts| util::format_elapsed_secs(now.saturating_sub(ts)))
+            .unwrap_or_else(|| "unknown".to_string());
+        // The remote does not know its agents' status; the workstation does.
+        let details = format!("{}, {}, {}", age, status_label(None), agent.name);
+        let (pane, worktree) = (&agent.pane, &agent.pane.worktree);
+        if force {
+            match agent.exit() {
+                Ok(()) => println!("Exited {pane} in {worktree} ({details})"),
+                Err(error) => {
+                    println!("Failed to exit {pane} in {worktree}: {error}");
+                    failures += 1;
+                }
+            }
+        } else {
+            println!("Would exit {pane} in {worktree} ({details})");
+        }
+    }
+
+    if !force {
+        println!("Run with -f/--force to exit these agents.");
+    }
+    if failures == 0 {
+        Ok(())
+    } else {
+        Err(anyhow!("failed to exit {} agent(s)", failures))
+    }
+}
+
+fn run_local(older_than_secs: u64, force: bool) -> Result<()> {
     let mux = create_backend(detect_backend());
     let store = StateStore::new()?;
     let agents = store.load_reconciled_agents(mux.as_ref())?;

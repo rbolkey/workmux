@@ -283,17 +283,21 @@ impl SessionHolder {
         Ok(running.into_iter().map(|(_, id)| id).collect())
     }
 
+    /// The pid of the process remote pane `id` started, once it is known.
+    pub fn pid(&self, id: &RemotePaneId) -> Option<i32> {
+        std::fs::read_to_string(self.pid_file(id))
+            .ok()
+            .and_then(|pid| pid.trim().parse::<i32>().ok())
+            .filter(|pid| *pid > 0)
+    }
+
     /// End remote pane `id`: hang up its process, as closing a terminal
     /// would, and kill it if it does not exit.
     pub fn kill(&self, id: &RemotePaneId) -> Result<()> {
         // A pane just created may not have recorded its pid yet.
         let deadline = Instant::now() + Duration::from_secs(2);
         let pid = loop {
-            let pid = std::fs::read_to_string(self.pid_file(id))
-                .ok()
-                .and_then(|pid| pid.trim().parse::<i32>().ok())
-                .filter(|pid| *pid > 0);
-            match pid {
+            match self.pid(id) {
                 Some(pid) => break pid,
                 None if Instant::now() < deadline && self.state(id)? == PaneState::Running => {
                     std::thread::sleep(Duration::from_millis(20));
