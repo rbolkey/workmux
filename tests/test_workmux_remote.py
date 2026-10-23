@@ -1127,3 +1127,58 @@ def test_open_and_resurrect_reattach_to_surviving_remote_panes(
                 os.kill(pid, signal.SIGTERM)
             except ProcessLookupError:
                 pass
+
+
+@requires_dtach
+@pytest.mark.tmux_only
+def test_remote_run_executes_in_the_remote_worktree(
+    mux_server: MuxEnvironment,
+    workmux_exe_path: Path,
+    repo_path: Path,
+    short_tmp: dict,
+    remote_root: Path,
+):
+    """`run` on a remote worktree runs its command on the remote in that
+    worktree, in a pane of the worktree's window, streaming its output and
+    exiting with its exit code."""
+    env = mux_server
+    assert isinstance(env, TmuxEnvironment)
+    origin = make_origin(env, env.tmp_path / "origin", "panes:\n  - command: sh\n")
+    worktree = remote_root / "home" / "code" / "api__worktrees" / "feature"
+
+    def wm(command, expect_fail=False):
+        return run_workmux_command(
+            env,
+            workmux_exe_path,
+            repo_path,
+            command,
+            pre_run_env=short_tmp,
+            expect_fail=expect_fail,
+            timeout=60.0,
+        )
+
+    wm(f"remote add lb --transport loopback --target {remote_root}")
+    wm(f"project add api --remote lb --repo {origin} --path code/api")
+    daemon_pid = None
+    try:
+        wm("add feature --project api")
+        daemon_pid = remote_daemon_ping(env, workmux_exe_path, repo_path, short_tmp)[
+            "pid"
+        ]
+        env.tmux(["select-window", "-t", env.runner_pane_id or "test:0"])
+
+        ran = wm(
+            "run feature --project api -- "
+            "sh -c 'pwd -P; echo $WORKMUX_REMOTE_PANE; echo oops >&2; exit 3'",
+            expect_fail=True,
+        )
+
+        assert ran.exit_code == 3, ran
+        lines = ran.stdout.splitlines()
+        assert lines[0] == str(worktree.resolve())
+        assert lines[1].startswith("api/feature/"), lines
+        assert "oops" in ran.stderr
+        assert "unsupported on remote" not in ran.stderr
+    finally:
+        if daemon_pid is not None:
+            os.kill(daemon_pid, signal.SIGTERM)
