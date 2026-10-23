@@ -3,6 +3,7 @@
 use anyhow::{Result, anyhow};
 use serde_json::Value;
 use std::io::BufReader;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use super::channel::{Handler, Peer};
@@ -22,7 +23,7 @@ pub struct Connection {
     pub hello: Hello,
     /// Set when the remote runs a different workmux release.
     pub warning: Option<String>,
-    process: StdioProcess,
+    process: Mutex<StdioProcess>,
 }
 
 impl Connection {
@@ -81,7 +82,7 @@ impl Connection {
             peer,
             hello,
             warning,
-            process,
+            process: Mutex::new(process),
         })
     }
 
@@ -92,8 +93,8 @@ impl Connection {
     }
 
     /// The transport's account of why the channel failed.
-    pub fn failure(&mut self) -> String {
-        self.process.failure(Duration::from_secs(1))
+    pub fn failure(&self) -> String {
+        self.process.lock().unwrap().failure(Duration::from_secs(1))
     }
 
     pub fn is_closed(&self) -> bool {
@@ -111,6 +112,7 @@ impl Drop for Connection {
 mod tests {
     use super::*;
     use crate::remote::handshake::{PROTOCOL_VERSION, SENTINEL};
+    use crate::remote::testing::ServeTransport;
     use crate::remote::transport::TtyExec;
     use std::process::{Command, Output};
 
@@ -125,29 +127,6 @@ mod tests {
         fn exec_stdio(&self, _argv: &[String]) -> Result<StdioProcess> {
             let mut command = Command::new("sh");
             command.arg("-c").arg(&self.0);
-            StdioProcess::spawn(command)
-        }
-
-        fn tty_command(&self, _exec: &TtyExec) -> Result<Command> {
-            unimplemented!()
-        }
-    }
-
-    /// Runs `workmux remote serve` as this test binary, through the isolated
-    /// test child below.
-    struct TestBinaryTransport;
-
-    impl Transport for TestBinaryTransport {
-        fn exec_captured(&self, _argv: &[String]) -> Result<Output> {
-            unimplemented!()
-        }
-
-        fn exec_stdio(&self, _argv: &[String]) -> Result<StdioProcess> {
-            let name = "remote::connection::tests::serve_child";
-            let mut command = Command::new(std::env::current_exe().unwrap());
-            command
-                .args([name, "--exact", "--nocapture", "--ignored"])
-                .env(crate::test_support::ISOLATED_TEST_ENV, name);
             StdioProcess::spawn(command)
         }
 
@@ -175,18 +154,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "runs as a child of serving_a_real_remote_over_stdio"]
-    fn serve_child() {
-        if crate::test_support::is_isolated_child("remote::connection::tests::serve_child") {
-            crate::remote::serve::run().unwrap();
-        }
-    }
-
-    #[test]
     fn serving_a_real_remote_over_stdio() {
         // The test harness prints its own lines before the hello, which the
         // workstation must discard like shell-startup noise.
-        let connection = open(&TestBinaryTransport).unwrap();
+        let connection = open(&ServeTransport::default()).unwrap();
 
         let ping = connection.ping().unwrap();
 

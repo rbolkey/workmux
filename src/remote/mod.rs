@@ -6,3 +6,6 @@ pub mod handshake;
 pub mod transport;
 pub mod connection;
 pub mod serve;
+pub mod channels;
+#[cfg(test)]
+pub mod testing;
