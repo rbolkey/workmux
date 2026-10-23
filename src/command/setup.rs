@@ -6,9 +6,10 @@ use crate::agent_setup::{self, Agent, StatusCheck};
 use crate::skills;
 use crate::ui::confirm::{self, ConfirmDefault};
 
-pub fn run(hooks_only: bool, skills_only: bool) -> Result<()> {
-    if !io::stdin().is_terminal() {
-        anyhow::bail!("workmux setup requires an interactive terminal");
+/// With `yes`, installs without asking, so it runs without a terminal.
+pub fn run(hooks_only: bool, skills_only: bool, yes: bool) -> Result<()> {
+    if !yes && !io::stdin().is_terminal() {
+        anyhow::bail!("workmux setup requires an interactive terminal (or --yes)");
     }
 
     // If neither flag is set, do both
@@ -29,20 +30,20 @@ pub fn run(hooks_only: bool, skills_only: bool) -> Result<()> {
     }
 
     if do_hooks {
-        run_hooks_setup(&checks)?;
+        run_hooks_setup(&checks, yes)?;
     }
 
     if do_skills {
         if do_hooks {
             println!();
         }
-        run_skills_setup(&checks)?;
+        run_skills_setup(&checks, yes)?;
     }
 
     Ok(())
 }
 
-fn run_hooks_setup(checks: &[agent_setup::AgentCheck]) -> Result<()> {
+fn run_hooks_setup(checks: &[agent_setup::AgentCheck], yes: bool) -> Result<()> {
     println!();
     println!("  {}", style("Status Tracking").bold().cyan());
     println!();
@@ -103,10 +104,12 @@ fn run_hooks_setup(checks: &[agent_setup::AgentCheck]) -> Result<()> {
     agent_setup::print_description("");
     println!();
 
-    if confirm::confirm(
-        "Install or update status tracking hooks?",
-        ConfirmDefault::Yes,
-    )? {
+    if yes
+        || confirm::confirm(
+            "Install or update status tracking hooks?",
+            ConfirmDefault::Yes,
+        )?
+    {
         let mut any_failed = false;
         for check in &needs_setup {
             match agent_setup::install(check.agent) {
@@ -126,7 +129,7 @@ fn run_hooks_setup(checks: &[agent_setup::AgentCheck]) -> Result<()> {
     Ok(())
 }
 
-fn run_skills_setup(checks: &[agent_setup::AgentCheck]) -> Result<()> {
+fn run_skills_setup(checks: &[agent_setup::AgentCheck], yes: bool) -> Result<()> {
     println!("  {}", style("Skills").bold().cyan());
     println!();
 
@@ -160,7 +163,7 @@ fn run_skills_setup(checks: &[agent_setup::AgentCheck]) -> Result<()> {
     );
     println!();
 
-    if confirm::confirm("Install bundled skills?", ConfirmDefault::Yes)? {
+    if yes || confirm::confirm("Install bundled skills?", ConfirmDefault::Yes)? {
         let mut any_failed = false;
         for agent in &skill_agents {
             match skills::install_skills(*agent) {

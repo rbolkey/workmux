@@ -396,6 +396,10 @@ impl Multiplexer for ForwardingMux {
         "tmux"
     }
 
+    fn runs_on_remote(&self) -> bool {
+        true
+    }
+
     fn is_running(&self) -> Result<bool> {
         self.get(MuxRequest::IsRunning)
     }

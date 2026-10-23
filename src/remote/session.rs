@@ -2,7 +2,7 @@
 //! output, confirmation prompts, cancellation and exit code.
 //!
 //! The workstation sends `command.run` over the control channel. Remote
-//! workmux clones the project on first use, runs the command in the
+//! workmux clones and provisions the project on first use, runs the command in the
 //! project's clone and streams its stdout and stderr back as
 //! `command.output` notifications before answering with the exit code.
 //! When the command reads an answer to a prompt, it sends `command.prompt`
@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use super::channel::Peer;
 use super::forwarded::SessionScope;
-use super::forwarding;
+use super::{forwarding, provision};
 use crate::multiplexer::InvocationContext;
 
 /// Request method that starts a command session on the remote.
@@ -442,15 +442,16 @@ fn exit_code(status: std::process::ExitStatus) -> i32 {
         .unwrap_or(1)
 }
 
-/// Clone the project to its registered path if it is missing.
+/// Clone the project to its registered path if it is missing. Returns
+/// whether it cloned.
 fn ensure_cloned(
     project: &ProjectSite,
     path: &Path,
     tracked: Option<Tracked>,
     emit: &(dyn Fn(Stream, &[u8]) + Sync),
-) -> Result<()> {
+) -> Result<bool> {
     if path.exists() {
-        return Ok(());
+        return Ok(false);
     }
     let Some(git_url) = &project.git_url else {
         bail!(
@@ -479,7 +480,64 @@ fn ensure_cloned(
     if !status.success() {
         bail!("git clone of {git_url} into {} failed", path.display());
     }
+    Ok(true)
+}
+
+/// Provision this remote for the project just cloned at `path`. A failed
+/// step is a warning: the command it came before still runs.
+fn provision(
+    project: &ProjectSite,
+    path: &Path,
+    tracked: Option<Tracked>,
+    emit: &(dyn Fn(Stream, &[u8]) + Sync),
+) -> Result<()> {
+    let mode = crate::config::Config::load_with_location_from(path, None)
+        .map(|(config, _)| config.sandbox.toolchain())
+        .unwrap_or_default();
+    let toolchain = crate::sandbox::toolchain::resolve_toolchain(&mode, path);
+    let plan = provision::plan(&toolchain, provision::has_command);
+    let remote = &project.remote;
+    for warning in &plan.warnings {
+        emit(
+            Stream::Stderr,
+            format!("warning: {}\n", warning.replace("this remote", remote)).as_bytes(),
+        );
+    }
+    for step in &plan.steps {
+        emit(
+            Stream::Stderr,
+            format!("Provisioning {remote}: {}\n", step.what).as_bytes(),
+        );
+        let mut command = remote_command(&step.argv)?;
+        command.current_dir(path);
+        let status = run_streamed(command, tracked, emit)?;
+        if !status.success() {
+            emit(
+                Stream::Stderr,
+                format!(
+                    "warning: {} on {remote} failed ({status}); do it there yourself\n",
+                    step.what
+                )
+                .as_bytes(),
+            );
+        }
+    }
     Ok(())
+}
+
+/// The command for `argv` on this machine, the remote, where `workmux`
+/// means remote workmux.
+fn remote_command(argv: &[String]) -> Result<Command> {
+    let (program, args) = argv
+        .split_first()
+        .ok_or_else(|| anyhow!("no command to run"))?;
+    let mut command = if program == "workmux" {
+        Command::new(std::env::current_exe().context("failed to locate the workmux binary")?)
+    } else {
+        Command::new(program)
+    };
+    command.args(args);
+    Ok(command)
 }
 
 /// Where a command run in a command session forwards its multiplexer
@@ -490,8 +548,8 @@ pub struct Forwarding<'a> {
     pub session: u64,
 }
 
-/// Run `request` on this machine, the remote: clone the project on first
-/// use, then run the command in its clone.
+/// Run `request` on this machine, the remote: clone and provision the
+/// project on first use, then run the command in its clone.
 pub fn run_on_remote(
     request: &CommandRequest,
     forwarding: Option<Forwarding>,
@@ -499,18 +557,11 @@ pub fn run_on_remote(
     emit: &(dyn Fn(Stream, &[u8]) + Sync),
 ) -> Result<i32> {
     let path = clone_path(&request.project.path)?;
-    ensure_cloned(&request.project, &path, tracked, emit)?;
-    let (program, args) = request
-        .argv
-        .split_first()
-        .ok_or_else(|| anyhow!("no command to run"))?;
-    let mut command = if program == "workmux" {
-        Command::new(std::env::current_exe().context("failed to locate the workmux binary")?)
-    } else {
-        Command::new(program)
-    };
+    if ensure_cloned(&request.project, &path, tracked, emit)? {
+        provision(&request.project, &path, tracked, emit)?;
+    }
+    let mut command = remote_command(&request.argv)?;
     command
-        .args(args)
         .current_dir(&path)
         .env(REMOTE_ENV, &request.project.remote)
         .env(PROJECT_ENV, &request.project.name);

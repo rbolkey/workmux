@@ -125,6 +125,12 @@ pub trait Multiplexer: Send + Sync {
     /// Returns the name of this backend (e.g., "tmux", "wezterm")
     fn name(&self) -> &'static str;
 
+    /// Whether panes run on a remote, where remote workmux starts agents in
+    /// the project's devshell.
+    fn runs_on_remote(&self) -> bool {
+        false
+    }
+
     // === Server/Session ===
 
     /// Check if the multiplexer server is running
@@ -814,6 +820,16 @@ pub trait Multiplexer: Send + Sync {
                     }
                 } else {
                     resolved.render_command()
+                };
+
+                let final_command = if is_agent_pane && self.runs_on_remote() {
+                    let toolchain = crate::sandbox::toolchain::resolve_toolchain(
+                        &config.sandbox.toolchain(),
+                        options.worktree_root.unwrap_or(working_dir),
+                    );
+                    crate::sandbox::toolchain::wrap_command(&final_command, &toolchain)
+                } else {
+                    final_command
                 };
 
                 let final_command = if is_agent_pane && self.name() == "zellij" {
