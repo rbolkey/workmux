@@ -385,11 +385,7 @@ pub fn run(worktrees: &[String], json: bool, all: bool, show_git: bool) -> Resul
                 continue;
             }
             if matching[0].remote.is_some() {
-                entries.extend(
-                    matching
-                        .iter()
-                        .map(|agent| remote_status_entry(agent, now)),
-                );
+                entries.extend(matching.iter().map(|agent| remote_status_entry(agent, now)));
                 continue;
             }
             let worktree_name = wt_path
@@ -574,7 +570,12 @@ mod tests {
                 "remote": "devbox", "project": "api", "worktree": "feature", "stale": true
             })
         );
-        assert!(serde_json::to_value(entry("/a")).unwrap().get("remote").is_none());
+        assert!(
+            serde_json::to_value(entry("/a"))
+                .unwrap()
+                .get("remote")
+                .is_none()
+        );
     }
 
     #[test]

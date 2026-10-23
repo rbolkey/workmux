@@ -429,6 +429,10 @@ enum Commands {
         /// Use an alternate config file for this invocation (still merges with global config)
         #[arg(long, value_hint = clap::ValueHint::FilePath)]
         config: Option<PathBuf>,
+
+        /// Open a worktree of a project registered on a remote
+        #[arg(long)]
+        project: Option<String>,
     },
 
     /// Close a worktree's tmux window (keeps the worktree and branch)
@@ -677,6 +681,10 @@ enum Commands {
         /// Maximum wait time in seconds
         #[arg(long)]
         timeout: Option<u64>,
+
+        /// Run in a worktree of a project registered on a remote
+        #[arg(long)]
+        project: Option<String>,
     },
 
     /// Exit tracked agent processes older than a configured age
@@ -996,6 +1004,20 @@ fn should_prompt_status_setup(cmd: &Commands) -> bool {
         )
 }
 
+/// Whether the command acts on workstation tmux, which a remote shell can
+/// reach only while its control channel is connected.
+fn needs_workstation(cmd: &Commands) -> bool {
+    matches!(
+        cmd,
+        Commands::Add { .. }
+            | Commands::Open { .. }
+            | Commands::Close { .. }
+            | Commands::Remove { .. }
+            | Commands::Merge { .. }
+            | Commands::Rename { .. }
+    )
+}
+
 /// Check if the command should trigger a background update check.
 fn should_check_update(cmd: &Commands) -> bool {
     !is_headless_add(cmd) && matches!(cmd, Commands::Add { .. })
@@ -1032,6 +1054,13 @@ pub fn run() -> Result<()> {
             e.exit()
         }
     };
+
+    // In a remote shell, fail before doing half the work.
+    if needs_workstation(&cli.command)
+        && let Some(shell) = crate::remote::shell::Shell::current()
+    {
+        shell.ensure_connected()?;
+    }
 
     // Extract config override early so the side-effect loads (nerdfont, update
     // check) respect the user's explicit --config choice.
@@ -1192,7 +1221,11 @@ pub fn run() -> Result<()> {
             continue_session,
             prompt,
             config,
+            project,
         } => {
+            if let Some(project) = crate::remote::router::resolve(project.as_deref())? {
+                return crate::remote::router::relay(&project);
+            }
             let mode_override = mode
                 .map(MuxMode::from)
                 .or(session.then_some(MuxMode::Session));
@@ -1308,7 +1341,13 @@ pub fn run() -> Result<()> {
             background,
             keep,
             timeout,
-        } => command::run::run(&name, command, background, keep, timeout),
+            project,
+        } => {
+            if let Some(project) = crate::remote::router::resolve(project.as_deref())? {
+                return crate::remote::router::relay(&project);
+            }
+            command::run::run(&name, command, background, keep, timeout)
+        }
         Commands::ReapAgents { hours, force } => {
             command::reap_agents::run(hours.saturating_mul(3600), force)
         }

@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -1088,7 +1089,7 @@ def test_remote_panes_survive_drops_and_reattach(
             panes = env.tmux(["list-panes", "-a", "-F", "#{pane_id}"]).stdout
             return target not in panes.split()
 
-        attach_pattern = "dtach -a .*/panes/api/feature/"
+        attach_pattern = f"dtach -a {re.escape(str(remote_root))}/.*/panes/api/feature/"
 
         def drop():
             clients = pids(attach_pattern)
@@ -1495,6 +1496,531 @@ def test_remote_agent_status_shows_live_turns_stale_and_catches_up_on_reconnect(
             os.kill(daemon_pid, signal.SIGTERM)
 
 
+@requires_dtach
+@pytest.mark.tmux_only
+def test_open_and_resurrect_reattach_to_surviving_remote_panes(
+    mux_server: MuxEnvironment,
+    workmux_exe_path: Path,
+    repo_path: Path,
+    short_tmp: dict,
+    remote_root: Path,
+):
+    """A remote worktree's window that goes away without workmux (killed in
+    tmux, or lost with the whole tmux server) leaves its remote panes
+    running. `open` and `resurrect` bring the window back showing those same
+    remote panes in the configured layout, without starting the agent
+    again."""
+    env = mux_server
+    assert isinstance(env, TmuxEnvironment)
+    started = remote_root / "agent.pids"
+    agent = remote_root / "agent.sh"
+    agent.write_text(f"echo $$ >> {started}\nexec sleep 600\n")
+    origin = make_origin(
+        env,
+        env.tmp_path / "origin",
+        f"panes:\n  - command: sh {agent}\n  - split: horizontal\n",
+    )
+
+    def wm(command):
+        return run_workmux_command(
+            env,
+            workmux_exe_path,
+            repo_path,
+            command,
+            pre_run_env=short_tmp,
+            timeout=60.0,
+        )
+
+    def remote_panes(window: str) -> list[str]:
+        return env.tmux(
+            ["list-panes", "-t", window, "-F", "#{@workmux_remote_pane}"]
+        ).stdout.split()
+
+    def window_gone(window: str) -> bool:
+        return env.tmux(["list-panes", "-t", window], check=False).returncode != 0
+
+    wm(f"remote add lb --transport loopback --target {remote_root}")
+    wm(f"project add api --remote lb --repo {origin} --path code/api")
+    daemons = []
+    try:
+        wm("add feature --project api")
+        daemons.append(
+            remote_daemon_ping(env, workmux_exe_path, repo_path, short_tmp)["pid"]
+        )
+        window = "=api:wm-feature"
+        shown = remote_panes(window)
+        assert len(shown) == 2, shown
+        agent_pid = int(wait_for(started).strip())
+
+        # The window is killed in tmux: its remote panes keep running.
+        env.tmux(["kill-window", "-t", window])
+        assert window_gone(window)
+        assert pid_alive(agent_pid)
+
+        reopened = wm("open feature --project api")
+        assert "Opened tmux window for 'feature'" in reopened.stdout
+        assert remote_panes(window) == shown
+        assert started.read_text().split() == [str(agent_pid)]
+
+        # Opening an open window only switches to it.
+        again = wm("open feature --project api")
+        assert "Switched to existing tmux window" in again.stdout
+        assert remote_panes(window) == shown
+
+        # The workstation's tmux server dies; the remote panes survive it.
+        env.tmux(["kill-server"], check=False)
+        env.start_server()
+        assert pid_alive(agent_pid)
+
+        planned = wm("resurrect --dry-run")
+        assert "feature" in planned.stdout and "restoring" in planned.stdout
+        assert window_gone(window)
+
+        restored = wm("resurrect")
+        assert "✓ Restored 1 worktree(s): feature" in restored.stdout
+        assert remote_panes(window) == shown
+        assert started.read_text().split() == [str(agent_pid)]
+        daemons.append(
+            remote_daemon_ping(env, workmux_exe_path, repo_path, short_tmp)["pid"]
+        )
+
+        # Nothing survives unshown now: a second resurrect restores nothing.
+        assert "Restored" not in wm("resurrect").stdout
+    finally:
+        for pid in daemons:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+
+
+@requires_dtach
+@pytest.mark.tmux_only
+def test_remote_run_executes_in_the_remote_worktree(
+    mux_server: MuxEnvironment,
+    workmux_exe_path: Path,
+    repo_path: Path,
+    short_tmp: dict,
+    remote_root: Path,
+):
+    """`run` on a remote worktree runs its command on the remote in that
+    worktree, in a pane of the worktree's window, streaming its output and
+    exiting with its exit code."""
+    env = mux_server
+    assert isinstance(env, TmuxEnvironment)
+    origin = make_origin(env, env.tmp_path / "origin", "panes:\n  - command: sh\n")
+    worktree = remote_root / "home" / "code" / "api__worktrees" / "feature"
+
+    def wm(command, expect_fail=False):
+        return run_workmux_command(
+            env,
+            workmux_exe_path,
+            repo_path,
+            command,
+            pre_run_env=short_tmp,
+            expect_fail=expect_fail,
+            timeout=60.0,
+        )
+
+    wm(f"remote add lb --transport loopback --target {remote_root}")
+    wm(f"project add api --remote lb --repo {origin} --path code/api")
+    daemon_pid = None
+    try:
+        wm("add feature --project api")
+        daemon_pid = remote_daemon_ping(env, workmux_exe_path, repo_path, short_tmp)[
+            "pid"
+        ]
+        env.tmux(["select-window", "-t", env.runner_pane_id or "test:0"])
+
+        ran = wm(
+            "run feature --project api -- "
+            "sh -c 'pwd -P; echo $WORKMUX_REMOTE_PANE; echo oops >&2; exit 3'",
+            expect_fail=True,
+        )
+
+        assert ran.exit_code == 3, ran
+        lines = ran.stdout.splitlines()
+        assert lines[0] == str(worktree.resolve())
+        assert lines[1].startswith("api/feature/"), lines
+        assert "oops" in ran.stderr
+        assert "unsupported on remote" not in ran.stderr
+    finally:
+        if daemon_pid is not None:
+            os.kill(daemon_pid, signal.SIGTERM)
+
+
+@requires_dtach
+@pytest.mark.tmux_only
+def test_reap_agents_reaps_aged_agents_on_the_remote(
+    mux_server: MuxEnvironment,
+    workmux_exe_path: Path,
+    repo_path: Path,
+    short_tmp: dict,
+    remote_root: Path,
+):
+    """`reap-agents` lists, and with --force exits, agents on a remote that
+    have been idle past the threshold, reporting them as it does local ones.
+    An agent's age comes from its status file (ticket 11) when its hooks
+    wrote one, else from its terminal's idle time. A recently active agent
+    is left alone, and a reaped agent's pane stays open."""
+    env = mux_server
+    assert isinstance(env, TmuxEnvironment)
+    started = remote_root / "agent.pids"
+    agent = remote_root / "fake-agent"
+    agent.write_text(f"#!/bin/sh\necho $$ >> {started}\nwhile :; do sleep 1; done\n")
+    agent.chmod(0o755)
+    origin = make_origin(
+        env,
+        env.tmp_path / "origin",
+        f"agent: {agent}\npanes:\n  - command: <agent>\n",
+    )
+    status_dir = remote_root / "home" / ".local" / "state" / "workmux" / "status"
+
+    def wm(command):
+        return run_workmux_command(
+            env,
+            workmux_exe_path,
+            repo_path,
+            command,
+            pre_run_env=short_tmp,
+            timeout=60.0,
+        )
+
+    def add_agent(name: str) -> int:
+        count = len(started.read_text().split()) if started.exists() else 0
+        wm(f"add {name} --project api")
+        wait_until(
+            lambda: started.exists() and len(started.read_text().split()) > count,
+            f"agent {name} to start",
+        )
+        return int(started.read_text().split()[-1])
+
+    def idle_terminal(pid: int, since: float):
+        tty = subprocess.run(
+            ["ps", "-o", "tty=", "-p", str(pid)], capture_output=True, text=True
+        ).stdout.strip()
+        os.utime(f"/dev/{tty}", (since, since))
+
+    def status_file(worktree: str, status: str, event_ts: float):
+        pane = tmux_value(env, f"=api:wm-{worktree}", "#{@workmux_remote_pane}")
+        slot = pane.rsplit("/", 1)[1]
+        path = status_dir / "api" / worktree / f"{slot}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "pane": pane,
+                    "status": status,
+                    "event_ts": int(event_ts),
+                    "work_gen": 1,
+                }
+            )
+        )
+
+    wm(f"remote add lb --transport loopback --target {remote_root}")
+    wm(f"project add api --remote lb --repo {origin} --path code/api")
+    daemon_pid = None
+    try:
+        busy = add_agent("busy")
+        daemon_pid = remote_daemon_ping(env, workmux_exe_path, repo_path, short_tmp)[
+            "pid"
+        ]
+        finished = add_agent("finished")
+        unhooked = add_agent("unhooked")
+        long_task = add_agent("longtask")
+        env.tmux(["select-window", "-t", env.runner_pane_id or "test:0"])
+        time.sleep(0.5)
+        now = time.time()
+        two_hours_ago = now - 2 * 3600
+        # Its status is recent though its terminal is quiet: not reaped.
+        idle_terminal(busy, two_hours_ago)
+        status_file("busy", "working", now)
+        # Done two hours ago by its status, though its terminal is fresh.
+        status_file("finished", "done", two_hours_ago)
+        # No hooks: its terminal was last used two hours ago.
+        idle_terminal(unhooked, two_hours_ago)
+        # Working on one task for two hours, still producing output: not old.
+        status_file("longtask", "working", two_hours_ago)
+
+        listed = wm("reap-agents --hours 1")
+        assert "api (on lb):" in listed.stdout
+        assert "Would exit api/finished/" in listed.stdout
+        assert "in finished (2h, done, fake-agent)" in listed.stdout
+        assert "Would exit api/unhooked/" in listed.stdout
+        assert "in unhooked (2h, unknown, fake-agent)" in listed.stdout
+        assert "busy" not in listed.stdout
+        assert "longtask" not in listed.stdout
+        assert pid_alive(finished) and pid_alive(unhooked)
+
+        reaped = wm("reap-agents --hours 1 --force")
+        assert "Exited api/finished/" in reaped.stdout
+        assert "Exited api/unhooked/" in reaped.stdout
+        wait_until(
+            lambda: not pid_alive(finished) and not pid_alive(unhooked),
+            "the idle agents to exit",
+        )
+        assert pid_alive(busy) and pid_alive(long_task)
+        assert tmux_value(env, "=api:wm-finished", "#{window_name}") == "wm-finished"
+    finally:
+        for pid in started.read_text().split() if started.exists() else []:
+            try:
+                os.kill(int(pid), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        if daemon_pid is not None:
+            os.kill(daemon_pid, signal.SIGTERM)
+
+
+@requires_dtach
+@pytest.mark.tmux_only
+def test_close_and_remove_end_the_worktrees_unshown_remote_panes_too(
+    mux_server: MuxEnvironment,
+    workmux_exe_path: Path,
+    repo_path: Path,
+    short_tmp: dict,
+    remote_root: Path,
+):
+    """`close` and `remove` end every remote pane of the worktree, not only
+    those its window shows: a pane whose view was closed in tmux, and the
+    survivors of a window killed outside workmux."""
+    env = mux_server
+    assert isinstance(env, TmuxEnvironment)
+    origin = make_origin(env, env.tmp_path / "origin", "panes:\n  - command: sh\n")
+    holders = f"dtach -n {remote_root}/home/.local/state/workmux/panes/api/feature/"
+
+    def wm(command):
+        return run_workmux_command(
+            env,
+            workmux_exe_path,
+            repo_path,
+            command,
+            pre_run_env=short_tmp,
+            timeout=60.0,
+        )
+
+    def running() -> int:
+        return len(pids(holders))
+
+    wm(f"remote add lb --transport loopback --target {remote_root}")
+    wm(f"project add api --remote lb --repo {origin} --path code/api")
+    daemon_pid = None
+    try:
+        wm("add feature --project api")
+        daemon_pid = remote_daemon_ping(env, workmux_exe_path, repo_path, short_tmp)[
+            "pid"
+        ]
+        env.tmux(["select-window", "-t", env.runner_pane_id or "test:0"])
+        window = "=api:wm-feature"
+        [shown] = env.tmux(
+            ["list-panes", "-t", window, "-F", "#{pane_id}"]
+        ).stdout.split()
+
+        # A long `run` gets a remote pane; its view is closed in tmux.
+        wm("run feature --project api --background -- sleep 600")
+        wait_until(lambda: running() == 2, "the run's remote pane")
+        [run_view] = [
+            pane
+            for pane in env.tmux(
+                ["list-panes", "-t", window, "-F", "#{pane_id}"]
+            ).stdout.split()
+            if pane != shown
+        ]
+        env.tmux(["kill-pane", "-t", run_view])
+        time.sleep(0.5)
+        assert running() == 2
+
+        wm("close feature --project api")
+        wait_until(lambda: running() == 0, "close to end every remote pane")
+
+        # The window is killed outside workmux; `remove` ends its survivors.
+        wm("open feature --project api")
+        wait_until(lambda: running() == 1, "the reopened window's remote pane")
+        env.tmux(["kill-window", "-t", window])
+        time.sleep(0.5)
+        assert running() == 1
+
+        wm("remove feature --project api")
+        wait_until(lambda: running() == 0, "remove to end every remote pane")
+    finally:
+        if daemon_pid is not None:
+            os.kill(daemon_pid, signal.SIGTERM)
+
+
+def shows_prompt(env, pane: str):
+    """Wait until the agent pane's `sh` shows its prompt: keys typed before
+    it starts are lost."""
+    wait_until(
+        lambda: "$" in env.tmux(["capture-pane", "-p", "-t", pane], check=False).stdout,
+        f"a shell prompt in {pane}",
+    )
+
+
+def run_in_remote_pane(env, target: str, script_body: str, out_dir: Path, timeout=60.0):
+    """Run a shell snippet in the remote pane the tmux pane `target` shows,
+    in the remote pane's own environment, returning (exit code, stdout,
+    stderr). Keys typed while the pane (re)attaches can be lost, so they are
+    typed again until the script starts; it runs at most once."""
+    out_dir.mkdir(exist_ok=True)
+    for name in ["out", "err", "code"]:
+        (out_dir / name).unlink(missing_ok=True)
+    started = out_dir / "started"
+    shutil.rmtree(started, ignore_errors=True)
+    script = out_dir / "run.sh"
+    script.write_text(
+        f"mkdir {started} 2>/dev/null || exit 0\n"
+        f"trap 'echo $? > {out_dir}/code' EXIT\n"
+        f"({script_body}) > {out_dir}/out 2> {out_dir}/err\n"
+    )
+    deadline = time.monotonic() + timeout
+    while not started.exists():
+        assert time.monotonic() < deadline, env.capture_pane(target)
+        env.send_keys(target, f"/bin/sh {script}", enter=True)
+        retry = time.monotonic() + 3.0
+        while not started.exists() and time.monotonic() < retry:
+            time.sleep(0.05)
+    while not (out_dir / "code").exists() or not (out_dir / "code").read_text():
+        assert time.monotonic() < deadline, "\n".join(
+            path.read_text() if path.exists() else f"(no {path.name})"
+            for path in [out_dir / "out", out_dir / "err"]
+        )
+        time.sleep(0.05)
+    return (
+        int((out_dir / "code").read_text()),
+        (out_dir / "out").read_text(),
+        (out_dir / "err").read_text(),
+    )
+
+
+@requires_dtach
+@pytest.mark.tmux_only
+def test_commands_typed_in_a_remote_pane_reach_the_workstation(
+    mux_server: MuxEnvironment,
+    workmux_exe_path: Path,
+    repo_path: Path,
+    short_tmp: dict,
+    remote_root: Path,
+):
+    """A remote pane's shell reaches the workstation through the shell
+    socket, never a tmux of its own: `add` typed there creates a worktree on
+    the remote and a window on the workstation, `close` typed in a window's
+    own pane closes it (and `remove` removes it), the built-in and allowlisted shims run on the
+    workstation and anything else is refused, and with the channel gone
+    commands fail as not connected."""
+    env = mux_server
+    assert isinstance(env, TmuxEnvironment)
+    root = remote_root
+    origin = make_origin(env, env.tmp_path / "origin", "panes:\n  - command: sh\n")
+    worktrees = root / "home" / "code" / "api__worktrees"
+    bin_dir = root / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "workmux").symlink_to(workmux_exe_path)
+    # The shims stay first on PATH, then the workmux under test, ahead of
+    # any installed one.
+    shims = root / "home/.local/state/workmux/shims/bin"
+    with_workmux = f'export PATH="{shims}:{bin_dir}:$PATH" WORKMUX_TEST=1; '
+
+    def wm(command):
+        return run_workmux_command(
+            env,
+            workmux_exe_path,
+            repo_path,
+            command,
+            pre_run_env=short_tmp,
+            timeout=60.0,
+        )
+
+    def windows():
+        return env.tmux(
+            ["list-windows", "-a", "-F", "#{session_name}:#{window_name}"]
+        ).stdout.split()
+
+    wm(f"remote add lb --transport loopback --target {root} --host-command pwd")
+    wm(f"project add api --remote lb --repo {origin} --path code/api")
+    daemon_pid = None
+    try:
+        wm("add feature --project api")
+        daemon_pid = remote_daemon_ping(env, workmux_exe_path, repo_path, short_tmp)[
+            "pid"
+        ]
+        env.tmux(["select-window", "-t", env.runner_pane_id or "test:0"])
+        pane = tmux_value(env, "=api:wm-feature", "#{pane_id}")
+        out = env.tmp_path / "pane-out"
+        shows_prompt(env, pane)
+
+        def in_pane(body: str):
+            return run_in_remote_pane(env, pane, with_workmux + body, out)
+
+        # The remote pane's shell has no tmux of its own.
+        code, stdout, _ = in_pane('echo "tmux=${TMUX:-none}"; command -v afplay')
+        assert code == 0
+        assert stdout.splitlines() == [
+            "tmux=none",
+            f"{root}/home/.local/state/workmux/shims/bin/afplay",
+        ]
+
+        # `add` typed in the remote pane: the worktree on the remote, the
+        # window in the project's session on the workstation.
+        code, stdout, stderr = in_pane("workmux add second")
+        assert code == 0, stderr
+        assert (worktrees / "second").is_dir()
+        assert "api:wm-second" in windows()
+        second = tmux_value(env, "=api:wm-second", "#{pane_id}")
+        shows_prompt(env, second)
+        assert (
+            env.tmux(
+                ["show-options", "-wqv", "-t", second, "@workmux_project_window"]
+            ).stdout.strip()
+            == "lb:api"
+        )
+
+        # An allowlisted host command runs on the workstation; anything
+        # else is refused.
+        code, stdout, stderr = in_pane("pwd -P; env pwd")
+        assert code == 0, stderr
+        here, there = stdout.splitlines()
+        assert here == str((worktrees / "feature").resolve())
+        assert there.endswith("/workmux-host-exec/lb"), stdout
+        code, _, stderr = in_pane("workmux host-exec ls")
+        assert code != 0
+        assert "host command ls is not allowed for remote lb" in stderr
+
+        # `close` typed in a window's own pane closes that window.
+        code, _, stderr = in_pane("workmux close")
+        assert code == 0, stderr
+        wait_until(lambda: "api:wm-feature" not in windows(), "the window to close")
+        assert (worktrees / "feature").is_dir()
+        holders = f"dtach -n {root}/home/.local/state/workmux/panes/api/feature/"
+        wait_until(
+            lambda: subprocess.run(["pgrep", "-f", holders]).returncode == 1,
+            "the window's remote panes to end",
+        )
+
+        # So does `remove`, which then removes the worktree.
+        code, _, stderr = run_in_remote_pane(
+            env, second, with_workmux + "workmux add third && workmux remove", out
+        )
+        assert code == 0, stderr
+        wait_until(lambda: "api:wm-second" not in windows(), "the window to close")
+        wait_until(lambda: not (worktrees / "second").exists(), "the worktree to go")
+        third = tmux_value(env, "=api:wm-third", "#{pane_id}")
+        shows_prompt(env, third)
+
+        # With the control channel gone, commands fail as not connected.
+        os.kill(daemon_pid, signal.SIGTERM)
+        daemon_pid = None
+        socket_path = root / "home/.local/state/workmux/shell.sock"
+        wait_until(lambda: not socket_path.exists(), "the shell socket to go")
+        code, _, stderr = run_in_remote_pane(
+            env, third, with_workmux + "workmux add fourth", out
+        )
+        assert code != 0
+        assert "workstation not connected" in stderr
+        assert not (worktrees / "fourth").exists()
+    finally:
+        if daemon_pid is not None:
+            os.kill(daemon_pid, signal.SIGTERM)
+
+
 # A stand-in agent that also takes input: each line typed into its pane is
 # echoed back and recorded in `got`.
 INPUT_AGENT = (
@@ -1597,7 +2123,7 @@ def test_agent_commands_reach_remote_agents_from_the_workstation(
         feed = SidebarFeed(short_tmp["TMPDIR"])
         threading.Thread(target=drain, args=(feed.sock,), daemon=True).start()
         view = tmux_value(env, "=api:wm-feature", "#{pane_id}")
-        wait_until(lambda: "agent ready" in env.capture_pane(view), "the agent")
+        wait_until(lambda: "agent ready" in (env.capture_pane(view) or ""), "the agent")
 
         # status and wait read the state store; send and capture use the view.
         hook_runs("working")
@@ -1621,8 +2147,9 @@ def test_agent_commands_reach_remote_agents_from_the_workstation(
             "the sent prompt",
         )
         wait_until(
-            lambda: "got: hello from the workstation"
-            in wm("capture feature -n 20").stdout,
+            lambda: (
+                "got: hello from the workstation" in wm("capture feature -n 20").stdout
+            ),
             "the reply in the captured view",
         )
 
@@ -1677,8 +2204,9 @@ def test_agent_commands_reach_remote_agents_from_the_workstation(
             count = len(local_done.read_text().split()) if local_done.exists() else 0
             local_next.write_text(status)
             wait_until(
-                lambda: local_done.exists()
-                and len(local_done.read_text().split()) > count,
+                lambda: (
+                    local_done.exists() and len(local_done.read_text().split()) > count
+                ),
                 f"the local {status} hook",
             )
 

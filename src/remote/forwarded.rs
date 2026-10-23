@@ -311,6 +311,23 @@ impl Workstation<'_> {
                 tmux.kill_pane(&pane_id)?;
                 json!(ended)
             }
+            MuxRequest::ShownRemotePanes => {
+                let tag = self.scope.tag();
+                let panes = tmux.query(&[
+                    "list-panes",
+                    "-a",
+                    "-F",
+                    &format!("#{{{WINDOW_TAG}}}\t{REMOTE_PANE_FORMAT}"),
+                ])?;
+                json!(
+                    panes
+                        .lines()
+                        .filter_map(|line| line.split_once('\t'))
+                        .filter(|(window, _)| *window == tag)
+                        .filter_map(|(_, pane)| pane.parse::<RemotePaneId>().ok())
+                        .collect::<Vec<_>>()
+                )
+            }
         })
     }
 

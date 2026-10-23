@@ -59,7 +59,7 @@ pub fn materialize_clipboard_png(worktree: &Path) -> Result<Option<PathBuf>> {
 }
 
 /// Platform-specific clipboard PNG reading.
-fn read_png_from_clipboard() -> Result<Option<Vec<u8>>> {
+pub fn read_png_from_clipboard() -> Result<Option<Vec<u8>>> {
     #[cfg(target_os = "macos")]
     {
         read_png_macos()

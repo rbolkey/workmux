@@ -12,15 +12,44 @@ use super::transport::{Provisioning, RemoteState, StdioProcess, Transport, TtyEx
 pub const SERVE_CHILD: &str = "remote::testing::serve_child";
 
 /// Runs `workmux remote serve` as a child of this test binary. Records each
-/// child's pid so a test can kill it to simulate a disconnect.
-#[derive(Default)]
+/// child's pid so a test can kill it to simulate a disconnect. Its remote
+/// keeps its state (the shell socket, shims) in a directory of its own.
 pub struct ServeTransport {
     pub pids: Mutex<Vec<u32>>,
-    /// Extra environment for the remote, such as its state dir.
+    /// Extra environment for the remote, such as another state dir.
     pub env: Vec<(String, std::path::PathBuf)>,
+    /// The remote's own state dir, unless `env` names another.
+    pub state: tempfile::TempDir,
+}
+
+impl Default for ServeTransport {
+    fn default() -> Self {
+        Self {
+            pids: Mutex::new(Vec::new()),
+            env: Vec::new(),
+            state: tempfile::Builder::new()
+                .prefix("wms")
+                .tempdir_in("/tmp")
+                .expect("a state directory"),
+        }
+    }
 }
 
 impl ServeTransport {
+    /// The socket commands run in this remote's shells reach the
+    /// workstation through.
+    pub fn shell_socket(&self) -> std::path::PathBuf {
+        self.state
+            .path()
+            .join("workmux")
+            .join(super::shell::SOCKET_NAME)
+    }
+
+    /// The directory of this remote's shims.
+    pub fn shims(&self) -> std::path::PathBuf {
+        self.state.path().join("workmux").join("shims/bin")
+    }
+
     pub fn kill_latest(&self) {
         let pid = *self.pids.lock().unwrap().last().expect("a served child");
         unsafe {
@@ -44,6 +73,7 @@ impl Transport for ServeTransport {
         command
             .args([SERVE_CHILD, "--exact", "--nocapture", "--ignored"])
             .env(crate::test_support::ISOLATED_TEST_ENV, SERVE_CHILD)
+            .env("XDG_STATE_HOME", self.state.path())
             .envs(self.env.iter().map(|(k, v)| (k, v)));
         let process = StdioProcess::spawn(command)?;
         self.pids.lock().unwrap().push(process.id());

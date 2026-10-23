@@ -66,14 +66,16 @@ fn resolve_target(name: &str, mux: &dyn crate::multiplexer::Multiplexer) -> Resu
         Ok(resolved) => resolved,
         Err(error) => return unstarted_remote_target(name)?.ok_or(error),
     };
-    Ok(match agents.first().and_then(|agent| agent.remote.as_ref()) {
-        Some(remote) => WaitTarget::Remote {
-            remote: remote.remote.clone(),
-            project: remote.project.clone(),
-            worktree: remote.worktree.clone(),
+    Ok(
+        match agents.first().and_then(|agent| agent.remote.as_ref()) {
+            Some(remote) => WaitTarget::Remote {
+                remote: remote.remote.clone(),
+                project: remote.project.clone(),
+                worktree: remote.worktree.clone(),
+            },
+            None => WaitTarget::Path(path),
         },
-        None => WaitTarget::Path(path),
-    })
+    )
 }
 
 /// A remote project's worktree that exists on its remote, for a target
@@ -191,6 +193,9 @@ pub fn run(
     timeout_secs: Option<u64>,
     any: bool,
 ) -> Result<()> {
+    if let Some(code) = crate::remote::shell::run_relayed(crate::remote::shell::own_argv(), None)? {
+        std::process::exit(code);
+    }
     let target_status_name = target_status;
     let target_status = parse_status(target_status)?;
     let mux = create_backend(detect_backend());
@@ -235,7 +240,12 @@ pub fn run(
                 continue;
             }
 
-            let observation = observe(target, &agent_panes, target_status, seen_agent.contains(name));
+            let observation = observe(
+                target,
+                &agent_panes,
+                target_status,
+                seen_agent.contains(name),
+            );
             if observation != Observation::NotStarted {
                 seen_agent.insert(name.clone());
             }

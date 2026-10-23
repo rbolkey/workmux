@@ -8,12 +8,33 @@ use crate::multiplexer::{create_backend, detect_backend};
 use crate::workflow;
 
 pub fn run(name: &str, text: Option<&str>, file: Option<&str>) -> Result<()> {
+    if crate::remote::shell::Shell::current().is_some() {
+        // The agents live on the workstation; the content is read here.
+        let content = content(text, file)?;
+        let argv = ["send", "--", name, &content].map(String::from).to_vec();
+        if let Some(code) = crate::remote::shell::run_relayed(argv, None)? {
+            std::process::exit(code);
+        }
+    }
     let cfg = config::Config::load(None).unwrap_or_default();
     let mux = create_backend(detect_backend());
     let (_path, agent) = workflow::resolve_worktree_agent(name, mux.as_ref())?;
     ensure_reachable(name, &agent)?;
+    let content = content(text, file)?;
 
-    // Determine content: positional arg > --file > stdin
+    let agent_identity = agent
+        .agent_kind
+        .as_deref()
+        .or(cfg.agent.as_deref())
+        .or(agent.agent_command.as_deref());
+    mux.send_prompt_to_agent(&agent.pane_id, &content, agent_identity)?;
+
+    Ok(())
+}
+
+/// The content to send: positional arg > --file > stdin, without its
+/// trailing newline.
+fn content(text: Option<&str>, file: Option<&str>) -> Result<String> {
     let content = if let Some(t) = text {
         t.to_string()
     } else if let Some(f) = file {
@@ -36,15 +57,7 @@ pub fn run(name: &str, text: Option<&str>, file: Option<&str>) -> Result<()> {
     if content.is_empty() {
         return Err(anyhow!("No content to send"));
     }
-
-    let agent_identity = agent
-        .agent_kind
-        .as_deref()
-        .or(cfg.agent.as_deref())
-        .or(agent.agent_command.as_deref());
-    mux.send_prompt_to_agent(&agent.pane_id, content, agent_identity)?;
-
-    Ok(())
+    Ok(content.to_string())
 }
 
 /// Refuse to type into the view of a remote agent whose remote is

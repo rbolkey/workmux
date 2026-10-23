@@ -70,6 +70,12 @@ pub enum RemoteCommand {
     /// Print whether a remote pane on this machine is running or ended
     #[command(hide = true)]
     PaneState { pane: RemotePaneId },
+    /// Forward one multiplexer request from a remote shell to the workstation (run by deferred scripts)
+    #[command(hide = true)]
+    Forward {
+        /// The request, as JSON
+        request: String,
+    },
 }
 
 pub fn run(args: RemoteArgs) -> Result<()> {
@@ -112,6 +118,11 @@ pub fn run(args: RemoteArgs) -> Result<()> {
                 SessionHolder::for_this_remote()?.state(&pane)?.as_str()
             );
             Ok(())
+        }
+        RemoteCommand::Forward { request } => {
+            let mux = crate::remote::forwarding::ForwardingMux::from_env()
+                .context("remote forward runs only in a remote shell")?;
+            mux.forward(serde_json::from_str(&request).context("unreadable request")?)
         }
     }
 }

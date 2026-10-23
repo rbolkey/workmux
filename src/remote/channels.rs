@@ -4,7 +4,7 @@
 //! in use, and reconnects with backoff after a drop. A remote whose
 //! transport reports it stopped is never started to fetch status.
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -16,11 +16,13 @@ use super::channel::Handler;
 use super::connection::{Connection, HELLO_TIMEOUT};
 use super::forwarded;
 use super::forwarding::{FORWARD_METHOD, Forwarded};
+use super::pane::RemotePaneId;
 use super::session::{self, CommandRequest, SessionParams, Sessions, Terminal};
 use super::status::{self, StatusSink};
 use super::transport::{RemoteState, Transport};
+use super::{shell, shims};
 use crate::config::{RemoteConfig, TransportKind};
-use crate::multiplexer::InvocationContext;
+use crate::multiplexer::{InvocationContext, TmuxBackend};
 
 /// Builds the transport for a configured remote.
 pub type TransportFactory =
@@ -36,6 +38,13 @@ pub struct ChannelPolicy {
     pub linger: Duration,
     /// The workstation workmux that panes run `remote attach` with.
     pub workmux: PathBuf,
+    /// The workstation's tmux server (its socket path); `None` for tmux's
+    /// default.
+    pub tmux_socket: Option<String>,
+    /// Whether a project of this name is registered on a remote.
+    pub registered: fn(remote: &str, project: &str) -> bool,
+    /// Reads the workstation clipboard's PNG image, for clipboard shims.
+    pub clipboard: fn() -> Result<Option<Vec<u8>>>,
 }
 
 impl Default for ChannelPolicy {
@@ -46,9 +55,24 @@ impl Default for ChannelPolicy {
             backoff_max: Duration::from_secs(30),
             linger: Duration::from_secs(60),
             workmux: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("workmux")),
+            tmux_socket: InvocationContext::current()
+                .tmux_socket_path()
+                .map(str::to_string),
+            registered: registered_in_global_config,
+            clipboard: crate::sandbox::clipboard::read_png_from_clipboard,
         }
     }
 }
+
+fn registered_in_global_config(remote: &str, project: &str) -> bool {
+    crate::config::Config::load_global_only()
+        .ok()
+        .and_then(|config| super::router::remote_project(&config, project).ok())
+        .is_some_and(|project| project.site.remote == remote)
+}
+
+/// How long a remote may take to install its shims.
+const SHIMS_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A remote's reachability as `workmux remote status` shows it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -85,6 +109,11 @@ struct WorkstationHandler {
     remote: String,
     workmux: PathBuf,
     sessions: Arc<Sessions>,
+    /// The remote's settings, which its shims are checked against.
+    config: RemoteConfig,
+    tmux_socket: Option<String>,
+    registered: fn(&str, &str) -> bool,
+    clipboard: fn() -> Result<Option<Vec<u8>>>,
     status: Arc<Mutex<Option<StatusSink>>>,
 }
 
@@ -108,6 +137,64 @@ impl WorkstationHandler {
         forwarded::answer(&scope, &scope.tmux(), &self.workmux, request)
     }
 
+    /// Open a shell session for a remote pane of a project on this remote,
+    /// invoked from the workstation pane showing it, if one does.
+    fn open_shell(&self, params: Value) -> Result<Value> {
+        let shell::OpenParams { pane } = serde_json::from_value(params)?;
+        if !(self.registered)(&self.remote, &pane.project) {
+            bail!(
+                "refused: project {} is not on remote {}",
+                pane.project,
+                self.remote
+            );
+        }
+        let invocation = self.viewing(&pane);
+        let session = self.sessions.open_shell(forwarded::SessionScope {
+            remote: self.remote.clone(),
+            project: pane.project,
+            invocation,
+        });
+        Ok(serde_json::to_value(shell::Opened { session })?)
+    }
+
+    /// The invocation context of a command run in remote pane `pane`'s
+    /// shell: the workstation pane in one of the project's windows showing
+    /// it, else none in the workstation's tmux.
+    fn viewing(&self, pane: &RemotePaneId) -> InvocationContext {
+        let socket = self.tmux_socket.as_deref().unwrap_or("default");
+        let tag = forwarded::project_tag(&self.remote, &pane.project);
+        let listing = TmuxBackend::for_socket(socket)
+            .query(&[
+                "list-panes",
+                "-a",
+                "-F",
+                "#{pane_id}\t#{@workmux_remote_pane}\t#{@workmux_project_window}\t#{socket_path},#{pid},#{session_id}",
+            ])
+            .unwrap_or_default();
+        let shown = pane.to_string();
+        listing
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.split('\t');
+                Some((
+                    fields.next()?,
+                    fields.next()?,
+                    fields.next()?,
+                    fields.next()?,
+                ))
+            })
+            .find(|(_, remote_pane, window_tag, _)| *remote_pane == shown && *window_tag == tag)
+            .map(|(pane_id, _, _, client)| InvocationContext {
+                pane_id: Some(pane_id.to_string()),
+                tmux: Some(client.replace('$', "")),
+                cwd: None,
+            })
+            .unwrap_or_else(|| InvocationContext {
+                tmux: Some(socket.to_string()),
+                ..InvocationContext::default()
+            })
+    }
+
     fn prompt(&self, params: Value) -> Result<Value> {
         let SessionParams { session } = serde_json::from_value(params)?;
         self.scope(session)?;
@@ -121,6 +208,22 @@ impl Handler for WorkstationHandler {
         match method {
             FORWARD_METHOD => self.forwarded(params).map_err(|error| format!("{error:#}")),
             session::PROMPT_METHOD => self.prompt(params).map_err(|error| format!("{error:#}")),
+            shell::OPEN_METHOD => self
+                .open_shell(params)
+                .map_err(|error| format!("{error:#}")),
+            shims::CLIPBOARD_METHOD => {
+                shims::answer_clipboard(&self.remote, &self.config, self.clipboard, params)
+                    .map_err(|error| format!("{error:#}"))
+            }
+            shims::EXEC_METHOD => shims::answer_exec(&self.remote, &self.config, params)
+                .map_err(|error| format!("{error:#}")),
+            shell::RELAY_METHOD => shell::answer_relay(
+                &self.remote,
+                &self.workmux,
+                self.tmux_socket.as_deref(),
+                params,
+            )
+            .map_err(|error| format!("{error:#}")),
             method => Err(format!("unknown method: {method}")),
         }
     }
@@ -128,6 +231,10 @@ impl Handler for WorkstationHandler {
     fn notification(&self, method: &str, params: Value) {
         match method {
             session::OUTPUT_METHOD => self.sessions.output(params),
+            shell::CLOSE_METHOD => match serde_json::from_value::<SessionParams>(params) {
+                Ok(params) => self.sessions.close_shell(params.session, &self.remote),
+                Err(error) => tracing::warn!(%error, "ignoring an unreadable shell close"),
+            },
             status::RECORDS_METHOD => match serde_json::from_value::<status::Records>(params) {
                 Ok(status::Records { records }) => {
                     let sink = self.status.lock().unwrap().clone();
@@ -300,11 +407,25 @@ impl Channels {
                 remote: name.to_string(),
                 workmux: self.shared.policy.workmux.clone(),
                 sessions: self.shared.sessions.clone(),
+                config: config.clone(),
+                tmux_socket: self.shared.policy.tmux_socket.clone(),
+                registered: self.shared.policy.registered,
+                clipboard: self.shared.policy.clipboard,
                 status: self.shared.status.clone(),
             },
             self.shared.policy.hello_timeout,
         )?);
         tracing::info!(remote = name, workmux = %connection.hello.workmux, "control channel open");
+        let install = shims::Install {
+            commands: shims::allowed(config),
+        };
+        if let Err(error) = connection.peer.request(
+            shims::INSTALL_METHOD,
+            serde_json::to_value(install)?,
+            SHIMS_TIMEOUT,
+        ) {
+            tracing::warn!(remote = name, error = %format!("{error:#}"), "failed to install shims");
+        }
         let mut slots = self.shared.slots.lock().unwrap();
         let slot = slots.entry(name.to_string()).or_insert_with(|| Slot {
             config: config.clone(),

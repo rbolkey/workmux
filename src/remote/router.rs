@@ -269,7 +269,13 @@ pub fn capture(project: &RemoteProject, argv: &[&str]) -> Result<(i32, Vec<u8>)>
 /// Run `argv` for `project` on its remote, discarding its output. Returns
 /// its exit code.
 pub fn quietly(project: &RemoteProject, argv: &[&str]) -> Result<i32> {
-    session(project, argv, &mut Invoking { output: |_, _: &[u8]| {} })
+    session(
+        project,
+        argv,
+        &mut Invoking {
+            output: |_, _: &[u8]| {},
+        },
+    )
 }
 
 /// This command's own arguments, for relaying to remote workmux: `workmux`
@@ -302,6 +308,34 @@ pub fn relay(project: &RemoteProject) -> Result<()> {
     let argv = relayed_argv();
     let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
     exit_with(run(project, &argv)?)
+}
+
+/// Relay this command, as it was typed, to every remote project, printing
+/// each one's output under its name; a project with nothing to say prints
+/// nothing. Returns how many projects failed or could not be reached.
+pub fn relay_to_every_project() -> Result<usize> {
+    let argv = relayed_argv();
+    let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let mut failures = 0;
+    for project in remote_projects()? {
+        let (name, remote) = (&project.site.name, &project.site.remote);
+        match capture(&project, &argv) {
+            Ok((code, stdout)) => {
+                if !stdout.is_empty() {
+                    println!("\n{name} (on {remote}):");
+                    print!("{}", String::from_utf8_lossy(&stdout));
+                }
+                if code != 0 {
+                    failures += 1;
+                }
+            }
+            Err(error) => {
+                eprintln!("Failed to reach remote project '{name}' on {remote}: {error:#}");
+                failures += 1;
+            }
+        }
+    }
+    Ok(failures)
 }
 
 /// Finish a command relayed to a remote with the remote command's exit code.

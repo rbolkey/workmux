@@ -420,9 +420,7 @@ mod tests {
             .to_string();
         assert!(error.contains("api@devbox:feature"), "{error}");
         assert!(error.contains("web@devbox:feature"), "{error}");
-        assert!(
-            resolve_worktree_agents_from_snapshot("api@other:feature", &panes).is_err()
-        );
+        assert!(resolve_worktree_agents_from_snapshot("api@other:feature", &panes).is_err());
     }
 
     #[test]

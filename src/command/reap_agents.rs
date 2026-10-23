@@ -4,10 +4,88 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Result, anyhow};
 
 use crate::multiplexer::{AgentPane, AgentStatus, Multiplexer, create_backend, detect_backend};
+use crate::remote::agents::{RemoteAgent, agents};
+use crate::remote::pane::SessionHolder;
+use crate::remote::session::ServedProject;
 use crate::state::{PaneKey, StateStore};
 use crate::util;
 
 pub fn run(older_than_secs: u64, force: bool) -> Result<()> {
+    if let Some(served) = ServedProject::current() {
+        return run_served(&served, older_than_secs, force);
+    }
+    let local = run_local(older_than_secs, force);
+    let remote_failures = crate::remote::router::relay_to_every_project()?;
+    local?;
+    if remote_failures > 0 {
+        return Err(anyhow!(
+            "failed to reap agents in {} remote project(s)",
+            remote_failures
+        ));
+    }
+    Ok(())
+}
+
+/// Reap, on a remote, the served project's agents idle for
+/// `older_than_secs`. Prints nothing when there are none.
+fn run_served(served: &ServedProject, older_than_secs: u64, force: bool) -> Result<()> {
+    let config = crate::config::Config::load(None)?;
+    let holder = SessionHolder::for_this_remote()?;
+    let status_files = holder.status_files();
+    let now = now_secs();
+    let old_agents: Vec<(RemoteAgent, u64, Option<AgentStatus>)> =
+        agents(&holder, &served.name, config.agent.as_deref())?
+            .into_iter()
+            .filter_map(|agent| {
+                // An agent's hooks record when it entered its status; one
+                // without hooks is as old as its terminal's last use. A
+                // working agent may have entered its status long ago, so
+                // output since then makes it young: never reap it mid-task.
+                let (last_activity, status) = match status_files.read(&agent.pane) {
+                    Some(record) if record.status == Some(AgentStatus::Working) => (
+                        Some(record.event_ts.max(agent.last_activity().unwrap_or(0))),
+                        record.status,
+                    ),
+                    Some(record) => (Some(record.event_ts), record.status),
+                    None => (agent.last_activity(), None),
+                };
+                let ts = last_activity?;
+                (now.saturating_sub(ts) >= older_than_secs).then_some((agent, ts, status))
+            })
+            .collect();
+    if old_agents.is_empty() {
+        return Ok(());
+    }
+
+    let mut failures = 0;
+    for (agent, ts, status) in &old_agents {
+        let age = util::format_elapsed_secs(now.saturating_sub(*ts));
+        let details = format!("{}, {}, {}", age, status_label(*status), agent.name);
+        let (pane, worktree) = (&agent.pane, &agent.pane.worktree);
+        if force {
+            match agent.exit() {
+                Ok(()) => println!("Exited {pane} in {worktree} ({details})"),
+                Err(error) => {
+                    println!("Failed to exit {pane} in {worktree}: {error}");
+                    failures += 1;
+                }
+            }
+        } else {
+            println!("Would exit {pane} in {worktree} ({details})");
+        }
+    }
+
+    if !force {
+        println!("Run with -f/--force to exit these agents.");
+    }
+    if failures == 0 {
+        Ok(())
+    } else {
+        Err(anyhow!("failed to exit {} agent(s)", failures))
+    }
+}
+
+fn run_local(older_than_secs: u64, force: bool) -> Result<()> {
     let mux = create_backend(detect_backend());
     let store = StateStore::new()?;
     let agents = store.load_reconciled_agents(mux.as_ref())?;
@@ -129,9 +207,12 @@ fn last_activity_ts(agent: &AgentPane) -> Option<u64> {
     agent.updated_ts.or(agent.status_ts)
 }
 
+/// The local agents idle for `older_than_secs`. A remote agent's process
+/// lives on its remote, whose workmux reaps it.
 fn old_agents(agents: &[AgentPane], now: u64, older_than_secs: u64) -> Vec<&AgentPane> {
     agents
         .iter()
+        .filter(|agent| agent.remote.is_none())
         .filter(|agent| {
             last_activity_ts(agent).is_some_and(|ts| now.saturating_sub(ts) >= older_than_secs)
         })
@@ -228,5 +309,24 @@ mod tests {
         let agents = vec![agent("%1", Some(400), None)];
 
         assert!(old_agents(&agents, 300, 100).is_empty());
+    }
+
+    #[test]
+    fn old_agents_leaves_remote_agents_to_their_remote() {
+        let mut remote = agent("%2", Some(100), None);
+        remote.remote = Some(crate::multiplexer::types::RemoteAgentPane {
+            remote: "lb".to_string(),
+            project: "api".to_string(),
+            worktree: "feature".to_string(),
+            stale: false,
+        });
+        let agents = vec![agent("%1", Some(100), None), remote];
+
+        let selected: Vec<&str> = old_agents(&agents, 300, 100)
+            .into_iter()
+            .map(|agent| agent.pane_id.as_str())
+            .collect();
+
+        assert_eq!(selected, vec!["%1"]);
     }
 }

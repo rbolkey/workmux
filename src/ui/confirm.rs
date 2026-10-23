@@ -45,7 +45,7 @@ pub fn confirm(prompt: &str, default: ConfirmDefault) -> Result<bool> {
 /// input. A command remote workmux runs in a command session reads it from
 /// the workstation terminal the command was invoked in.
 pub fn read_answer() -> Result<String> {
-    if let Some(mux) = crate::remote::forwarding::ForwardingMux::from_env() {
+    if let Some(mux) = crate::remote::forwarding::ForwardingMux::for_command_session() {
         return Ok(mux.read_line()?.unwrap_or_default());
     }
     let mut input = String::new();

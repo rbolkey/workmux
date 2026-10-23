@@ -1288,7 +1288,8 @@ impl StateStore {
     ) -> Result<Vec<crate::multiplexer::AgentPane>> {
         let all_agents = self.list_all_agents()?;
         let instance = mux.instance_id();
-        self.reconcile_agents_for_context(all_agents, mux, &instance, false, true)
+        let agents = self.reconcile_agents_for_context(all_agents, mux, &instance, false, true)?;
+        Ok(crate::remote::shell::scope_relayed(agents))
     }
 
     /// Observe reconciled agents together with the complete state-file census.

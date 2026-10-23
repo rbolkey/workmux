@@ -4817,38 +4817,38 @@ mod tests {
             now_ts: u64,
         ) -> TickInput {
             TickInput {
-                    agents,
-                    tmux_state: TmuxState {
-                        live_panes: HashMap::new(),
-                        window_statuses: HashMap::new(),
-                        active_windows: HashSet::new(),
-                        pane_window_ids: HashMap::new(),
-                        pane_window_indexes: HashMap::new(),
-                        active_pane_ids: HashSet::new(),
-                        window_pane_counts: HashMap::new(),
-                        server_boot_id: None,
-                        position: None,
-                        layout: None,
-                        filter: None,
-                        sleeping_panes: None,
-                        group_by: None,
-                        expanded_groups: None,
-                    },
-                    captured_panes: captures,
-                    sort: crate::config::SidebarSort::default(),
+                agents,
+                tmux_state: TmuxState {
+                    live_panes: HashMap::new(),
+                    window_statuses: HashMap::new(),
+                    active_windows: HashSet::new(),
+                    pane_window_ids: HashMap::new(),
+                    pane_window_indexes: HashMap::new(),
+                    active_pane_ids: HashSet::new(),
+                    window_pane_counts: HashMap::new(),
+                    server_boot_id: None,
+                    position: None,
+                    layout: None,
+                    filter: None,
+                    sleeping_panes: None,
                     group_by: None,
-                    collapse_stale: false,
-                    stale_threshold_secs: crate::command::sidebar::snapshot::STALE_THRESHOLD_SECS,
-                    expanded_groups: Vec::new(),
-                    now,
-                    now_ts,
-                    position: SidebarPosition::Left,
-                    layout_mode: SidebarLayoutMode::default(),
-                    filter_mode: SidebarFilterMode::default(),
-                    git_statuses: HashMap::new(),
-                    pr_statuses: HashMap::new(),
-                    check_statuses: HashMap::new(),
-                    sleeping_pane_ids: HashSet::new(),
+                    expanded_groups: None,
+                },
+                captured_panes: captures,
+                sort: crate::config::SidebarSort::default(),
+                group_by: None,
+                collapse_stale: false,
+                stale_threshold_secs: crate::command::sidebar::snapshot::STALE_THRESHOLD_SECS,
+                expanded_groups: Vec::new(),
+                now,
+                now_ts,
+                position: SidebarPosition::Left,
+                layout_mode: SidebarLayoutMode::default(),
+                filter_mode: SidebarFilterMode::default(),
+                git_statuses: HashMap::new(),
+                pr_statuses: HashMap::new(),
+                check_statuses: HashMap::new(),
+                sleeping_pane_ids: HashSet::new(),
             }
         }
 
@@ -4959,17 +4959,25 @@ mod tests {
             let output = tick(&mut tracker, false, &HashSet::new());
             assert_eq!(output.connected_remotes, connected);
             assert_eq!(
-                output.runtime_write.map(|runtime| runtime.connected_remotes),
+                output
+                    .runtime_write
+                    .map(|runtime| runtime.connected_remotes),
                 Some(connected.clone())
             );
 
             // Unchanged, and no heartbeat due: nothing to write.
-            assert!(tick(&mut tracker, false, &connected).runtime_write.is_none());
+            assert!(
+                tick(&mut tracker, false, &connected)
+                    .runtime_write
+                    .is_none()
+            );
 
             // The channel drops: written at once, not at the next heartbeat.
             let output = tick(&mut tracker, true, &connected);
             assert_eq!(
-                output.runtime_write.map(|runtime| runtime.connected_remotes),
+                output
+                    .runtime_write
+                    .map(|runtime| runtime.connected_remotes),
                 Some(HashSet::new())
             );
         }
