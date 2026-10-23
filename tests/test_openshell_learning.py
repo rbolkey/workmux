@@ -22,6 +22,7 @@ import pytest
 
 from .support.openshell import (
     Sandbox,
+    FIXTURE_DIR,
     create_sandbox,
     new_sandbox_name,
     openshell,
@@ -333,59 +334,184 @@ def test_workspace_survives_stop_and_start():
         kept.delete()
 
 
-def test_nix_installs_at_provisioning_and_survives_restart():
-    """The Lima backend's Determinate installer flow, run inside a stock sandbox."""
-    policy = os.environ.get("WORKMUX_TEST_OPENSHELL_NIX_POLICY")
-    nixed, created = create_sandbox("nix", policy=policy)
+def test_default_policy_blocks_provisioning_nix(sandbox: Sandbox):
+    """No egress, no root and no writable / under the default policy."""
+    blocked = sandbox.sh(
+        "curl -sS -m 10 -o /dev/null https://install.determinate.systems/nix; echo curl=$?; "
+        "command -v sudo || echo no-sudo; "
+        "mkdir /wm-learn-nix 2>&1; echo mkdir=$?"
+    )
+    print(blocked.stdout, blocked.stderr)
+    assert "curl=7" in blocked.stdout
+    assert "no-sudo" in blocked.stdout
+    assert "mkdir=1" in blocked.stdout
+
+
+def test_nix_profiles_fail_even_with_a_nix_policy():
+    """Documents a failure: Nix opens "/", which Landlock denies even when the
+    policy lists "/" read-only. The store itself works and survives restart."""
+    nixed, created = create_sandbox("nix", policy=str(FIXTURE_DIR / "nix-policy.yaml"))
     try:
         assert created.returncode == 0, created.stderr
         nixed.wait_for_phase("Ready")
         install = nixed.sh(
-            "curl --proto '=https' --tlsv1.2 -sSf -L https://install.determinate.systems/nix "
-            "| sh -s -- install linux --init none --no-confirm",
+            "curl -sSfL https://nixos.org/nix/install -o /tmp/install "
+            "&& sh /tmp/install --no-daemon --yes",
             timeout=900,
         )
-        print(install.stdout[-4000:], install.stderr[-4000:])
-        assert install.returncode == 0
+        print(install.stdout[-2000:], install.stderr[-2000:])
+        assert 'opening file "/": Permission denied' in install.stdout + install.stderr
+        nix = "$(ls -d /nix/store/*-nix-[0-9]*/bin | head -1)/nix"
+        assert (
+            nixed.sh_ok(
+                f"{nix} --extra-experimental-features nix-command eval --expr 1+1"
+            ).strip()
+            == "2"
+        )
+
         assert nixed.stop().returncode == 0
         nixed.wait_for_phase("Stopped")
         assert nixed.start().returncode == 0
         nixed.wait_for_phase("Ready")
-        nixed.sh_ok("/nix/var/nix/profiles/default/bin/nix --version")
+        assert "Nix" in nixed.sh_ok(f"{nix} --version")
     finally:
         nixed.delete()
 
 
-def test_root_user_image_is_refused_under_default_policy():
-    refused, created = create_sandbox("root", image="docker.io/library/ubuntu:24.04")
+def test_slash_cannot_be_granted_read_write():
+    refused, created = create_sandbox(
+        "root", policy=str(FIXTURE_DIR / "rw-root-policy.yaml")
+    )
     try:
-        print(created.returncode, created.stdout, created.stderr)
+        print(created.stderr)
         assert created.returncode != 0
+        assert "overly broad" in created.stderr
     finally:
         refused.delete()
 
 
-def test_status_and_errors_for_running_stopped_and_missing():
-    tracked, created = create_sandbox("status")
+@pytest.mark.parametrize(
+    "image",
+    ["docker.io/library/ubuntu:24.04", "docker.io/library/debian:bookworm-slim"],
+)
+def test_any_image_runs_as_uid_1000_in_sandbox_workdir(image: str):
+    """Root-user images and images without a uid 1000 user are both accepted."""
+    stock, created = create_sandbox("img", image=image)
     try:
         assert created.returncode == 0, created.stderr
-        tracked.wait_for_phase("Ready")
-        assert tracked.name in openshell(["sandbox", "list", "--names"]).stdout.split()
-
-        assert tracked.stop().returncode == 0
-        tracked.wait_for_phase("Stopped")
-        assert tracked.name in openshell(["sandbox", "list", "--names"]).stdout.split()
-        stopped_exec = tracked.sh("true")
-        print("exec on stopped:", stopped_exec.returncode, stopped_exec.stderr)
-        assert stopped_exec.returncode != 0
+        stock.wait_for_phase("Ready")
+        assert stock.sh_ok("id -u; pwd; echo $HOME").split() == [
+            "1000",
+            "/sandbox",
+            "/sandbox",
+        ]
     finally:
-        tracked.delete()
+        stock.delete()
 
-    missing = Sandbox(new_sandbox_name("missing"))
-    get_missing = missing.get()
-    exec_missing = missing.sh("true")
-    print("get missing:", get_missing.returncode, get_missing.stderr)
-    print("exec missing:", exec_missing.returncode, exec_missing.stderr)
-    assert get_missing.returncode != 0
-    assert exec_missing.returncode != 0
-    assert missing.name not in openshell(["sandbox", "list", "--names"]).stdout.split()
+
+def test_stock_image_lacks_git_and_python():
+    stock, created = create_sandbox("stock", image=None)
+    try:
+        assert created.returncode == 0, created.stderr
+        stock.wait_for_phase("Ready")
+        output = stock.sh_ok(
+            "for b in git python3 curl; do command -v $b || echo no-$b; done"
+        )
+        assert output.split() == ["no-git", "no-python3", "no-curl"]
+    finally:
+        stock.delete()
+
+
+def test_sandbox_names_are_limited_to_19_characters():
+    long_name = openshell(
+        ["sandbox", "create", "--name", "wm-learn-name-123456", "--no-tty", "--detach"]
+    )
+    assert long_name.returncode != 0
+    assert "maximum length (20 > 19)" in long_name.stderr
+
+
+def test_exit_of_initial_command_completes_the_sandbox_and_refuses_exec():
+    done = Sandbox(new_sandbox_name("done"))
+    try:
+        created = openshell(
+            [
+                "sandbox",
+                "create",
+                "--name",
+                done.name,
+                "--no-tty",
+                "--no-auto-providers",
+                "--",
+                "true",
+            ]
+        )
+        assert created.returncode == 0, created.stderr
+        done.wait_for_phase("Completed")
+        refused = done.sh("true")
+        assert refused.returncode == 1
+        assert "is not ready (phase: Completed)" in refused.stderr
+    finally:
+        done.delete()
+
+
+def test_default_policy_denies_allocating_a_pty(sandbox: Sandbox):
+    """Ticket 02 criterion 3: /dev/ptmx is outside the default Landlock policy."""
+    for tty in (False, True):
+        process, master = run_in_pty(
+            sandbox.exec_args(
+                ["sh", "-c", "dtach -n /tmp/t.sock -E sleep 1; echo rc=$?"], tty=tty
+            ),
+            rows=24,
+            cols=80,
+        )
+        try:
+            output = read_pty_until(master, "rc=", timeout=30)
+            assert "init_pty: Permission denied" in output
+            assert "rc=1" in output
+        finally:
+            process.kill()
+            process.wait()
+            os.close(master)
+
+
+@pytest.fixture(scope="module")
+def pty_sandbox() -> Generator[Sandbox, None, None]:
+    sandbox, created = create_sandbox(
+        "pty", policy=str(FIXTURE_DIR / "pty-policy.yaml")
+    )
+    try:
+        assert created.returncode == 0, created.stderr
+        sandbox.wait_for_phase("Ready")
+        yield sandbox
+    finally:
+        sandbox.delete()
+
+
+@pytest.mark.parametrize(
+    "socket_dir", ["$PWD/.workmux/panes", "$HOME/.local/state/workmux", "/tmp"]
+)
+def test_dtach_holder_with_pty_devices_in_policy(pty_sandbox: Sandbox, socket_dir: str):
+    """Ticket 02 criterion 3: with /dev/pts and /dev/ptmx read-write, a dtach
+    remote pane can be created by one exec and attached from another."""
+    socket = f"{socket_dir}/t-{uuid.uuid4().hex[:6]}.sock"
+    # The holder must not inherit the exec's stdio, or the exec never returns.
+    pty_sandbox.sh_ok(
+        f'mkdir -p "$(dirname {socket})" && '
+        f"dtach -n {socket} -E sh -c 'while :; do echo tick; sleep 1; done' "
+        "</dev/null >/dev/null 2>&1",
+        timeout=60,
+    )
+    process, master = run_in_pty(
+        pty_sandbox.exec_args(
+            ["sh", "-c", f"exec dtach -a {socket} -E -r winch"], tty=True
+        ),
+        rows=24,
+        cols=80,
+    )
+    try:
+        assert "tick" in read_pty_until(master, "tick", timeout=30)
+    finally:
+        process.kill()
+        process.wait()
+        os.close(master)
+    pty_sandbox.sh_ok(f"pkill -f '^dtach -n {socket}'; rm -f {socket}")

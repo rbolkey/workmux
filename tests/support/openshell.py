@@ -4,18 +4,22 @@ Every sandbox created here is named with the `wm-learn-` prefix and deleted by
 the fixture that created it; nothing here touches other sandboxes.
 """
 
+import functools
 import json
 import os
 import shutil
 import subprocess
 import time
 import uuid
+from pathlib import Path
 from dataclasses import dataclass
-from typing import Any, Optional, Sequence
+from typing import Optional, Sequence
 
 import pytest
 
 SANDBOX_PREFIX = "wm-learn-"
+LEARNING_IMAGE = "wm-learn-openshell:latest"
+FIXTURE_DIR = Path(__file__).parent.parent / "fixtures" / "openshell"
 READY_TIMEOUT = float(os.environ.get("WORKMUX_TEST_OPENSHELL_READY_TIMEOUT", "300"))
 
 requires_openshell = pytest.mark.skipif(
@@ -44,24 +48,19 @@ def openshell(
 
 
 def new_sandbox_name(label: str) -> str:
-    return f"{SANDBOX_PREFIX}{label}-{uuid.uuid4().hex[:6]}"
+    """A unique name within OpenShell's 19-character limit on sandbox names."""
+    return f"{SANDBOX_PREFIX}{label[:4]}-{uuid.uuid4().hex[:5]}"
 
 
-def find_key(value: Any, key: str) -> Optional[Any]:
-    """Return the first value stored under `key` anywhere in a decoded JSON document."""
-    if isinstance(value, dict):
-        if key in value:
-            return value[key]
-        children = list(value.values())
-    elif isinstance(value, list):
-        children = value
-    else:
-        return None
-    for child in children:
-        found = find_key(child, key)
-        if found is not None:
-            return found
-    return None
+@functools.cache
+def build_learning_image() -> str:
+    """Build the fixture image; OpenShell's stock image has no git or python3."""
+    subprocess.run(
+        ["docker", "build", "-q", "-t", LEARNING_IMAGE, str(FIXTURE_DIR)],
+        check=True,
+        capture_output=True,
+    )
+    return LEARNING_IMAGE
 
 
 @dataclass
@@ -115,16 +114,16 @@ class Sandbox:
         result = self.get()
         if result.returncode != 0:
             return None
-        phase = find_key(json.loads(result.stdout), "phase")
-        return None if phase is None else str(phase)
+        return json.loads(result.stdout).get("phase")
 
     def wait_for_phase(self, wanted: str, timeout: float = READY_TIMEOUT) -> None:
         deadline = time.monotonic() + timeout
         seen: Optional[str] = None
         while time.monotonic() < deadline:
             seen = self.phase()
-            if seen is not None and seen.lower().endswith(wanted.lower()):
+            if seen == wanted:
                 return
+            assert seen != "Error", f"{self.name} entered phase Error"
             time.sleep(2)
         raise AssertionError(f"{self.name} never reached {wanted}; last phase {seen!r}")
 
@@ -141,11 +140,18 @@ class Sandbox:
 def create_sandbox(
     label: str,
     *,
-    image: Optional[str] = None,
+    image: Optional[str] = LEARNING_IMAGE,
     policy: Optional[str] = None,
     providers: Sequence[str] = (),
 ) -> tuple[Sandbox, subprocess.CompletedProcess[str]]:
-    """Create a kept sandbox whose initial command exits at once, and return the create result."""
+    """Create a detached sandbox and return it with the create result.
+
+    `image=None` uses OpenShell's stock image. A sandbox whose initial command
+    exits goes to phase Completed and refuses exec, so the main process is
+    always the detached default.
+    """
+    if image == LEARNING_IMAGE:
+        build_learning_image()
     sandbox = Sandbox(new_sandbox_name(label))
     args = [
         "sandbox",
@@ -154,6 +160,7 @@ def create_sandbox(
         sandbox.name,
         "--no-tty",
         "--no-auto-providers",
+        "--detach",
     ]
     if image is not None:
         args += ["--from", image]
@@ -161,7 +168,7 @@ def create_sandbox(
         args += ["--policy", policy]
     for provider in providers:
         args += ["--provider", provider]
-    return sandbox, openshell([*args, "--", "true"], timeout=READY_TIMEOUT)
+    return sandbox, openshell(args, timeout=READY_TIMEOUT)
 
 
 def workspace_dir(sandbox: Sandbox) -> str:
