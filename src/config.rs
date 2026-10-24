@@ -2869,22 +2869,21 @@ pub fn validate_layouts_config(layouts: &HashMap<String, LayoutConfig>) -> anyho
     Ok(())
 }
 
+/// The agent the image at `named` names, an OpenShell sandbox's, for
+/// when no config names one.
+fn image_agent(named: &Path) -> Option<String> {
+    std::fs::read_to_string(named)
+        .ok()
+        .map(|agent| agent.trim().to_string())
+        .filter(|agent| !agent.is_empty())
+}
+
 /// Get the path to the global config file.
 ///
 /// Resolves via `$XDG_CONFIG_HOME/workmux/` (default `~/.config/workmux/`).
 /// If a custom `XDG_CONFIG_HOME` is set and no config exists there yet,
 /// falls back to the legacy `~/.config/workmux/` location for reading.
 /// Prefers existing .yml file to avoid shadowing, otherwise defaults to .yaml.
-/// The agent to run when no config names one: the one the image at
-/// `named` names (an OpenShell sandbox's), else `claude`.
-fn fallback_agent(named: &Path) -> String {
-    std::fs::read_to_string(named)
-        .ok()
-        .map(|agent| agent.trim().to_string())
-        .filter(|agent| !agent.is_empty())
-        .unwrap_or_else(|| "claude".to_string())
-}
-
 pub fn global_config_path() -> Option<PathBuf> {
     let xdg_dir = crate::xdg::config_dir().ok()?;
     let yaml = xdg_dir.join("config.yaml");
@@ -3115,16 +3114,36 @@ impl Config {
         cli_agent: Option<&str>,
         defaults_root: &std::path::Path,
     ) -> anyhow::Result<Self> {
-        let has_explicit_agent =
-            cli_agent.is_some() || project_config.agent.is_some() || global_config.agent.is_some();
+        Self::merge_and_apply_defaults_with_image_agent(
+            global_config,
+            project_config,
+            cli_agent,
+            image_agent(Path::new(crate::remote::openshell::image::DEFAULT_AGENT)),
+            defaults_root,
+        )
+    }
+
+    /// [`Self::merge_and_apply_defaults`], where `image_agent` is the agent
+    /// an OpenShell sandbox's image names: the project chose it, so it
+    /// counts as configured.
+    fn merge_and_apply_defaults_with_image_agent(
+        global_config: Self,
+        project_config: Self,
+        cli_agent: Option<&str>,
+        image_agent: Option<String>,
+        defaults_root: &std::path::Path,
+    ) -> anyhow::Result<Self> {
+        let has_explicit_agent = cli_agent.is_some()
+            || project_config.agent.is_some()
+            || global_config.agent.is_some()
+            || image_agent.is_some();
 
         let final_agent = cli_agent
             .map(|s| s.to_string())
             .or_else(|| project_config.agent.clone())
             .or_else(|| global_config.agent.clone())
-            .unwrap_or_else(|| {
-                fallback_agent(Path::new(crate::remote::openshell::image::DEFAULT_AGENT))
-            });
+            .or(image_agent)
+            .unwrap_or_else(|| "claude".to_string());
 
         let mut config = global_config.merge(project_config);
 
@@ -4380,10 +4399,32 @@ projects:
     fn with_no_agent_configured_an_openshell_sandbox_runs_the_one_its_image_names() {
         let dir = tempfile::tempdir().unwrap();
         let named = dir.path().join("default-agent");
-
-        assert_eq!(super::fallback_agent(&named), "claude");
+        assert_eq!(super::image_agent(&named), None);
         std::fs::write(&named, "codex\n").unwrap();
-        assert_eq!(super::fallback_agent(&named), "codex");
+        let root = tempfile::tempdir().unwrap();
+
+        let config = Config::merge_and_apply_defaults_with_image_agent(
+            Config::default(),
+            Config::default(),
+            None,
+            super::image_agent(&named),
+            root.path(),
+        )
+        .unwrap();
+
+        assert_eq!(config.agent.as_deref(), Some("codex"));
+        // Its first pane runs the agent, as with a configured one.
+        assert_eq!(config.panes.unwrap()[0].command.as_deref(), Some("<agent>"));
+        let project: Config = serde_yaml::from_str("agent: claude").unwrap();
+        let config = Config::merge_and_apply_defaults_with_image_agent(
+            Config::default(),
+            project,
+            None,
+            Some("codex".to_string()),
+            root.path(),
+        )
+        .unwrap();
+        assert_eq!(config.agent.as_deref(), Some("claude"));
     }
 
     #[test]

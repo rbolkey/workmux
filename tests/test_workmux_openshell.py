@@ -289,3 +289,50 @@ def test_a_recreate_carries_a_worktree_and_its_commit_across(project: Project):
         project.sh(f"git -C /sandbox/{project.name} remote get-url origin").strip()
         == "/sandbox/origin"
     )
+
+
+def test_an_openshell_projects_sandbox_runs_claude_code(project: Project):
+    """The image installs the default agent, Claude Code, where OpenShell's
+    claude-code provider profile expects it, and `add` starts it in the
+    sandbox with no credentials attached."""
+    env = project.env
+    added = project.wm(
+        f"project add {project.name} --openshell --repo /sandbox/origin "
+        f"--image {LEARNING_IMAGE}"
+    )
+    assert "Agent claude: installed at /usr/local/bin/claude" in added.stdout, (
+        added.stdout
+    )
+    assert "no provider of type claude-code is attached" in added.stderr, added.stderr
+    project.wm(f"remote start {project.name}", timeout=900.0)
+    # A project with no panes of its own: its agent pane runs the agent.
+    project.sh(
+        "set -e; mkdir -p /sandbox/origin; git -C /sandbox/origin init -q -b main; "
+        "echo api > /sandbox/origin/README; git -C /sandbox/origin add README; "
+        "git -C /sandbox/origin -c user.name=t -c user.email=t@t commit -q -m initial"
+    )
+    status = project.wm(f"remote status {project.name}").stdout
+    assert "agent:    claude: installed at /usr/local/bin/claude" in status, status
+
+    daemon_pid = None
+    try:
+        project.wm(f"add feature --project {project.name}", timeout=120.0)
+        daemon_pid = remote_daemon_ping(env, project.exe, project.repo, project.tmp)[
+            "pid"
+        ]
+        wait_until(
+            lambda: (
+                project.sh(
+                    "for p in /proc/[0-9]*; do cat $p/comm 2>/dev/null; done "
+                    "| grep -x claude || true"
+                ).strip()
+                != ""
+            ),
+            "claude to run in the sandbox",
+            timeout=60.0,
+        )
+        assert "Claude Code" in project.sh("claude --version")
+        project.wm(f"remove feature --project {project.name} --force", timeout=120.0)
+    finally:
+        if daemon_pid is not None:
+            os.kill(daemon_pid, 15)
