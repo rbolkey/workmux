@@ -2890,10 +2890,10 @@ def test_a_command_for_every_project_checks_each_remotes_state_once(
     short_tmp: dict,
 ):
     """A command relayed to every remote project asks each OpenShell
-    sandbox for its state once, then reconciles a running one's policy
-    (which reads the sandbox again), and asks nothing more of a sandbox
-    whose channel is already open. A stopped sandbox is skipped, not
-    started. `openshell` is a fake on PATH."""
+    sandbox for its state once, whether or not the workstation daemon has
+    its channel open yet, and reconciles a running one's policy from that
+    same state. A stopped sandbox is skipped, not started. `openshell` is
+    a fake on PATH."""
     env = mux_server
     assert isinstance(env, TmuxEnvironment)
     state = Path(tempfile.mkdtemp(prefix="wmo", dir="/tmp"))
@@ -2942,11 +2942,15 @@ def test_a_command_for_every_project_checks_each_remotes_state_once(
         first = calls()
         assert first["web"] == ["sandbox get"], first
         assert "sandbox exec" in first["api"], first
+        assert [call for call in first["api"] if call != "sandbox exec"] == [
+            "sandbox get",
+            "policy set",
+        ], first
 
         wm("reap-agents")
 
         assert calls() == {
-            "api": ["sandbox get", "sandbox get", "policy set"],
+            "api": ["sandbox get", "policy set"],
             "web": ["sandbox get"],
         }
         assert (state / "web.phase").read_text() == "Stopped"

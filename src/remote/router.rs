@@ -244,17 +244,31 @@ pub fn forget_recent_daemon_socket() {
     *RECENT_DAEMON.lock().unwrap() = None;
 }
 
+/// What a command session does about its remote's state before it runs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Readiness {
+    /// Make the remote ready with [`ready`], starting it.
+    Start,
+    /// The caller has just found the remote running with [`ready`].
+    Running,
+    /// Leave the remote as it is; the channel's opener checks its state.
+    AsItIs,
+}
+
 /// Run a command session for `project`, through the workstation daemon,
 /// which holds the control channels, or directly when no daemon can run.
+/// A remote found running is not checked again on the way.
 fn session(
     project: &RemoteProject,
     argv: &[&str],
     terminal: &mut dyn Terminal,
-    start: bool,
+    readiness: Readiness,
 ) -> Result<i32> {
-    if start {
-        ready(project, true)?;
-    }
+    let running = match readiness {
+        Readiness::Start => ready(project, true)?,
+        Readiness::Running => true,
+        Readiness::AsItIs => false,
+    };
     let request = CommandRequest {
         project: project.site.clone(),
         argv: argv.iter().map(|arg| arg.to_string()).collect(),
@@ -267,6 +281,7 @@ fn session(
             &request,
             InvocationContext::current(),
             terminal,
+            running,
         );
     };
     let mut undelivered = None;
@@ -277,6 +292,7 @@ fn session(
             "remote": project.site.remote,
             "request": request,
             "invocation": InvocationContext::current(),
+            "running": running,
         }),
         None,
         &mut |method, params| match method {
@@ -344,7 +360,12 @@ fn write_to(stream: Stream, data: &[u8]) {
 /// Run `argv` for `project` on its remote, streaming its output to this
 /// terminal. Returns the command's exit code.
 pub fn run(project: &RemoteProject, argv: &[&str]) -> Result<i32> {
-    session(project, argv, &mut Invoking { output: write_to }, true)
+    session(
+        project,
+        argv,
+        &mut Invoking { output: write_to },
+        Readiness::Start,
+    )
 }
 
 /// Make `project`'s remote ready in this process, so creating or starting
@@ -374,7 +395,7 @@ pub fn capture_running(project: &RemoteProject, argv: &[&str]) -> Result<(i32, V
                 Stream::Stderr => write_to(stream, data),
             },
         },
-        false,
+        Readiness::Running,
     )?;
     Ok((exit, stdout))
 }
@@ -388,7 +409,7 @@ pub fn quietly(project: &RemoteProject, argv: &[&str]) -> Result<i32> {
         &mut Invoking {
             output: |_, _: &[u8]| {},
         },
-        false,
+        Readiness::AsItIs,
     )
 }
 
@@ -426,7 +447,7 @@ impl Terminal for Collecting {
 /// terminal: output is kept and prompts read end of input.
 pub fn captured(project: &RemoteProject, argv: &[&str]) -> Result<Captured> {
     let mut terminal = Collecting::default();
-    let exit_code = session(project, argv, &mut terminal, false)?;
+    let exit_code = session(project, argv, &mut terminal, Readiness::AsItIs)?;
     Ok(Captured {
         exit_code,
         stdout: terminal.stdout,

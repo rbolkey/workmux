@@ -285,6 +285,10 @@ struct CommandSessionParams {
     /// Where the command was run from on the workstation.
     #[serde(default)]
     invocation: crate::multiplexer::InvocationContext,
+    /// The client has just found the remote running, so its state is not
+    /// checked again.
+    #[serde(default)]
+    running: bool,
 }
 
 /// The terminal of a command session run for a client of the daemon.
@@ -389,6 +393,7 @@ fn command_session(
                 answers,
                 gone,
             },
+            params.running,
         )?;
         Ok(serde_json::json!({ "exit_code": exit_code }))
     };

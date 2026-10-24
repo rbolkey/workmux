@@ -1227,6 +1227,7 @@ mod tests {
                         let _ = env.send(String::from_utf8_lossy(data).into_owned());
                     }
                 },
+                false,
             )
         });
         let line = received
