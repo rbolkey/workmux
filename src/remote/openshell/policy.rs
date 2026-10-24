@@ -1,5 +1,5 @@
 //! The policy an OpenShell project sandbox gets: workmux's base policy with
-//! the project's policy file merged on top (ticket 21).
+//! the project's policy file merged on top.
 //!
 //! OpenShell takes one policy file and fills in missing top-level sections
 //! from its default, so the merged file always carries a full

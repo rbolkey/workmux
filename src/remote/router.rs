@@ -31,6 +31,17 @@ impl RemoteProject {
     }
 }
 
+/// Refuse `what`, which would open an editor, for `project`: the command
+/// runs on the remote with no terminal to open one in, and would edit a
+/// file there.
+pub fn refuse_editor(project: &RemoteProject, what: &str, instead: &str) -> anyhow::Error {
+    anyhow!(
+        "{what} cannot open an editor for remote project '{}' on {}. {instead}",
+        project.site.name,
+        project.site.remote
+    )
+}
+
 /// The remote project `name` in `config`.
 pub fn remote_project(config: &Config, name: &str) -> Result<RemoteProject> {
     let entry = config

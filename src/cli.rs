@@ -1180,6 +1180,20 @@ pub fn run() -> Result<()> {
             project,
         } => {
             if let Some(project) = crate::remote::router::resolve(project.as_deref())? {
+                if prompt.prompt_editor {
+                    return Err(crate::remote::router::refuse_editor(
+                        &project,
+                        "--prompt-editor",
+                        "Pass the prompt with -p TEXT instead.",
+                    ));
+                }
+                if auto_name && prompt.prompt.is_none() && prompt.prompt_file.is_none() {
+                    return Err(crate::remote::router::refuse_editor(
+                        &project,
+                        "--auto-name without a prompt",
+                        "Pass the prompt with -p TEXT.",
+                    ));
+                }
                 return crate::remote::router::relay(&project);
             }
             let mode_override = mode
@@ -1224,6 +1238,13 @@ pub fn run() -> Result<()> {
             project,
         } => {
             if let Some(project) = crate::remote::router::resolve(project.as_deref())? {
+                if prompt.prompt_editor {
+                    return Err(crate::remote::router::refuse_editor(
+                        &project,
+                        "--prompt-editor",
+                        "Pass the prompt with -p TEXT instead.",
+                    ));
+                }
                 return crate::remote::router::relay(&project);
             }
             let mode_override = mode

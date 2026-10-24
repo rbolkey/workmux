@@ -26,7 +26,7 @@ const RETRY_MAX: Duration = Duration::from_secs(30);
 const STEADY: Duration = Duration::from_secs(10);
 
 /// When to force a redraw after attaching. Some interfaces (Claude Code)
-/// only repaint on a real size change (ticket 02), and the attach must be
+/// only repaint on a real size change, and the attach must be
 /// through before the change reaches them; the later one covers a slow
 /// connect.
 const REDRAW_AFTER: [Duration; 2] = [Duration::from_millis(300), Duration::from_secs(2)];

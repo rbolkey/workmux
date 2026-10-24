@@ -272,7 +272,44 @@ fn remote_entries(remote: &RemoteProject, stdout: &[u8]) -> Result<Vec<ProjectWo
 
 /// A remote project's worktrees, listed by remote workmux without writing
 /// to this terminal. Each carries the project's cache key as its repo key.
+/// While the remote is stopped or unreachable, the last list it sent is
+/// used, without agent statuses, so its branches keep their PR status.
 pub fn remote_worktrees(remote: &RemoteProject) -> Result<Vec<workflow::types::WorktreeInfo>> {
+    let saved = saved_list_path(remote);
+    let (stdout, live) = match list_from_remote(remote) {
+        Ok(stdout) => {
+            if let Ok(path) = &saved
+                && let Err(error) = save_list(path, &stdout)
+            {
+                tracing::warn!(error = %format!("{error:#}"), "saving the remote worktree list");
+            }
+            (stdout, true)
+        }
+        Err(error) => match saved
+            .as_ref()
+            .ok()
+            .and_then(|path| std::fs::read(path).ok())
+        {
+            Some(stdout) => {
+                tracing::debug!(error = %format!("{error:#}"), "using the last remote worktree list");
+                (stdout, false)
+            }
+            None => return Err(error),
+        },
+    };
+    let project = remote.project();
+    let repo_key = project.cache_key(Path::new(""))?;
+    Ok(remote_entries(remote, &stdout)?
+        .into_iter()
+        .map(|entry| workflow::types::WorktreeInfo {
+            repo_key: repo_key.clone(),
+            agent_status: entry.worktree.agent_status.filter(|_| live),
+            ..entry.worktree
+        })
+        .collect())
+}
+
+fn list_from_remote(remote: &RemoteProject) -> Result<Vec<u8>> {
     let listed = router::captured(remote, &["workmux", "list", "--json"])?;
     if listed.exit_code != 0 {
         bail!(
@@ -281,15 +318,25 @@ pub fn remote_worktrees(remote: &RemoteProject) -> Result<Vec<workflow::types::W
             String::from_utf8_lossy(&listed.stderr).trim()
         );
     }
-    let project = remote.project();
-    let repo_key = project.cache_key(Path::new(""))?;
-    Ok(remote_entries(remote, &listed.stdout)?
-        .into_iter()
-        .map(|entry| workflow::types::WorktreeInfo {
-            repo_key: repo_key.clone(),
-            ..entry.worktree
-        })
-        .collect())
+    Ok(listed.stdout)
+}
+
+/// Where the workstation keeps the last worktree list `remote` sent.
+fn saved_list_path(remote: &RemoteProject) -> Result<PathBuf> {
+    Ok(crate::xdg::state_dir()?
+        .join("remote-worktrees")
+        .join(&remote.site.remote)
+        .join(format!("{}.json", remote.site.name)))
+}
+
+fn save_list(path: &Path, stdout: &[u8]) -> Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let partial = path.with_extension("json.partial");
+    std::fs::write(&partial, stdout)?;
+    std::fs::rename(&partial, path)?;
+    Ok(())
 }
 
 pub fn run(

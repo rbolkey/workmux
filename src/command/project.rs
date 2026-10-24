@@ -118,6 +118,10 @@ fn add(name: &str, project: ProjectEntry) -> Result<()> {
             project.path.as_deref().unwrap_or_default(),
             path.display()
         );
+        println!(
+            "Note: only a flake devshell (flake.nix) is baked into an OpenShell sandbox's image; \
+             a devbox project gets no devshell there, so put its toolchain in the image (--image)"
+        );
         return Ok(());
     }
     println!(

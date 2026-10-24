@@ -3,9 +3,9 @@
 Run with WORKMUX_TEST_OPENSHELL=1 and an active OpenShell gateway. The git push
 test also needs WORKMUX_TEST_OPENSHELL_GITHUB_PROVIDER (a configured `github`
 provider) and WORKMUX_TEST_OPENSHELL_GITHUB_REPO (an HTTPS repository the token
-may push scratch branches to). Findings live in ticket 01's `## Answer`; the
-policy composition, live policy change and baked devshell findings live in
-ticket 21's `## Answer`.
+may push scratch branches to). Each test states the behaviour it pins: sandbox
+naming and lifecycle, exec, PTY devices, policy composition, live policy
+changes and a devshell baked into the image.
 """
 
 import fcntl
@@ -471,7 +471,8 @@ def test_exit_of_initial_command_completes_the_sandbox_and_refuses_exec():
 
 
 def test_default_policy_denies_allocating_a_pty(sandbox: Sandbox):
-    """Ticket 02 criterion 3: /dev/ptmx is outside the default Landlock policy."""
+    """/dev/ptmx is outside the default Landlock policy, so no PTY (and no
+    session holder) can be allocated under it."""
     for tty in (False, True):
         process, master = run_in_pty(
             sandbox.exec_args(
@@ -507,7 +508,7 @@ def pty_sandbox() -> Generator[Sandbox, None, None]:
     "socket_dir", ["$PWD/.workmux/panes", "$HOME/.local/state/workmux", "/tmp"]
 )
 def test_dtach_holder_with_pty_devices_in_policy(pty_sandbox: Sandbox, socket_dir: str):
-    """Ticket 02 criterion 3: with /dev/pts and /dev/ptmx read-write, a dtach
+    """With /dev/pts and /dev/ptmx read-write, a dtach
     remote pane can be created by one exec and attached from another."""
     assert_dtach_holder_attaches(pty_sandbox, socket_dir)
 
@@ -543,7 +544,7 @@ def assert_dtach_holder_attaches(
     sandbox.sh_ok(f"pkill -f '^dtach -n {socket}'; rm -f {socket}")
 
 
-# Ticket 21: policy composition, policy changes on a running sandbox, and a
+# Policy composition, policy changes on a running sandbox, and a
 # devshell baked into the image under the candidate workmux base policy.
 
 BASE_POLICY = str(FIXTURE_DIR / "base-policy.yaml")

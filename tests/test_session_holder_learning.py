@@ -1,4 +1,4 @@
-"""Learning tests for picking the session holder (remote-project-hosts ticket 02).
+"""Learning tests for picking the session holder for remote panes.
 
 A session holder keeps a remote pane alive on a remote while no workstation
 pane is attached, without multiplexing (ADR 0003). These tests drive each
@@ -362,7 +362,7 @@ def force_resize(terminal: Terminal, cols: int, rows: int) -> None:
 def test_reattach_redraws_full_screen_interface(
     holder: Holder, terminal: Terminal, tmp_path: Path
 ):
-    """Criterion 1: after a drop, a new client sees the whole interface again."""
+    """After a drop, a new client sees the whole interface again."""
     holder.create("agent", fake_tui(tmp_path))
     terminal.run(holder.attach_argv("agent"), holder.env)
     terminal.wait_for("FAKE-TUI rows=30 cols=100")
@@ -380,7 +380,7 @@ def test_reattach_redraws_full_screen_interface(
 def test_resize_reaches_inner_process(
     holder: Holder, terminal: Terminal, tmp_path: Path
 ):
-    """Criterion 2: the inner process sees the workstation pane's size."""
+    """The inner process sees the workstation pane's size."""
     holder.create("agent", fake_tui(tmp_path))
     terminal.run(holder.attach_argv("agent"), holder.env)
     terminal.wait_for("rows=30 cols=100")
@@ -437,7 +437,7 @@ def test_attach_after_inner_process_exits_reports_ended(
 ):
     """The remote pane ends with its process; a later attach fails clearly.
 
-    Ticket 10 tells "ended" apart from "unreachable": the transport reaching the
+    "Ended" must be told apart from "unreachable": the transport reaching the
     remote but the attach failing this way means the remote pane is gone.
     """
     holder.create("agent", fake_tui(tmp_path))
@@ -468,7 +468,8 @@ def test_attach_after_inner_process_exits_reports_ended(
     reason="set WORKMUX_TEST_SESSION_HOLDER_CLAUDE=1 to reattach to Claude Code",
 )
 def test_reattach_redraws_claude_code(holder: Holder, terminal: Terminal):
-    """Criterion 1 against the real agent interface."""
+    """A new client sees the whole interface again after a drop, against the
+    real agent interface."""
     claude = shutil.which("claude")
     if claude is None:
         pytest.skip("claude not on PATH")
@@ -500,7 +501,7 @@ def test_reattach_redraws_claude_code(holder: Holder, terminal: Terminal):
 )
 @pytest.mark.parametrize("cls", HOLDERS, ids=lambda h: h.name)
 def test_holder_installs_through_nix(cls: type[Holder]):
-    """Criterion 4: the holder comes from nixpkgs with its binary in bin/."""
+    """The holder comes from nixpkgs with its binary in bin/."""
     out = subprocess.run(
         ["nix", "build", "--no-link", "--print-out-paths", f"nixpkgs#{cls.binary}"],
         capture_output=True,
