@@ -10,6 +10,7 @@
 //! place only when they widen a grant.
 
 pub mod agents;
+pub mod github;
 pub mod image;
 pub mod policy;
 pub mod repo;
@@ -39,6 +40,9 @@ pub struct OpenShell {
     origin: Option<OpenshellRemote>,
     openshell: PathBuf,
     docker: PathBuf,
+    gh: PathBuf,
+    /// workmux's state directory (default: the XDG one).
+    state: Option<PathBuf>,
     phase_poll: Duration,
     /// The sandbox as the last state check described it, kept for the one
     /// policy read that follows, so a command asks OpenShell about the
@@ -60,6 +64,8 @@ impl OpenShell {
             origin,
             openshell: PathBuf::from("openshell"),
             docker: PathBuf::from("docker"),
+            gh: PathBuf::from("gh"),
+            state: None,
             phase_poll: Duration::from_secs(1),
             last_get: Mutex::new(None),
         }
@@ -229,7 +235,7 @@ impl OpenShell {
     /// for a sandbox that belongs to no project.
     pub fn agent_report(&self) -> Option<agents::Report> {
         let origin = self.origin.as_ref()?;
-        let providers = &origin.settings.providers;
+        let providers = &self.attached_providers();
         let found = if providers.is_empty() {
             Ok(Default::default())
         } else {
@@ -242,7 +248,46 @@ impl OpenShell {
         ))
     }
 
-    /// The attached providers that give git credentials for github.com.
+    /// Whether the sandbox gets the workstation's `gh` login (`--github
+    /// host`).
+    pub fn github_host(&self) -> bool {
+        self.origin.as_ref().is_some_and(|origin| {
+            origin.settings.github == Some(crate::config::GithubCredentials::Host)
+        })
+    }
+
+    /// The providers attached to the sandbox: the project's, and the one
+    /// holding the `gh` login for `--github host`.
+    fn attached_providers(&self) -> Vec<String> {
+        let mut providers = self
+            .origin
+            .as_ref()
+            .map(|origin| origin.settings.providers.clone())
+            .unwrap_or_default();
+        if self.github_host() {
+            providers.push(github::PROVIDER.to_string());
+        }
+        providers
+    }
+
+    /// For `project add --github host`: the `gh` login must be there, and
+    /// no attached provider may already give GitHub credentials. Returns
+    /// warnings, for a gateway that can't be asked.
+    pub fn check_github_host(&self) -> Result<Vec<String>> {
+        if !self.github_host() {
+            return Ok(Vec::new());
+        }
+        github::host_token(&self.gh)?;
+        match self.github_providers() {
+            Ok(providers) => github::refuse_alongside(&providers).map(|()| Vec::new()),
+            Err(error) => Ok(vec![format!(
+                "could not check whether an attached provider already gives GitHub credentials ({error:#})"
+            )]),
+        }
+    }
+
+    /// The project's own attached providers that give git credentials for
+    /// github.com (not the one `--github host` attaches).
     pub fn github_providers(&self) -> Result<Vec<String>> {
         let Some(origin) = &self.origin else {
             return Ok(Vec::new());
@@ -263,12 +308,35 @@ impl OpenShell {
             .collect())
     }
 
+    /// Every provider profile on the gateway.
+    fn profiles(&self) -> Result<Value> {
+        let output = self.run(&["provider", "profile", "list", "-o", "json"])?;
+        serde_json::from_slice(&output.stdout).context("openshell sent an unreadable profile list")
+    }
+
+    /// Every provider on the gateway, as `provider list` describes it,
+    /// read page by page.
+    fn provider_list(&self) -> Result<Vec<Value>> {
+        let mut providers = Vec::new();
+        let mut token = String::new();
+        loop {
+            let output = self.run(&["provider", "list", "-o", "json", "--page-token", &token])?;
+            let mut page: Value = serde_json::from_slice(&output.stdout)
+                .context("openshell sent an unreadable provider list")?;
+            if let Some(Value::Array(found)) = page.get_mut("providers").map(Value::take) {
+                providers.extend(found);
+            }
+            match page["next_page_token"].as_str() {
+                Some(next) if !next.is_empty() && next != token => token = next.to_string(),
+                _ => return Ok(providers),
+            }
+        }
+    }
+
     /// Every provider on the gateway by name, with the binaries its
     /// profile allows.
     fn providers(&self) -> Result<std::collections::BTreeMap<String, agents::Provider>> {
-        let output = self.run(&["provider", "profile", "list", "-o", "json"])?;
-        let profiles: Value = serde_json::from_slice(&output.stdout)
-            .context("openshell sent an unreadable profile list")?;
+        let profiles = self.profiles()?;
         let profile = |provider_type: &str| {
             profiles
                 .as_array()?
@@ -296,37 +364,172 @@ impl OpenShell {
             })
         };
         let mut providers = std::collections::BTreeMap::new();
-        let mut token = String::new();
-        loop {
-            let output = self.run(&["provider", "list", "-o", "json", "--page-token", &token])?;
-            let page: Value = serde_json::from_slice(&output.stdout)
-                .context("openshell sent an unreadable provider list")?;
-            for provider in page["providers"].as_array().into_iter().flatten() {
-                let (Some(name), Some(provider_type)) =
-                    (provider["name"].as_str(), provider["type"].as_str())
-                else {
-                    continue;
-                };
-                providers.insert(
-                    name.to_string(),
-                    agents::Provider {
-                        provider_type: provider_type.to_string(),
-                        binaries: binaries(provider_type),
-                        hosts: hosts(provider_type),
-                    },
-                );
+        for provider in self.provider_list()? {
+            let (Some(name), Some(provider_type)) =
+                (provider["name"].as_str(), provider["type"].as_str())
+            else {
+                continue;
+            };
+            providers.insert(
+                name.to_string(),
+                agents::Provider {
+                    provider_type: provider_type.to_string(),
+                    binaries: binaries(provider_type),
+                    hosts: hosts(provider_type),
+                },
+            );
+        }
+        Ok(providers)
+    }
+
+    /// Import workmux's GitHub profile into the gateway, or update it there
+    /// when it differs.
+    fn sync_github_profile(&self) -> Result<()> {
+        let profiles = self.profiles()?;
+        let installed = profiles
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|profile| profile["id"] == github::PROFILE);
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("profile.yaml");
+        let path_arg = path.to_string_lossy();
+        match installed {
+            None => {
+                std::fs::write(&path, github::profile_yaml())?;
+                self.run(&["provider", "profile", "import", "--global", "-f", &path_arg])?;
             }
-            match page["next_page_token"].as_str() {
-                Some(next) if !next.is_empty() && next != token => token = next.to_string(),
-                _ => return Ok(providers),
+            Some(installed) if github::profile_differs(installed) => {
+                std::fs::write(
+                    &path,
+                    github::profile_update_yaml(&installed["resource_version"])?,
+                )?;
+                self.run(&[
+                    "provider",
+                    "profile",
+                    "update",
+                    "--global",
+                    "-f",
+                    &path_arg,
+                    github::PROFILE,
+                ])?;
+            }
+            Some(_) => {}
+        }
+        Ok(())
+    }
+
+    /// Give the provider holding the `gh` login the login's current
+    /// token, creating the provider on first use; at sandbox create
+    /// (`sync_profile`), workmux's profile is brought up to date too. An
+    /// unchanged token is not sent again. The token reaches `openshell`
+    /// through its environment only, never its arguments.
+    fn refresh_github_login(&self, sync_profile: bool) -> Result<()> {
+        if !self.github_host() {
+            return Ok(());
+        }
+        let token = github::host_token(&self.gh)?;
+        if sync_profile {
+            self.sync_github_profile()?;
+        }
+        let record = self.github_login_record();
+        let id = match self.provider_id(github::PROVIDER)? {
+            Some(id) => {
+                let sent = record
+                    .as_ref()
+                    .and_then(|record| std::fs::read_to_string(record).ok());
+                if sent.as_deref() == Some(github::digest(&id, &token).as_str()) {
+                    return Ok(());
+                }
+                self.run_with_token(
+                    &[
+                        "provider",
+                        "update",
+                        github::PROVIDER,
+                        "--credential",
+                        github::CREDENTIAL,
+                        "--wait",
+                    ],
+                    &token,
+                )?;
+                id
+            }
+            None => {
+                if !sync_profile {
+                    self.sync_github_profile()?;
+                }
+                self.run_with_token(
+                    &[
+                        "provider",
+                        "create",
+                        "--name",
+                        github::PROVIDER,
+                        "--type",
+                        github::PROFILE,
+                        "--global-profile",
+                        "--credential",
+                        github::CREDENTIAL,
+                    ],
+                    &token,
+                )?;
+                self.provider_id(github::PROVIDER)?.ok_or_else(|| {
+                    anyhow!("provider {} is missing after its create", github::PROVIDER)
+                })?
+            }
+        };
+        if let Some(record) = record {
+            let written = record
+                .parent()
+                .map_or(Ok(()), std::fs::create_dir_all)
+                .and_then(|()| std::fs::write(&record, github::digest(&id, &token)));
+            if let Err(error) = written {
+                tracing::warn!(error = %error, "recording the gh login given to the gateway");
             }
         }
+        Ok(())
+    }
+
+    /// The id of provider `name`, or `None` when the gateway has none.
+    fn provider_id(&self, name: &str) -> Result<Option<String>> {
+        Ok(self
+            .provider_list()?
+            .iter()
+            .find(|provider| provider["name"] == name)
+            .map(|provider| provider["id"].as_str().unwrap_or_default().to_string()))
+    }
+
+    /// Where workmux records which `gh` token it last gave the gateway.
+    fn github_login_record(&self) -> Option<PathBuf> {
+        let state = match &self.state {
+            Some(state) => state.clone(),
+            None => crate::xdg::state_dir().ok()?,
+        };
+        Some(state.join("openshell").join("github-login"))
+    }
+
+    /// Run an `openshell` command that reads the credential from its
+    /// environment.
+    fn run_with_token(&self, args: &[&str], token: &str) -> Result<()> {
+        let output = self
+            .openshell()
+            .args(args)
+            .env(github::CREDENTIAL, token)
+            .stdin(Stdio::null())
+            .output()
+            .context("failed to run openshell")?;
+        if !output.status.success() {
+            bail!("{}", failure(&output));
+        }
+        Ok(())
     }
 
     /// Whether the image's git gets a credential helper for github.com.
     /// When the providers can't be looked up it does: the helper hands git
     /// only the placeholder already in the sandbox's environment.
     fn github_credentials(&self) -> bool {
+        if self.github_host() {
+            return true;
+        }
         self.github_providers().map_or_else(
             |error| {
                 eprintln!(
@@ -408,8 +611,8 @@ impl OpenShell {
         ]
         .map(str::to_string)
         .to_vec();
-        for provider in &origin.settings.providers {
-            args.extend(["--provider".to_string(), provider.clone()]);
+        for provider in self.attached_providers() {
+            args.extend(["--provider".to_string(), provider]);
         }
         args.extend([
             "--annotation".to_string(),
@@ -602,6 +805,7 @@ impl Provisioning for OpenShell {
 
     fn create(&self) -> Result<()> {
         let origin = self.origin()?;
+        self.refresh_github_login(true)?;
         let context = tempfile::tempdir()?;
         let image = self.build_image(origin, context.path())?;
         for warning in self.agent_report().map(|r| r.warnings).unwrap_or_default() {
@@ -640,7 +844,12 @@ impl Provisioning for OpenShell {
         if self.origin.is_none() {
             return Ok(Vec::new());
         }
+        self.refresh_github_login(false)?;
         self.sync_policy(true)
+    }
+
+    fn refresh_credentials(&self) -> Result<()> {
+        self.refresh_github_login(false)
     }
 }
 
@@ -690,14 +899,28 @@ mod tests {
                  'sandbox delete') rm -f \"$dir/phase\" ;;\n\
                  'provider list') token=; while [ $# -gt 0 ]; do [ \"$1\" = --page-token ] && token=$2; shift; done;\n\
                    cat \"$dir/providers$token\" ;;\n\
-                 'provider profile') cat \"$dir/profiles\" ;;\n\
+                 'provider profile') case $3 in\n\
+                   list) cat \"$dir/profiles\" ;;\n\
+                   *) while [ \"$1\" != -f ]; do shift; done; cp \"$2\" \"$dir/imported\" ;;\n\
+                   esac ;;\n\
+                 'provider create') echo \"create $GH_TOKEN\" >> \"$dir/sent\";\n\
+                   echo '{{\"next_page_token\":\"\",\"providers\":[{{\"name\":\"workmux-gh-host\",\"type\":\"workmux-github\",\"id\":\"id-1\"}}]}}' > \"$dir/providers\" ;;\n\
+                 'provider update') echo \"update $GH_TOKEN\" >> \"$dir/sent\" ;;\n\
                  'sandbox exec') shift 2; while [ \"$1\" != -- ]; do shift; done; shift; exec \"$@\" ;;\n\
                  esac\n",
+                dir = dir.path().display()
+            );
+            // A stand-in `gh`, logged in with the token in `gh-token`.
+            let gh = format!(
+                "#!/bin/sh\n\
+                 [ -f {dir}/gh-token ] || {{ echo 'no oauth token found for github.com' >&2; exit 1; }}\n\
+                 cat {dir}/gh-token\n",
                 dir = dir.path().display()
             );
             for (name, body) in [
                 ("openshell", script.as_str()),
                 ("docker", "#!/bin/sh\nexit 0\n"),
+                ("gh", gh.as_str()),
             ] {
                 let path = dir.path().join(name);
                 std::fs::write(&path, body).unwrap();
@@ -710,6 +933,8 @@ mod tests {
             OpenShell {
                 openshell: self.dir.path().join("openshell"),
                 docker: self.dir.path().join("docker"),
+                gh: self.dir.path().join("gh"),
+                state: Some(self.dir.path().join("state")),
                 phase_poll: Duration::from_millis(10),
                 ..OpenShell::new("api", origin)
             }
@@ -912,6 +1137,202 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    fn host_login_origin() -> OpenshellRemote {
+        let mut origin = origin();
+        origin.settings.providers = vec!["anthropic".to_string()];
+        origin.settings.github = Some(crate::config::GithubCredentials::Host);
+        origin
+    }
+
+    impl FakeOpenShell {
+        /// The tokens `openshell provider create/update` got in their
+        /// environment.
+        fn sent(&self) -> Vec<String> {
+            std::fs::read_to_string(self.dir.path().join("sent"))
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect()
+        }
+
+        fn log_in(&self, token: &str) {
+            std::fs::write(self.dir.path().join("gh-token"), format!("{token}\n")).unwrap();
+        }
+    }
+
+    #[test]
+    fn the_gh_login_is_kept_in_a_provider_created_on_first_use_and_attached_to_the_sandbox() {
+        let fake = FakeOpenShell::new();
+        let dir = fake.dir.path();
+        std::fs::write(
+            dir.join("providers"),
+            r#"{"next_page_token":"","providers":[]}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("profiles"), "[]").unwrap();
+        fake.log_in("gho_first");
+        let transport = fake.transport(Some(host_login_origin()));
+
+        transport.create().unwrap();
+
+        let log = fake.log();
+        assert!(
+            log.iter()
+                .any(|line| line.starts_with("provider profile import --global -f ")),
+            "{log:?}"
+        );
+        let imported: serde_yaml::Value =
+            serde_yaml::from_str(&std::fs::read_to_string(dir.join("imported")).unwrap()).unwrap();
+        assert_eq!(imported["id"], "workmux-github");
+        assert!(log.contains(
+            &"provider create --name workmux-gh-host --type workmux-github --global-profile --credential GH_TOKEN"
+                .to_string()
+        ));
+        assert_eq!(fake.sent(), ["create gho_first"]);
+        let create = log
+            .iter()
+            .find(|line| line.starts_with("sandbox create"))
+            .unwrap();
+        assert!(
+            create.contains("--provider anthropic --provider workmux-gh-host"),
+            "{create}"
+        );
+        assert!(
+            log.iter().all(|line| !line.contains("gho_first")),
+            "{log:?}"
+        );
+    }
+
+    #[test]
+    fn a_new_gh_login_updates_the_provider_and_an_unchanged_one_is_not_sent_again() {
+        let fake = FakeOpenShell::new();
+        let dir = fake.dir.path();
+        std::fs::write(
+            dir.join("providers"),
+            r#"{"next_page_token":"","providers":[]}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("profiles"), "[]").unwrap();
+        fake.log_in("gho_first");
+        let transport = fake.transport(Some(host_login_origin()));
+        transport.create().unwrap();
+
+        transport.reconcile().unwrap();
+        assert_eq!(fake.sent(), ["create gho_first"]);
+
+        fake.log_in("gho_second");
+        transport.refresh_credentials().unwrap();
+        transport.refresh_credentials().unwrap();
+
+        assert_eq!(fake.sent(), ["create gho_first", "update gho_second"]);
+        assert!(
+            fake.log().contains(
+                &"provider update workmux-gh-host --credential GH_TOKEN --wait".to_string()
+            )
+        );
+        assert!(fake.log().iter().all(|line| !line.contains("gho_")));
+    }
+
+    #[test]
+    fn a_logged_out_gh_fails_create_and_attach_closed() {
+        let fake = FakeOpenShell::new();
+        std::fs::write(
+            fake.dir.path().join("providers"),
+            r#"{"next_page_token":"","providers":[]}"#,
+        )
+        .unwrap();
+        std::fs::write(fake.dir.path().join("profiles"), "[]").unwrap();
+        let transport = fake.transport(Some(host_login_origin()));
+
+        let error = transport.create().unwrap_err().to_string();
+
+        assert!(error.ends_with("run `gh auth login`"), "{error}");
+        assert!(
+            fake.log()
+                .iter()
+                .all(|line| !line.starts_with("sandbox create"))
+        );
+        let error = transport.refresh_credentials().unwrap_err().to_string();
+        assert!(error.contains("gh is not logged in"), "{error}");
+    }
+
+    #[test]
+    fn an_outdated_shipped_profile_is_updated_at_create() {
+        let fake = FakeOpenShell::new();
+        let dir = fake.dir.path();
+        std::fs::write(
+            dir.join("providers"),
+            r#"{"next_page_token":"","providers":[{"name":"workmux-gh-host","type":"workmux-github","id":"id-1"}]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("profiles"),
+            r#"[{"id":"workmux-github","resource_version":2,"binaries":["/usr/bin/git"],
+                 "endpoints":[{"host":"github.com","port":443}]}]"#,
+        )
+        .unwrap();
+        fake.log_in("gho_first");
+
+        fake.transport(Some(host_login_origin())).create().unwrap();
+
+        let log = fake.log();
+        assert!(
+            log.iter().any(
+                |line| line.starts_with("provider profile update --global -f ")
+                    && line.ends_with(" workmux-github")
+            ),
+            "{log:?}"
+        );
+        let imported: serde_yaml::Value =
+            serde_yaml::from_str(&std::fs::read_to_string(dir.join("imported")).unwrap()).unwrap();
+        assert_eq!(imported["resource_version"], 2);
+        // The provider exists: its token is updated, not created.
+        assert_eq!(fake.sent(), ["update gho_first"]);
+    }
+
+    #[test]
+    fn project_add_checks_the_gh_login_and_refuses_it_beside_a_github_provider() {
+        let fake = FakeOpenShell::new();
+        let dir = fake.dir.path();
+        std::fs::write(
+            dir.join("providers"),
+            r#"{"next_page_token":"","providers":[{"name":"anthropic","type":"claude-code"},{"name":"work","type":"github"}]}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("profiles"), "[]").unwrap();
+
+        let error = fake
+            .transport(Some(host_login_origin()))
+            .check_github_host()
+            .unwrap_err();
+        assert!(
+            error.to_string().ends_with("run `gh auth login`"),
+            "{error}"
+        );
+
+        fake.log_in("gho_first");
+        assert!(
+            fake.transport(Some(host_login_origin()))
+                .check_github_host()
+                .unwrap()
+                .is_empty()
+        );
+        let mut origin = host_login_origin();
+        origin.settings.providers.push("work".to_string());
+        let error = fake
+            .transport(Some(origin))
+            .check_github_host()
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("provider work already gives it GitHub credentials"),
+            "{error}"
+        );
+        // Nothing is created before first use.
+        assert!(fake.sent().is_empty());
     }
 
     #[test]

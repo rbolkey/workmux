@@ -62,8 +62,13 @@ pub fn run(remote: &str, pane: &RemotePaneId) -> Result<()> {
     }
 }
 
-/// Attach this terminal to `pane` until the attachment ends.
+/// Attach this terminal to `pane` until the attachment ends. The
+/// credentials the remote gets from the workstation are refreshed first; a
+/// failure there fails the attach.
 fn attach_once(transport: &dyn Transport, pane: &RemotePaneId) -> Result<()> {
+    if let Some(provisioning) = transport.provisioning() {
+        provisioning.refresh_credentials()?;
+    }
     let mut command = transport.tty_command(&TtyExec {
         argv: ["workmux", "remote", "pane-attach", &pane.to_string()]
             .map(String::from)

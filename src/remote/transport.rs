@@ -48,6 +48,12 @@ pub trait Provisioning: Send + Sync {
     fn reconcile(&self) -> Result<Vec<String>> {
         Ok(Vec::new())
     }
+
+    /// Bring the credentials the remote gets from the workstation up to
+    /// date, before a terminal attaches to it.
+    fn refresh_credentials(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Make a remote that manages its lifecycle ready for a command that

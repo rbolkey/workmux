@@ -70,6 +70,14 @@ pub fn ssh_notice(github: Result<&[String], &str>) -> String {
     }
 }
 
+/// What `project add` says about an SSH `--repo` it rewrote when the
+/// sandbox gets the workstation's `gh` login.
+pub fn ssh_notice_with_host_login() -> String {
+    "`--repo` uses SSH, which OpenShell sandboxes don't support; \
+     the sandbox reaches github.com over HTTPS with your `gh` login's credentials instead (`--github host`)."
+        .to_string()
+}
+
 /// A project's git URL as workmux shows it: with the SSH URL it was
 /// rewritten from, if any.
 pub fn describe(git_url: &str, ssh_git_url: Option<&str>) -> String {
@@ -151,6 +159,15 @@ mod tests {
             ssh_notice(Ok(&["work".to_string(), "bot".to_string()])),
             "`--repo` uses SSH, which OpenShell sandboxes don't support; \
              the sandbox reaches github.com over HTTPS with `work`, `bot` credentials instead."
+        );
+    }
+
+    #[test]
+    fn with_the_gh_login_the_notice_names_it() {
+        assert_eq!(
+            ssh_notice_with_host_login(),
+            "`--repo` uses SSH, which OpenShell sandboxes don't support; \
+             the sandbox reaches github.com over HTTPS with your `gh` login's credentials instead (`--github host`)."
         );
     }
 

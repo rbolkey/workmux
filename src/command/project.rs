@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand};
 
 use super::global_config::{self, PROJECTS};
-use crate::config::{OpenshellProject, ProjectEntry, ProjectPlacement};
+use crate::config::{GithubCredentials, OpenshellProject, ProjectEntry, ProjectPlacement};
 use crate::remote::registry;
 
 #[derive(Debug, Args)]
@@ -49,6 +49,10 @@ pub struct AddArgs {
     /// OpenShell provider to attach to the sandbox, for credentials (repeatable)
     #[arg(long = "provider", value_name = "PROVIDER", requires = "openshell")]
     pub providers: Vec<String>,
+    /// Where the sandbox's GitHub credentials come from besides its providers:
+    /// `host` gives it your `gh` login (OpenShell only)
+    #[arg(long, value_enum, value_name = "SOURCE", requires = "openshell")]
+    pub github: Option<GithubCredentials>,
     /// Agent the sandbox's image installs, such as claude or codex; the first is its
     /// default agent (repeatable; default: your default agent's type; OpenShell only)
     #[arg(long = "agent", value_name = "AGENT", requires = "openshell")]
@@ -91,6 +95,7 @@ fn project_entry(args: AddArgs) -> Result<ProjectEntry> {
         image,
         policy,
         providers,
+        github,
         agents,
         sandbox,
         repo,
@@ -112,6 +117,7 @@ fn project_entry(args: AddArgs) -> Result<ProjectEntry> {
             image,
             policy: policy.map(absolute_policy).transpose()?,
             providers,
+            github,
             agents,
         })
     } else {
@@ -141,9 +147,13 @@ fn absolute_policy(policy: std::path::PathBuf) -> Result<String> {
 fn add(name: &str, project: ProjectEntry) -> Result<()> {
     let (path, content) = global_config::read()?;
     let updated = add_project_to(&content, name, &project)?;
-    global_config::write(&path, &updated)?;
     if project.openshell.is_some() {
         let config = global_config::parse(&updated)?.with_implicit_remotes();
+        let remote = &config.remotes[name];
+        let sandbox =
+            crate::remote::openshell::OpenShell::new(&remote.target, remote.openshell.clone());
+        let warnings = sandbox.check_github_host()?;
+        global_config::write(&path, &updated)?;
         println!(
             "Added project {name} in OpenShell sandbox {} ({}) to {}; the sandbox is created on first use",
             config.remotes[name].target,
@@ -154,19 +164,29 @@ fn add(name: &str, project: ProjectEntry) -> Result<()> {
             "Note: only a flake devshell (flake.nix) is baked into an OpenShell sandbox's image; \
              a devbox project gets no devshell there, so put its toolchain in the image (--image)"
         );
-        let remote = &config.remotes[name];
-        let sandbox =
-            crate::remote::openshell::OpenShell::new(&remote.target, remote.openshell.clone());
-        if project.ssh_git_url.is_some() {
-            let github = sandbox
-                .github_providers()
-                .map_err(|error| format!("{error:#}"));
+        if sandbox.github_host() {
             println!(
-                "Note: {}",
-                crate::remote::openshell::repo::ssh_notice(
-                    github.as_deref().map_err(String::as_str)
-                )
+                "Note: the sandbox gets your gh login's GitHub access, which usually reaches every repo you can \
+                 (push and pull requests included); workmux keeps its token in OpenShell provider {} on the \
+                 gateway and updates it whenever it creates or attaches to the sandbox",
+                crate::remote::openshell::github::PROVIDER
             );
+            for warning in warnings {
+                eprintln!("warning: {warning}");
+            }
+        }
+        if project.ssh_git_url.is_some() {
+            let notice = if sandbox.github_host() {
+                crate::remote::openshell::repo::ssh_notice_with_host_login()
+            } else {
+                let github = sandbox
+                    .github_providers()
+                    .map_err(|error| format!("{error:#}"));
+                crate::remote::openshell::repo::ssh_notice(
+                    github.as_deref().map_err(String::as_str),
+                )
+            };
+            println!("Note: {notice}");
         }
         if let Some(report) = sandbox.agent_report() {
             for note in report.notes {
@@ -178,6 +198,7 @@ fn add(name: &str, project: ProjectEntry) -> Result<()> {
         }
         return Ok(());
     }
+    global_config::write(&path, &updated)?;
     println!(
         "Added project {name} on remote {} ({}) to {}",
         project.remote.as_deref().unwrap_or_default(),
@@ -376,6 +397,7 @@ remotes:
             image: None,
             policy: None,
             providers: Vec::new(),
+            github: None,
             agents: Vec::new(),
             sandbox: None,
             repo: repo.to_string(),
