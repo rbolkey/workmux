@@ -9,12 +9,11 @@
 //! control channel open.
 
 use anyhow::{Result, anyhow};
-use std::io::Write;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::io::{Read, Write};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
-use super::pane::{PaneState, RemotePaneId};
+use super::pane::{ATTACHED, PaneState, RemotePaneId};
 use super::registry;
 use super::transport::{Transport, TtyExec};
 
@@ -24,12 +23,6 @@ const RETRY_MAX: Duration = Duration::from_secs(30);
 /// An attachment that lasted this long was a working connection: the next
 /// drop starts the backoff over.
 const STEADY: Duration = Duration::from_secs(10);
-
-/// When to force a redraw after attaching. Some interfaces (Claude Code)
-/// only repaint on a real size change, and the attach must be
-/// through before the change reaches them; the later one covers a slow
-/// connect.
-const REDRAW_AFTER: [Duration; 2] = [Duration::from_millis(300), Duration::from_secs(2)];
 
 /// What the user chose on the reconnecting screen.
 #[derive(Debug, PartialEq, Eq)]
@@ -77,43 +70,45 @@ fn attach_once(transport: &dyn Transport, pane: &RemotePaneId) -> Result<()> {
         workdir: None,
         env: Vec::new(),
     })?;
+    // The attachment's output passes through this process, which forces a
+    // redraw once the session holder has attached it: some interfaces
+    // (Claude Code) only repaint on a real size change, and the change must
+    // reach them after the attach, however long connecting takes.
+    command.stdout(Stdio::piped());
     let mut child = command.spawn()?;
-    let attached = Arc::new(AtomicBool::new(true));
-    {
-        let attached = attached.clone();
-        std::thread::spawn(move || {
-            let mut waited = Duration::ZERO;
-            for at in REDRAW_AFTER {
-                std::thread::sleep(at - waited);
-                waited = at;
-                if !attached.load(Ordering::Acquire) {
-                    return;
-                }
-                force_resize();
-            }
-        });
-    }
+    let output = child.stdout.take().expect("stdout is piped");
+    let relayed = std::thread::spawn(move || {
+        relay(output, std::io::stdout(), || {
+            std::thread::spawn(force_resize);
+        })
+    });
     let status = child.wait();
-    attached.store(false, Ordering::Release);
+    let _ = relayed.join();
     status?;
     Ok(())
 }
 
-/// Shrink this terminal by a row and restore it, so the remote pane's
-/// process sees a real size change and repaints.
+/// Shrink this terminal by a row, then by two, and restore it, so the remote
+/// pane's process sees a real size change and repaints. A dtach client that
+/// has only just attached can hold the first change back until something
+/// else wakes it, and then reports the size as it is by then; the second
+/// shrink is that wake, and still a change.
 fn force_resize() {
     let mut size: libc::winsize = unsafe { std::mem::zeroed() };
     // SAFETY: TIOCGWINSZ and TIOCSWINSZ read and write a winsize.
     if unsafe { libc::ioctl(libc::STDIN_FILENO, libc::TIOCGWINSZ, &mut size) } != 0
-        || size.ws_row < 2
+        || size.ws_row < 3
     {
         return;
     }
-    let mut smaller = size;
-    smaller.ws_row -= 1;
-    unsafe { libc::ioctl(libc::STDIN_FILENO, libc::TIOCSWINSZ, &smaller) };
-    std::thread::sleep(Duration::from_millis(100));
-    unsafe { libc::ioctl(libc::STDIN_FILENO, libc::TIOCSWINSZ, &size) };
+    for shrink in [1, 2, 0] {
+        let mut resized = size;
+        resized.ws_row -= shrink;
+        unsafe { libc::ioctl(libc::STDIN_FILENO, libc::TIOCSWINSZ, &resized) };
+        if shrink != 0 {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
 }
 
 /// Ask the remote whether `pane` still runs. An error means the remote
@@ -216,4 +211,87 @@ fn reconnecting_screen(remote: &str, reason: &str, wait: Duration) -> Choice {
     };
     let _ = crossterm::terminal::disable_raw_mode();
     choice
+}
+
+/// Copy an attachment's output from `from` to `to`, calling `attached` once
+/// the session holder says the client is attached.
+fn relay(
+    mut from: impl Read,
+    mut to: impl Write,
+    attached: impl FnOnce(),
+) -> std::io::Result<()> {
+    let mut attached = Some(attached);
+    // The end of the output so far, to spot the marker across reads.
+    let mut tail = Vec::new();
+    let mut buf = vec![0; 64 * 1024];
+    loop {
+        let read = match from.read(&mut buf) {
+            Ok(0) => return Ok(()),
+            Ok(read) => &buf[..read],
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        to.write_all(read)?;
+        to.flush()?;
+        if attached.is_none() {
+            continue;
+        }
+        tail.extend_from_slice(read);
+        if tail.windows(ATTACHED.len()).any(|window| window == ATTACHED) {
+            attached.take().expect("not yet attached")();
+        } else {
+            tail.drain(..tail.len().saturating_sub(ATTACHED.len() - 1));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A reader that hands out one chunk per read.
+    struct Chunks(std::collections::VecDeque<Vec<u8>>);
+
+    impl Read for Chunks {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let Some(chunk) = self.0.pop_front() else {
+                return Ok(0);
+            };
+            buf[..chunk.len()].copy_from_slice(&chunk);
+            Ok(chunk.len())
+        }
+    }
+
+    #[test]
+    fn relay_passes_output_through_and_notices_the_attach_once() {
+        let chunks = [
+            &b"motd\r\n\x1b[H"[..],
+            b"\x1b[J",
+            b"interface\x1b[H\x1b[J",
+        ];
+        let mut out = Vec::new();
+        let mut attached = 0;
+
+        relay(
+            Chunks(chunks.iter().map(|c| c.to_vec()).collect()),
+            &mut out,
+            || attached += 1,
+        )
+        .unwrap();
+
+        assert_eq!(out, b"motd\r\n\x1b[H\x1b[Jinterface\x1b[H\x1b[J");
+        assert_eq!(attached, 1);
+    }
+
+    #[test]
+    fn relay_without_an_attach_never_calls_it_attached() {
+        let mut attached = false;
+
+        relay(&b"dtach: No such file or directory\r\n"[..], std::io::sink(), || {
+            attached = true
+        })
+        .unwrap();
+
+        assert!(!attached);
+    }
 }
