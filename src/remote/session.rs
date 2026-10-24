@@ -520,6 +520,7 @@ fn provision(
         .unwrap_or_default();
     let toolchain = crate::sandbox::toolchain::resolve_toolchain(&mode, path);
     let plan = provision::plan(&toolchain, provision::has_command);
+    provision::record_devshell_warning_here(&toolchain);
     let remote = &project.remote;
     for warning in &plan.warnings {
         emit(

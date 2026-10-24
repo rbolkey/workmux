@@ -285,7 +285,11 @@ pub fn remote_worktrees(remote: &RemoteProject) -> Result<Vec<workflow::types::W
             }
             (stdout, true)
         }
-        Err(error) => match saved.as_ref().ok().and_then(|path| std::fs::read(path).ok()) {
+        Err(error) => match saved
+            .as_ref()
+            .ok()
+            .and_then(|path| std::fs::read(path).ok())
+        {
             Some(stdout) => {
                 tracing::debug!(error = %format!("{error:#}"), "using the last remote worktree list");
                 (stdout, false)

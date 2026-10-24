@@ -97,6 +97,7 @@ fn plan_for(toolchain: &DetectedToolchain, devshell: Devshell, has: impl Fn(&str
     if let Some(warning) = holder_warning(&has) {
         plan.warnings.push(warning);
     }
+    plan.warnings.extend(devshell_warning(toolchain, devshell));
     let needs_nix = devshell == Devshell::Nix && *toolchain != DetectedToolchain::None;
     if needs_nix && !has("nix") {
         plan.steps.push(shell("installing nix", NIX_INSTALL));
@@ -111,6 +112,60 @@ fn plan_for(toolchain: &DetectedToolchain, devshell: Devshell, has: impl Fn(&str
             .to_vec(),
     });
     plan
+}
+
+/// A warning when the project's toolchain gets no devshell here: only a
+/// flake devshell is baked into an OpenShell image, and nix can neither be
+/// installed nor build inside the sandbox, so a devbox project has none.
+fn devshell_warning(toolchain: &DetectedToolchain, devshell: Devshell) -> Option<String> {
+    (*toolchain == DetectedToolchain::Devbox && devshell != Devshell::Nix).then(|| {
+        "devbox projects get no devshell in an OpenShell sandbox (only a flake devshell is \
+         baked into its image), so agents start without the project's devbox packages; put \
+         the toolchain in the project's image, or give the project a flake.nix"
+            .to_string()
+    })
+}
+
+/// Where remote workmux keeps the devshell warning provisioning gave, for
+/// `workmux remote status` to repeat.
+fn devshell_warning_record() -> Option<std::path::PathBuf> {
+    crate::xdg::state_dir()
+        .ok()
+        .map(|dir| dir.join("devshell-warning"))
+}
+
+/// Keep `warning` at `record`, or remove the record when there is none.
+fn record_devshell_warning(record: &Path, warning: Option<&str>) {
+    let written = match warning {
+        Some(warning) => record
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| std::fs::write(record, warning)),
+        None => match std::fs::remove_file(record) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
+            _ => Ok(()),
+        },
+    };
+    if let Err(error) = written {
+        tracing::warn!(error = %error, "recording the devshell warning");
+    }
+}
+
+fn recorded_devshell_warning(record: &Path) -> Option<String> {
+    std::fs::read_to_string(record)
+        .ok()
+        .filter(|warning| !warning.is_empty())
+}
+
+/// Record the devshell warning for a project whose toolchain is
+/// `toolchain` on this machine, the remote.
+pub fn record_devshell_warning_here(toolchain: &DetectedToolchain) {
+    if let Some(record) = devshell_warning_record() {
+        record_devshell_warning(
+            &record,
+            devshell_warning(toolchain, devshell_here()).as_deref(),
+        );
+    }
 }
 
 fn holder_warning(has: &impl Fn(&str) -> bool) -> Option<String> {
@@ -157,6 +212,8 @@ pub fn current_warnings() -> Vec<String> {
     let mut warnings = warnings(has_command, &crate::agent_setup::check_all());
     let source = Path::new(crate::remote::openshell::image::DEVSHELL_SOURCE);
     warnings.extend(baked_devshell_warning(source));
+    warnings
+        .extend(devshell_warning_record().and_then(|record| recorded_devshell_warning(&record)));
     warnings
 }
 
@@ -242,6 +299,48 @@ mod tests {
                 assert_eq!(steps(&plan), ["installing agent hooks"]);
             }
         }
+    }
+
+    #[test]
+    fn a_devbox_project_in_an_openshell_sandbox_is_told_it_gets_no_devshell() {
+        let plan = plan_for(
+            &DetectedToolchain::Devbox,
+            Devshell::Unavailable,
+            has(&["dtach"]),
+        );
+
+        assert_eq!(steps(&plan), ["installing agent hooks"]);
+        let [warning] = plan.warnings.as_slice() else {
+            panic!("{:?}", plan.warnings)
+        };
+        assert!(warning.contains("devbox"), "{warning}");
+        assert!(warning.contains("OpenShell"), "{warning}");
+        for (toolchain, devshell) in [
+            (DetectedToolchain::Flake, Devshell::Unavailable),
+            (DetectedToolchain::Devbox, Devshell::Nix),
+        ] {
+            assert!(
+                plan_for(&toolchain, devshell, has(&["dtach"]))
+                    .warnings
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn remote_status_repeats_the_devshell_warning_provisioning_gave() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = dir.path().join("state").join("devshell-warning");
+        assert_eq!(recorded_devshell_warning(&record), None);
+
+        record_devshell_warning(&record, Some("no devshell"));
+        assert_eq!(
+            recorded_devshell_warning(&record).as_deref(),
+            Some("no devshell")
+        );
+
+        record_devshell_warning(&record, None);
+        assert_eq!(recorded_devshell_warning(&record), None);
     }
 
     #[test]
