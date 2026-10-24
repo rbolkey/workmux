@@ -4,7 +4,8 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand};
 
 use super::global_config::{self, PROJECTS};
-use crate::config::{GithubCredentials, OpenshellProject, ProjectEntry, ProjectPlacement};
+use crate::config::{OpenshellProject, ProjectEntry, ProjectPlacement};
+use crate::remote::openshell::github::GH_LOGIN;
 use crate::remote::registry;
 
 #[derive(Debug, Args)]
@@ -83,13 +84,13 @@ pub struct OpenshellOptions {
     /// Policy file merged on top of workmux's base policy
     #[arg(long, value_name = "FILE")]
     pub policy: Option<std::path::PathBuf>,
-    /// OpenShell provider to attach to the sandbox, for credentials (repeatable)
+    /// OpenShell provider to attach to the sandbox, for credentials (repeatable).
+    /// `gh-login` is special: workmux creates it from your workstation's `gh` login
+    /// and keeps it current, and it gives the sandbox everything that login can do on
+    /// GitHub, every repo it reaches, push and pull requests included. At most one
+    /// attached provider may give GitHub credentials
     #[arg(long = "provider", value_name = "PROVIDER")]
     pub providers: Vec<String>,
-    /// Where the sandbox's GitHub credentials come from besides its providers:
-    /// `host` gives it your `gh` login
-    #[arg(long, value_enum, value_name = "SOURCE")]
-    pub github: Option<GithubCredentials>,
     /// Agent the sandbox's image installs, such as claude or codex; the first is its
     /// default agent (repeatable; default: your default agent's type)
     #[arg(long = "agent", value_name = "AGENT")]
@@ -144,7 +145,6 @@ fn project_entry(command: AddCommand) -> Result<(String, ProjectEntry)> {
                 image: options.image,
                 policy: options.policy.map(absolute_policy).transpose()?,
                 providers: options.providers,
-                github: options.github,
                 agents: options.agents,
             })
         })
@@ -179,7 +179,7 @@ fn add(name: &str, project: ProjectEntry) -> Result<()> {
         let remote = &config.remotes[name];
         let sandbox =
             crate::remote::openshell::OpenShell::new(&remote.target, remote.openshell.clone());
-        let warnings = sandbox.check_github_host()?;
+        sandbox.check_github_credentials()?;
         global_config::write(&path, &updated)?;
         println!(
             "Added project {name} in OpenShell sandbox {} ({}) to {}; the sandbox is created on first use",
@@ -191,28 +191,24 @@ fn add(name: &str, project: ProjectEntry) -> Result<()> {
             "Note: only a flake devshell (flake.nix) is baked into an OpenShell sandbox's image; \
              a devbox project gets no devshell there, so put its toolchain in the image (--image)"
         );
-        if sandbox.github_host() {
+        let github = sandbox
+            .github_providers()
+            .map_err(|error| format!("{error:#}"));
+        if remote
+            .openshell
+            .as_ref()
+            .is_some_and(|origin| origin.settings.providers.iter().any(|p| p == GH_LOGIN))
+        {
             println!(
-                "Note: the sandbox gets your gh login's GitHub access, which usually reaches every repo you can \
-                 (push and pull requests included); workmux keeps its token in OpenShell provider {} on the \
-                 gateway and updates it whenever it creates or attaches to the sandbox",
-                crate::remote::openshell::github::PROVIDER
+                "Note: provider {GH_LOGIN} gives the sandbox your gh login's GitHub access, which usually \
+                 reaches every repo you can (push and pull requests included); workmux keeps its token in \
+                 that provider on the gateway and updates it whenever it creates or attaches to the sandbox"
             );
-            for warning in warnings {
-                eprintln!("warning: {warning}");
-            }
         }
         if project.ssh_git_url.is_some() {
-            let notice = if sandbox.github_host() {
-                crate::remote::openshell::repo::ssh_notice_with_host_login()
-            } else {
-                let github = sandbox
-                    .github_providers()
-                    .map_err(|error| format!("{error:#}"));
-                crate::remote::openshell::repo::ssh_notice(
-                    github.as_deref().map_err(String::as_str),
-                )
-            };
+            let notice = crate::remote::openshell::repo::ssh_notice(
+                github.as_deref().map_err(String::as_str),
+            );
             println!("Note: {notice}");
         }
         if let Some(report) = sandbox.agent_report() {

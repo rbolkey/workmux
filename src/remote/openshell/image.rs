@@ -52,10 +52,10 @@ printf 'username=x-access-token\\npassword=%s\\n' \"$token\"
 /// What the image adds to `/etc/gitconfig`. SSH GitHub URLs go over HTTPS,
 /// because the sandbox has no SSH; with GitHub credentials, the helper is
 /// github.com's only one.
-fn gitconfig(github_credentials: bool) -> String {
+fn gitconfig(git_credential_helper: bool) -> String {
     let mut out =
         String::from("# Added by workmux: OpenShell sandboxes reach github.com over HTTPS only.\n");
-    if github_credentials {
+    if git_credential_helper {
         out.push_str(&format!(
             "[credential \"https://github.com\"]\n\thelper =\n\thelper = {CREDENTIAL_HELPER}\n"
         ));
@@ -132,9 +132,9 @@ pub struct Recipe {
     /// A checkout of the project, in the build context's `project`
     /// directory, whose flake devshell is baked in.
     pub devshell: Option<PathBuf>,
-    /// Whether an attached provider gives GitHub credentials, which git
-    /// then gets from workmux's credential helper.
-    pub github_credentials: bool,
+    /// Whether the image's git gets workmux's credential helper for
+    /// github.com, because an attached provider gives GitHub credentials.
+    pub git_credential_helper: bool,
 }
 
 /// The Dockerfile for `recipe`. Its context holds `workmux`,
@@ -223,7 +223,7 @@ pub fn dockerfile(recipe: &Recipe) -> String {
         ));
     }
     out.push_str("COPY --from=gitconfig /etc/gitconfig /etc/gitconfig\n");
-    if recipe.github_credentials {
+    if recipe.git_credential_helper {
         out.push_str(&format!(
             "COPY --chmod=0755 git-credential-workmux {CREDENTIAL_HELPER}\n"
         ));
@@ -285,10 +285,10 @@ pub fn prepare(recipe: &Recipe, sandbox: &str, clone: &str, context: &Path) -> R
         }
         Workmux::Release => {}
     }
-    let gitconfig = gitconfig(recipe.github_credentials);
+    let gitconfig = gitconfig(recipe.git_credential_helper);
     digest.extend(gitconfig.as_bytes());
     std::fs::write(context.join("gitconfig"), gitconfig)?;
-    if recipe.github_credentials {
+    if recipe.git_credential_helper {
         digest.extend(CREDENTIAL_HELPER_SCRIPT.as_bytes());
         std::fs::write(
             context.join("git-credential-workmux"),
@@ -397,7 +397,7 @@ mod tests {
             workmux: Workmux::Release,
             agents: Vec::new(),
             devshell: None,
-            github_credentials: false,
+            git_credential_helper: false,
         });
 
         assert!(dockerfile.contains("FROM docker.io/library/ubuntu:24.04 AS base"));
@@ -418,7 +418,7 @@ mod tests {
             workmux: Workmux::Release,
             agents: Vec::new(),
             devshell: None,
-            github_credentials: false,
+            git_credential_helper: false,
         });
 
         assert!(dockerfile.contains(&format!("WORKMUX_VERSION=v{}", env!("CARGO_PKG_VERSION"))));
@@ -437,7 +437,7 @@ mod tests {
             workmux: Workmux::Release,
             agents: vec!["claude".to_string()],
             devshell: None,
-            github_credentials: false,
+            git_credential_helper: false,
         });
 
         let stage = dockerfile
@@ -467,7 +467,7 @@ mod tests {
             workmux: Workmux::Release,
             agents: vec!["gemini".to_string(), "codex".to_string()],
             devshell: None,
-            github_credentials: false,
+            git_credential_helper: false,
         };
         let context = tempfile::tempdir().unwrap();
 
@@ -493,7 +493,7 @@ mod tests {
             workmux: Workmux::Source(PathBuf::from("/src/workmux")),
             agents: Vec::new(),
             devshell: None,
-            github_credentials: false,
+            git_credential_helper: false,
         });
 
         assert!(!dockerfile.contains("install.sh"), "{dockerfile}");
@@ -519,7 +519,7 @@ mod tests {
             workmux: Workmux::Binary(PathBuf::from("/tmp/workmux")),
             agents: Vec::new(),
             devshell: Some(PathBuf::from("/tmp/ctx/project")),
-            github_credentials: false,
+            git_credential_helper: false,
         });
 
         assert!(!dockerfile.contains("AS base"));
@@ -545,7 +545,7 @@ mod tests {
             workmux: Workmux::Release,
             agents: Vec::new(),
             devshell: None,
-            github_credentials: true,
+            git_credential_helper: true,
         };
         let context = tempfile::tempdir().unwrap();
 
@@ -632,7 +632,7 @@ mod tests {
             workmux: Workmux::Release,
             agents: Vec::new(),
             devshell: None,
-            github_credentials: false,
+            git_credential_helper: false,
         };
         let context = tempfile::tempdir().unwrap();
 
@@ -658,7 +658,7 @@ mod tests {
         let context = tempfile::tempdir().unwrap();
         let with = prepare(
             &Recipe {
-                github_credentials: true,
+                git_credential_helper: true,
                 ..recipe
             },
             "api",
@@ -721,7 +721,7 @@ mod tests {
             workmux: Workmux::Source(source.path().to_path_buf()),
             agents: Vec::new(),
             devshell: None,
-            github_credentials: false,
+            git_credential_helper: false,
         };
         let context = tempfile::tempdir().unwrap();
 
@@ -755,7 +755,7 @@ mod tests {
             workmux: Workmux::Release,
             agents: Vec::new(),
             devshell: Some(project.clone()),
-            github_credentials: false,
+            git_credential_helper: false,
         };
 
         let first = prepare(&recipe, "api", "/sandbox/api", context.path()).unwrap();
@@ -793,7 +793,7 @@ mod contract {
             workmux,
             agents: agents.iter().map(|a| a.to_string()).collect(),
             devshell: None,
-            github_credentials: false,
+            git_credential_helper: false,
         };
         run_recipe(&recipe, label, &[], argv)
     }
@@ -886,7 +886,7 @@ mod contract {
             workmux: Workmux::Release,
             agents: Vec::new(),
             devshell: None,
-            github_credentials: true,
+            git_credential_helper: true,
         };
         let out = run_recipe(
             &recipe,

@@ -32,8 +32,8 @@ The repository is cloned on the remote by the first command that needs it.
 
 - `--image <image>`: Image the sandbox is built from; it must contain git and dtach.
 - `--policy <file>`: Policy file merged on top of workmux's base policy.
-- `--provider <provider>`: OpenShell provider to attach, for credentials (repeatable).
-- `--github host`: Give the sandbox your workstation's `gh` login, kept in a gateway provider workmux manages. Fails when `gh` is missing or logged out, or beside a `--provider` that already gives GitHub credentials. See [Your gh login](/guide/remote-projects/openshell/#your-gh-login-github-host).
+- `--provider <provider>`: OpenShell provider to attach, for credentials (repeatable). At most one attached provider may give GitHub credentials.
+  - `--provider gh-login` is special: workmux creates the `gh-login` provider from your workstation's `gh` login and keeps it current. It gives the sandbox everything that login can do on GitHub: every repository it reaches, push and pull requests included. Fails when `gh` is missing or logged out, or when the gateway has a `gh-login` provider workmux didn't create. See [Your gh login](/guide/remote-projects/openshell/#your-gh-login-provider-gh-login).
 - `--agent <agent>`: Agent the sandbox's image installs, such as `claude` or `codex` (repeatable). The first is the sandbox's default agent. Default: your default agent's type. Prints the provider type each agent needs, and warns when no attached provider has it.
 - `--sandbox <name>`: Sandbox name. Default: derived from the project name.
 

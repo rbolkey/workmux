@@ -1100,27 +1100,17 @@ pub struct OpenshellProject {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy: Option<String>,
 
-    /// OpenShell providers attached to the sandbox, for credentials.
+    /// OpenShell providers attached to the sandbox, for credentials;
+    /// `gh-login` is the one workmux keeps from the workstation's `gh`
+    /// login.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub providers: Vec<String>,
-
-    /// GitHub credentials workmux attaches itself, besides `providers`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub github: Option<GithubCredentials>,
 
     /// Agents the sandbox's image installs, by type such as `claude` or
     /// `codex`; the first is remote workmux's default agent (default: the
     /// default agent's type).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub agents: Vec<String>,
-}
-
-/// GitHub credentials workmux attaches to an OpenShell project's sandbox.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
-#[serde(rename_all = "kebab-case")]
-pub enum GithubCredentials {
-    /// The workstation's `gh` login, kept in a gateway provider.
-    Host,
 }
 
 /// OpenShell's limit on sandbox name length.
