@@ -919,7 +919,7 @@ def test_commands_that_would_open_an_editor_refuse_for_a_remote_project(
     worktree = root / "home" / "code" / "api__worktrees" / "feature"
     opened = env.tmp_path / "editor-opened"
     editor = env.tmp_path / "editor.sh"
-    editor.write_text(f"#!/bin/sh\ntouch {opened}\necho message > \"$1\"\n")
+    editor.write_text(f'#!/bin/sh\ntouch {opened}\necho message > "$1"\n')
     editor.chmod(0o755)
     tmp_env = {**short_tmp, "EDITOR": str(editor), "GIT_EDITOR": str(editor)}
 
@@ -2758,3 +2758,200 @@ def test_dashboard_shows_pr_status_for_a_remote_projects_branches_while_unreacha
         (remote_root / "offline").unlink(missing_ok=True)
         if daemon_pid is not None:
             os.kill(daemon_pid, signal.SIGTERM)
+
+
+@pytest.mark.tmux_only
+def test_removing_an_openshell_project_closes_its_workstation_windows(
+    mux_server: MuxEnvironment,
+    workmux_exe_path: Path,
+    repo_path: Path,
+    short_tmp: dict,
+):
+    """`remote rm` on an OpenShell project deletes its sandbox and closes
+    every workstation window tagged with the project, leaving the user's
+    other windows alone. `openshell` is a fake on PATH."""
+    env = mux_server
+    assert isinstance(env, TmuxEnvironment)
+    state = env.tmp_path / "openshell"
+    state.mkdir()
+    (state / "phase").write_text("Ready")
+    env.install_script(
+        env.fake_bin_dir / "openshell",
+        f"""#!/bin/sh
+printf '%s\\n' "$*" >> {state}/log
+case "$1 $2" in
+'sandbox get')
+  [ -e {state}/phase ] || {{ echo "sandbox not found" >&2; exit 1; }}
+  printf '{{"phase":"%s","policy":{{}}}}' "$(cat {state}/phase)" ;;
+'sandbox delete') rm -f {state}/phase ;;
+'sandbox exec') echo '[]' ;;
+esac
+""",
+    )
+
+    def wm(command):
+        return run_workmux_command(
+            env,
+            workmux_exe_path,
+            repo_path,
+            command,
+            pre_run_env=short_tmp,
+            timeout=30.0,
+        )
+
+    wm("project add api --openshell --repo https://example.com/api.git")
+    env.tmux(["new-session", "-d", "-s", "api", "-n", "wm-feature"])
+    env.tmux(["set-option", "-t", "=api:", "@workmux_project", "api:api"])
+    env.tmux(
+        [
+            "set-option",
+            "-w",
+            "-t",
+            "=api:wm-feature",
+            "@workmux_project_window",
+            "api:api",
+        ]
+    )
+    env.tmux(["new-window", "-d", "-t", "test:", "-n", "wm-other"])
+    env.tmux(
+        [
+            "set-option",
+            "-w",
+            "-t",
+            "=test:wm-other",
+            "@workmux_project_window",
+            "api:api",
+        ]
+    )
+    env.tmux(["new-window", "-d", "-t", "test:", "-n", "mine"])
+
+    removed = wm("remote rm api --yes")
+
+    assert "sandbox delete" in (state / "log").read_text()
+    assert "Closed 2 workstation window(s) of project api" in removed.stderr
+    windows = env.tmux(["list-windows", "-a", "-F", "#{window_name}"]).stdout.split()
+    assert "wm-feature" not in windows
+    assert "wm-other" not in windows
+    assert "mine" in windows
+    sessions = env.tmux(["list-sessions", "-F", "#{session_name}"]).stdout.split()
+    assert "api" not in sessions
+
+
+FAKE_OPENSHELL = """#!/usr/bin/env python3
+# A fake `openshell`: each sandbox's phase is a file, and exec runs the
+# command on this machine under the sandbox's own HOME.
+import json, os, sys
+
+state, exe = {state!r}, {exe!r}
+args = sys.argv[1:]
+with open(os.path.join(state, "log"), "a") as log:
+    log.write(" ".join(args) + "\\n")
+if args[:2] == ["sandbox", "get"]:
+    phase = os.path.join(state, args[2] + ".phase")
+    if not os.path.exists(phase):
+        sys.exit("sandbox not found")
+    print(json.dumps({{"phase": open(phase).read().strip(), "policy": {{}}}}))
+elif args[:2] == ["sandbox", "exec"]:
+    split = args.index("--")
+    options, argv = args[2:split], args[split + 1:]
+    name = options[options.index("-n") + 1]
+    home = os.path.join(state, name)
+    os.makedirs(home, exist_ok=True)
+    env = {{
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith(("TMUX", "WORKMUX_"))
+    }}
+    env.update(
+        HOME=home,
+        XDG_CONFIG_HOME=home + "/.config",
+        XDG_STATE_HOME=home + "/.local/state",
+        XDG_CACHE_HOME=home + "/.cache",
+    )
+    workdir = home
+    for flag, value in zip(options, options[1:]):
+        if flag == "--env":
+            key, _, value = value.partition("=")
+            env[key] = value
+        elif flag == "--workdir":
+            workdir = value
+    if argv[0] == "workmux":
+        argv[0] = exe
+    os.chdir(workdir)
+    os.execvpe(argv[0], argv, env)
+"""
+
+
+@pytest.mark.tmux_only
+def test_a_command_for_every_project_checks_each_remotes_state_once(
+    mux_server: MuxEnvironment,
+    workmux_exe_path: Path,
+    repo_path: Path,
+    short_tmp: dict,
+):
+    """A command relayed to every remote project asks each OpenShell
+    sandbox for its state once, then reconciles a running one's policy
+    (which reads the sandbox again), and asks nothing more of a sandbox
+    whose channel is already open. A stopped sandbox is skipped, not
+    started. `openshell` is a fake on PATH."""
+    env = mux_server
+    assert isinstance(env, TmuxEnvironment)
+    state = Path(tempfile.mkdtemp(prefix="wmo", dir="/tmp"))
+    origin = make_origin(env, env.tmp_path / "origin", "panes:\n  - command: sh\n")
+    env.install_script(
+        env.fake_bin_dir / "openshell",
+        FAKE_OPENSHELL.format(state=str(state), exe=str(workmux_exe_path)),
+    )
+    (state / "api.phase").write_text("Ready")
+    (state / "web.phase").write_text("Stopped")
+    log = state / "log"
+
+    def wm(command):
+        return run_workmux_command(
+            env,
+            workmux_exe_path,
+            repo_path,
+            command,
+            pre_run_env=short_tmp,
+            timeout=60.0,
+        )
+
+    def calls() -> dict:
+        lines = log.read_text().splitlines() if log.exists() else []
+        log.unlink(missing_ok=True)
+        by_sandbox: dict = {}
+        for line in lines:
+            words = line.split()
+            name = words[words.index("-n") + 1] if "-n" in words else words[2]
+            by_sandbox.setdefault(name, []).append(" ".join(words[:2]))
+        return by_sandbox
+
+    daemon_pid = None
+    try:
+        for name in ("api", "web"):
+            wm(
+                f"project add {name} --openshell --repo {origin} "
+                f"--path {state}/{name}/{name}"
+            )
+        cold = wm("reap-agents")
+        daemon_pid = remote_daemon_ping(env, workmux_exe_path, repo_path, short_tmp)[
+            "pid"
+        ]
+        assert "Skipping remote project 'web'" in cold.stderr
+        assert (state / "api" / "api" / ".git").is_dir()
+        first = calls()
+        assert first["web"] == ["sandbox get"], first
+        assert "sandbox exec" in first["api"], first
+
+        wm("reap-agents")
+
+        assert calls() == {
+            "api": ["sandbox get", "sandbox get", "policy set"],
+            "web": ["sandbox get"],
+        }
+        assert (state / "web.phase").read_text() == "Stopped"
+    finally:
+        if daemon_pid is not None:
+            os.kill(daemon_pid, signal.SIGTERM)
+        subprocess.run(["pkill", "-f", f"{state}/"], check=False)
+        shutil.rmtree(state, ignore_errors=True)
