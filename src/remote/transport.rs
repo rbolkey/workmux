@@ -261,11 +261,14 @@ pub struct Loopback {
     root: std::path::PathBuf,
     /// Binary that stands in for `workmux` on the remote.
     workmux: std::path::PathBuf,
+    /// While this file exists the remote is unreachable; see [`OFFLINE_ENV`].
+    offline_marker: Option<std::path::PathBuf>,
 }
 
-/// A file in a loopback root that makes the remote unreachable, standing in
-/// for a network outage.
-pub const OFFLINE_FILE: &str = "offline";
+/// Test-only: names a file; while it exists every loopback remote is
+/// unreachable, standing in for a network outage. Unset, loopback remotes are
+/// always reachable.
+pub const OFFLINE_ENV: &str = "WORKMUX_TEST_LOOPBACK_OFFLINE";
 
 /// Environment that points a process at the workstation's multiplexer or
 /// sandbox supervisor; a loopback remote must not inherit it.
@@ -285,6 +288,7 @@ impl Loopback {
         Ok(Self {
             root: root.into(),
             workmux: std::env::current_exe().context("failed to locate the workmux binary")?,
+            offline_marker: std::env::var_os(OFFLINE_ENV).map(Into::into),
         })
     }
 
@@ -296,7 +300,14 @@ impl Loopback {
         Self {
             root: root.into(),
             workmux: workmux.into(),
+            offline_marker: None,
         }
+    }
+
+    #[cfg(test)]
+    pub fn offline_while(mut self, marker: impl Into<std::path::PathBuf>) -> Self {
+        self.offline_marker = Some(marker.into());
+        self
     }
 
     fn command(&self, argv: &[String], workdir: Option<&str>) -> Result<Command> {
@@ -306,7 +317,11 @@ impl Loopback {
                 self.root.display()
             ));
         }
-        if self.root.join(OFFLINE_FILE).exists() {
+        if self
+            .offline_marker
+            .as_ref()
+            .is_some_and(|marker| marker.exists())
+        {
             return Err(anyhow!("loopback remote is offline"));
         }
         let (program, args) = argv
@@ -565,15 +580,26 @@ mod tests {
     }
 
     #[test]
-    fn a_loopback_root_holding_an_offline_file_is_unreachable() {
+    fn a_loopback_remote_is_unreachable_while_its_outage_marker_exists() {
         let root = tempfile::tempdir().unwrap();
-        let loopback = Loopback::with_workmux(root.path(), "/bin/echo");
-        std::fs::write(root.path().join(OFFLINE_FILE), "").unwrap();
+        let marker = root.path().join("outage");
+        let loopback = Loopback::with_workmux(root.path(), "/bin/echo").offline_while(&marker);
+        assert!(loopback.exec_stdio(&argv(&["workmux"])).is_ok());
 
+        std::fs::write(&marker, "").unwrap();
         let error = loopback.exec_stdio(&argv(&["workmux"])).err().unwrap();
 
         assert_eq!(error.to_string(), "loopback remote is offline");
-        std::fs::remove_file(root.path().join(OFFLINE_FILE)).unwrap();
+        std::fs::remove_file(&marker).unwrap();
+        assert!(loopback.exec_stdio(&argv(&["workmux"])).is_ok());
+    }
+
+    #[test]
+    fn a_file_in_the_loopback_root_never_takes_the_remote_offline() {
+        let root = tempfile::tempdir().unwrap();
+        let loopback = Loopback::with_workmux(root.path(), "/bin/echo");
+        std::fs::write(root.path().join("offline"), "").unwrap();
+
         assert!(loopback.exec_stdio(&argv(&["workmux"])).is_ok());
     }
 
