@@ -33,6 +33,11 @@ impl RemoteProject {
     pub fn id(&self) -> RemoteProjectId {
         self.site.id()
     }
+
+    /// The remote the project is on.
+    pub fn host(&self) -> super::Remote<'_> {
+        super::Remote::new(&self.site.remote, &self.remote)
+    }
 }
 
 /// Refuse `what`, which would open an editor, for `project`: the command
@@ -266,8 +271,7 @@ fn session(
     };
     let Some(socket) = daemon_socket() else {
         return super::channels().run_command(
-            &project.site.remote,
-            &project.remote,
+            project.host(),
             &request,
             InvocationContext::current(),
             terminal,

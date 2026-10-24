@@ -127,8 +127,7 @@ fn remote_dashboard(params: &Value) -> Result<Value> {
         );
     }
     crate::remote::channels().dashboard(
-        &params.remote,
-        &project.remote,
+        project.host(),
         &project.site,
         &params.request,
         params.connect,
@@ -231,7 +230,7 @@ fn pane_hold(request: &Request) -> Result<crate::remote::channels::PaneHold> {
     let config = remotes
         .get(name)
         .ok_or_else(|| anyhow!("no remote named {name}"))?;
-    crate::remote::channels().hold_for_pane(name, config)
+    crate::remote::channels().hold_for_pane(crate::remote::Remote::new(name, config))
 }
 
 /// Keep `remote`'s control channel open for an attached pane until the
@@ -380,8 +379,7 @@ fn command_session(
         }
         // A client that has gone away cancels the command.
         let exit_code = crate::remote::channels().run_command(
-            &params.remote,
-            &project.remote,
+            project.host(),
             &params.request,
             &params.invocation,
             &mut ClientTerminal {

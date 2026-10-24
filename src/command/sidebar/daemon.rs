@@ -1416,8 +1416,7 @@ fn ask_remote_git_status(entry: &RemoteGitPath) -> Result<GitStatus> {
         );
     }
     let answer = crate::remote::channels().dashboard(
-        &entry.remote,
-        &project.remote,
+        project.host(),
         &project.site,
         &crate::remote::dashboard::DashboardRequest::GitStatus {
             worktree: entry.worktree.clone(),

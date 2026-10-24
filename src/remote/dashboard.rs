@@ -217,13 +217,7 @@ pub fn request<T: DeserializeOwned>(
             TIMEOUT + Duration::from_secs(5),
         )
         .inspect_err(|_| super::router::forget_recent_daemon_socket())?,
-        None => super::channels().dashboard(
-            &project.site.remote,
-            &project.remote,
-            &project.site,
-            request,
-            connect,
-        )?,
+        None => super::channels().dashboard(project.host(), &project.site, request, connect)?,
     };
     Ok(serde_json::from_value(answer)?)
 }
@@ -299,7 +293,12 @@ mod tests {
         clone: &Path,
         request: DashboardRequest,
     ) -> Result<T> {
-        let answer = channels.dashboard("devbox", &remote(), &site(clone), &request, true)?;
+        let answer = channels.dashboard(
+            crate::remote::Remote::new("devbox", &remote()),
+            &site(clone),
+            &request,
+            true,
+        )?;
         Ok(serde_json::from_value(answer)?)
     }
 
@@ -442,7 +441,12 @@ mod tests {
         let request = DashboardRequest::GitStatus { worktree };
 
         let error = channels
-            .dashboard("devbox", &remote(), &site(&clone), &request, false)
+            .dashboard(
+                crate::remote::Remote::new("devbox", &remote()),
+                &site(&clone),
+                &request,
+                false,
+            )
             .unwrap_err();
 
         assert_eq!(error.to_string(), "remote devbox is not connected");

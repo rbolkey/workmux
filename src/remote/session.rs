@@ -699,8 +699,7 @@ mod tests {
     fn run(request: &CommandRequest, mut on_stdout: impl FnMut(&str)) -> (Result<i32>, Captured) {
         let mut captured = Captured::default();
         let exit = channels().run_command(
-            "devbox",
-            &remote(),
+            crate::remote::Remote::new("devbox", &remote()),
             request,
             &InvocationContext::default(),
             &mut |stream, data: &[u8]| {
@@ -774,8 +773,7 @@ mod tests {
         let started = std::time::Instant::now();
 
         let exit = channels().run_command(
-            "devbox",
-            &remote(),
+            crate::remote::Remote::new("devbox", &remote()),
             &request(project.path(), None, script),
             &InvocationContext::default(),
             &mut Interrupting::default(),
@@ -842,8 +840,7 @@ mod tests {
         };
 
         let exit = channels().run_command(
-            "devbox",
-            &remote(),
+            crate::remote::Remote::new("devbox", &remote()),
             &request,
             &InvocationContext::default(),
             &mut terminal,

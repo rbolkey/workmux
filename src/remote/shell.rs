@@ -388,7 +388,7 @@ mod tests {
             },
         );
         channels
-            .channel(
+            .channel(crate::remote::Remote::new(
                 "devbox",
                 &RemoteConfig {
                     transport: TransportKind::Loopback,
@@ -397,7 +397,7 @@ mod tests {
                     host_commands: vec![],
                     openshell: None,
                 },
-            )
+            ))
             .unwrap();
         (transport, channels)
     }

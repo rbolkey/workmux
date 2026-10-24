@@ -21,7 +21,7 @@ use super::pane::RemotePaneId;
 use super::session::{self, CommandRequest, ProjectSite, SessionParams, Sessions, Terminal};
 use super::status::{self, StatusSink};
 use super::transport::{RemoteState, Transport};
-use super::{shell, shims};
+use super::{Remote, shell, shims};
 use crate::config::{RemoteConfig, TransportKind};
 use crate::multiplexer::{InvocationContext, TmuxBackend};
 use crate::project::RemoteProjectId;
@@ -313,24 +313,24 @@ impl Channels {
         *self.shared.status.lock().unwrap() = Some(sink);
     }
 
-    /// Report `name`'s reachability, opening its channel if needed.
-    pub fn status(&self, name: &str, config: &RemoteConfig) -> RemoteStatus {
+    /// Report `remote`'s reachability, opening its channel if needed.
+    pub fn status(&self, remote: Remote<'_>) -> RemoteStatus {
         RemoteStatus {
-            name: name.to_string(),
-            transport: config.transport,
-            target: config.target.clone(),
-            reach: self.reach(name, config),
+            name: remote.name.to_string(),
+            transport: remote.config.transport,
+            target: remote.config.target.clone(),
+            reach: self.reach(remote),
         }
     }
 
-    fn reach(&self, name: &str, config: &RemoteConfig) -> Reach {
+    fn reach(&self, remote: Remote<'_>) -> Reach {
         let unreachable = |error: anyhow::Error| Reach::Unreachable {
             error: format!("{error:#}"),
         };
-        let connection = match self.open_channel_for(name, config, true) {
+        let connection = match self.open_channel_for(remote, true) {
             Some(connection) => connection,
             None => {
-                let transport = match (self.shared.factory)(name, config) {
+                let transport = match (self.shared.factory)(remote.name, remote.config) {
                     Ok(transport) => transport,
                     Err(error) => return unreachable(error),
                 };
@@ -341,7 +341,7 @@ impl Channels {
                         Err(error) => return unreachable(error),
                     }
                 }
-                match self.channel_with(name, config, transport, true) {
+                match self.channel_with(remote, transport, true) {
                     Ok(connection) => connection,
                     Err(error) => return unreachable(error),
                 }
@@ -358,40 +358,35 @@ impl Channels {
         }
     }
 
-    /// The open channel to `name`, opened on demand.
-    pub fn channel(&self, name: &str, config: &RemoteConfig) -> Result<Arc<Connection>> {
-        self.channel_for(name, config, true)
+    /// The open channel to `remote`, opened on demand.
+    pub fn channel(&self, remote: Remote<'_>) -> Result<Arc<Connection>> {
+        self.channel_for(remote, true)
     }
 
     /// `use_now` marks the channel used; a background reconnect does not, so
     /// it never extends the linger period by itself.
-    fn channel_for(
-        &self,
-        name: &str,
-        config: &RemoteConfig,
-        use_now: bool,
-    ) -> Result<Arc<Connection>> {
+    fn channel_for(&self, remote: Remote<'_>, use_now: bool) -> Result<Arc<Connection>> {
         // An open channel needs no word from the transport: a remote that
         // stopped has closed it.
-        if let Some(connection) = self.open_channel_for(name, config, use_now) {
+        if let Some(connection) = self.open_channel_for(remote, use_now) {
             return Ok(connection);
         }
-        let transport = (self.shared.factory)(name, config)?;
+        let transport = (self.shared.factory)(remote.name, remote.config)?;
         if let Some(provisioning) = transport.provisioning()
             && provisioning.status()? != RemoteState::Running
         {
-            return Err(anyhow!("remote {name} is stopped"));
+            return Err(anyhow!("remote {} is stopped", remote.name));
         }
-        self.channel_with(name, config, transport, use_now)
+        self.channel_with(remote, transport, use_now)
     }
 
     fn channel_with(
         &self,
-        name: &str,
-        config: &RemoteConfig,
+        remote: Remote<'_>,
         transport: Arc<dyn Transport>,
         use_now: bool,
     ) -> Result<Arc<Connection>> {
+        let Remote { name, config } = remote;
         let lock = self
             .shared
             .connecting
@@ -401,7 +396,7 @@ impl Channels {
             .or_default()
             .clone();
         let _connecting = lock.lock().unwrap();
-        if let Some(connection) = self.open_channel_for(name, config, use_now) {
+        if let Some(connection) = self.open_channel_for(remote, use_now) {
             return Ok(connection);
         }
         if let Some(slot) = self.shared.slots.lock().unwrap().get_mut(name)
@@ -516,7 +511,7 @@ impl Channels {
                     break;
                 }
             }
-            match self.channel_for(name, &config, false) {
+            match self.channel_for(Remote::new(name, &config), false) {
                 Ok(_) => break,
                 Err(error) => {
                     tracing::info!(remote = name, error = %format!("{error:#}"), "control channel reconnect failed");
@@ -533,43 +528,41 @@ impl Channels {
         slot.holds > 0 || slot.last_used.elapsed() < self.shared.policy.linger
     }
 
-    /// Run a command session on `name`, passing its output to `terminal` as
-    /// it arrives and reading its prompts' answers there. Multiplexer
+    /// Run a command session on `remote`, passing its output to `terminal`
+    /// as it arrives and reading its prompts' answers there. Multiplexer
     /// requests the command forwards are answered from `invocation`.
     /// Returns the command's exit code.
     pub fn run_command(
         &self,
-        name: &str,
-        config: &RemoteConfig,
+        remote: Remote<'_>,
         request: &CommandRequest,
         invocation: &InvocationContext,
         terminal: &mut dyn Terminal,
     ) -> Result<i32> {
-        let connection = self.channel(name, config)?;
-        self.hold(name, 1);
+        let connection = self.channel(remote)?;
+        self.hold(remote.name, 1);
         let exit = self
             .shared
             .sessions
             .run(&connection.peer, request, invocation, terminal);
-        self.hold(name, -1);
+        self.hold(remote.name, -1);
         exit
     }
 
-    /// Run a dashboard operation on `project`, a project of `name`. Without
-    /// `connect` only an already open channel is used.
+    /// Run a dashboard operation on `project`, a project of `remote`.
+    /// Without `connect` only an already open channel is used.
     pub fn dashboard(
         &self,
-        name: &str,
-        config: &RemoteConfig,
+        remote: Remote<'_>,
         project: &ProjectSite,
         request: &DashboardRequest,
         connect: bool,
     ) -> Result<Value> {
         let connection = if connect {
-            self.channel(name, config)?
+            self.channel(remote)?
         } else {
-            self.open_channel(name)
-                .ok_or_else(|| anyhow!("remote {name} is not connected"))?
+            self.open_channel(remote.name)
+                .ok_or_else(|| anyhow!("remote {} is not connected", remote.name))?
         };
         connection.peer.request(
             dashboard::METHOD,
@@ -578,16 +571,13 @@ impl Channels {
         )
     }
 
-    /// `name`'s channel, when it is open under `config`; `use_now` marks it
-    /// used.
-    fn open_channel_for(
-        &self,
-        name: &str,
-        config: &RemoteConfig,
-        use_now: bool,
-    ) -> Option<Arc<Connection>> {
+    /// `remote`'s channel, when it is open under its current settings;
+    /// `use_now` marks it used.
+    fn open_channel_for(&self, remote: Remote<'_>, use_now: bool) -> Option<Arc<Connection>> {
         let mut slots = self.shared.slots.lock().unwrap();
-        let slot = slots.get_mut(name).filter(|slot| slot.config == *config)?;
+        let slot = slots
+            .get_mut(remote.name)
+            .filter(|slot| slot.config == *remote.config)?;
         let connection = slot
             .connection
             .clone()
@@ -610,15 +600,15 @@ impl Channels {
             .filter(|connection| !connection.is_closed())
     }
 
-    /// Keep `name`'s channel open, and reconnecting after drops, while the
+    /// Keep `remote`'s channel open, and reconnecting after drops, while the
     /// returned hold lives: a workstation pane is attached to one of its
     /// remote panes.
-    pub fn hold_for_pane(&self, name: &str, config: &RemoteConfig) -> Result<PaneHold> {
-        self.channel(name, config)?;
-        self.hold(name, 1);
+    pub fn hold_for_pane(&self, remote: Remote<'_>) -> Result<PaneHold> {
+        self.channel(remote)?;
+        self.hold(remote.name, 1);
         Ok(PaneHold {
             channels: self.clone(),
-            remote: name.to_string(),
+            remote: remote.name.to_string(),
         })
     }
 
@@ -719,7 +709,7 @@ mod tests {
         let transport = Arc::new(ServeTransport::default());
         let channels = channels_over(transport.clone(), fast_policy());
 
-        let mut status = channels.status("devbox", &config());
+        let mut status = channels.status(Remote::new("devbox", &config()));
         // Setup warnings depend on this machine's agents and dtach.
         if let Reach::Reachable { warnings, .. } = &mut status.reach {
             warnings.clear();
@@ -750,7 +740,7 @@ mod tests {
         let threads: Vec<_> = (0..4)
             .map(|_| {
                 let channels = channels.clone();
-                std::thread::spawn(move || channels.status("devbox", &config()))
+                std::thread::spawn(move || channels.status(Remote::new("devbox", &config())))
             })
             .collect();
         for thread in threads {
@@ -770,7 +760,7 @@ mod tests {
         ]));
         let channels = channels_over(transport, fast_policy());
 
-        let status = channels.status("devbox", &config());
+        let status = channels.status(Remote::new("devbox", &config()));
 
         assert_eq!(
             status.reach,
@@ -786,7 +776,7 @@ mod tests {
         let transport = Arc::new(StoppedTransport::default());
         let channels = channels_over(transport.clone(), fast_policy());
 
-        let status = channels.status("sandbox", &config());
+        let status = channels.status(Remote::new("sandbox", &config()));
 
         assert_eq!(status.reach, Reach::Stopped);
         assert_eq!(transport.starts.load(Ordering::SeqCst), 0);
@@ -797,7 +787,7 @@ mod tests {
     fn a_killed_remote_is_reconnected() {
         let transport = Arc::new(ServeTransport::default());
         let channels = channels_over(transport.clone(), fast_policy());
-        channels.status("devbox", &config());
+        channels.status(Remote::new("devbox", &config()));
 
         transport.kill_latest();
 
@@ -805,7 +795,7 @@ mod tests {
             transport.exec_count() == 2 && channels.open_count() == 1
         });
         assert!(matches!(
-            channels.status("devbox", &config()).reach,
+            channels.status(Remote::new("devbox", &config())).reach,
             Reach::Reachable { .. }
         ));
         assert_eq!(transport.exec_count(), 2);
@@ -819,7 +809,7 @@ mod tests {
             "echo 'Connection refused' >&2; exit 255".to_string(),
         ]));
         let channels = channels_over(transport.clone(), fast_policy());
-        channels.status("devbox", &config());
+        channels.status(Remote::new("devbox", &config()));
 
         wait_until("four attempts", || transport.exec_count() >= 4);
 
@@ -841,7 +831,7 @@ mod tests {
                 ..fast_policy()
             },
         );
-        channels.status("devbox", &config());
+        channels.status(Remote::new("devbox", &config()));
         std::thread::sleep(Duration::from_millis(150));
 
         channels.close_idle();
@@ -862,7 +852,9 @@ mod tests {
             },
         );
 
-        let hold = channels.hold_for_pane("devbox", &config()).unwrap();
+        let hold = channels
+            .hold_for_pane(Remote::new("devbox", &config()))
+            .unwrap();
         std::thread::sleep(Duration::from_millis(150));
         channels.close_idle();
         assert_eq!(channels.open_count(), 1);
@@ -913,7 +905,9 @@ mod tests {
                 .expect("a status record")
         };
 
-        let _hold = channels.hold_for_pane("devbox", &config()).unwrap();
+        let _hold = channels
+            .hold_for_pane(Remote::new("devbox", &config()))
+            .unwrap();
         assert!(channels.connected_remotes().contains("devbox"));
         let (remote, first) = next();
         assert_eq!(remote, "devbox");
@@ -963,16 +957,18 @@ mod tests {
                 ..fast_policy()
             },
         );
-        channels.channel("devbox", &config()).unwrap();
+        channels.channel(Remote::new("devbox", &config())).unwrap();
         let connecting = channels.clone();
-        std::thread::spawn(move || connecting.channel("hanging", &config()));
+        std::thread::spawn(move || connecting.channel(Remote::new("hanging", &config())));
         std::thread::sleep(Duration::from_millis(200));
 
         let started = Instant::now();
-        channels.channel("devbox", &config()).unwrap();
-        assert!(channels.status("devbox", &config()).reach != Reach::Stopped);
+        channels.channel(Remote::new("devbox", &config())).unwrap();
+        assert!(channels.status(Remote::new("devbox", &config())).reach != Reach::Stopped);
         // A remote not yet connected connects meanwhile too.
-        channels.channel("buildbox", &config()).unwrap();
+        channels
+            .channel(Remote::new("buildbox", &config()))
+            .unwrap();
 
         assert!(
             started.elapsed() < Duration::from_secs(5),
@@ -1031,9 +1027,9 @@ mod tests {
         let channels = channels_over(transport.clone(), fast_policy());
 
         for _ in 0..3 {
-            channels.channel("sandbox", &config()).unwrap();
+            channels.channel(Remote::new("sandbox", &config())).unwrap();
         }
-        channels.status("sandbox", &config());
+        channels.status(Remote::new("sandbox", &config()));
 
         assert_eq!(transport.statuses.load(Ordering::SeqCst), 1);
     }

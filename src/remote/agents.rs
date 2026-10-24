@@ -9,7 +9,7 @@ use anyhow::{Context, Result, anyhow};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use super::pane::{RemotePaneId, SessionHolder};
 
@@ -35,8 +35,7 @@ impl RemoteAgent {
         let meta = std::fs::metadata(self.tty.as_ref()?).ok()?;
         [meta.accessed(), meta.modified()]
             .into_iter()
-            .filter_map(|time| time.ok()?.duration_since(UNIX_EPOCH).ok())
-            .map(|since| since.as_secs())
+            .filter_map(|time| crate::util::unix_secs(time.ok()?))
             .max()
     }
 
