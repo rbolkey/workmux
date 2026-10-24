@@ -2644,3 +2644,117 @@ def test_dashboard_worktrees_tab_lists_adds_closes_and_removes_remote_worktrees(
     finally:
         if daemon_pid is not None:
             os.kill(daemon_pid, signal.SIGTERM)
+
+
+@requires_dtach
+@pytest.mark.tmux_only
+def test_dashboard_shows_pr_status_for_a_remote_projects_branches_while_unreachable(
+    mux_server: MuxEnvironment,
+    workmux_exe_path: Path,
+    repo_path: Path,
+    short_tmp: dict,
+    remote_root: Path,
+):
+    """The Worktrees tab lists a remote project's worktrees from the last
+    list the workstation saw while the remote cannot be reached, so their
+    branches keep their PR status."""
+    env = mux_server
+    assert isinstance(env, TmuxEnvironment)
+    control = Path(short_tmp["TMPDIR"])
+    origin = make_origin(env, env.tmp_path / "origin", "panes:\n  - command: sh\n")
+
+    def wm(command):
+        return run_workmux_command(
+            env,
+            workmux_exe_path,
+            repo_path,
+            command,
+            pre_run_env=short_tmp,
+            timeout=60.0,
+        )
+
+    wm(f"remote add lb --transport loopback --target {remote_root}")
+    wm(f"project add api --remote lb --repo {origin} --path code/api")
+    daemon_pid = None
+    try:
+        wm("add feature --project api")
+        daemon_pid = remote_daemon_ping(env, workmux_exe_path, repo_path, short_tmp)[
+            "pid"
+        ]
+        env.tmux(["new-window", "-t", "test:", "-n", "dash"])
+        env.tmux(["resize-window", "-t", "=test:dash", "-x", "220", "-y", "50"])
+        launch = control / "dashboard.sh"
+        launch.write_text(
+            f"export PATH={shlex.quote(env.env['PATH'])} "
+            f"HOME={shlex.quote(str(env.home_path))} "
+            f"TMPDIR={short_tmp['TMPDIR']} WORKMUX_TEST=1\n"
+            f"cd {repo_path}\n"
+            f"exec {workmux_exe_path} dashboard --tab worktrees\n"
+        )
+
+        def screen() -> str:
+            return env.capture_pane("=test:dash") or ""
+
+        def wait_for_screen(predicate, what: str, timeout=20.0):
+            try:
+                wait_until(lambda: predicate(screen()), what, timeout)
+            except AssertionError as error:
+                raise AssertionError(f"{error}\n{screen()}") from None
+
+        def keys(*sequence: str):
+            for key in sequence:
+                env.send_keys("=test:dash", key, enter=False)
+                time.sleep(0.2)
+
+        def show_remote_project():
+            env.send_keys("=test:dash", f"sh {launch}", enter=True)
+            wait_for_screen(lambda shown: "Worktrees" in shown, "the Worktrees tab")
+            keys("p")
+            wait_for_screen(
+                lambda shown: "api@lb" in shown, "the remote project in the picker"
+            )
+            keys("a", "p", "i", "@", "l", "b", "Enter")
+
+        show_remote_project()
+        wait_for_screen(
+            lambda shown: "api@lb" in dashboard_row(shown, "feature"),
+            "the remote's worktrees",
+        )
+        keys("q")
+        wait_until(lambda: "Worktrees" not in screen(), "the dashboard to quit")
+
+        # The workstation knows a PR for the branch, and the remote goes away.
+        cache = env.home_path / ".cache" / "workmux"
+        cache.mkdir(parents=True, exist_ok=True)
+        (cache / "pr_status_cache.json").write_text(
+            json.dumps(
+                {
+                    "remote/lb/api": {
+                        "feature": {
+                            "number": 77,
+                            "title": "Remote feature",
+                            "state": "OPEN",
+                            "isDraft": False,
+                        }
+                    }
+                }
+            )
+        )
+        (remote_root / "offline").write_text("")
+        for pid in subprocess.run(
+            ["pgrep", "-P", str(daemon_pid), "-f", "remote serve"],
+            capture_output=True,
+            text=True,
+        ).stdout.split():
+            os.kill(int(pid), signal.SIGKILL)
+
+        show_remote_project()
+        wait_for_screen(
+            lambda shown: "#77" in dashboard_row(shown, "feature"),
+            "the remote branch's PR while the remote is unreachable",
+        )
+        keys("q")
+    finally:
+        (remote_root / "offline").unlink(missing_ok=True)
+        if daemon_pid is not None:
+            os.kill(daemon_pid, signal.SIGTERM)
