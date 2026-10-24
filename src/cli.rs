@@ -1194,7 +1194,11 @@ pub fn run() -> Result<()> {
                         "Pass the prompt with -p TEXT.",
                     ));
                 }
-                return crate::remote::router::relay(&project);
+                return crate::remote::router::relay_with_prompt_file(
+                    &project,
+                    prompt.prompt_file.as_deref(),
+                    &subcommand("add").expect("add is a subcommand"),
+                );
             }
             let mode_override = mode
                 .map(MuxMode::from)
@@ -1245,7 +1249,11 @@ pub fn run() -> Result<()> {
                         "Pass the prompt with -p TEXT instead.",
                     ));
                 }
-                return crate::remote::router::relay(&project);
+                return crate::remote::router::relay_with_prompt_file(
+                    &project,
+                    prompt.prompt_file.as_deref(),
+                    &subcommand("open").expect("open is a subcommand"),
+                );
             }
             let mode_override = mode
                 .map(MuxMode::from)
@@ -1522,6 +1530,11 @@ pub fn run() -> Result<()> {
         }
         Commands::CheckUpdate => command::update::run_background_check(),
     }
+}
+
+/// The command line definition of the subcommand `name`.
+pub fn subcommand(name: &str) -> Option<clap::Command> {
+    Cli::command().find_subcommand(name).cloned()
 }
 
 fn prune_claude_config() -> Result<()> {

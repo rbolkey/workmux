@@ -249,6 +249,7 @@ pub fn forget_recent_daemon_socket() {
 fn session(
     project: &RemoteProject,
     argv: &[&str],
+    prompt_file: Option<String>,
     terminal: &mut dyn Terminal,
     start: bool,
 ) -> Result<i32> {
@@ -259,6 +260,7 @@ fn session(
         project: project.site.clone(),
         argv: argv.iter().map(|arg| arg.to_string()).collect(),
         invoking_window_token: invoking_window_token(project),
+        prompt_file,
     };
     let Some(socket) = daemon_socket() else {
         return super::channels().run_command(
@@ -344,7 +346,13 @@ fn write_to(stream: Stream, data: &[u8]) {
 /// Run `argv` for `project` on its remote, streaming its output to this
 /// terminal. Returns the command's exit code.
 pub fn run(project: &RemoteProject, argv: &[&str]) -> Result<i32> {
-    session(project, argv, &mut Invoking { output: write_to }, true)
+    session(
+        project,
+        argv,
+        None,
+        &mut Invoking { output: write_to },
+        true,
+    )
 }
 
 /// Make `project`'s remote ready in this process, so creating or starting
@@ -368,6 +376,7 @@ pub fn capture_running(project: &RemoteProject, argv: &[&str]) -> Result<(i32, V
     let exit = session(
         project,
         argv,
+        None,
         &mut Invoking {
             output: |stream, data: &[u8]| match stream {
                 Stream::Stdout => stdout.extend_from_slice(data),
@@ -385,6 +394,7 @@ pub fn quietly(project: &RemoteProject, argv: &[&str]) -> Result<i32> {
     session(
         project,
         argv,
+        None,
         &mut Invoking {
             output: |_, _: &[u8]| {},
         },
@@ -426,7 +436,7 @@ impl Terminal for Collecting {
 /// terminal: output is kept and prompts read end of input.
 pub fn captured(project: &RemoteProject, argv: &[&str]) -> Result<Captured> {
     let mut terminal = Collecting::default();
-    let exit_code = session(project, argv, &mut terminal, false)?;
+    let exit_code = session(project, argv, None, &mut terminal, false)?;
     Ok(Captured {
         exit_code,
         stdout: terminal.stdout,
@@ -458,12 +468,117 @@ fn without_project(args: impl IntoIterator<Item = String>) -> Vec<String> {
     argv
 }
 
+/// `argv`, a relayed `workmux <subcommand> ...` defined by `command`, less
+/// its `--prompt-file`/`-P` option, however it was spelled.
+fn without_prompt_file(argv: Vec<String>, command: &clap::Command) -> Vec<String> {
+    let takes_value =
+        |found: Option<&clap::Arg>| found.is_some_and(|arg| arg.get_action().takes_values());
+    let mut args = argv.into_iter();
+    let mut kept: Vec<String> = args.by_ref().take(2).collect();
+    while let Some(arg) = args.next() {
+        if arg == "--" {
+            kept.push(arg);
+            kept.extend(args.by_ref());
+            break;
+        }
+        if arg == "--prompt-file" {
+            args.next();
+            continue;
+        }
+        if arg.starts_with("--prompt-file=") {
+            continue;
+        }
+        if let Some(long) = arg.strip_prefix("--") {
+            let wants_next = !long.contains('=')
+                && takes_value(command.get_arguments().find(|a| a.get_long() == Some(long)));
+            kept.push(arg);
+            if wants_next {
+                kept.extend(args.next());
+            }
+            continue;
+        }
+        let Some(cluster) = arg.strip_prefix('-').filter(|cluster| !cluster.is_empty()) else {
+            kept.push(arg);
+            continue;
+        };
+        // A cluster of short flags: the first one that takes a value takes
+        // the rest of the cluster, or the next argument when none is left.
+        let mut wants_next = false;
+        let mut kept_cluster = arg.clone();
+        for (at, flag) in cluster.char_indices() {
+            if !takes_value(
+                command
+                    .get_arguments()
+                    .find(|a| a.get_short() == Some(flag)),
+            ) {
+                continue;
+            }
+            let value = &cluster[at + flag.len_utf8()..];
+            wants_next = value.is_empty();
+            if flag == 'P' {
+                kept_cluster = format!("-{}", &cluster[..at]);
+                if wants_next {
+                    args.next();
+                    wants_next = false;
+                }
+            }
+            break;
+        }
+        if kept_cluster != "-" {
+            kept.push(kept_cluster);
+        }
+        if wants_next {
+            kept.extend(args.next());
+        }
+    }
+    kept
+}
+
 /// Relay this command, as it was typed, to `project`'s remote and exit
 /// with the remote command's exit code.
 pub fn relay(project: &RemoteProject) -> Result<()> {
     let argv = relayed_argv();
     let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
     exit_with(run(project, &argv)?)
+}
+
+/// The largest prompt file relayed to a remote: well within the control
+/// channel's line limit.
+const MAX_PROMPT_FILE_BYTES: u64 = 1024 * 1024;
+
+/// Relay this command, `command` as it was typed, to `project`'s remote like
+/// [`relay`], with its prompt file, `prompt_file`, read here on the
+/// workstation, where the user means it, rather than on the remote.
+pub fn relay_with_prompt_file(
+    project: &RemoteProject,
+    prompt_file: Option<&Path>,
+    command: &clap::Command,
+) -> Result<()> {
+    let Some(path) = prompt_file else {
+        return relay(project);
+    };
+    let contents = read_prompt_file(path)?;
+    let argv = without_prompt_file(relayed_argv(), command);
+    let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+    exit_with(session(
+        project,
+        &argv,
+        Some(contents),
+        &mut Invoking { output: write_to },
+        true,
+    )?)
+}
+
+fn read_prompt_file(path: &Path) -> Result<String> {
+    let failed = || format!("Failed to read prompt file: {}", path.display());
+    let size = std::fs::metadata(path).with_context(failed)?.len();
+    if size > MAX_PROMPT_FILE_BYTES {
+        return Err(anyhow!(
+            "Prompt file {} is {size} bytes, more than the {MAX_PROMPT_FILE_BYTES} bytes a remote project accepts",
+            path.display()
+        ));
+    }
+    std::fs::read_to_string(path).with_context(failed)
 }
 
 /// Relay this command, as it was typed, to every remote project, printing
@@ -600,6 +715,49 @@ projects:
             ])),
             args(&["workmux", "add", "feature", "--", "--project"])
         );
+    }
+
+    #[test]
+    fn a_relayed_command_loses_its_prompt_file_however_it_was_spelled() {
+        let args = |list: &[&str]| list.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+        let add = crate::cli::subcommand("add").unwrap();
+        let relayed = |list: &[&str]| without_prompt_file(args(list), &add);
+
+        for spelled in [
+            &["-P", "p.md"][..],
+            &["-Pp.md"],
+            &["--prompt-file", "p.md"],
+            &["--prompt-file=p.md"],
+        ] {
+            let typed = [&["workmux", "add", "feature"][..], spelled, &["-w"]].concat();
+            assert_eq!(relayed(&typed), args(&["workmux", "add", "feature", "-w"]));
+        }
+        // Flags clustered with -P stay; -P inside another flag's value is
+        // that value, as is anything after `--`.
+        assert_eq!(
+            relayed(&["workmux", "add", "feature", "-HP", "p.md"]),
+            args(&["workmux", "add", "feature", "-H"])
+        );
+        assert_eq!(
+            relayed(&["workmux", "add", "-HPp.md", "feature"]),
+            args(&["workmux", "add", "-H", "feature"])
+        );
+        let untouched = ["workmux", "add", "feature", "-bpPlease"];
+        assert_eq!(relayed(&untouched), args(&untouched));
+        let untouched = ["workmux", "add", "feature", "--", "-P", "p.md"];
+        assert_eq!(relayed(&untouched), args(&untouched));
+    }
+
+    #[test]
+    fn a_prompt_file_too_large_for_a_remote_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prompt.md");
+        std::fs::write(&path, "x".repeat(MAX_PROMPT_FILE_BYTES as usize)).unwrap();
+        assert!(read_prompt_file(&path).is_ok());
+
+        std::fs::write(&path, "x".repeat(MAX_PROMPT_FILE_BYTES as usize + 1)).unwrap();
+        let refused = read_prompt_file(&path).unwrap_err().to_string();
+        assert!(refused.contains("more than the 1048576 bytes"), "{refused}");
     }
 
     #[test]

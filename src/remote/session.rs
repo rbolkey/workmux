@@ -14,7 +14,7 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -84,6 +84,11 @@ pub struct CommandRequest {
     /// that window's worktree, as it would locally.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub invoking_window_token: Option<String>,
+    /// Contents of the prompt file the command was given on the workstation,
+    /// whose `--prompt-file` option `argv` no longer has: remote workmux gets
+    /// them in a file of its own, as the command's prompt file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_file: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -586,7 +591,27 @@ pub fn run_on_remote(
     if ensure_cloned(&request.project, &path, tracked, emit)? {
         provision(&request.project, &path, tracked, emit)?;
     }
-    let mut command = remote_command(&request.argv)?;
+    let prompt_file = request
+        .prompt_file
+        .as_deref()
+        .map(write_prompt_file)
+        .transpose()?;
+    let mut argv = request.argv.clone();
+    if let Some(file) = &prompt_file {
+        // Options go before any `--`, after which everything is positional.
+        let at = argv
+            .iter()
+            .position(|arg| arg == "--")
+            .unwrap_or(argv.len());
+        argv.splice(
+            at..at,
+            [
+                "--prompt-file".to_string(),
+                file.path().display().to_string(),
+            ],
+        );
+    }
+    let mut command = remote_command(&argv)?;
     let workdir = request
         .invoking_window_token
         .as_deref()
@@ -606,6 +631,20 @@ pub fn run_on_remote(
             .env(forwarding::SESSION_ENV, forwarding.session.to_string());
     }
     Ok(exit_code(run_streamed(command, tracked, emit)?))
+}
+
+/// A file holding `contents`, a prompt file from the workstation, removed
+/// when dropped.
+fn write_prompt_file(contents: &str) -> Result<tempfile::NamedTempFile> {
+    let mut file = tempfile::Builder::new()
+        .prefix("workmux-prompt-")
+        .suffix(".md")
+        .tempfile()
+        .context("failed to create a file for the workstation's prompt file")?;
+    file.write_all(contents.as_bytes())
+        .and_then(|()| file.flush())
+        .context("failed to write the workstation's prompt file")?;
+    Ok(file)
 }
 
 /// The worktree of the clone at `clone` whose window carries `token`.
@@ -681,6 +720,7 @@ mod tests {
             },
             argv: ["sh", "-c", script].map(String::from).to_vec(),
             invoking_window_token: None,
+            prompt_file: None,
         }
     }
 
@@ -730,6 +770,31 @@ mod tests {
         assert_eq!(exit.unwrap(), 3);
         assert_eq!(captured.stdout, "started\n");
         assert_eq!(captured.stderr, "failed\n");
+    }
+
+    #[test]
+    fn a_prompt_file_from_the_workstation_reaches_the_command_as_its_prompt_file() {
+        let project = tempfile::tempdir().unwrap();
+        let mut request = request(
+            project.path(),
+            None,
+            r#"echo "$@"; cat "$4"; echo "$4" > seen"#,
+        );
+        request
+            .argv
+            .extend(["sh", "add", "feature"].map(String::from));
+        request.prompt_file = Some("the workstation's file\n".to_string());
+
+        let (exit, captured) = run(&request, |_| {});
+
+        assert_eq!(exit.unwrap(), 0, "{}", captured.stderr);
+        let mut lines = captured.stdout.lines();
+        let args = lines.next().unwrap();
+        assert!(args.starts_with("add feature --prompt-file /"), "{args}");
+        assert_eq!(lines.next(), Some("the workstation's file"));
+        // The file lasts only as long as the command.
+        let seen = std::fs::read_to_string(project.path().join("seen")).unwrap();
+        assert!(!Path::new(seen.trim()).exists());
     }
 
     /// A terminal whose user presses Ctrl-C once the command has printed
