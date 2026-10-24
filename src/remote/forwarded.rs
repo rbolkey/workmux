@@ -64,6 +64,43 @@ pub fn parse_project_tag(tag: &str) -> Option<(&str, &str)> {
         .filter(|(remote, name)| !remote.is_empty() && !name.is_empty())
 }
 
+/// Close every window of project `name` on `remote` in `tmux`, returning
+/// how many. A session left holding other windows loses the project's tag,
+/// so it is no longer taken for the project's.
+pub fn close_project_windows(tmux: &TmuxBackend, remote: &str, name: &str) -> Result<usize> {
+    let tag = project_tag(remote, name);
+    let windows = tmux.query(&[
+        "list-windows",
+        "-a",
+        "-F",
+        &format!("#{{window_id}}\t#{{{WINDOW_TAG}}}"),
+    ])?;
+    let mut closed = 0;
+    for (window, _) in windows
+        .lines()
+        .filter_map(|line| line.split_once('\t'))
+        .filter(|(_, window_tag)| window_tag.trim() == tag)
+    {
+        tmux.query(&["kill-window", "-t", window])?;
+        closed += 1;
+    }
+    let sessions = tmux
+        .query(&[
+            "list-sessions",
+            "-F",
+            &format!("#{{session_id}}\t#{{{SESSION_TAG}}}"),
+        ])
+        .unwrap_or_default();
+    for (session, _) in sessions
+        .lines()
+        .filter_map(|line| line.split_once('\t'))
+        .filter(|(_, session_tag)| session_tag.trim() == tag)
+    {
+        tmux.query(&["set-option", "-qu", "-t", session, SESSION_TAG])?;
+    }
+    Ok(closed)
+}
+
 /// Answer `request` from `scope`'s remote, against `tmux`. Panes attach to
 /// remote panes by running `workmux`'s `remote attach`.
 pub fn answer(
@@ -566,6 +603,10 @@ mod tests {
         fn tmux(&self, args: &[&str]) -> String {
             self.server.query(args)
         }
+
+        fn server_tmux(&self) -> TmuxBackend {
+            TmuxBackend::for_socket(&self.server.socket)
+        }
     }
 
     fn remote_pane() -> RemotePaneId {
@@ -801,6 +842,44 @@ mod tests {
         let windows = ws.tmux(&["list-windows", "-a", "-F", "#{window_id}"]);
         assert!(!windows.lines().any(|id| id == api_window), "{windows}");
         assert!(windows.lines().any(|id| id == web_window), "{windows}");
+    }
+
+    #[test]
+    fn closing_a_projects_windows_leaves_every_other_window() {
+        let Some(ws) = Workstation::start() else {
+            return;
+        };
+        let invoking = ws.server.new_session("mine", ws.remote_root.path());
+        let create = |project: &str, session: &str| {
+            pane(
+                ws.ask(
+                    &ws.scope("devbox", project, &invoking),
+                    MuxRequest::CreateSession {
+                        name: session.to_string(),
+                        initial_window_name: Some("wm-feature".to_string()),
+                        pane: remote_pane(),
+                    },
+                )
+                .unwrap(),
+            )
+        };
+        create("api", "api");
+        let web = create("web", "web");
+        // The user's own window in the project's session.
+        let own = ws.server.new_window("api");
+
+        let closed = close_project_windows(&ws.server_tmux(), "devbox", "api").unwrap();
+
+        assert_eq!(closed, 1);
+        let windows = ws.tmux(&["list-windows", "-a", "-F", "#{pane_id}"]);
+        assert!(windows.lines().any(|pane| pane == web), "{windows}");
+        let window_ids = ws.tmux(&["list-windows", "-a", "-F", "#{window_id}"]);
+        assert!(window_ids.lines().any(|id| id == own), "{window_ids}");
+        assert!(windows.lines().any(|pane| pane == invoking), "{windows}");
+        assert_eq!(
+            ws.tmux(&["show-options", "-qv", "-t", "api", SESSION_TAG]),
+            ""
+        );
     }
 
     #[test]

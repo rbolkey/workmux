@@ -285,18 +285,30 @@ fn delete_prompt(name: &str, sandbox: &str, risks: Option<&[AtRisk]>) -> String 
     prompt
 }
 
-/// Delete an OpenShell project's sandbox, then unregister the project.
+/// Delete an OpenShell project's sandbox, close the project's workstation
+/// windows, then unregister the project. A sandbox started only to check
+/// its worktrees is stopped again when the delete does not go ahead.
 fn rm_openshell(project: &crate::remote::router::RemoteProject, yes: bool) -> Result<()> {
     let name = &project.site.remote;
     let transport = registry::transport(name, &project.remote)?;
     let provisioning = lifecycle(transport.as_ref());
-    if provisioning.status()? != RemoteState::Missing {
-        if provisioning.status()? == RemoteState::Stopped {
+    let state = provisioning.status()?;
+    if state != RemoteState::Missing {
+        let started = state == RemoteState::Stopped;
+        if started {
             eprintln!(
                 "Starting remote {name} to check its worktrees for work that exists only there…"
             );
             provisioning.start()?;
         }
+        let stop_again = || {
+            if started {
+                eprintln!("Stopping remote {name} again…");
+                if let Err(error) = provisioning.stop() {
+                    eprintln!("warning: remote {name} was left running: {error:#}");
+                }
+            }
+        };
         let risks = match crate::remote::carry::remote_at_risk(
             transport.as_ref(),
             &project.site.path,
@@ -307,16 +319,25 @@ fn rm_openshell(project: &crate::remote::router::RemoteProject, yes: bool) -> Re
                 None
             }
         };
-        if !confirmed(
+        match confirmed(
             &delete_prompt(&project.site.name, &project.remote.target, risks.as_deref()),
             yes,
-        )? {
-            println!("Kept remote {name}");
-            return Ok(());
+        ) {
+            Ok(true) => {}
+            Ok(false) => {
+                stop_again();
+                println!("Kept remote {name}");
+                return Ok(());
+            }
+            Err(error) => {
+                stop_again();
+                return Err(error);
+            }
         }
         eprintln!("Deleting sandbox {}…", project.remote.target);
         provisioning.delete()?;
     }
+    close_workstation_windows(project);
     let (path, content) = global_config::read()?;
     let updated = global_config::remove_entry(&content, &PROJECTS, &project.site.name)?;
     global_config::write(&path, &updated)?;
@@ -327,6 +348,31 @@ fn rm_openshell(project: &crate::remote::router::RemoteProject, yes: bool) -> Re
         path.display()
     );
     Ok(())
+}
+
+/// Close the workstation windows of `project`, whose remote is gone: views
+/// onto remote panes that no longer exist.
+fn close_workstation_windows(project: &crate::remote::router::RemoteProject) {
+    use crate::multiplexer::Multiplexer as _;
+    let tmux = crate::multiplexer::TmuxBackend::new();
+    if !tmux.is_running().unwrap_or(false) {
+        return;
+    }
+    match crate::remote::forwarded::close_project_windows(
+        &tmux,
+        &project.site.remote,
+        &project.site.name,
+    ) {
+        Ok(0) => {}
+        Ok(closed) => eprintln!(
+            "Closed {closed} workstation window(s) of project {}",
+            project.site.name
+        ),
+        Err(error) => eprintln!(
+            "warning: could not close the workstation windows of project {}: {error:#}",
+            project.site.name
+        ),
+    }
 }
 
 fn recreate(name: &str, yes: bool) -> Result<()> {
@@ -583,6 +629,81 @@ fn status(name: Option<&str>) -> Result<bool> {
 mod tests {
     use super::*;
     use crate::config::Config;
+
+    #[test]
+    fn declining_to_delete_a_stopped_sandbox_stops_it_again() {
+        const TEST_NAME: &str =
+            "command::remote::tests::declining_to_delete_a_stopped_sandbox_stops_it_again";
+        if !crate::test_support::is_isolated_child(TEST_NAME) {
+            use std::os::unix::fs::PermissionsExt;
+            let temp = tempfile::tempdir().unwrap();
+            let bin = temp.path().join("bin");
+            let config = temp.path().join("config/workmux");
+            std::fs::create_dir_all(&bin).unwrap();
+            std::fs::create_dir_all(&config).unwrap();
+            std::fs::write(
+                config.join("config.yaml"),
+                "projects:\n  api:\n    git_url: https://example.com/api.git\n    openshell: {}\n",
+            )
+            .unwrap();
+            let dir = temp.path().display();
+            std::fs::write(temp.path().join("phase"), "Stopped").unwrap();
+            for (name, body) in [
+                (
+                    "openshell",
+                    format!(
+                        "#!/bin/sh\n\
+                         printf '%s\\n' \"$*\" >> '{dir}/log'\n\
+                         case \"$1 $2\" in\n\
+                         'sandbox get') printf '{{\"phase\":\"%s\",\"policy\":{{}}}}' \"$(cat '{dir}/phase')\" ;;\n\
+                         'sandbox start') echo Ready > '{dir}/phase' ;;\n\
+                         'sandbox stop') echo Stopped > '{dir}/phase' ;;\n\
+                         'sandbox delete') rm -f '{dir}/phase' ;;\n\
+                         'sandbox exec') shift 2; while [ \"$1\" != -- ]; do shift; done; shift; exec \"$@\" ;;\n\
+                         esac\n"
+                    ),
+                ),
+                ("workmux", "#!/bin/sh\necho '[]'\n".to_string()),
+                ("docker", "#!/bin/sh\nexit 1\n".to_string()),
+            ] {
+                let path = bin.join(name);
+                std::fs::write(&path, body).unwrap();
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            let path = std::env::join_paths(
+                std::iter::once(bin.clone())
+                    .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+            )
+            .unwrap();
+            crate::test_support::run_isolated_test(
+                TEST_NAME,
+                temp.path(),
+                &[
+                    ("XDG_CONFIG_HOME", &temp.path().join("config")),
+                    ("XDG_STATE_HOME", temp.path()),
+                    ("HOME", temp.path()),
+                    ("PATH", std::path::Path::new(&path)),
+                ],
+            );
+            let log = std::fs::read_to_string(temp.path().join("log")).unwrap_or_default();
+            assert!(log.contains("sandbox start"), "{log}");
+            assert!(!log.contains("sandbox delete"), "{log}");
+            assert_eq!(
+                std::fs::read_to_string(temp.path().join("phase"))
+                    .unwrap()
+                    .trim(),
+                "Stopped",
+                "{log}"
+            );
+            return;
+        }
+        println!("{}", crate::test_support::ISOLATED_TEST_CANARY);
+
+        // stdin is closed: the confirmation reads no, the default.
+        rm("api", false).unwrap();
+
+        assert!(openshell_project("api").unwrap().is_some());
+    }
 
     fn ssh(target: &str) -> RemoteConfig {
         RemoteConfig {
