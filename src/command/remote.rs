@@ -254,10 +254,28 @@ fn confirmed(prompt: &str, yes: bool) -> Result<bool> {
     crate::ui::confirm::confirm(prompt, crate::ui::confirm::ConfirmDefault::No)
 }
 
-/// The confirmation for deleting `sandbox`, naming the work only it holds.
+/// The confirmation for deleting `sandbox`, naming the work only it holds
+/// and the branches not merged into the project's base branch.
 fn delete_prompt(name: &str, sandbox: &str, risks: Option<&[AtRisk]>) -> String {
-    let mut prompt =
-        format!("Delete sandbox {sandbox} of project {name}? Its clone and worktrees are lost.");
+    with_risks(
+        format!("Delete sandbox {sandbox} of project {name}? Its clone and worktrees are lost."),
+        risks,
+    )
+}
+
+/// The confirmation for recreating `sandbox`, naming the same work as
+/// [`delete_prompt`], which the recreate carries across.
+fn recreate_prompt(name: &str, sandbox: &str, risks: Option<&[AtRisk]>) -> String {
+    with_risks(
+        format!(
+            "Recreate sandbox {sandbox} of project {name}? Agents running in it are ended and their remote panes lost; committed work on every branch is carried across."
+        ),
+        risks,
+    )
+}
+
+/// `prompt`, then each of `risks` on a line of its own.
+fn with_risks(mut prompt: String, risks: Option<&[AtRisk]>) -> String {
     match risks {
         None => prompt.push_str(
             "
@@ -267,7 +285,7 @@ fn delete_prompt(name: &str, sandbox: &str, risks: Option<&[AtRisk]>) -> String 
         Some(risks) => {
             prompt.push_str(
                 "
-  These have work that exists only in the sandbox:",
+  These have work that is unmerged or exists only in the sandbox:",
             );
             for risk in risks {
                 prompt.push_str(&format!(
@@ -391,17 +409,24 @@ fn recreate(name: &str, yes: bool) -> Result<()> {
         return ensure_running(name, transport.as_ref(), true, &mut print_notice).map(|_| ());
     }
     ensure_running(name, transport.as_ref(), true, &mut print_notice)?;
-    if !resuming
-        && !confirmed(
-        &format!(
-            "Recreate sandbox {} of project {}? Agents running in it are ended and their remote panes lost; committed work on every branch is carried across.
- ",
-            project.remote.target, project.site.name
-        ),
-        yes,
-    )? {
-        println!("Kept remote {name} as it is");
-        return Ok(());
+    if !resuming && !yes {
+        let risks = match crate::remote::carry::remote_at_risk(
+            transport.as_ref(),
+            &project.site.path,
+        ) {
+            Ok(risks) => Some(risks),
+            Err(error) => {
+                tracing::warn!(error = %format!("{error:#}"), "checking worktrees before recreate");
+                None
+            }
+        };
+        if !confirmed(
+            &recreate_prompt(&project.site.name, &project.remote.target, risks.as_deref()),
+            yes,
+        )? {
+            println!("Kept remote {name} as it is");
+            return Ok(());
+        }
     }
     crate::remote::carry::recreate(
         transport.as_ref(),
@@ -727,23 +752,52 @@ mod tests {
                 branch: Some("feature".to_string()),
                 uncommitted: true,
                 unpushed: 2,
+                unmerged_into: Some("main".to_string()),
             },
             AtRisk {
                 path: None,
                 branch: Some("spike".to_string()),
                 uncommitted: false,
                 unpushed: 1,
+                unmerged_into: None,
+            },
+            AtRisk {
+                path: None,
+                branch: Some("review".to_string()),
+                uncommitted: false,
+                unpushed: 0,
+                unmerged_into: Some("main".to_string()),
             },
         ];
 
         assert_eq!(
             delete_prompt("api", "api", Some(&risks)),
             "Delete sandbox api of project api? Its clone and worktrees are lost.\n  \
-             These have work that exists only in the sandbox:\n    \
-             /sandbox/api__worktrees/feature (branch feature): uncommitted changes, 2 commits not on any remote\n    \
-             branch spike: 1 commit not on any remote\n "
+             These have work that is unmerged or exists only in the sandbox:\n    \
+             /sandbox/api__worktrees/feature (branch feature): uncommitted changes, 2 commits not on any remote, not merged into main\n    \
+             branch spike: 1 commit not on any remote\n    \
+             branch review: not merged into main\n "
         );
         assert!(delete_prompt("api", "api", None).contains("could not be checked"));
+    }
+
+    #[test]
+    fn recreating_a_sandbox_names_the_unmerged_work_it_carries_across() {
+        let risks = [AtRisk {
+            path: Some("/sandbox/api__worktrees/review".into()),
+            branch: Some("review".to_string()),
+            uncommitted: false,
+            unpushed: 0,
+            unmerged_into: Some("main".to_string()),
+        }];
+
+        assert_eq!(
+            recreate_prompt("api", "api", Some(&risks)),
+            "Recreate sandbox api of project api? Agents running in it are ended and their remote panes lost; committed work on every branch is carried across.\n  \
+             These have work that is unmerged or exists only in the sandbox:\n    \
+             /sandbox/api__worktrees/review (branch review): not merged into main\n "
+        );
+        assert!(recreate_prompt("api", "api", None).contains("could not be checked"));
     }
 
     #[test]

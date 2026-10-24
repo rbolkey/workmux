@@ -32,6 +32,10 @@ pub struct AtRisk {
     /// Commits on no remote-tracking branch: unpushed, and unmerged into
     /// anything pushed.
     pub unpushed: usize,
+    /// The project's base branch, when the branch has commits not merged
+    /// into it (pushed or not).
+    #[serde(default)]
+    pub unmerged_into: Option<String>,
 }
 
 impl AtRisk {
@@ -51,6 +55,9 @@ impl AtRisk {
             0 => {}
             1 => what.push("1 commit not on any remote".to_string()),
             n => what.push(format!("{n} commits not on any remote")),
+        }
+        if let Some(base) = &self.unmerged_into {
+            what.push(format!("not merged into {base}"));
         }
         format!("{name}: {}", what.join(", "))
     }
@@ -155,10 +162,46 @@ fn unpushed(clone: &Path, rev: &str) -> Result<usize> {
         .with_context(|| format!("unreadable commit count {count:?}"))
 }
 
+/// The project's base branch: its configured `main_branch`, else the
+/// clone's default branch. `None` when neither can be told.
+fn base_branch(clone: &Path) -> Option<String> {
+    crate::config::Config::load_with_location_from(clone, None)
+        .ok()
+        .and_then(|(config, _)| config.main_branch)
+        .or_else(|| crate::git::get_default_branch_in(Some(clone)).ok())
+}
+
+/// Whether `branch` has commits merged into neither the local `base` nor
+/// origin's.
+fn unmerged(clone: &Path, branch: &str, base: &str) -> Result<bool> {
+    let mut args = vec!["rev-list".to_string(), "--count".to_string()];
+    args.push(format!("refs/heads/{branch}"));
+    args.push("--not".to_string());
+    for base in [
+        format!("refs/heads/{base}"),
+        format!("refs/remotes/origin/{base}"),
+    ] {
+        if git(clone, &["rev-parse", "--verify", "--quiet", &base]).is_ok() {
+            args.push(base);
+        }
+    }
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    Ok(git(clone, &args)?.trim() != "0")
+}
+
 /// Every worktree and branch of the clone at `clone` whose work exists
-/// only here.
+/// only here, or is not merged into the project's base branch.
 pub fn at_risk(clone: &Path) -> Result<Vec<AtRisk>> {
     let worktrees = worktrees(clone)?;
+    let base = base_branch(clone);
+    let unmerged_into = |branch: &str| -> Result<Option<String>> {
+        match &base {
+            Some(base) if base != branch && unmerged(clone, branch, base)? => {
+                Ok(Some(base.clone()))
+            }
+            _ => Ok(None),
+        }
+    };
     let mut risks = Vec::new();
     let mut checked_out = Vec::new();
     for worktree in &worktrees {
@@ -169,12 +212,17 @@ pub fn at_risk(clone: &Path) -> Result<Vec<AtRisk>> {
         checked_out.extend(branch.clone());
         let uncommitted = !git(&worktree.path, &["status", "--porcelain"])?.is_empty();
         let unpushed = unpushed(clone, &rev)?;
-        if uncommitted || unpushed > 0 {
+        let unmerged_into = match &branch {
+            Some(branch) => unmerged_into(branch)?,
+            None => None,
+        };
+        if uncommitted || unpushed > 0 || unmerged_into.is_some() {
             risks.push(AtRisk {
                 path: Some(worktree.path.clone()),
                 branch,
                 uncommitted,
                 unpushed,
+                unmerged_into,
             });
         }
     }
@@ -183,12 +231,14 @@ pub fn at_risk(clone: &Path) -> Result<Vec<AtRisk>> {
             continue;
         }
         let unpushed = unpushed(clone, &format!("refs/heads/{branch}"))?;
-        if unpushed > 0 {
+        let unmerged_into = unmerged_into(&branch)?;
+        if unpushed > 0 || unmerged_into.is_some() {
             risks.push(AtRisk {
                 path: None,
                 branch: Some(branch),
                 uncommitted: false,
                 unpushed,
+                unmerged_into,
             });
         }
     }
@@ -618,8 +668,17 @@ mod tests {
         let dirty = project.worktree("dirty");
         std::fs::write(dirty.join("notes.txt"), "draft").unwrap();
         project.worktree("pushed");
+        let review = project.worktree("review");
+        project.commit(&review, "c.txt");
+        run_git(&review, &["push", "--quiet", "-u", "origin", "review"]);
         run_git(&project.clone, &["branch", "--quiet", "parked"]);
         run_git(&project.clone, &["branch", "--quiet", "spike", "feature"]);
+        run_git(&project.clone, &["branch", "--quiet", "shipped", "review"]);
+        run_git(&project.clone, &["merge", "--quiet", "--ff-only", "review"]);
+        let unmerged = project.worktree("unmerged");
+        project.commit(&unmerged, "d.txt");
+        run_git(&unmerged, &["push", "--quiet", "-u", "origin", "unmerged"]);
+        run_git(&project.clone, &["branch", "--quiet", "hold", "unmerged"]);
 
         let risks: Vec<String> = at_risk(&project.clone)
             .unwrap()
@@ -632,10 +691,15 @@ mod tests {
             [
                 format!("{} (branch dirty): uncommitted changes", dirty.display()),
                 format!(
-                    "{} (branch feature): 2 commits not on any remote",
+                    "{} (branch feature): 2 commits not on any remote, not merged into main",
                     feature.display()
                 ),
-                "branch spike: 2 commits not on any remote".to_string(),
+                format!(
+                    "{} (branch unmerged): not merged into main",
+                    unmerged.display()
+                ),
+                "branch hold: not merged into main".to_string(),
+                "branch spike: 2 commits not on any remote, not merged into main".to_string(),
             ]
         );
     }
