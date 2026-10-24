@@ -339,3 +339,84 @@ def test_an_openshell_projects_sandbox_runs_claude_code(project: Project):
     finally:
         if daemon_pid is not None:
             os.kill(daemon_pid, 15)
+
+
+PRIVATE_REPO = os.environ.get("WORKMUX_TEST_OPENSHELL_PRIVATE_REPO", "")
+GITHUB_PROFILE = (
+    Path(__file__).parent / "fixtures" / "openshell" / "github-profile.yaml"
+)
+
+
+@pytest.fixture
+def github_provider(project: Project):
+    """A provider holding the workstation's `gh` token, made from a copy of
+    OpenShell's stock `github` profile (clone and fetch only); both are
+    deleted afterwards, after the project's sandbox. The token goes through
+    the environment only."""
+    if not PRIVATE_REPO:
+        pytest.skip("set WORKMUX_TEST_OPENSHELL_PRIVATE_REPO=<owner>/<repo>")
+    token = subprocess.run(
+        ["gh", "auth", "token", "--hostname", "github.com"],
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    if not token:
+        pytest.skip("needs a `gh` login on the workstation")
+    name = f"wm-test-35-{uuid.uuid4().hex[:6]}"
+    profile = Path(tempfile.mkdtemp(prefix="wm-")) / "github.yaml"
+    profile.write_text(
+        GITHUB_PROFILE.read_text().replace("\nid: github\n", f"\nid: {name}\n")
+    )
+    imported = openshell(
+        ["provider", "profile", "import", "-f", str(profile), "--global"]
+    )
+    assert imported.returncode == 0, imported.stderr
+    try:
+        created = subprocess.run(
+            ["openshell", "provider", "create", "--name", name, "--type", name]
+            + ["--global-profile", "--credential", "GITHUB_TOKEN"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            env={**os.environ, "NO_COLOR": "1", "GITHUB_TOKEN": token},
+        )
+        assert created.returncode == 0, created.stderr
+        yield name
+    finally:
+        # A provider attached to a sandbox can't be deleted.
+        project.clean_up()
+        openshell(["provider", "delete", name])
+        openshell(["provider", "profile", "delete", "--global", name])
+        shutil.rmtree(profile.parent, ignore_errors=True)
+
+
+def test_a_private_ssh_github_repo_clones_over_https_with_the_providers_credentials(
+    project: Project, github_provider: str
+):
+    """An SSH `--repo` on github.com is rewritten to HTTPS, visibly; the
+    image's credential helper hands git the provider's placeholder, so the
+    first-use clone of a private repository succeeds, and SSH GitHub URLs
+    typed in the sandbox go over HTTPS too."""
+    ssh = f"git@github.com:{PRIVATE_REPO}.git"
+    https = f"https://github.com/{PRIVATE_REPO}.git"
+    added = project.wm(
+        f"project add {project.name} --openshell --repo {ssh} "
+        f"--image {LEARNING_IMAGE} --provider {github_provider}"
+    )
+    assert (
+        "`--repo` uses SSH, which OpenShell sandboxes don't support; the sandbox "
+        f"reaches github.com over HTTPS with `{github_provider}` credentials instead."
+    ) in added.stdout, added.stdout
+    project.wm(f"remote start {project.name}", timeout=900.0)
+
+    listed = project.wm(f"list --project {project.name}", timeout=300.0)
+    assert (
+        f"Cloning {https} (rewritten from SSH: {ssh}) into /sandbox/{project.name}"
+    ) in listed.stderr, listed.stderr
+    assert project.sh(f"git -C /sandbox/{project.name} config remote.origin.url") == (
+        f"{https}\n"
+    )
+    status = project.wm(f"remote status {project.name}").stdout
+    assert f"repo:     {https} (rewritten from SSH: {ssh})" in status, status
+    for url in [ssh, f"ssh://git@github.com/{PRIVATE_REPO}.git"]:
+        assert "HEAD" in project.sh(f"git ls-remote {shlex.quote(url)} HEAD")

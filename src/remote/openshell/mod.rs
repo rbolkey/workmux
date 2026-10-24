@@ -254,7 +254,11 @@ impl OpenShell {
         let providers = self.providers()?;
         Ok(attached
             .iter()
-            .filter(|name| providers.get(*name).is_some_and(agents::Provider::gives_github))
+            .filter(|name| {
+                providers
+                    .get(*name)
+                    .is_some_and(agents::Provider::gives_github)
+            })
             .cloned()
             .collect())
     }
@@ -272,12 +276,14 @@ impl OpenShell {
                 .find(|profile| profile["id"] == provider_type)
         };
         let binaries = |provider_type: &str| {
-            profile(provider_type)?["binaries"].as_array().map(|binaries| {
-                binaries
-                    .iter()
-                    .filter_map(|binary| Some(binary.as_str()?.to_string()))
-                    .collect()
-            })
+            profile(provider_type)?["binaries"]
+                .as_array()
+                .map(|binaries| {
+                    binaries
+                        .iter()
+                        .filter_map(|binary| Some(binary.as_str()?.to_string()))
+                        .collect()
+                })
         };
         let hosts = |provider_type: &str| {
             profile(provider_type).map(|profile| {

@@ -88,10 +88,22 @@ mod tests {
         for (ssh, https) in [
             ("git@github.com:me/api.git", "https://github.com/me/api.git"),
             ("git@github.com:me/api", "https://github.com/me/api"),
-            ("git@GitHub.com:/me/api.git", "https://github.com/me/api.git"),
-            ("ssh://git@github.com/me/api.git", "https://github.com/me/api.git"),
-            ("ssh://git@github.com:22/me/api.git", "https://github.com/me/api.git"),
-            ("git+ssh://github.com/me/api.git", "https://github.com/me/api.git"),
+            (
+                "git@GitHub.com:/me/api.git",
+                "https://github.com/me/api.git",
+            ),
+            (
+                "ssh://git@github.com/me/api.git",
+                "https://github.com/me/api.git",
+            ),
+            (
+                "ssh://git@github.com:22/me/api.git",
+                "https://github.com/me/api.git",
+            ),
+            (
+                "git+ssh://github.com/me/api.git",
+                "https://github.com/me/api.git",
+            ),
         ] {
             assert_eq!(https_for_ssh(ssh).unwrap().as_deref(), Some(https), "{ssh}");
         }
@@ -161,7 +173,10 @@ mod tests {
     #[test]
     fn a_rewritten_url_is_shown_with_its_original() {
         assert_eq!(
-            describe("https://github.com/me/api.git", Some("git@github.com:me/api.git")),
+            describe(
+                "https://github.com/me/api.git",
+                Some("git@github.com:me/api.git")
+            ),
             "https://github.com/me/api.git (rewritten from SSH: git@github.com:me/api.git)"
         );
         assert_eq!(

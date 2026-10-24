@@ -581,12 +581,23 @@ mod tests {
              \tinsteadOf = ssh://git@github.com/\n"
         );
         let helper = context.path().join("git-credential-workmux");
-        assert_eq!(credentials_from(&helper, "get", &[("GH_TOKEN", "gh-ph"), ("GITHUB_TOKEN", "ghp-ph")]),
-            "username=x-access-token\npassword=gh-ph\n");
-        assert_eq!(credentials_from(&helper, "get", &[("GITHUB_TOKEN", "ghp-ph")]),
-            "username=x-access-token\npassword=ghp-ph\n");
+        assert_eq!(
+            credentials_from(
+                &helper,
+                "get",
+                &[("GH_TOKEN", "gh-ph"), ("GITHUB_TOKEN", "ghp-ph")]
+            ),
+            "username=x-access-token\npassword=gh-ph\n"
+        );
+        assert_eq!(
+            credentials_from(&helper, "get", &[("GITHUB_TOKEN", "ghp-ph")]),
+            "username=x-access-token\npassword=ghp-ph\n"
+        );
         assert_eq!(credentials_from(&helper, "get", &[]), "");
-        assert_eq!(credentials_from(&helper, "store", &[("GH_TOKEN", "gh-ph")]), "");
+        assert_eq!(
+            credentials_from(&helper, "store", &[("GH_TOKEN", "gh-ph")]),
+            ""
+        );
     }
 
     /// What the credential helper at `helper` answers git's `action`, with
@@ -628,8 +639,14 @@ mod tests {
         let without = prepare(&recipe, "api", "/sandbox/api", context.path()).unwrap();
 
         let dockerfile = std::fs::read_to_string(context.path().join("Dockerfile")).unwrap();
-        assert!(dockerfile.contains("\nFROM base AS gitconfig\n"), "{dockerfile}");
-        assert!(!dockerfile.contains("git-credential-workmux"), "{dockerfile}");
+        assert!(
+            dockerfile.contains("\nFROM base AS gitconfig\n"),
+            "{dockerfile}"
+        );
+        assert!(
+            !dockerfile.contains("git-credential-workmux"),
+            "{dockerfile}"
+        );
         assert!(!context.path().join("git-credential-workmux").exists());
         assert_eq!(
             std::fs::read_to_string(context.path().join("gitconfig")).unwrap(),

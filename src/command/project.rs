@@ -408,9 +408,9 @@ remotes:
         let error = project_entry(add_args("git@gitlab.com:me/api.git", true)).unwrap_err();
 
         assert!(
-            error
-                .to_string()
-                .contains("OpenShell sandboxes don't support: they reach git hosts over HTTPS only"),
+            error.to_string().contains(
+                "OpenShell sandboxes don't support: they reach git hosts over HTTPS only"
+            ),
             "{error}"
         );
     }

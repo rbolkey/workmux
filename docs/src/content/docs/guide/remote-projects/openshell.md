@@ -45,7 +45,37 @@ projects:
 
 The project's remote is implicit and has the project's name, so commands such as `workmux remote status api` work without a `remote add`.
 
-Git credentials and agent API keys should come from OpenShell providers, so that secrets never sit in the sandbox environment.
+Git credentials and agent API keys should come from OpenShell providers, so that secrets never sit in the sandbox environment. See [Git and GitHub](#git-and-github) for git.
+
+## Git and GitHub
+
+### Credentials
+
+OpenShell gives the sandbox only a placeholder token (in `GITHUB_TOKEN` or `GH_TOKEN`), and its proxy swaps in the real one on requests to the provider's endpoints. git sends no credentials unless a credential helper supplies them, so on its own `git clone` of a private repository fails with "could not read Username".
+
+When an attached provider's profile reaches `github.com`, workmux's image sets a credential helper for `https://github.com` only. It hands git `x-access-token` and the placeholder from `GH_TOKEN`, else `GITHUB_TOKEN`. The helper adds no exposure: the placeholder is already in the environment, and the proxy resolves it only for the provider's endpoints. It replaces any other helper the image's `/etc/gitconfig` sets for github.com, such as `gh auth git-credential`. workmux never uses git's `store` helper and never puts a token in an image.
+
+What git and agents may do on GitHub is set by the provider's profile and the token's scope:
+
+- **OpenShell's stock `github` profile is read-only:** clone and fetch work; push (`git-receive-pack`) and API writes, such as creating a pull request, are denied. The stock profiles aren't installed in a gateway by default; import one with `openshell provider profile import`.
+- **Push and pull requests** need a profile that allows `git-receive-pack` and API writes. The easy path is `--github host`, which gives the sandbox your workstation's `gh` login. For tighter access, create a provider from a fine-grained personal access token limited to the repositories the agent needs, and attach it with `--provider`. A `--policy` file can also allow push for just the project's repository on top of a read-only profile.
+
+### SSH is not supported in OpenShell sandboxes
+
+The proxy substitutes credentials only in HTTPS, and no profile allows SSH. workmux doesn't put an SSH key in the sandbox or forward your SSH agent, because either would hand the sandbox a real secret. Instead, SSH GitHub URLs are rewritten to HTTPS, visibly:
+
+- `project add --openshell` with an SSH `--repo` on github.com (`git@github.com:me/api.git` or `ssh://git@github.com/me/api.git`) stores the HTTPS form as the project's `git_url` and the original as `ssh_git_url`, and says so:
+
+  ```text
+  Note: `--repo` uses SSH, which OpenShell sandboxes don't support; the sandbox reaches github.com over HTTPS with `github` credentials instead.
+  ```
+
+  The sandbox's identity is the provider's, which may not be your SSH key's: a work-account key and a personal `gh` login reach different repositories. With no GitHub provider attached, the note adds that public repositories will clone, but private ones and push need `--github host` or a GitHub `--provider`. workmux can't tell whether a repository is private, so it doesn't fail.
+- An SSH `--repo` on any other host fails at `project add`.
+- `remote status` and the first-use clone show the URL as `https://github.com/me/api.git (rewritten from SSH: git@github.com:me/api.git)`.
+- Inside the sandbox, the image rewrites `git@github.com:` and `ssh://git@github.com/` to `https://github.com/` with git's `url.<base>.insteadOf`, so submodules and URLs an agent types go over HTTPS too. On your workstation, workmux still clones the original URL to look for a flake devshell.
+
+Not covered: SSH hosts other than github.com, and private nix flake inputs (`git+ssh://` inputs may ignore `insteadOf`, and `github:` inputs use nix's `access-tokens`, not git's credential helper).
 
 ## Lifecycle
 
@@ -92,6 +122,7 @@ If the restore fails, run `workmux remote recreate` again. It resumes from the k
 workmux builds the sandbox image with `docker build` on the Docker daemon your OpenShell gateway uses, so it is native to the sandbox's architecture. The image is tagged `workmux-openshell-<sandbox>:<hash>`, and is rebuilt when its inputs change.
 
 - **Default image:** `ubuntu:24.04` with git, dtach, curl and workmux.
+- **Git:** every image gets workmux's [git settings](#git-and-github) appended to its `/etc/gitconfig`, so your `--image` needs `/bin/sh`.
 - **Agents:** every image gets the project's [agents](#agents-in-the-sandbox) that workmux can install.
 - **Your image (`--image`):** used as the base as it is. It must contain git and dtach, because nothing can be installed in a running sandbox.
 
