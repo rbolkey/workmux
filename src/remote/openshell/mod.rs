@@ -279,6 +279,7 @@ impl OpenShell {
             workmux,
             agents: origin.agents.clone(),
             devshell,
+            github_credentials: false,
         };
         let tag = image::prepare(&recipe, &self.sandbox, &sandbox_path(&origin.path), context)?;
         image::build(&self.docker, context, &tag)?;

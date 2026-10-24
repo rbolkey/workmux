@@ -33,6 +33,39 @@ pub const DEFAULT_AGENT: &str = "/etc/workmux/default-agent";
 /// workmux can tell when the project's `flake.lock` has moved on.
 pub const DEVSHELL_SOURCE: &str = "/nix/devshell-source.json";
 
+/// Where the image has workmux's git credential helper.
+const CREDENTIAL_HELPER: &str = "/usr/local/bin/git-credential-workmux";
+
+/// Hands git the provider's placeholder token for github.com, which the
+/// OpenShell proxy swaps for the real one. `--credential GITHUB_TOKEN`
+/// sets only `GITHUB_TOKEN`, so it falls back to that.
+const CREDENTIAL_HELPER_SCRIPT: &str = "#!/bin/sh
+# git credential helper added by workmux: OpenShell gives the sandbox a
+# placeholder token, and its proxy swaps in the real one on the way out.
+cat >/dev/null
+[ \"$1\" = get ] || exit 0
+token=${GH_TOKEN:-$GITHUB_TOKEN}
+[ -n \"$token\" ] || exit 0
+printf 'username=x-access-token\\npassword=%s\\n' \"$token\"
+";
+
+/// What the image adds to `/etc/gitconfig`. SSH GitHub URLs go over HTTPS,
+/// because the sandbox has no SSH; with GitHub credentials, the helper is
+/// github.com's only one.
+fn gitconfig(github_credentials: bool) -> String {
+    let mut out =
+        String::from("# Added by workmux: OpenShell sandboxes reach github.com over HTTPS only.\n");
+    if github_credentials {
+        out.push_str(&format!(
+            "[credential \"https://github.com\"]\n\thelper =\n\thelper = {CREDENTIAL_HELPER}\n"
+        ));
+    }
+    out.push_str(
+        "[url \"https://github.com/\"]\n\tinsteadOf = git@github.com:\n\tinsteadOf = ssh://git@github.com/\n",
+    );
+    out
+}
+
 const DEVSHELL_WRAPPER: &str = "#!/bin/bash
 # Run a command in the project's devshell, baked into this image by workmux:
 # load the environment recorded with `nix print-dev-env`, then exec it.
@@ -99,6 +132,9 @@ pub struct Recipe {
     /// A checkout of the project, in the build context's `project`
     /// directory, whose flake devshell is baked in.
     pub devshell: Option<PathBuf>,
+    /// Whether an attached provider gives GitHub credentials, which git
+    /// then gets from workmux's credential helper.
+    pub github_credentials: bool,
 }
 
 /// The Dockerfile for `recipe`. Its context holds `workmux`,
@@ -157,10 +193,16 @@ pub fn dockerfile(recipe: &Recipe) -> String {
              && cp -a $(nix-store -qR /devshell/profile) /closure/\n"
         ));
     }
+    let base = recipe.base.as_deref().unwrap_or("base");
+    // Appended to the base's own system config, in a stage of its own so
+    // the image's user is left as it is.
     out.push_str(&format!(
-        "\nFROM {}\n",
-        recipe.base.as_deref().unwrap_or("base")
+        "\nFROM {base} AS gitconfig\n\
+         USER root\n\
+         COPY gitconfig /tmp/workmux-gitconfig\n\
+         RUN cat /tmp/workmux-gitconfig >> /etc/gitconfig\n"
     ));
+    out.push_str(&format!("\nFROM {base}\n"));
     out.push_str(match recipe.workmux {
         Workmux::Binary(_) => "COPY --chmod=0755 workmux /usr/local/bin/workmux\n",
         _ => "COPY --from=workmux /usr/local/bin/workmux /usr/local/bin/workmux\n",
@@ -178,6 +220,12 @@ pub fn dockerfile(recipe: &Recipe) -> String {
              COPY --from=devshell /devshell/env.sh /nix/devshell-env.sh\n\
              COPY devshell-source.json {DEVSHELL_SOURCE}\n\
              COPY --chmod=0755 workmux-devshell {BAKED_DEVSHELL}\n"
+        ));
+    }
+    out.push_str("COPY --from=gitconfig /etc/gitconfig /etc/gitconfig\n");
+    if recipe.github_credentials {
+        out.push_str(&format!(
+            "COPY --chmod=0755 git-credential-workmux {CREDENTIAL_HELPER}\n"
         ));
     }
     out
@@ -236,6 +284,16 @@ pub fn prepare(recipe: &Recipe, sandbox: &str, clone: &str, context: &Path) -> R
             copy_working_tree(source, &context.join("workmux-source"), &mut digest)?;
         }
         Workmux::Release => {}
+    }
+    let gitconfig = gitconfig(recipe.github_credentials);
+    digest.extend(gitconfig.as_bytes());
+    std::fs::write(context.join("gitconfig"), gitconfig)?;
+    if recipe.github_credentials {
+        digest.extend(CREDENTIAL_HELPER_SCRIPT.as_bytes());
+        std::fs::write(
+            context.join("git-credential-workmux"),
+            CREDENTIAL_HELPER_SCRIPT,
+        )?;
     }
     if let Some(agent) = recipe.agents.first() {
         std::fs::write(context.join("default-agent"), format!("{agent}\n"))?;
@@ -339,6 +397,7 @@ mod tests {
             workmux: Workmux::Release,
             agents: Vec::new(),
             devshell: None,
+            github_credentials: false,
         });
 
         assert!(dockerfile.contains("FROM docker.io/library/ubuntu:24.04 AS base"));
@@ -346,7 +405,7 @@ mod tests {
         assert!(dockerfile.contains(&format!("WORKMUX_VERSION=v{}", env!("CARGO_PKG_VERSION"))));
         assert!(
             dockerfile.ends_with(
-                "FROM base\nCOPY --from=workmux /usr/local/bin/workmux /usr/local/bin/workmux\n"
+                "FROM base\nCOPY --from=workmux /usr/local/bin/workmux /usr/local/bin/workmux\nCOPY --from=gitconfig /etc/gitconfig /etc/gitconfig\n"
             ),
             "{dockerfile}"
         );
@@ -359,12 +418,13 @@ mod tests {
             workmux: Workmux::Release,
             agents: Vec::new(),
             devshell: None,
+            github_credentials: false,
         });
 
         assert!(dockerfile.contains(&format!("WORKMUX_VERSION=v{}", env!("CARGO_PKG_VERSION"))));
         assert!(
             dockerfile.ends_with(
-                "FROM ghcr.io/me/api-dev:1\nCOPY --from=workmux /usr/local/bin/workmux /usr/local/bin/workmux\n"
+                "FROM ghcr.io/me/api-dev:1\nCOPY --from=workmux /usr/local/bin/workmux /usr/local/bin/workmux\nCOPY --from=gitconfig /etc/gitconfig /etc/gitconfig\n"
             ),
             "{dockerfile}"
         );
@@ -377,6 +437,7 @@ mod tests {
             workmux: Workmux::Release,
             agents: vec!["claude".to_string()],
             devshell: None,
+            github_credentials: false,
         });
 
         let stage = dockerfile
@@ -406,6 +467,7 @@ mod tests {
             workmux: Workmux::Release,
             agents: vec!["gemini".to_string(), "codex".to_string()],
             devshell: None,
+            github_credentials: false,
         };
         let context = tempfile::tempdir().unwrap();
 
@@ -431,6 +493,7 @@ mod tests {
             workmux: Workmux::Source(PathBuf::from("/src/workmux")),
             agents: Vec::new(),
             devshell: None,
+            github_credentials: false,
         });
 
         assert!(!dockerfile.contains("install.sh"), "{dockerfile}");
@@ -443,8 +506,9 @@ mod tests {
         assert!(stage.contains("COPY workmux-source /src"), "{stage}");
         assert!(stage.contains("cargo build --locked"), "{stage}");
         assert!(
-            dockerfile
-                .ends_with("COPY --from=workmux /usr/local/bin/workmux /usr/local/bin/workmux\n")
+            dockerfile.ends_with(
+                "COPY --from=workmux /usr/local/bin/workmux /usr/local/bin/workmux\nCOPY --from=gitconfig /etc/gitconfig /etc/gitconfig\n"
+            )
         );
     }
 
@@ -455,6 +519,7 @@ mod tests {
             workmux: Workmux::Binary(PathBuf::from("/tmp/workmux")),
             agents: Vec::new(),
             devshell: Some(PathBuf::from("/tmp/ctx/project")),
+            github_credentials: false,
         });
 
         assert!(!dockerfile.contains("AS base"));
@@ -468,8 +533,123 @@ mod tests {
              COPY --from=devshell /closure /nix/store\n\
              COPY --from=devshell /devshell/env.sh /nix/devshell-env.sh\n\
              COPY devshell-source.json /nix/devshell-source.json\n\
-             COPY --chmod=0755 workmux-devshell /usr/local/bin/workmux-devshell\n"
+             COPY --chmod=0755 workmux-devshell /usr/local/bin/workmux-devshell\n\
+             COPY --from=gitconfig /etc/gitconfig /etc/gitconfig\n"
         );
+    }
+
+    #[test]
+    fn with_github_credentials_git_gets_the_placeholder_from_a_credential_helper() {
+        let recipe = Recipe {
+            base: Some("ghcr.io/me/api-dev:1".to_string()),
+            workmux: Workmux::Release,
+            agents: Vec::new(),
+            devshell: None,
+            github_credentials: true,
+        };
+        let context = tempfile::tempdir().unwrap();
+
+        prepare(&recipe, "api", "/sandbox/api", context.path()).unwrap();
+
+        let dockerfile = std::fs::read_to_string(context.path().join("Dockerfile")).unwrap();
+        // The project image's own /etc/gitconfig is kept and added to.
+        let stage = dockerfile
+            .split("\nFROM ")
+            .find(|s| s.contains("AS gitconfig"))
+            .unwrap();
+        assert!(
+            stage.starts_with("ghcr.io/me/api-dev:1 AS gitconfig\nUSER root\n"),
+            "{stage}"
+        );
+        assert!(stage.contains(">> /etc/gitconfig"), "{stage}");
+        let last_stage = dockerfile.rsplit("\nFROM ").next().unwrap();
+        assert!(
+            last_stage.ends_with(
+                "COPY --from=gitconfig /etc/gitconfig /etc/gitconfig\n\
+                 COPY --chmod=0755 git-credential-workmux /usr/local/bin/git-credential-workmux\n"
+            ),
+            "{last_stage}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(context.path().join("gitconfig")).unwrap(),
+            "# Added by workmux: OpenShell sandboxes reach github.com over HTTPS only.\n\
+             [credential \"https://github.com\"]\n\
+             \thelper =\n\
+             \thelper = /usr/local/bin/git-credential-workmux\n\
+             [url \"https://github.com/\"]\n\
+             \tinsteadOf = git@github.com:\n\
+             \tinsteadOf = ssh://git@github.com/\n"
+        );
+        let helper = context.path().join("git-credential-workmux");
+        assert_eq!(credentials_from(&helper, "get", &[("GH_TOKEN", "gh-ph"), ("GITHUB_TOKEN", "ghp-ph")]),
+            "username=x-access-token\npassword=gh-ph\n");
+        assert_eq!(credentials_from(&helper, "get", &[("GITHUB_TOKEN", "ghp-ph")]),
+            "username=x-access-token\npassword=ghp-ph\n");
+        assert_eq!(credentials_from(&helper, "get", &[]), "");
+        assert_eq!(credentials_from(&helper, "store", &[("GH_TOKEN", "gh-ph")]), "");
+    }
+
+    /// What the credential helper at `helper` answers git's `action`, with
+    /// only `env` set.
+    fn credentials_from(helper: &Path, action: &str, env: &[(&str, &str)]) -> String {
+        use std::io::Write;
+        let mut child = Command::new("sh")
+            .arg(helper)
+            .arg(action)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .envs(env.iter().copied())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"protocol=https\nhost=github.com\n\n")
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8(output.stdout).unwrap()
+    }
+
+    #[test]
+    fn without_github_credentials_ssh_github_urls_still_go_over_https() {
+        let recipe = Recipe {
+            base: None,
+            workmux: Workmux::Release,
+            agents: Vec::new(),
+            devshell: None,
+            github_credentials: false,
+        };
+        let context = tempfile::tempdir().unwrap();
+
+        let without = prepare(&recipe, "api", "/sandbox/api", context.path()).unwrap();
+
+        let dockerfile = std::fs::read_to_string(context.path().join("Dockerfile")).unwrap();
+        assert!(dockerfile.contains("\nFROM base AS gitconfig\n"), "{dockerfile}");
+        assert!(!dockerfile.contains("git-credential-workmux"), "{dockerfile}");
+        assert!(!context.path().join("git-credential-workmux").exists());
+        assert_eq!(
+            std::fs::read_to_string(context.path().join("gitconfig")).unwrap(),
+            "# Added by workmux: OpenShell sandboxes reach github.com over HTTPS only.\n\
+             [url \"https://github.com/\"]\n\
+             \tinsteadOf = git@github.com:\n\
+             \tinsteadOf = ssh://git@github.com/\n"
+        );
+        let context = tempfile::tempdir().unwrap();
+        let with = prepare(
+            &Recipe {
+                github_credentials: true,
+                ..recipe
+            },
+            "api",
+            "/sandbox/api",
+            context.path(),
+        )
+        .unwrap();
+        assert_ne!(without, with);
     }
 
     #[test]
@@ -524,6 +704,7 @@ mod tests {
             workmux: Workmux::Source(source.path().to_path_buf()),
             agents: Vec::new(),
             devshell: None,
+            github_credentials: false,
         };
         let context = tempfile::tempdir().unwrap();
 
@@ -557,6 +738,7 @@ mod tests {
             workmux: Workmux::Release,
             agents: Vec::new(),
             devshell: Some(project.clone()),
+            github_credentials: false,
         };
 
         let first = prepare(&recipe, "api", "/sandbox/api", context.path()).unwrap();
@@ -589,18 +771,27 @@ mod contract {
 
     /// Run `argv` as the sandbox user in an image built from the recipe.
     fn run_in_image(workmux: Workmux, agents: &[&str], label: &str, argv: &[&str]) -> String {
-        let context = tempfile::tempdir().unwrap();
         let recipe = Recipe {
             base: None,
             workmux,
             agents: agents.iter().map(|a| a.to_string()).collect(),
             devshell: None,
+            github_credentials: false,
         };
+        run_recipe(&recipe, label, &[], argv)
+    }
+
+    /// Run `argv` as the sandbox user, with `env`, in an image built from
+    /// `recipe`.
+    fn run_recipe(recipe: &Recipe, label: &str, env: &[&str], argv: &[&str]) -> String {
+        let context = tempfile::tempdir().unwrap();
         let sandbox = format!("wm-c29-{label}-{:04x}", std::process::id() % 0x10000);
-        let tag = prepare(&recipe, &sandbox, "/sandbox/api", context.path()).unwrap();
+        let tag = prepare(recipe, &sandbox, "/sandbox/api", context.path()).unwrap();
         build(Path::new("docker"), context.path(), &tag).unwrap();
         let output = Command::new("docker")
-            .args(["run", "--rm", "--user", "1000", "-e", "HOME=/tmp", &tag])
+            .args(["run", "--rm", "--user", "1000", "-e", "HOME=/tmp"])
+            .args(env.iter().flat_map(|var| ["-e", var]))
+            .arg(&tag)
             .args(argv)
             .output()
             .unwrap();
@@ -655,5 +846,53 @@ mod contract {
         assert!(lines[0].contains("Claude Code"), "{out}");
         assert!(lines[1].starts_with("codex"), "{out}");
         assert_eq!(lines[2], "claude", "{out}");
+    }
+
+    /// An image whose `/etc/gitconfig` already names a credential helper
+    /// for github.com, as `gh auth setup-git` leaves it.
+    const IMAGE_WITH_GH_HELPER: &str = "wm-trellis-base:latest";
+
+    #[test]
+    fn git_in_the_image_gets_the_placeholder_and_rewrites_ssh_github_urls() {
+        if !enabled() {
+            return;
+        }
+        let has_base = Command::new("docker")
+            .args(["image", "inspect", IMAGE_WITH_GH_HELPER])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        let base = has_base.then(|| IMAGE_WITH_GH_HELPER.to_string());
+        let recipe = Recipe {
+            base,
+            workmux: Workmux::Release,
+            agents: Vec::new(),
+            devshell: None,
+            github_credentials: true,
+        };
+        let out = run_recipe(
+            &recipe,
+            "git",
+            &["GITHUB_TOKEN=ghp-placeholder"],
+            &[
+                "sh",
+                "-c",
+                "printf 'protocol=https\\nhost=github.com\\n\\n' | git credential fill \
+                 && git ls-remote --get-url git@github.com:me/api.git \
+                 && git ls-remote --get-url ssh://git@github.com/me/api.git",
+            ],
+        );
+        assert_eq!(
+            out,
+            "protocol=https\n\
+             host=github.com\n\
+             username=x-access-token\n\
+             password=ghp-placeholder\n\
+             https://github.com/me/api.git\n\
+             https://github.com/me/api.git",
+            "base: {:?}",
+            recipe.base
+        );
     }
 }
