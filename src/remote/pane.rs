@@ -164,9 +164,22 @@ impl SessionHolder {
         self.dir.join(project).join(worktree)
     }
 
-    /// Start `argv` in a new remote pane for `project`, in `workdir`.
-    /// The pane's worktree is the git worktree holding `workdir`.
+    /// [`create_with_env`](Self::create_with_env) with no added environment.
+    #[cfg(test)]
     pub fn create(&self, project: &str, workdir: &Path, argv: &[String]) -> Result<RemotePaneId> {
+        self.create_with_env(project, workdir, argv, &[])
+    }
+
+    /// Start `argv` in a new remote pane for `project`, in `workdir`, with
+    /// `env` added to its environment. The pane's worktree is the git
+    /// worktree holding `workdir`.
+    pub fn create_with_env(
+        &self,
+        project: &str,
+        workdir: &Path,
+        argv: &[String],
+        env: &[(&str, &str)],
+    ) -> Result<RemotePaneId> {
         if argv.is_empty() {
             bail!("no command for the remote pane");
         }
@@ -190,6 +203,7 @@ impl SessionHolder {
             .args(argv)
             .current_dir(workdir)
             .env(PANE_ENV, id.to_string())
+            .envs(env.iter().copied())
             .env_remove(super::forwarding::SOCKET_ENV)
             .env_remove(super::forwarding::SESSION_ENV)
             // The holder outlives this process: it must not hold our stdio.
@@ -400,34 +414,6 @@ impl SessionHolder {
             Some(None) => false,
             None => true,
         }
-    }
-
-    /// Type `input` into remote pane `id`, as a terminal attached to it
-    /// would.
-    pub fn push(&self, id: &RemotePaneId, input: &[u8]) -> Result<()> {
-        use std::io::Write;
-        let mut child = Command::new("dtach")
-            .arg("-p")
-            .arg(self.socket(id))
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .context("failed to run dtach")?;
-        child
-            .stdin
-            .take()
-            .expect("piped stdin")
-            .write_all(input)
-            .with_context(|| format!("failed to type into remote pane {id}"))?;
-        let output = child.wait_with_output()?;
-        if !output.status.success() {
-            bail!(
-                "typing into remote pane {id} failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-        Ok(())
     }
 
     /// The command that attaches this terminal to remote pane `id`. The

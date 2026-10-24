@@ -388,6 +388,31 @@ pub struct ForwardingMux {
     /// The remote pane each workstation pane this command made shows, so a
     /// respawn can end the one it replaces.
     panes: Mutex<HashMap<String, RemotePaneId>>,
+    /// Workstation panes this command made whose remote pane is a login
+    /// shell nothing has been typed into yet, with its workdir: a command
+    /// for one starts in a remote pane of its own instead of being typed.
+    fresh: Mutex<HashMap<String, PathBuf>>,
+}
+
+/// Environment carrying a pane's command to the shell that runs it.
+const PANE_COMMAND_ENV: &str = "WORKMUX_PANE_COMMAND";
+
+/// What a pane is started with while it awaits its command: a login shell
+/// that the command, once known, replaces (see [`ForwardingMux::send_keys`]).
+const AWAITS_COMMAND: &str = "# workmux: remote pane awaits its command";
+
+/// The handshake of a forwarding multiplexer: none is needed, since a
+/// command never goes to a pane's shell as keystrokes.
+struct AwaitCommand;
+
+impl crate::multiplexer::handshake::PaneHandshake for AwaitCommand {
+    fn wrapper_command(&self, _shell: &str) -> String {
+        AWAITS_COMMAND.to_string()
+    }
+
+    fn wait(self: Box<Self>) -> Result<()> {
+        Ok(())
+    }
 }
 
 impl ForwardingMux {
@@ -399,6 +424,7 @@ impl ForwardingMux {
             project,
             holder,
             panes: Mutex::new(HashMap::new()),
+            fresh: Mutex::new(HashMap::new()),
         }
     }
 
@@ -411,6 +437,7 @@ impl ForwardingMux {
             connection: Mutex::new(None),
             holder,
             panes: Mutex::new(HashMap::new()),
+            fresh: Mutex::new(HashMap::new()),
         }
     }
 
@@ -520,14 +547,36 @@ impl ForwardingMux {
         command: Option<&str>,
         request: impl FnOnce(RemotePaneId) -> MuxRequest,
     ) -> Result<String> {
+        self.attach_new_pane_with_env(workdir, command, &[], request)
+    }
+
+    /// [`attach_new_pane`](Self::attach_new_pane), with `env` added to the
+    /// remote pane's environment.
+    fn attach_new_pane_with_env(
+        &self,
+        workdir: &Path,
+        command: Option<&str>,
+        env: &[(&str, &str)],
+        request: impl FnOnce(RemotePaneId) -> MuxRequest,
+    ) -> Result<String> {
+        let shell_only = command.is_none_or(|script| script == AWAITS_COMMAND);
         let argv = match command {
-            Some(script) => ["sh", "-c", script].map(String::from).to_vec(),
-            None => vec![self.get_default_shell()?, "-l".to_string()],
+            Some(script) if !shell_only => ["sh", "-c", script].map(String::from).to_vec(),
+            _ => vec![self.get_default_shell()?, "-l".to_string()],
         };
-        let pane = self.holder.create(&self.project, workdir, &argv)?;
-        self.attach(pane.clone(), request).inspect_err(|_| {
+        let pane = self
+            .holder
+            .create_with_env(&self.project, workdir, &argv, env)?;
+        let pane_id = self.attach(pane.clone(), request).inspect_err(|_| {
             let _ = self.holder.kill(&pane);
-        })
+        })?;
+        let mut fresh = self.fresh.lock().unwrap();
+        if shell_only {
+            fresh.insert(pane_id.clone(), workdir.to_path_buf());
+        } else {
+            fresh.remove(&pane_id);
+        }
+        Ok(pane_id)
     }
 
     /// Forward the request that attaches a workstation pane to remote pane
@@ -942,6 +991,7 @@ impl Multiplexer for ForwardingMux {
     }
 
     fn send_text_fragment(&self, pane_id: &str, text: &str) -> Result<()> {
+        self.fresh.lock().unwrap().remove(pane_id);
         self.act(MuxRequest::SendText {
             pane_id: pane_id.to_string(),
             text: text.to_string(),
@@ -954,19 +1004,40 @@ impl Multiplexer for ForwardingMux {
         })
     }
 
-    /// A command for a pane this process started goes straight to its
-    /// remote pane, so it runs even while the workstation pane's view is
-    /// not attached (its first attach failed and it waits to reconnect,
-    /// reading keystrokes it would swallow).
+    /// A command for a pane this command made, still a fresh login shell,
+    /// starts in a remote pane of its own (an interactive login shell
+    /// running it, then a login shell) that replaces the fresh one. Typed,
+    /// it could be lost: to the shell still starting up, or to a
+    /// workstation view whose first attach failed.
     fn send_keys(&self, pane_id: &str, command: &str) -> Result<()> {
-        let remote = self.panes.lock().unwrap().get(pane_id).cloned();
-        match remote {
-            Some(remote) => self.holder.push(&remote, format!("{command}\r").as_bytes()),
-            None => {
-                self.send_text_fragment(pane_id, command)?;
-                self.send_enter(pane_id)
-            }
-        }
+        let fresh = self.fresh.lock().unwrap().remove(pane_id);
+        let Some(workdir) = fresh else {
+            self.send_text_fragment(pane_id, command)?;
+            return self.send_enter(pane_id);
+        };
+        // The command travels in the environment, so it shows in no command
+        // line but its own.
+        let shell = crate::shell::shell_quote(&self.get_default_shell()?);
+        let script = format!(
+            "exec {shell} -l -i -c {}",
+            crate::shell::shell_quote(&format!(
+                "command=${PANE_COMMAND_ENV}; unset {PANE_COMMAND_ENV}; eval \"$command\"\nexec {shell} -l"
+            ))
+        );
+        self.attach_new_pane_with_env(
+            &workdir,
+            Some(&script),
+            &[(PANE_COMMAND_ENV, command)],
+            |pane| MuxRequest::RespawnPane {
+                pane_id: pane_id.to_string(),
+                pane,
+            },
+        )
+        .map(drop)
+    }
+
+    fn create_handshake(&self) -> Result<Box<dyn crate::multiplexer::handshake::PaneHandshake>> {
+        Ok(Box::new(AwaitCommand))
     }
 
     fn send_key(&self, _pane_id: &str, _key: &str) -> Result<()> {
