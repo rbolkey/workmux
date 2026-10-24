@@ -404,10 +404,17 @@ pub struct PrListEntry {
 /// The `gh` arguments that pick the repository `source` names: none for a
 /// checkout, which `gh` reads from its working directory.
 fn repo_args(source: &RepoSource) -> Result<Vec<String>> {
+    repo_args_with(source, resolve_ssh_host)
+}
+
+fn repo_args_with(
+    source: &RepoSource,
+    resolve_ssh_host: impl Fn(&str) -> Option<String>,
+) -> Result<Vec<String>> {
     Ok(match source {
         RepoSource::Checkout(_) => Vec::new(),
         RepoSource::GitUrl(url) => {
-            let (owner, name, hostname) = url_repo_context(url)?;
+            let (owner, name, hostname) = url_repo_context_with(url, resolve_ssh_host)?;
             vec!["--repo".to_string(), format!("{hostname}/{owner}/{name}")]
         }
     })
@@ -699,18 +706,19 @@ fn list_branch_summaries_for_url(
     git_url: &str,
     branches: &[String],
 ) -> Result<HashMap<String, BranchSummary>> {
-    list_branch_summaries_for_url_with(git_url, branches, &mut run_graphql)
+    list_branch_summaries_for_url_with(git_url, branches, resolve_ssh_host, &mut run_graphql)
 }
 
 fn list_branch_summaries_for_url_with(
     git_url: &str,
     branches: &[String],
+    resolve_ssh_host: impl Fn(&str) -> Option<String>,
     run: &mut impl FnMut(&str, &[u8]) -> Result<GraphqlCommandResponse>,
 ) -> Result<HashMap<String, BranchSummary>> {
     if branches.is_empty() {
         return Ok(HashMap::new());
     }
-    let (owner, name, hostname) = url_repo_context(git_url)?;
+    let (owner, name, hostname) = url_repo_context_with(git_url, resolve_ssh_host)?;
     let remote = RemoteQuery {
         hostname,
         owner,
@@ -726,16 +734,60 @@ fn list_branch_summaries_for_url_with(
 
 /// Owner, name and API hostname of the repository at `git_url`.
 fn url_repo_context(git_url: &str) -> Result<ResolvedRepoContext> {
+    url_repo_context_with(git_url, resolve_ssh_host)
+}
+
+fn url_repo_context_with(
+    git_url: &str,
+    resolve_ssh_host: impl Fn(&str) -> Option<String>,
+) -> Result<ResolvedRepoContext> {
     let identity = crate::git::parse_repo_identity_from_git_url(git_url)
         .ok_or_else(|| anyhow!("cannot tell the GitHub repository of {git_url}"))?;
     // An ssh:// URL may carry a port; the API host never does.
-    let hostname = identity
-        .host
-        .split(':')
-        .next()
-        .unwrap_or(&identity.host)
-        .to_string();
+    let host = identity.host.split(':').next().unwrap_or(&identity.host);
+    // An SSH URL's host may be an SSH config alias (`git@github-work:…`)
+    // that only `ssh` knows the real host of.
+    let is_ssh = git_url.starts_with("git@") || git_url.starts_with("ssh://");
+    let mut hostname = is_ssh
+        .then(|| resolve_ssh_host(host))
+        .flatten()
+        .unwrap_or_else(|| host.to_string());
+    // GitHub's SSH-over-HTTPS endpoint serves github.com's repositories.
+    if hostname == "ssh.github.com" {
+        hostname = "github.com".to_string();
+    }
     Ok((identity.owner, identity.repo, hostname))
+}
+
+static SSH_HOST_CACHE: OnceLock<Mutex<HashMap<String, Option<String>>>> = OnceLock::new();
+
+/// The real hostname SSH connects to for `host`, from `ssh -G`, which reads
+/// the SSH config without connecting. Resolved once per host.
+fn resolve_ssh_host(host: &str) -> Option<String> {
+    let cache = SSH_HOST_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(cache) = cache.lock()
+        && let Some(hostname) = cache.get(host)
+    {
+        return hostname.clone();
+    }
+    let hostname = Command::new("ssh")
+        .args(["-G", "--", host])
+        .stdin(Stdio::null())
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| parse_ssh_g_hostname(&String::from_utf8_lossy(&output.stdout)));
+    if let Ok(mut cache) = cache.lock() {
+        cache.insert(host.to_string(), hostname.clone());
+    }
+    hostname
+}
+
+fn parse_ssh_g_hostname(output: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        line.strip_prefix("hostname ")
+            .map(|hostname| hostname.trim().to_string())
+    })
 }
 
 fn repo_context_of(source: &RepoSource) -> Result<ResolvedRepoContext> {
@@ -2148,17 +2200,81 @@ mod tests {
         );
     }
 
+    /// An SSH config with no aliases, so unit tests never run the real `ssh -G`.
+    fn no_ssh_alias(_: &str) -> Option<String> {
+        None
+    }
+
     #[test]
     fn gh_is_pointed_at_a_registered_git_urls_repository() {
         assert_eq!(
-            repo_args(&RepoSource::GitUrl("git@github.com:me/api.git".to_string())).unwrap(),
+            repo_args_with(
+                &RepoSource::GitUrl("git@github.com:me/api.git".to_string()),
+                no_ssh_alias
+            )
+            .unwrap(),
             ["--repo", "github.com/me/api"]
         );
         assert!(
-            repo_args(&RepoSource::Checkout(PathBuf::from("/src/api")))
-                .unwrap()
-                .is_empty()
+            repo_args_with(
+                &RepoSource::Checkout(PathBuf::from("/src/api")),
+                no_ssh_alias
+            )
+            .unwrap()
+            .is_empty()
         );
+    }
+
+    #[test]
+    fn a_git_urls_ssh_host_alias_is_resolved_to_its_real_host() {
+        let resolve = |alias: &str| (alias == "github-work").then(|| "github.com".to_string());
+        assert_eq!(
+            url_repo_context_with("git@github-work:org/repo.git", resolve).unwrap(),
+            (
+                "org".to_string(),
+                "repo".to_string(),
+                "github.com".to_string()
+            )
+        );
+        assert_eq!(
+            url_repo_context_with("ssh://git@github-work:22/org/repo.git", resolve).unwrap(),
+            (
+                "org".to_string(),
+                "repo".to_string(),
+                "github.com".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn an_https_git_urls_host_is_not_an_ssh_alias() {
+        let resolve = |_: &str| -> Option<String> { panic!("https hosts are not SSH aliases") };
+        assert_eq!(
+            url_repo_context_with("https://github.com/org/repo.git", resolve).unwrap(),
+            (
+                "org".to_string(),
+                "repo".to_string(),
+                "github.com".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn githubs_ssh_over_https_host_resolves_to_github() {
+        let resolve = |_: &str| Some("ssh.github.com".to_string());
+        assert_eq!(
+            url_repo_context_with("git@github-443:org/repo.git", resolve)
+                .unwrap()
+                .2,
+            "github.com"
+        );
+    }
+
+    #[test]
+    fn ssh_g_output_names_the_real_hostname() {
+        let output = "user git\nhostname github.com\nport 22\n";
+        assert_eq!(parse_ssh_g_hostname(output), Some("github.com".to_string()));
+        assert_eq!(parse_ssh_g_hostname("user git\n"), None);
     }
 
     #[test]
@@ -2167,6 +2283,7 @@ mod tests {
         let summaries = list_branch_summaries_for_url_with(
             "ssh://git@github.example.com:22/me/api.git",
             &["feature".to_string()],
+            no_ssh_alias,
             &mut |hostname, body| {
                 let request: serde_json::Value = serde_json::from_slice(body).unwrap();
                 asked.push((
