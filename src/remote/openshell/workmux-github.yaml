@@ -1,0 +1,50 @@
+# The profile of the provider `--github host` attaches: the workstation's
+# `gh` login, with what that login can do on GitHub. Unlike OpenShell's
+# stock `github` profile, it allows push (git-receive-pack) and read-write
+# REST and GraphQL, so agents can push branches and open pull requests.
+# workmux imports it into the gateway when it is missing or differs.
+id: workmux-github
+display_name: GitHub (workmux, gh login)
+description: GitHub API and Git operations with the workstation's gh login, including push and pull requests
+category: source_control
+credentials:
+  - name: api_token
+    description: The workstation's gh token
+    env_vars: [GITHUB_TOKEN, GH_TOKEN]
+    required: true
+    auth_style: bearer
+    header_name: authorization
+discovery:
+  credentials: [api_token]
+endpoints:
+  - host: api.github.com
+    port: 443
+    protocol: rest
+    access: read-write
+    enforcement: enforce
+  - host: api.github.com
+    port: 443
+    path: /graphql
+    protocol: graphql
+    access: read-write
+    enforcement: enforce
+  - host: github.com
+    port: 443
+    protocol: rest
+    enforcement: enforce
+    rules:
+      - allow: {method: GET, path: "**"}
+      - allow: {method: HEAD, path: "**"}
+      - allow: {method: OPTIONS, path: "**"}
+      - allow: {method: POST, path: /**/git-upload-pack}
+      - allow: {method: POST, path: /**/git-receive-pack}
+# git's git-remote-https helper matches by ancestry. A baked flake devshell
+# has nix's git (the real binary) and gh (a wrapper that execs .gh-wrapped).
+binaries:
+  - /usr/bin/gh
+  - /usr/local/bin/gh
+  - /usr/bin/git
+  - /usr/local/bin/git
+  - /nix/store/*-git-*/bin/git
+  - /nix/store/*-gh-*/bin/gh
+  - /nix/store/*-gh-*/bin/.gh-wrapped

@@ -420,3 +420,65 @@ def test_a_private_ssh_github_repo_clones_over_https_with_the_providers_credenti
     assert f"repo:     {https} (rewritten from SSH: {ssh})" in status, status
     for url in [ssh, f"ssh://git@github.com/{PRIVATE_REPO}.git"]:
         assert "HEAD" in project.sh(f"git ls-remote {shlex.quote(url)} HEAD")
+
+
+@pytest.fixture
+def gh_login(project: Project):
+    """The workstation's real `gh` login, which the isolated HOME can't
+    reach: a `gh` on PATH runs the real one with the real HOME (it holds no
+    token). The provider and profile workmux creates on the gateway are
+    deleted afterwards, after the project's sandbox, unless they were
+    there before."""
+    if not PRIVATE_REPO:
+        pytest.skip("set WORKMUX_TEST_OPENSHELL_PRIVATE_REPO=<owner>/<repo>")
+    gh = shutil.which("gh")
+    if not gh or subprocess.run([gh, "auth", "token"], capture_output=True).returncode:
+        pytest.skip("needs a `gh` login on the workstation")
+    shims = Path(tempfile.mkdtemp(prefix="wm-"))
+    (shims / "gh").write_text(
+        f'#!/bin/sh\nHOME={shlex.quote(str(Path.home()))} exec {shlex.quote(gh)} "$@"\n'
+    )
+    (shims / "gh").chmod(0o755)
+    project.tmp["PATH"] = f"{shims}:{os.environ['PATH']}"
+    provider_there = openshell(["provider", "get", "workmux-gh-host"]).returncode == 0
+    profile_there = (
+        "workmux-github"
+        in openshell(["provider", "profile", "list", "-o", "json"]).stdout
+    )
+    try:
+        yield
+    finally:
+        project.clean_up()
+        if not provider_there:
+            openshell(["provider", "delete", "workmux-gh-host"])
+        if not profile_there:
+            openshell(["provider", "profile", "delete", "--global", "workmux-github"])
+        shutil.rmtree(shims, ignore_errors=True)
+
+
+def test_a_projects_sandbox_gets_the_workstations_gh_login(
+    project: Project, gh_login: None
+):
+    """`--github host` needs only a `gh` login: workmux keeps its token in a
+    gateway provider of its own full-access profile, so the first-use clone
+    of a private repository succeeds and push is authorised."""
+    https = f"https://github.com/{PRIVATE_REPO}.git"
+    added = project.wm(
+        f"project add {project.name} --openshell --github host --repo {https} "
+        f"--image {LEARNING_IMAGE}"
+    )
+    assert "the sandbox gets your gh login's GitHub access" in added.stdout, (
+        added.stdout
+    )
+    project.wm(f"remote start {project.name}", timeout=900.0)
+    project.wm(f"list --project {project.name}", timeout=300.0)
+
+    assert project.sh(f"git -C /sandbox/{project.name} rev-parse --verify HEAD")
+    # An empty, no-op push, as git's child: 200 is authorised, 401 is not.
+    probe = (
+        "curl -s -o /dev/null -w %{http_code} -X POST -u x-access-token:$GH_TOKEN "
+        "-H 'Content-Type: application/x-git-receive-pack-request' "
+        f"--data-binary 0000 {https}/git-receive-pack"
+    )
+    pushed = project.sh(f"git -c alias.probe={shlex.quote('!' + probe)} probe")
+    assert pushed == "200", pushed
