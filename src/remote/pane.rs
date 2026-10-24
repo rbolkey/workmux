@@ -27,6 +27,10 @@ pub const PANE_ENV: &str = "WORKMUX_REMOTE_PANE";
 /// bytes on macOS and 108 on Linux.
 const MAX_SOCKET_PATH: usize = 100;
 
+/// What the session holder writes to a client once it is attached (dtach
+/// clears the screen), before the remote pane's own output.
+pub const ATTACHED: &[u8] = b"\x1b[H\x1b[J";
+
 /// Terminal type for a remote pane whose creator had none: the holder starts
 /// before any workstation terminal attaches.
 const DEFAULT_TERM: &str = "xterm-256color";

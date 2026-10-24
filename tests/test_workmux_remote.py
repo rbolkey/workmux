@@ -1305,13 +1305,23 @@ def test_remote_panes_survive_drops_and_reattach(
 ):
     """An agent pane runs on the remote inside the session holder. Killing the
     transport's attach process leaves the agent running: the workstation pane
-    shows the reconnecting screen, reattaches on its own and redraws. "r"
-    retries at once, "q" closes the view but not the remote pane, and the pane
-    closes once the agent itself exits."""
+    shows the reconnecting screen, reattaches on its own and redraws, however
+    long the attach takes. "r" retries at once, "q" closes the view but not
+    the remote pane, and the pane closes once the agent itself exits."""
     env = mux_server
     assert isinstance(env, TmuxEnvironment)
     agent = remote_root / "fake_tui.py"
     agent.write_text(FAKE_TUI)
+    # While `slow` exists, attaching to the session holder takes longer than
+    # any fixed redraw delay would wait (a passphrase prompt, a slow link).
+    slow = remote_root / "slow"
+    shim = env.fake_bin_dir / "dtach"
+    shim.write_text(
+        "#!/bin/sh\n"
+        f'[ "$1" = -a ] && [ -e {slow} ] && sleep 4\n'
+        f'exec {shutil.which("dtach")} "$@"\n'
+    )
+    shim.chmod(0o755)
     agent_pattern = str(agent)
     origin = make_origin(
         env,
@@ -1379,6 +1389,14 @@ def test_remote_panes_survive_drops_and_reattach(
         drop()
         env.tmux(["send-keys", "-t", pane, "r"])
         shows(f"FAKE-TUI rows={rows} key=x", timeout=1.5)
+
+        # A slow reattach still redraws, once it is through.
+        slow.write_text("")
+        drop()
+        env.tmux(["send-keys", "-t", pane, "r"])
+        shows(f"FAKE-TUI rows={rows} key=x", timeout=10)
+        shows("FAKE-TUI-FOOTER")
+        slow.unlink()
 
         # "q" closes the workstation pane; the remote pane keeps running.
         drop()
