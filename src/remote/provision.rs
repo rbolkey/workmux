@@ -54,7 +54,8 @@ pub const BAKED_DEVSHELL: &str = "/usr/local/bin/workmux-devshell";
 pub enum Devshell {
     /// nix is (or gets) installed, and agents start in `nix develop`.
     Nix,
-    /// The image carries the project's devshell closure (ticket 21);
+    /// The image carries the project's devshell closure, built on the
+    /// workstation;
     /// nothing is installed or built on the remote.
     Baked,
     /// An OpenShell sandbox without a baked devshell: nix can neither be

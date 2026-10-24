@@ -2,7 +2,7 @@
 //! (ADR 0003). A workstation pane is only a view onto one, attached through
 //! the transport's TTY exec.
 //!
-//! The session holder is dtach (ticket 02): one `dtach -n` master per remote
+//! The session holder is dtach: one `dtach -n` master per remote
 //! pane, its socket at `<state dir>/panes/<project>/<worktree>/<slot>.sock`.
 //! A remote pane is named by its project, worktree and pane slot, written
 //! `<project>/<worktree>/<slot>`; the name is also its socket's path under

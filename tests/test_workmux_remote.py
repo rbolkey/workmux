@@ -1660,7 +1660,7 @@ def test_reap_agents_reaps_aged_agents_on_the_remote(
 ):
     """`reap-agents` lists, and with --force exits, agents on a remote that
     have been idle past the threshold, reporting them as it does local ones.
-    An agent's age comes from its status file (ticket 11) when its hooks
+    An agent's age comes from its status file (ADR 0002, remote status via files) when its hooks
     wrote one, else from its terminal's idle time. A recently active agent
     is left alone, and a reaped agent's pane stays open."""
     env = mux_server

@@ -1,7 +1,7 @@
 //! The image an OpenShell project sandbox runs, built with `docker build` on
-//! the workstation before create (ticket 01): the project's image, or
+//! the workstation before create: the project's image, or
 //! workmux's default, plus remote workmux and, for a flake project, the
-//! devshell's closure baked into `/nix` (ticket 21). Nothing is installed
+//! devshell's closure baked into `/nix`. Nothing is installed
 //! or built inside the sandbox.
 
 use anyhow::{Context, Result, bail};

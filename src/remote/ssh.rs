@@ -148,8 +148,9 @@ impl Transport for Ssh {
     }
 }
 
-/// Contract tests, env-gated like ticket 03's learning tests and run against
-/// the same user-mode `sshd` harness: `WORKMUX_TEST_SSH=1`.
+/// Contract tests, env-gated like the SSH learning tests
+/// (`src/ssh_learning`) and run against the same user-mode `sshd` harness:
+/// `WORKMUX_TEST_SSH=1`.
 #[cfg(test)]
 mod tests {
     use super::*;

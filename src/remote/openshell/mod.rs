@@ -3,8 +3,8 @@
 //! image, policy and providers come from the project's settings), starts it
 //! when a command needs it, and stops or deletes it only when asked.
 //!
-//! Observed behaviour this relies on is pinned by ticket 01's and ticket
-//! 21's learning tests: names of at most 19 characters, `--detach` at
+//! Observed behaviour this relies on is pinned by the OpenShell learning
+//! tests (`tests/test_openshell_learning.py`): names of at most 19 characters, `--detach` at
 //! create, exec with `--no-login-shell`, the workload running as uid 1000
 //! with `HOME` and workdir `/sandbox`, and policy changes that apply in
 //! place only when they widen a grant.
@@ -748,8 +748,8 @@ mod tests {
     }
 }
 
-/// Contract tests against a real OpenShell gateway, env-gated like ticket
-/// 01's learning tests: `WORKMUX_TEST_OPENSHELL=1`. Each test owns one
+/// Contract tests against a real OpenShell gateway, env-gated like the
+/// OpenShell learning tests: `WORKMUX_TEST_OPENSHELL=1`. Each test owns one
 /// `wm-c20-…` sandbox and deletes it.
 #[cfg(test)]
 mod contract {
