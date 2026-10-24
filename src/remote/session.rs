@@ -67,6 +67,9 @@ pub struct ProjectSite {
     /// from the remote's home directory.
     pub path: String,
     pub git_url: Option<String>,
+    /// The SSH URL `git_url` was rewritten from, shown beside it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_git_url: Option<String>,
     /// Workstation session for the project's windows in window mode; `None`
     /// places them in the invoking session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -503,7 +506,8 @@ fn ensure_cloned(
     emit(
         Stream::Stderr,
         format!(
-            "Cloning {git_url} into {} on {}\n",
+            "Cloning {} into {} on {}\n",
+            crate::remote::openshell::repo::describe(git_url, project.ssh_git_url.as_deref()),
             path.display(),
             project.remote
         )
@@ -723,6 +727,7 @@ mod tests {
                 name: "api".to_string(),
                 path: path.display().to_string(),
                 git_url: git_url.map(|url| url.display().to_string()),
+                ssh_git_url: None,
                 session: None,
             },
             argv: ["sh", "-c", script].map(String::from).to_vec(),
@@ -995,6 +1000,30 @@ mod tests {
         assert!(
             captured.stderr.contains(&format!(
                 "Cloning {} into {} on devbox",
+                origin.display(),
+                path.display()
+            )),
+            "{}",
+            captured.stderr
+        );
+    }
+
+    #[test]
+    fn a_first_use_clone_shows_the_ssh_url_its_https_url_was_rewritten_from() {
+        let temp = tempfile::tempdir().unwrap();
+        let origin = temp.path().join("origin");
+        std::fs::create_dir(&origin).unwrap();
+        crate::test_support::init_repo(&origin);
+        let path = temp.path().join("api");
+        let mut request = request(&path, Some(&origin), "true");
+        request.project.ssh_git_url = Some("git@github.com:me/api.git".to_string());
+
+        let (exit, captured) = run(&request, |_| {});
+
+        assert_eq!(exit.unwrap(), 0);
+        assert!(
+            captured.stderr.contains(&format!(
+                "Cloning {} (rewritten from SSH: git@github.com:me/api.git) into {} on devbox",
                 origin.display(),
                 path.display()
             )),

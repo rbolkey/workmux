@@ -12,6 +12,7 @@
 pub mod agents;
 pub mod image;
 pub mod policy;
+pub mod repo;
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::Value;
@@ -241,17 +242,41 @@ impl OpenShell {
         ))
     }
 
+    /// The attached providers that give git credentials for github.com.
+    pub fn github_providers(&self) -> Result<Vec<String>> {
+        let Some(origin) = &self.origin else {
+            return Ok(Vec::new());
+        };
+        let attached = &origin.settings.providers;
+        if attached.is_empty() {
+            return Ok(Vec::new());
+        }
+        let providers = self.providers()?;
+        Ok(attached
+            .iter()
+            .filter(|name| {
+                providers
+                    .get(*name)
+                    .is_some_and(agents::Provider::gives_github)
+            })
+            .cloned()
+            .collect())
+    }
+
     /// Every provider on the gateway by name, with the binaries its
     /// profile allows.
     fn providers(&self) -> Result<std::collections::BTreeMap<String, agents::Provider>> {
         let output = self.run(&["provider", "profile", "list", "-o", "json"])?;
         let profiles: Value = serde_json::from_slice(&output.stdout)
             .context("openshell sent an unreadable profile list")?;
-        let binaries = |provider_type: &str| {
+        let profile = |provider_type: &str| {
             profiles
                 .as_array()?
                 .iter()
-                .find(|profile| profile["id"] == provider_type)?["binaries"]
+                .find(|profile| profile["id"] == provider_type)
+        };
+        let binaries = |provider_type: &str| {
+            profile(provider_type)?["binaries"]
                 .as_array()
                 .map(|binaries| {
                     binaries
@@ -259,6 +284,16 @@ impl OpenShell {
                         .filter_map(|binary| Some(binary.as_str()?.to_string()))
                         .collect()
                 })
+        };
+        let hosts = |provider_type: &str| {
+            profile(provider_type).map(|profile| {
+                profile["endpoints"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|endpoint| Some(endpoint["host"].as_str()?.to_string()))
+                    .collect()
+            })
         };
         let mut providers = std::collections::BTreeMap::new();
         let mut token = String::new();
@@ -277,6 +312,7 @@ impl OpenShell {
                     agents::Provider {
                         provider_type: provider_type.to_string(),
                         binaries: binaries(provider_type),
+                        hosts: hosts(provider_type),
                     },
                 );
             }
@@ -287,12 +323,30 @@ impl OpenShell {
         }
     }
 
+    /// Whether the image's git gets a credential helper for github.com.
+    /// When the providers can't be looked up it does: the helper hands git
+    /// only the placeholder already in the sandbox's environment.
+    fn github_credentials(&self) -> bool {
+        self.github_providers().map_or_else(
+            |error| {
+                eprintln!(
+                    "warning: could not check which providers give GitHub credentials ({error:#}); \
+                     the sandbox image gets git's credential helper for github.com anyway"
+                );
+                true
+            },
+            |providers| !providers.is_empty(),
+        )
+    }
+
     /// Build the sandbox's image, returning its tag.
     fn build_image(&self, origin: &OpenshellRemote, context: &std::path::Path) -> Result<String> {
         let checkout = context.join("project");
+        // The workstation has SSH: clone the way the user gave the URL.
         let devshell = origin
-            .git_url
+            .ssh_git_url
             .as_deref()
+            .or(origin.git_url.as_deref())
             .is_some_and(|url| self.fetch_flake(url, &checkout))
             .then_some(checkout);
         let workmux = image::Workmux::current();
@@ -307,6 +361,7 @@ impl OpenShell {
             workmux,
             agents: origin.agents.clone(),
             devshell,
+            github_credentials: self.github_credentials(),
         };
         let tag = image::prepare(&recipe, &self.sandbox, &sandbox_path(&origin.path), context)?;
         image::build(&self.docker, context, &tag)?;
@@ -603,6 +658,7 @@ mod tests {
         OpenshellRemote {
             project: "api".to_string(),
             git_url: None,
+            ssh_git_url: None,
             path: "~/api".to_string(),
             settings: OpenshellProject {
                 providers: vec!["github".to_string(), "anthropic".to_string()],
@@ -821,6 +877,44 @@ mod tests {
     }
 
     #[test]
+    fn github_credentials_come_from_providers_whose_profile_reaches_github() {
+        let fake = FakeOpenShell::new();
+        let dir = fake.dir.path();
+        std::fs::write(
+            dir.join("providers"),
+            r#"{"next_page_token":"","providers":[
+                {"name":"work","type":"github-dev"},
+                {"name":"stock","type":"github"},
+                {"name":"anthropic","type":"claude-code"},
+                {"name":"unused","type":"github-dev"}]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("profiles"),
+            r#"[{"id":"github-dev","binaries":["/usr/bin/git"],
+                 "endpoints":[{"host":"api.github.com","port":443},{"host":"github.com","port":443}]},
+                {"id":"claude-code","binaries":["/usr/local/bin/claude"],
+                 "endpoints":[{"host":"api.anthropic.com","port":443}]}]"#,
+        )
+        .unwrap();
+        let mut origin = origin();
+        // `stock`'s profile is not installed: its stock type is enough.
+        origin.settings.providers = ["anthropic", "work", "stock"].map(String::from).to_vec();
+
+        let github = fake.transport(Some(origin)).github_providers().unwrap();
+
+        assert_eq!(github, ["work", "stock"]);
+        let mut origin = self::origin();
+        origin.settings.providers.clear();
+        assert!(
+            fake.transport(Some(origin))
+                .github_providers()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn a_registered_sandbox_without_a_project_is_never_created() {
         let fake = FakeOpenShell::new();
 
@@ -960,6 +1054,7 @@ mod contract {
         let origin = OpenshellRemote {
             project: name.clone(),
             git_url: None,
+            ssh_git_url: None,
             path: "~/api".to_string(),
             settings: crate::config::OpenshellProject {
                 image: Some(fixture_image()),

@@ -21,7 +21,7 @@ The repository is cloned on the remote by the first command that needs it.
 
 - `--remote <remote>`: Remote the project lives on. It must already be registered with [`remote add`](/reference/commands/remote/).
 - `--openshell`: Give the project its own OpenShell sandbox as its remote, created on first use.
-- `--repo <url>`: Git URL the remote clones the project from.
+- `--repo <url>`: Git URL the remote clones the project from. For an OpenShell project, an SSH URL on github.com is stored as its HTTPS form, because [OpenShell sandboxes don't support SSH](/guide/remote-projects/openshell/#ssh-is-not-supported-in-openshell-sandboxes); an SSH URL on another host is refused.
 - `--path <path>`: Path of the clone on the remote. Default: `~/<name>`. `~` and relative paths resolve against the remote's home.
 - `--session <name>`: Workstation session for the project's windows. Default: the project name.
 - `--placement <project-session|current-session>`: Where the project's windows go in window mode. Default: `project-session`.

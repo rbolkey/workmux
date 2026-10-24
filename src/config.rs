@@ -1075,6 +1075,8 @@ pub struct OpenshellRemote {
     /// The project the sandbox belongs to.
     pub project: String,
     pub git_url: Option<String>,
+    /// The SSH URL `git_url` was rewritten from.
+    pub ssh_git_url: Option<String>,
     /// Path of the project's clone in the sandbox.
     pub path: String,
     pub settings: OpenshellProject,
@@ -1161,6 +1163,11 @@ pub struct ProjectEntry {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_url: Option<String>,
+
+    /// The SSH URL `project add` was given for an OpenShell project, whose
+    /// HTTPS form `git_url` is: the sandbox has no SSH.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_git_url: Option<String>,
 
     /// Path of the project's clone on the remote.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3266,6 +3273,7 @@ impl Config {
                     openshell: Some(OpenshellRemote {
                         project: name.clone(),
                         git_url: entry.git_url.clone(),
+                        ssh_git_url: entry.ssh_git_url.clone(),
                         path: entry.path.clone().unwrap_or_else(|| format!("~/{name}")),
                         settings: settings.clone(),
                         agents: if settings.agents.is_empty() {

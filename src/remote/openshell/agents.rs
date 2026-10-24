@@ -79,9 +79,22 @@ pub struct Provider {
     /// The binaries its profile lets reach the profile's endpoints, or
     /// `None` when the profile could not be found.
     pub binaries: Option<Vec<String>>,
+    /// The hosts of its profile's endpoints, or `None` when the profile
+    /// could not be found.
+    pub hosts: Option<Vec<String>>,
 }
 
 impl Provider {
+    /// Whether the provider gives git credentials for github.com: its
+    /// profile reaches github.com, or, with no profile to go by, it is of
+    /// OpenShell's stock `github` type.
+    pub fn gives_github(&self) -> bool {
+        match &self.hosts {
+            Some(hosts) => hosts.iter().any(|host| host == "github.com"),
+            None => self.provider_type == "github",
+        }
+    }
+
     /// Whether the provider gives `agent` its credentials: its profile
     /// allows the agent's binary, or, with no profile to go by, it is of
     /// the agent's stock type.
@@ -168,6 +181,7 @@ mod tests {
         Provider {
             provider_type: provider_type.to_string(),
             binaries: binaries.map(names),
+            hosts: None,
         }
     }
 

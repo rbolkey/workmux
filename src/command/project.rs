@@ -73,45 +73,59 @@ pub struct AddArgs {
 pub fn run(args: ProjectArgs) -> Result<()> {
     match args.command {
         ProjectCommand::Add(args) => {
-            let AddArgs {
-                name,
-                remote,
-                openshell,
-                image,
-                policy,
-                providers,
-                agents,
-                sandbox,
-                repo,
-                path,
-                session,
-                placement,
-            } = *args;
-            let openshell = if openshell {
-                Some(OpenshellProject {
-                    sandbox,
-                    image,
-                    policy: policy.map(absolute_policy).transpose()?,
-                    providers,
-                    agents,
-                })
-            } else {
-                None
-            };
-            add(
-                &name,
-                ProjectEntry {
-                    path: Some(path.unwrap_or_else(|| format!("~/{name}"))),
-                    remote,
-                    git_url: Some(repo),
-                    session,
-                    placement,
-                    openshell,
-                },
-            )
+            let name = args.name.clone();
+            add(&name, project_entry(*args)?)
         }
         ProjectCommand::Rm { name, yes } => rm(&name, yes),
     }
+}
+
+/// The global config entry for `project add`'s arguments. An OpenShell
+/// project's SSH `--repo` on github.com is stored as its HTTPS form, with
+/// the original beside it; on another host, it is refused.
+fn project_entry(args: AddArgs) -> Result<ProjectEntry> {
+    let AddArgs {
+        name,
+        remote,
+        openshell,
+        image,
+        policy,
+        providers,
+        agents,
+        sandbox,
+        repo,
+        path,
+        session,
+        placement,
+    } = args;
+    let (git_url, ssh_git_url) = match openshell
+        .then(|| crate::remote::openshell::repo::https_for_ssh(&repo))
+        .transpose()?
+        .flatten()
+    {
+        Some(https) => (https, Some(repo)),
+        None => (repo, None),
+    };
+    let openshell = if openshell {
+        Some(OpenshellProject {
+            sandbox,
+            image,
+            policy: policy.map(absolute_policy).transpose()?,
+            providers,
+            agents,
+        })
+    } else {
+        None
+    };
+    Ok(ProjectEntry {
+        path: Some(path.unwrap_or_else(|| format!("~/{name}"))),
+        remote,
+        git_url: Some(git_url),
+        ssh_git_url,
+        session,
+        placement,
+        openshell,
+    })
 }
 
 /// A policy file's absolute path, so the project resolves it from anywhere.
@@ -143,6 +157,17 @@ fn add(name: &str, project: ProjectEntry) -> Result<()> {
         let remote = &config.remotes[name];
         let sandbox =
             crate::remote::openshell::OpenShell::new(&remote.target, remote.openshell.clone());
+        if project.ssh_git_url.is_some() {
+            let github = sandbox
+                .github_providers()
+                .map_err(|error| format!("{error:#}"));
+            println!(
+                "Note: {}",
+                crate::remote::openshell::repo::ssh_notice(
+                    github.as_deref().map_err(String::as_str)
+                )
+            );
+        }
         if let Some(report) = sandbox.agent_report() {
             for note in report.notes {
                 println!("Agent {note}");
@@ -243,6 +268,7 @@ remotes:
         ProjectEntry {
             remote: Some("devbox".to_string()),
             git_url: Some("git@github.com:me/api.git".to_string()),
+            ssh_git_url: None,
             path: Some("~/code/api".to_string()),
             session: None,
             placement: Some(ProjectPlacement::CurrentSession),
@@ -339,6 +365,53 @@ remotes:
         assert_eq!(
             error.to_string(),
             "project api is an OpenShell project, whose sandbox is its remote; remove both with: workmux remote rm api"
+        );
+    }
+
+    fn add_args(repo: &str, openshell: bool) -> AddArgs {
+        AddArgs {
+            name: "api".to_string(),
+            remote: (!openshell).then(|| "devbox".to_string()),
+            openshell,
+            image: None,
+            policy: None,
+            providers: Vec::new(),
+            agents: Vec::new(),
+            sandbox: None,
+            repo: repo.to_string(),
+            path: None,
+            session: None,
+            placement: None,
+        }
+    }
+
+    #[test]
+    fn an_openshell_projects_ssh_github_repo_is_stored_as_https_with_its_original() {
+        let entry = project_entry(add_args("git@github.com:me/api.git", true)).unwrap();
+
+        assert_eq!(
+            entry.git_url.as_deref(),
+            Some("https://github.com/me/api.git")
+        );
+        assert_eq!(
+            entry.ssh_git_url.as_deref(),
+            Some("git@github.com:me/api.git")
+        );
+        // An SSH remote speaks SSH.
+        let entry = project_entry(add_args("git@github.com:me/api.git", false)).unwrap();
+        assert_eq!(entry.git_url.as_deref(), Some("git@github.com:me/api.git"));
+        assert_eq!(entry.ssh_git_url, None);
+    }
+
+    #[test]
+    fn an_openshell_projects_ssh_repo_on_another_host_is_refused() {
+        let error = project_entry(add_args("git@gitlab.com:me/api.git", true)).unwrap_err();
+
+        assert!(
+            error.to_string().contains(
+                "OpenShell sandboxes don't support: they reach git hosts over HTTPS only"
+            ),
+            "{error}"
         );
     }
 
