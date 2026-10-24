@@ -1024,6 +1024,7 @@ def test_remote_merge_merges_in_the_remotes_clone_without_pushing(
             os.kill(daemon_pid, signal.SIGTERM)
 
 
+@requires_dtach
 @pytest.mark.tmux_only
 def test_commands_that_would_open_an_editor_refuse_for_a_remote_project(
     mux_server: MuxEnvironment,
@@ -1103,6 +1104,7 @@ def test_commands_that_would_open_an_editor_refuse_for_a_remote_project(
             os.kill(daemon_pid, signal.SIGTERM)
 
 
+@requires_dtach
 @pytest.mark.tmux_only
 def test_a_prompt_file_is_read_on_the_workstation_for_a_remote_project(
     mux_server: MuxEnvironment,
