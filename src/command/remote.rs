@@ -394,7 +394,7 @@ fn rm_openshell(project: &crate::remote::router::RemoteProject, yes: bool) -> Re
         eprintln!("Deleting sandbox {}…", project.remote.target);
         provisioning.delete()?;
     }
-    close_workstation_windows(project);
+    close_workstation_windows(&project.site.remote, &project.site.name);
     let (path, content) = global_config::read()?;
     let updated = global_config::remove_entry(&content, &PROJECTS, &project.site.name)?;
     global_config::write(&path, &updated)?;
@@ -407,27 +407,19 @@ fn rm_openshell(project: &crate::remote::router::RemoteProject, yes: bool) -> Re
     Ok(())
 }
 
-/// Close the workstation windows of `project`, whose remote is gone: views
-/// onto remote panes that no longer exist.
-fn close_workstation_windows(project: &crate::remote::router::RemoteProject) {
+/// Close the workstation windows of project `name` on `remote` and untag
+/// its adopted session, for a project being unregistered.
+pub(super) fn close_workstation_windows(remote: &str, name: &str) {
     use crate::multiplexer::Multiplexer as _;
     let tmux = crate::multiplexer::TmuxBackend::new();
     if !tmux.is_running().unwrap_or(false) {
         return;
     }
-    match crate::remote::forwarded::close_project_windows(
-        &tmux,
-        &project.site.remote,
-        &project.site.name,
-    ) {
+    match crate::remote::forwarded::close_project_windows(&tmux, remote, name) {
         Ok(0) => {}
-        Ok(closed) => eprintln!(
-            "Closed {closed} workstation window(s) of project {}",
-            project.site.name
-        ),
+        Ok(closed) => eprintln!("Closed {closed} workstation window(s) of project {name}"),
         Err(error) => eprintln!(
-            "warning: could not close the workstation windows of project {}: {error:#}",
-            project.site.name
+            "warning: could not close the workstation windows of project {name}: {error:#}"
         ),
     }
 }

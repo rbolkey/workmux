@@ -3020,6 +3020,67 @@ esac
     assert "api" not in sessions
 
 
+@pytest.mark.tmux_only
+def test_removing_a_project_closes_its_workstation_windows_and_keeps_its_remote(
+    mux_server: MuxEnvironment,
+    workmux_exe_path: Path,
+    repo_path: Path,
+    short_tmp: dict,
+):
+    """`project rm` asks first, then unregisters the project and closes every
+    workstation window tagged with it, untagging its adopted session. Its
+    remote stays registered; nothing is run on the remote."""
+    env = mux_server
+    assert isinstance(env, TmuxEnvironment)
+
+    def wm(command, stdin_input=None):
+        return run_workmux_command(
+            env,
+            workmux_exe_path,
+            repo_path,
+            command,
+            stdin_input=stdin_input,
+            pre_run_env=short_tmp,
+            timeout=30.0,
+        )
+
+    wm("remote add devbox --transport ssh --target devbox")
+    wm("project add api --remote devbox --repo git@example.com:me/api.git")
+    env.tmux(["new-window", "-d", "-t", "test:", "-n", "wm-feature"])
+    env.tmux(
+        [
+            "set-option",
+            "-w",
+            "-t",
+            "=test:wm-feature",
+            "@workmux_project_window",
+            "devbox:api",
+        ]
+    )
+    env.tmux(["set-option", "-t", "=test:", "@workmux_project", "devbox:api"])
+    env.tmux(["new-window", "-d", "-t", "test:", "-n", "mine"])
+    config_path = env.home_path / ".config" / "workmux" / "config.yaml"
+
+    kept = wm("project rm api", stdin_input="n\n")
+
+    assert "Kept project api" in kept.stdout
+    assert "api:" in config_path.read_text()
+    windows = env.tmux(["list-windows", "-a", "-F", "#{window_name}"]).stdout.split()
+    assert "wm-feature" in windows
+
+    removed = wm("project rm api --yes")
+
+    assert "Closed 1 workstation window(s) of project api" in removed.stderr
+    config = config_path.read_text()
+    assert "api:" not in config
+    assert "devbox:" in config
+    windows = env.tmux(["list-windows", "-a", "-F", "#{window_name}"]).stdout.split()
+    assert "wm-feature" not in windows
+    assert "mine" in windows
+    tag = env.tmux(["show-options", "-qv", "-t", "=test:", "@workmux_project"])
+    assert tag.stdout.strip() == ""
+
+
 FAKE_OPENSHELL = """#!/usr/bin/env python3
 # A fake `openshell`: each sandbox's phase is a file, and exec runs the
 # command on this machine under the sandbox's own HOME.
