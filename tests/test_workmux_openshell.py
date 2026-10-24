@@ -1,9 +1,10 @@
 """End-to-end tests of OpenShell projects against a real gateway.
 
-Env-gated: `WORKMUX_TEST_OPENSHELL=1`, plus `WORKMUX_OPENSHELL_WORKMUX`
-pointing at a Linux build of this workmux for the gateway's architecture,
-which workmux puts in the sandbox image. Each test owns one `wm-e20-…`
-project and sandbox, and deletes the sandbox and the images built for it.
+Env-gated: `WORKMUX_TEST_OPENSHELL=1`. The workmux under test is a dev
+build, so workmux builds a Linux workmux from this checkout into the sandbox
+image; `WORKMUX_OPENSHELL_WORKMUX`, when set, points at a Linux build to use
+instead. Each test owns one `wm-e20-…` project and sandbox, and deletes the
+sandbox and the images built for it.
 """
 
 import json
@@ -32,10 +33,8 @@ LINUX_WORKMUX = os.environ.get("WORKMUX_OPENSHELL_WORKMUX", "")
 
 pytestmark = [
     pytest.mark.skipif(
-        os.environ.get("WORKMUX_TEST_OPENSHELL") != "1"
-        or not LINUX_WORKMUX
-        or not Path(LINUX_WORKMUX).is_file(),
-        reason="set WORKMUX_TEST_OPENSHELL=1 and WORKMUX_OPENSHELL_WORKMUX to a Linux workmux",
+        os.environ.get("WORKMUX_TEST_OPENSHELL") != "1",
+        reason="set WORKMUX_TEST_OPENSHELL=1",
     ),
     pytest.mark.tmux_only,
 ]
@@ -64,7 +63,7 @@ class Project:
         self.env, self.exe, self.repo = env, exe, repo
         self.tmp = {
             **tmp,
-            "WORKMUX_OPENSHELL_WORKMUX": LINUX_WORKMUX,
+            **({"WORKMUX_OPENSHELL_WORKMUX": LINUX_WORKMUX} if LINUX_WORKMUX else {}),
             "DOCKER_CONFIG": str(Path.home() / ".docker"),
         }
         # The test's isolated HOME must still reach the user's gateway.
