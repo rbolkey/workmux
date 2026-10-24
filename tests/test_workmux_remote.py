@@ -54,7 +54,10 @@ def outage(mux_server: MuxEnvironment, short_tmp: dict):
 
 requires_dtach = pytest.mark.skipif(
     shutil.which("dtach") is None,
-    reason="remote panes need the session holder dtach on PATH",
+    reason=(
+        "remote panes need the session holder dtach on PATH: use `devbox shell`, "
+        "`nix shell nixpkgs#dtach`, or `apt-get install dtach`"
+    ),
 )
 
 
