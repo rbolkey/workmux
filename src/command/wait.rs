@@ -100,6 +100,7 @@ fn unstarted_remote_target(name: &str) -> Result<Option<WaitTarget>> {
     let Some(project) = project else {
         return Ok(None);
     };
+    crate::remote::router::ready(&project, true)?;
     if crate::remote::router::quietly(&project, &["workmux", "path", handle])? != 0 {
         return Ok(None);
     }

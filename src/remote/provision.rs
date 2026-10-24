@@ -45,18 +45,62 @@ fn shell(what: &'static str, script: &str) -> Step {
     }
 }
 
+/// The baked devshell's wrapper in an OpenShell image: it loads the
+/// environment the workstation recorded and execs its arguments.
+pub const BAKED_DEVSHELL: &str = "/usr/local/bin/workmux-devshell";
+
+/// Where a remote's devshell for a nix toolchain comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Devshell {
+    /// nix is (or gets) installed, and agents start in `nix develop`.
+    Nix,
+    /// The image carries the project's devshell closure (ticket 21);
+    /// nothing is installed or built on the remote.
+    Baked,
+    /// An OpenShell sandbox without a baked devshell: nix can neither be
+    /// installed nor build there, so the toolchain comes from the image.
+    Unavailable,
+}
+
+/// Where this machine, the remote, gets its devshell.
+pub fn devshell_here() -> Devshell {
+    if Path::new(BAKED_DEVSHELL).is_file() {
+        Devshell::Baked
+    } else if std::env::var_os("OPENSHELL_SANDBOX").is_some_and(|value| value == "1") {
+        Devshell::Unavailable
+    } else {
+        Devshell::Nix
+    }
+}
+
+/// `command` wrapped to start in the project's devshell.
+pub fn wrap(command: &str, toolchain: &DetectedToolchain, devshell: Devshell) -> String {
+    match (devshell, toolchain) {
+        (Devshell::Nix, _) => crate::sandbox::toolchain::wrap_command(command, toolchain),
+        (Devshell::Baked, DetectedToolchain::Flake) => format!(
+            "{BAKED_DEVSHELL} bash -c '{}'",
+            crate::shell::shell_escape(command)
+        ),
+        _ => command.to_string(),
+    }
+}
+
 /// Provisioning for a project whose toolchain is `toolchain`, on a remote
 /// where `has` tells whether a command is installed.
 pub fn plan(toolchain: &DetectedToolchain, has: impl Fn(&str) -> bool) -> Plan {
+    plan_for(toolchain, devshell_here(), has)
+}
+
+fn plan_for(toolchain: &DetectedToolchain, devshell: Devshell, has: impl Fn(&str) -> bool) -> Plan {
     let mut plan = Plan::default();
     if let Some(warning) = holder_warning(&has) {
         plan.warnings.push(warning);
     }
-    let needs_nix = *toolchain != DetectedToolchain::None;
+    let needs_nix = devshell == Devshell::Nix && *toolchain != DetectedToolchain::None;
     if needs_nix && !has("nix") {
         plan.steps.push(shell("installing nix", NIX_INSTALL));
     }
-    if *toolchain == DetectedToolchain::Devbox && !has("devbox") {
+    if needs_nix && *toolchain == DetectedToolchain::Devbox && !has("devbox") {
         plan.steps.push(shell("installing devbox", DEVBOX_INSTALL));
     }
     plan.steps.push(Step {
@@ -109,7 +153,25 @@ pub fn warnings(has: impl Fn(&str) -> bool, agents: &[AgentCheck]) -> Vec<String
 
 /// [`warnings`] for this machine, the remote.
 pub fn current_warnings() -> Vec<String> {
-    warnings(has_command, &crate::agent_setup::check_all())
+    let mut warnings = warnings(has_command, &crate::agent_setup::check_all());
+    let source = Path::new(crate::remote::openshell::image::DEVSHELL_SOURCE);
+    warnings.extend(baked_devshell_warning(source));
+    warnings
+}
+
+/// A warning when the devshell baked into this sandbox was built from
+/// another `flake.lock` than the project's clone has now.
+fn baked_devshell_warning(source: &Path) -> Option<String> {
+    use crate::remote::openshell::image::{DevshellSource, flake_lock_digest};
+    let source: DevshellSource = serde_json::from_slice(&std::fs::read(source).ok()?).ok()?;
+    let clone = Path::new(&source.clone);
+    (clone.is_dir() && flake_lock_digest(clone) != source.flake_lock_sha256).then(|| {
+        format!(
+            "the devshell baked into this sandbox was built from another flake.lock than {}'s; \
+             run `workmux remote recreate` for the project to rebuild it",
+            source.clone
+        )
+    })
 }
 
 #[cfg(test)]
@@ -168,6 +230,61 @@ mod tests {
             steps(&plan(&DetectedToolchain::Devbox, has(&["dtach", "nix"]))),
             ["installing devbox", "installing agent hooks"]
         );
+    }
+
+    #[test]
+    fn a_baked_devshell_or_an_openshell_sandbox_never_gets_nix_installed() {
+        for devshell in [Devshell::Baked, Devshell::Unavailable] {
+            for toolchain in [DetectedToolchain::Flake, DetectedToolchain::Devbox] {
+                let plan = plan_for(&toolchain, devshell, has(&["dtach"]));
+
+                assert_eq!(steps(&plan), ["installing agent hooks"]);
+            }
+        }
+    }
+
+    #[test]
+    fn agents_start_in_the_baked_devshell_instead_of_nix_develop() {
+        assert_eq!(
+            wrap("claude --help", &DetectedToolchain::Flake, Devshell::Baked),
+            "/usr/local/bin/workmux-devshell bash -c 'claude --help'"
+        );
+        assert_eq!(
+            wrap("claude", &DetectedToolchain::Flake, Devshell::Nix),
+            "nix develop --command bash -c 'claude'"
+        );
+        assert_eq!(
+            wrap("claude", &DetectedToolchain::Flake, Devshell::Unavailable),
+            "claude"
+        );
+        assert_eq!(
+            wrap("claude", &DetectedToolchain::None, Devshell::Baked),
+            "claude"
+        );
+    }
+
+    #[test]
+    fn a_baked_devshell_older_than_the_clones_flake_lock_is_warned_about() {
+        let dir = tempfile::tempdir().unwrap();
+        let clone = dir.path().join("api");
+        std::fs::create_dir(&clone).unwrap();
+        std::fs::write(clone.join("flake.lock"), "v1").unwrap();
+        let source = dir.path().join("devshell-source.json");
+        std::fs::write(
+            &source,
+            format!(
+                r#"{{"clone":"{}","flake_lock_sha256":"{}"}}"#,
+                clone.display(),
+                crate::remote::openshell::image::sha256_hex(b"v1")
+            ),
+        )
+        .unwrap();
+        assert_eq!(baked_devshell_warning(&source), None);
+
+        std::fs::write(clone.join("flake.lock"), "v2").unwrap();
+
+        let warning = baked_devshell_warning(&source).expect("a warning");
+        assert!(warning.contains("workmux remote recreate"), "{warning}");
     }
 
     #[test]

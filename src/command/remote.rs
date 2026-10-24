@@ -1,6 +1,6 @@
 //! `workmux remote`: register remotes and check that they are reachable.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Subcommand};
 use std::borrow::Cow;
 use std::time::Duration;
@@ -9,11 +9,14 @@ use tabled::{
     settings::{Padding, Style, object::Columns},
 };
 
-use super::global_config::{self, REMOTES};
+use super::global_config::{self, PROJECTS, REMOTES};
 use crate::config::{RemoteConfig, TransportKind};
+use crate::remote::carry::AtRisk;
 use crate::remote::channels::{Reach, RemoteStatus};
 use crate::remote::pane::{RemotePaneId, SessionHolder};
 use crate::remote::registry;
+use crate::remote::transport::{Provisioning, RemoteState, Transport, ensure_running};
+use std::sync::Arc;
 
 /// How long a status call may take: opening a channel can wait on a slow
 /// transport.
@@ -52,8 +55,24 @@ pub enum RemoteCommand {
         /// Remote to check (default: all)
         name: Option<String>,
     },
-    /// Remove a remote from your global config
-    Rm { name: String },
+    /// Start a remote's stopped sandbox (creating it if it does not exist yet)
+    Start { name: String },
+    /// Stop a remote's sandbox, keeping its workspace
+    Stop { name: String },
+    /// Delete and recreate an OpenShell project's sandbox, carrying its committed work across
+    Recreate {
+        name: String,
+        /// Don't ask for confirmation
+        #[arg(short, long)]
+        yes: bool,
+    },
+    /// Remove a remote from your global config; for an OpenShell project, delete its sandbox and the project
+    Rm {
+        name: String,
+        /// Don't ask for confirmation
+        #[arg(short, long)]
+        yes: bool,
+    },
     /// Show a remote pane in this terminal, reattaching after drops (run by workstation panes)
     Attach {
         /// Remote the pane runs on
@@ -70,6 +89,16 @@ pub enum RemoteCommand {
     /// Print whether a remote pane on this machine is running or ended
     #[command(hide = true)]
     PaneState { pane: RemotePaneId },
+    /// Carry a project's committed work across a recreate (run through transports)
+    #[command(hide = true)]
+    Carry {
+        /// at-risk, manifest, bundle or restore
+        action: String,
+        /// The project's clone
+        path: String,
+        /// For restore: the manifest, as JSON
+        manifest: Option<String>,
+    },
     /// Forward one multiplexer request from a remote shell to the workstation (run by deferred scripts)
     #[command(hide = true)]
     Forward {
@@ -93,6 +122,7 @@ pub fn run(args: RemoteArgs) -> Result<()> {
                 target,
                 builtin_shims: no_builtin_shims.then_some(false),
                 host_commands,
+                openshell: None,
             },
         ),
         RemoteCommand::List => list(),
@@ -102,7 +132,10 @@ pub fn run(args: RemoteArgs) -> Result<()> {
             }
             Ok(())
         }
-        RemoteCommand::Rm { name } => rm(&name),
+        RemoteCommand::Start { name } => start(&name),
+        RemoteCommand::Stop { name } => stop(&name),
+        RemoteCommand::Recreate { name, yes } => recreate(&name, yes),
+        RemoteCommand::Rm { name, yes } => rm(&name, yes),
         RemoteCommand::Attach { remote, pane } => crate::remote::attach::run(&remote, &pane),
         RemoteCommand::Serve => crate::remote::serve::run(),
         RemoteCommand::PaneAttach { pane } => {
@@ -119,6 +152,11 @@ pub fn run(args: RemoteArgs) -> Result<()> {
             );
             Ok(())
         }
+        RemoteCommand::Carry {
+            action,
+            path,
+            manifest,
+        } => crate::remote::carry::serve(&action, &path, manifest.as_deref()),
         RemoteCommand::Forward { request } => {
             let mux = crate::remote::forwarding::ForwardingMux::from_env()
                 .context("remote forward runs only in a remote shell")?;
@@ -130,6 +168,13 @@ pub fn run(args: RemoteArgs) -> Result<()> {
 fn add(name: &str, remote: RemoteConfig) -> Result<()> {
     registry::validate_name(name)?;
     let (path, content) = global_config::read()?;
+    if global_config::parse(&content)?
+        .projects
+        .get(name)
+        .is_some_and(|project| project.openshell.is_some())
+    {
+        bail!("project {name} is in an OpenShell sandbox, which is already its remote {name}");
+    }
     let updated = global_config::add_entry(&content, &REMOTES, name, &remote)?;
     global_config::write(&path, &updated)?;
     println!(
@@ -141,7 +186,229 @@ fn add(name: &str, remote: RemoteConfig) -> Result<()> {
     Ok(())
 }
 
-fn rm(name: &str) -> Result<()> {
+/// A registered remote whose transport manages its lifecycle.
+fn managed(name: &str) -> Result<(RemoteConfig, Arc<dyn Transport>)> {
+    let remote = registry::remotes()?
+        .remove(name)
+        .ok_or_else(|| anyhow!("no remote named {name}"))?;
+    let transport = registry::transport(name, &remote)?;
+    if transport.provisioning().is_none() {
+        bail!(
+            "remote {name} is reached over {}; workmux does not start or stop it",
+            remote.transport
+        );
+    }
+    Ok((remote, transport))
+}
+
+fn lifecycle(transport: &dyn Transport) -> &dyn Provisioning {
+    transport.provisioning().expect("a managed remote")
+}
+
+fn print_notice(notice: &str) {
+    eprintln!("{notice}");
+}
+
+fn start(name: &str) -> Result<()> {
+    let (_, transport) = managed(name)?;
+    ensure_running(name, transport.as_ref(), true, &mut print_notice)?;
+    // Reconnect now rather than at the next backoff retry.
+    let statuses = fetch_statuses(Some(name))?;
+    for status in statuses {
+        println!("{name}: {}", summary(&status.reach));
+    }
+    Ok(())
+}
+
+fn stop(name: &str) -> Result<()> {
+    let (_, transport) = managed(name)?;
+    let provisioning = lifecycle(transport.as_ref());
+    match provisioning.status()? {
+        RemoteState::Missing => bail!("remote {name} has no sandbox yet"),
+        RemoteState::Stopped => println!("Remote {name} is already stopped"),
+        RemoteState::Running => {
+            eprintln!("Stopping remote {name}…");
+            provisioning.stop()?;
+            println!(
+                "Stopped remote {name}; its agents show as stale until `workmux remote start {name}`"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The OpenShell project whose implicit remote `name` is.
+fn openshell_project(name: &str) -> Result<Option<crate::remote::router::RemoteProject>> {
+    let config = crate::config::Config::load_global_only()?;
+    let Some(origin) = config.remotes.get(name).and_then(|r| r.openshell.clone()) else {
+        return Ok(None);
+    };
+    crate::remote::router::remote_project(&config, &origin.project).map(Some)
+}
+
+/// Ask `prompt`, unless `yes`.
+fn confirmed(prompt: &str, yes: bool) -> Result<bool> {
+    if yes {
+        return Ok(true);
+    }
+    crate::ui::confirm::confirm(prompt, crate::ui::confirm::ConfirmDefault::No)
+}
+
+/// The confirmation for deleting `sandbox`, naming the work only it holds.
+fn delete_prompt(name: &str, sandbox: &str, risks: Option<&[AtRisk]>) -> String {
+    let mut prompt =
+        format!("Delete sandbox {sandbox} of project {name}? Its clone and worktrees are lost.");
+    match risks {
+        None => prompt.push_str(
+            "
+  Its worktrees could not be checked for unpushed work.",
+        ),
+        Some([]) => {}
+        Some(risks) => {
+            prompt.push_str(
+                "
+  These have work that exists only in the sandbox:",
+            );
+            for risk in risks {
+                prompt.push_str(&format!(
+                    "
+    {}",
+                    risk.describe()
+                ));
+            }
+        }
+    }
+    prompt.push_str(
+        "
+ ",
+    );
+    prompt
+}
+
+/// Delete an OpenShell project's sandbox, then unregister the project.
+fn rm_openshell(project: &crate::remote::router::RemoteProject, yes: bool) -> Result<()> {
+    let name = &project.site.remote;
+    let transport = registry::transport(name, &project.remote)?;
+    let provisioning = lifecycle(transport.as_ref());
+    if provisioning.status()? != RemoteState::Missing {
+        if provisioning.status()? == RemoteState::Stopped {
+            eprintln!(
+                "Starting remote {name} to check its worktrees for work that exists only there…"
+            );
+            provisioning.start()?;
+        }
+        let risks = match crate::remote::carry::remote_at_risk(
+            transport.as_ref(),
+            &project.site.path,
+        ) {
+            Ok(risks) => Some(risks),
+            Err(error) => {
+                tracing::warn!(error = %format!("{error:#}"), "checking worktrees before delete");
+                None
+            }
+        };
+        if !confirmed(
+            &delete_prompt(&project.site.name, &project.remote.target, risks.as_deref()),
+            yes,
+        )? {
+            println!("Kept remote {name}");
+            return Ok(());
+        }
+        eprintln!("Deleting sandbox {}…", project.remote.target);
+        provisioning.delete()?;
+    }
+    let (path, content) = global_config::read()?;
+    let updated = global_config::remove_entry(&content, &PROJECTS, &project.site.name)?;
+    global_config::write(&path, &updated)?;
+    println!(
+        "Deleted sandbox {} and removed project {} from {}",
+        project.remote.target,
+        project.site.name,
+        path.display()
+    );
+    Ok(())
+}
+
+fn recreate(name: &str, yes: bool) -> Result<()> {
+    let project = openshell_project(name)?.ok_or_else(|| {
+        anyhow!("remote {name} is not an OpenShell project's sandbox; only those are recreated")
+    })?;
+    let transport = registry::transport(name, &project.remote)?;
+    let provisioning = lifecycle(transport.as_ref());
+    if provisioning.status()? == RemoteState::Missing {
+        return ensure_running(name, transport.as_ref(), true, &mut print_notice).map(|_| ());
+    }
+    ensure_running(name, transport.as_ref(), true, &mut print_notice)?;
+    if !confirmed(
+        &format!(
+            "Recreate sandbox {} of project {}? Agents running in it are ended and their remote panes lost; committed work on every branch is carried across.
+ ",
+            project.remote.target, project.site.name
+        ),
+        yes,
+    )? {
+        println!("Kept remote {name} as it is");
+        return Ok(());
+    }
+    let keep = crate::xdg::state_dir()?
+        .join("recreate")
+        .join(&project.remote.target);
+    crate::remote::carry::recreate(
+        transport.as_ref(),
+        &project.site.path,
+        &keep,
+        &mut || {
+            eprintln!("Deleting sandbox {}…", project.remote.target);
+            provisioning.delete()?;
+            eprintln!("Creating sandbox {}…", project.remote.target);
+            provisioning.create()
+        },
+        &mut print_notice,
+    )
+    .with_context(|| format!("recreating remote {name}"))?;
+    let hooks =
+        transport.exec_captured(&["workmux", "setup", "--hooks", "--yes"].map(String::from))?;
+    if !hooks.status.success() {
+        eprintln!(
+            "warning: installing agent hooks on {name} failed ({}); run `workmux setup --hooks` there",
+            hooks.status
+        );
+    }
+    println!(
+        "Recreated remote {name}; its branches and worktrees are back. Reopen worktrees with `workmux open`"
+    );
+    Ok(())
+}
+
+/// Show an OpenShell remote's effective policy, read from the sandbox.
+fn print_policy(name: &str, remote: &RemoteConfig) {
+    let sandbox =
+        crate::remote::openshell::OpenShell::new(&remote.target, remote.openshell.clone());
+    match sandbox.policy_report() {
+        Ok(None) => {
+            println!("  sandbox:  not created yet; the first command that needs it creates it")
+        }
+        Ok(Some((policy, warnings))) => {
+            let mut lines = policy.iter();
+            println!(
+                "  policy:   {}",
+                lines.next().map(String::as_str).unwrap_or_default()
+            );
+            for line in lines {
+                println!("            {line}");
+            }
+            for warning in warnings {
+                println!("  warning:  {warning}");
+            }
+        }
+        Err(error) => println!("  policy:   unknown ({error:#}) for {name}"),
+    }
+}
+
+fn rm(name: &str, yes: bool) -> Result<()> {
+    if let Some(project) = openshell_project(name)? {
+        return rm_openshell(&project, yes);
+    }
     let (path, content) = global_config::read()?;
     let users: Vec<String> = global_config::parse(&content)?
         .projects
@@ -267,6 +534,7 @@ fn status(name: Option<&str>) -> Result<bool> {
         );
         return Ok(true);
     }
+    let remotes = registry::remotes()?;
     let mut all_reachable = true;
     for (i, status) in statuses.iter().enumerate() {
         if i > 0 {
@@ -298,6 +566,11 @@ fn status(name: Option<&str>) -> Result<bool> {
                 }
             }
         }
+        if let Some(remote) = remotes.get(&status.name)
+            && remote.transport == TransportKind::Openshell
+        {
+            print_policy(&status.name, remote);
+        }
     }
     Ok(all_reachable)
 }
@@ -313,11 +586,39 @@ mod tests {
             target: target.to_string(),
             builtin_shims: None,
             host_commands: vec![],
+            openshell: None,
         }
     }
 
     fn parse(content: &str) -> Config {
         serde_yaml::from_str(content).unwrap()
+    }
+
+    #[test]
+    fn deleting_a_sandbox_names_the_work_that_exists_only_there() {
+        let risks = [
+            AtRisk {
+                path: Some("/sandbox/api__worktrees/feature".into()),
+                branch: Some("feature".to_string()),
+                uncommitted: true,
+                unpushed: 2,
+            },
+            AtRisk {
+                path: None,
+                branch: Some("spike".to_string()),
+                uncommitted: false,
+                unpushed: 1,
+            },
+        ];
+
+        assert_eq!(
+            delete_prompt("api", "api", Some(&risks)),
+            "Delete sandbox api of project api? Its clone and worktrees are lost.\n  \
+             These have work that exists only in the sandbox:\n    \
+             /sandbox/api__worktrees/feature (branch feature): uncommitted changes, 2 commits not on any remote\n    \
+             branch spike: 1 commit not on any remote\n "
+        );
+        assert!(delete_prompt("api", "api", None).contains("could not be checked"));
     }
 
     #[test]
@@ -357,6 +658,7 @@ nerdfont: true
             &RemoteConfig {
                 builtin_shims: Some(false),
                 host_commands: vec!["just".to_string()],
+                openshell: None,
                 ..ssh("gpu-box")
             },
         )

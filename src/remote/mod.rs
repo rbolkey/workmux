@@ -3,6 +3,7 @@
 
 pub mod agents;
 pub mod attach;
+pub mod carry;
 pub mod channel;
 pub mod channels;
 pub mod connection;
@@ -10,6 +11,7 @@ pub mod dashboard;
 pub mod forwarded;
 pub mod forwarding;
 pub mod handshake;
+pub mod openshell;
 pub mod pane;
 pub mod provision;
 pub mod registry;

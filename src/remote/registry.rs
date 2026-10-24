@@ -1,10 +1,11 @@
 //! Remote registry: resolves remotes and their transports from global config.
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, bail};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use super::channels::TransportFactory;
+use super::openshell::OpenShell;
 use super::ssh::Ssh;
 use super::transport::{Loopback, Transport};
 use crate::config::{Config, RemoteConfig, TransportKind};
@@ -21,9 +22,10 @@ pub fn transport(_name: &str, remote: &RemoteConfig) -> Result<Arc<dyn Transport
             &remote.target,
         ))?)),
         TransportKind::Ssh => Ok(Arc::new(Ssh::new(&remote.target))),
-        kind @ TransportKind::Openshell => Err(anyhow!(
-            "the {kind} transport is not supported by this workmux yet"
-        )),
+        TransportKind::Openshell => Ok(Arc::new(OpenShell::new(
+            &remote.target,
+            remote.openshell.clone(),
+        ))),
     }
 }
 

@@ -1,10 +1,10 @@
 //! `workmux project`: register projects that live on a remote.
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand};
 
 use super::global_config::{self, PROJECTS};
-use crate::config::{ProjectEntry, ProjectPlacement};
+use crate::config::{OpenshellProject, ProjectEntry, ProjectPlacement};
 use crate::remote::registry;
 
 #[derive(Debug, Args)]
@@ -20,8 +20,27 @@ pub enum ProjectCommand {
         /// Name commands use to refer to the project
         name: String,
         /// Remote the project lives on
+        #[arg(
+            long,
+            required_unless_present = "openshell",
+            conflicts_with = "openshell"
+        )]
+        remote: Option<String>,
+        /// Give the project its own OpenShell sandbox as its remote, created on first use
         #[arg(long)]
-        remote: String,
+        openshell: bool,
+        /// Image the sandbox runs; it must contain git (OpenShell only)
+        #[arg(long, requires = "openshell")]
+        image: Option<String>,
+        /// Policy file merged on top of workmux's base policy (OpenShell only)
+        #[arg(long, value_name = "FILE", requires = "openshell")]
+        policy: Option<std::path::PathBuf>,
+        /// OpenShell provider to attach to the sandbox, for credentials (repeatable)
+        #[arg(long = "provider", value_name = "PROVIDER", requires = "openshell")]
+        providers: Vec<String>,
+        /// Sandbox name (default: derived from the project name; OpenShell only)
+        #[arg(long, requires = "openshell")]
+        sandbox: Option<String>,
         /// Git URL the remote clones the project from on first use
         #[arg(long, value_name = "URL")]
         repo: String,
@@ -42,27 +61,65 @@ pub fn run(args: ProjectArgs) -> Result<()> {
         ProjectCommand::Add {
             name,
             remote,
+            openshell,
+            image,
+            policy,
+            providers,
+            sandbox,
             repo,
             path,
             session,
             placement,
-        } => add(
-            &name,
-            ProjectEntry {
-                path: Some(path.unwrap_or_else(|| format!("~/{name}"))),
-                remote: Some(remote),
-                git_url: Some(repo),
-                session,
-                placement,
-            },
-        ),
+        } => {
+            let openshell = if openshell {
+                Some(OpenshellProject {
+                    sandbox,
+                    image,
+                    policy: policy.map(absolute_policy).transpose()?,
+                    providers,
+                })
+            } else {
+                None
+            };
+            add(
+                &name,
+                ProjectEntry {
+                    path: Some(path.unwrap_or_else(|| format!("~/{name}"))),
+                    remote,
+                    git_url: Some(repo),
+                    session,
+                    placement,
+                    openshell,
+                },
+            )
+        }
     }
+}
+
+/// A policy file's absolute path, so the project resolves it from anywhere.
+fn absolute_policy(policy: std::path::PathBuf) -> Result<String> {
+    let absolute = std::path::absolute(&policy)
+        .with_context(|| format!("failed to resolve {}", policy.display()))?;
+    if !absolute.is_file() {
+        bail!("policy file {} does not exist", absolute.display());
+    }
+    Ok(absolute.display().to_string())
 }
 
 fn add(name: &str, project: ProjectEntry) -> Result<()> {
     let (path, content) = global_config::read()?;
     let updated = add_project_to(&content, name, &project)?;
     global_config::write(&path, &updated)?;
+    if project.openshell.is_some() {
+        let config = global_config::parse(&updated)?.with_implicit_remotes();
+        println!(
+            "Added project {name} in OpenShell sandbox {} ({}) to {}; the sandbox is created on first use",
+            config.remotes[name].target,
+            project.path.as_deref().unwrap_or_default(),
+            path.display()
+        );
+        return Ok(());
+    }
     println!(
         "Added project {name} on remote {} ({}) to {}",
         project.remote.as_deref().unwrap_or_default(),
@@ -84,12 +141,18 @@ fn add_project_to(content: &str, name: &str, project: &ProjectEntry) -> Result<S
             "no remote named {remote}; add it with: workmux remote add {remote} --transport ssh --target <host>"
         );
     }
+    if project.openshell.is_some() && config.remotes.contains_key(name) {
+        bail!(
+            "remote {name} already exists; an OpenShell project's sandbox is its remote, named after it"
+        );
+    }
     global_config::add_entry(content, &PROJECTS, name, project)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::TransportKind;
 
     const WITH_REMOTE: &str = "\
 # my remotes
@@ -106,6 +169,7 @@ remotes:
             path: Some("~/code/api".to_string()),
             session: None,
             placement: Some(ProjectPlacement::CurrentSession),
+            openshell: None,
         }
     }
 
@@ -126,6 +190,44 @@ remotes:
         let error = add_project_to(&once, "api", &api()).unwrap_err();
 
         assert_eq!(error.to_string(), "project api already exists");
+    }
+
+    fn openshell_api() -> ProjectEntry {
+        ProjectEntry {
+            remote: None,
+            git_url: Some("https://github.com/me/api.git".to_string()),
+            path: Some("~/api".to_string()),
+            openshell: Some(OpenshellProject {
+                image: Some("ghcr.io/me/api-dev:1".to_string()),
+                providers: vec!["github".to_string()],
+                ..OpenshellProject::default()
+            }),
+            ..ProjectEntry::default()
+        }
+    }
+
+    #[test]
+    fn an_openshell_project_needs_no_registered_remote() {
+        let updated = add_project_to("", "api", &openshell_api()).unwrap();
+
+        let config = global_config::parse(&updated)
+            .unwrap()
+            .with_implicit_remotes();
+        assert_eq!(config.projects["api"].openshell, openshell_api().openshell);
+        assert_eq!(config.remotes["api"].transport, TransportKind::Openshell);
+        assert!(!updated.contains("remotes:"), "{updated}");
+    }
+
+    #[test]
+    fn an_openshell_project_may_not_take_a_registered_remotes_name() {
+        let content = "remotes:\n  api:\n    transport: ssh\n    target: devbox\n";
+
+        let error = add_project_to(content, "api", &openshell_api()).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "remote api already exists; an OpenShell project's sandbox is its remote, named after it"
+        );
     }
 
     #[test]
