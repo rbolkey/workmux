@@ -10,7 +10,7 @@ const NOTIFY_COOLDOWN_SECS: u64 = 7 * 24 * 60 * 60;
 const NOTIFY_BURST_COUNT: u64 = 3;
 
 /// Map OS/arch to the release artifact suffix used in GitHub releases.
-fn platform_suffix() -> Result<&'static str> {
+pub(crate) fn platform_suffix() -> Result<&'static str> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("macos", "aarch64") => Ok("darwin-arm64"),
         ("macos", "x86_64") => Ok("darwin-amd64"),
@@ -76,7 +76,7 @@ fn parse_latest_release_tag(payload: &[u8]) -> Result<String> {
 }
 
 /// Download a URL to a file path using curl.
-fn download(url: &str, dest: &std::path::Path) -> Result<()> {
+pub(crate) fn download(url: &str, dest: &std::path::Path) -> Result<()> {
     let status = Command::new("curl")
         .args(["-sSLf", "-o"])
         .arg(dest)
@@ -91,7 +91,7 @@ fn download(url: &str, dest: &std::path::Path) -> Result<()> {
 }
 
 /// Extract a tar.gz archive into a directory.
-fn extract_tar(archive: &std::path::Path, dest: &std::path::Path) -> Result<()> {
+pub(crate) fn extract_tar(archive: &std::path::Path, dest: &std::path::Path) -> Result<()> {
     let status = Command::new("tar")
         .arg("-xzf")
         .arg(archive)
@@ -137,7 +137,7 @@ fn sha256_of(path: &std::path::Path) -> Result<String> {
 }
 
 /// Verify SHA-256 checksum of a file against the expected checksum line.
-fn verify_checksum(file: &std::path::Path, expected_line: &str) -> Result<()> {
+pub(crate) fn verify_checksum(file: &std::path::Path, expected_line: &str) -> Result<()> {
     // The .sha256 file format is: "<hash>  <filename>"
     let expected_hash = expected_line
         .split_whitespace()

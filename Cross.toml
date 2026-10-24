@@ -1,0 +1,3 @@
+[build.env]
+# Marks a release build (see .github/workflows/release.yml).
+passthrough = ["WORKMUX_RELEASE_BUILD"]

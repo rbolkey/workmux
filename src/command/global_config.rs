@@ -144,6 +144,17 @@ pub fn add_entry<T: Serialize + PartialEq>(
     Ok(updated)
 }
 
+/// Replace entry `name` of `section` with `value`.
+pub fn replace_entry<T: Serialize + PartialEq>(
+    content: &str,
+    section: &Section<T>,
+    name: &str,
+    value: &T,
+) -> Result<String> {
+    let removed = remove_entry(content, section, name)?;
+    add_entry(&removed, section, name, value)
+}
+
 /// Remove entry `name` from `section` of a global config file's text.
 pub fn remove_entry<T>(content: &str, section: &Section<T>, name: &str) -> Result<String> {
     let noun = section.noun;

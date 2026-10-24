@@ -18,6 +18,7 @@ const NON_INTERACTIVE: &[&str] = &["-T", "-o", "BatchMode=yes", "-o", "ConnectTi
 
 /// Keepalives on a control channel. Without them a silent drop (a dead
 /// network path) is never noticed.
+#[derive(Clone, Copy)]
 struct Keepalive {
     /// Seconds between keepalives.
     interval: u32,
@@ -30,12 +31,26 @@ const KEEPALIVE: Keepalive = Keepalive {
     count: 3,
 };
 
+/// The remote directory an uploaded workmux of this release lives in: a
+/// per-user cache directory workmux owns, never a directory on the user's
+/// PATH. The remote shell expands it.
+pub fn uploaded_workmux_dir() -> String {
+    format!(
+        "${{XDG_CACHE_HOME:-$HOME/.cache}}/workmux/bin/{}",
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
+#[derive(Clone)]
 pub struct Ssh {
     /// Host as the user's SSH config knows it, such as `devbox` or `me@devbox`.
     target: String,
     /// An `ssh_config` to use instead of the user's, for tests.
     config: Option<PathBuf>,
     keepalive: Keepalive,
+    /// Whether remote commands look for workmux in
+    /// [`uploaded_workmux_dir`] before the remote's PATH.
+    uploaded_workmux: bool,
 }
 
 impl Ssh {
@@ -44,6 +59,53 @@ impl Ssh {
             target: target.into(),
             config: None,
             keepalive: KEEPALIVE,
+            uploaded_workmux: false,
+        }
+    }
+
+    /// Prefer the workmux uploaded to the remote's cache directory, if any,
+    /// to the one on its PATH.
+    pub fn with_uploaded_workmux(mut self, uploaded: bool) -> Self {
+        self.uploaded_workmux = uploaded;
+        self
+    }
+
+    /// Copy `binary` to the remote as [`uploaded_workmux_dir`]`/workmux`,
+    /// replacing only a copy uploaded before.
+    pub fn upload_workmux(&self, binary: &std::path::Path) -> Result<()> {
+        let file = std::fs::File::open(binary)
+            .with_context(|| format!("failed to read {}", binary.display()))?;
+        // Written beside its final name and moved there, so a running copy
+        // is never truncated and a failed upload leaves none half written.
+        let remote_command = format!(
+            "dir=\"{}\" && mkdir -p \"$dir\" && tmp=\"$dir/.workmux.$$\" && \
+             cat > \"$tmp\" && chmod 755 \"$tmp\" && mv -f \"$tmp\" \"$dir/workmux\"",
+            uploaded_workmux_dir()
+        );
+        let output = self
+            .ssh(NON_INTERACTIVE, &remote_command)
+            .stdin(file)
+            .output()
+            .context("failed to run ssh")?;
+        if !output.status.success() {
+            return Err(anyhow!(
+                "failed to upload workmux to {}: {}",
+                self.target,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        Ok(())
+    }
+
+    /// `command` as sshd should hand it to the remote's login shell.
+    fn remote_command(&self, command: &str) -> String {
+        if self.uploaded_workmux {
+            format!(
+                "PATH=\"{}:$PATH\"; export PATH; {command}",
+                uploaded_workmux_dir()
+            )
+        } else {
+            command.to_string()
         }
     }
 
@@ -57,7 +119,7 @@ impl Ssh {
             .args(options)
             .arg("--")
             .arg(&self.target)
-            .arg(remote_command);
+            .arg(self.remote_command(remote_command));
         command
     }
 }
@@ -152,7 +214,7 @@ impl Transport for Ssh {
 /// (`src/ssh_learning`) and run against the same user-mode `sshd` harness:
 /// `WORKMUX_TEST_SSH=1`.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::remote::channel::Handler;
     use crate::remote::connection::Connection;
@@ -172,17 +234,18 @@ mod tests {
         args.iter().map(|a| a.to_string()).collect()
     }
 
-    fn transport(harness: &SshHarness) -> Ssh {
+    pub(crate) fn transport(harness: &SshHarness) -> Ssh {
         Ssh {
             target: harness.host().to_string(),
             config: harness.ssh_config().map(PathBuf::from),
             keepalive: KEEPALIVE,
+            uploaded_workmux: false,
         }
     }
 
     /// Puts a `workmux` running `script` first on the remote's PATH, after
     /// shell startup that prints `noise`.
-    fn install_remote_workmux(harness: &SshHarness, noise: &str, script: &str) {
+    pub(crate) fn install_remote_workmux(harness: &SshHarness, noise: &str, script: &str) {
         let bin = format!("{}/bin", harness.remote_dir());
         std::fs::create_dir_all(&bin).unwrap();
         let workmux = format!("{bin}/workmux");
@@ -197,7 +260,7 @@ mod tests {
 
     /// A remote `workmux` that serves a real control channel: this test
     /// binary's serve child, whose libtest output is more noise.
-    fn serve_script() -> String {
+    pub(crate) fn serve_script() -> String {
         format!(
             "{}={SERVE_CHILD} exec '{}' {SERVE_CHILD} --exact --nocapture --ignored",
             crate::test_support::ISOLATED_TEST_ENV,

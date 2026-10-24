@@ -194,6 +194,7 @@ mod tests {
             target: "/remote".to_string(),
             builtin_shims,
             host_commands: host_commands.iter().map(|c| c.to_string()).collect(),
+            upload_workmux: None,
             openshell: None,
         }
     }

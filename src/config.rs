@@ -1057,6 +1057,12 @@ pub struct RemoteConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub host_commands: Vec<String>,
 
+    /// Whether workmux may install a matching workmux in the remote's cache
+    /// directory and run that one: the user's answer the first time a
+    /// remote lacked a compatible workmux. Unset until asked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upload_workmux: Option<bool>,
+
     /// For an OpenShell project's implicit remote: what its sandbox is
     /// created from. Never written to config.
     #[serde(skip)]
@@ -1072,6 +1078,9 @@ pub struct OpenshellRemote {
     /// Path of the project's clone in the sandbox.
     pub path: String,
     pub settings: OpenshellProject,
+    /// The agents the sandbox runs, by plain CLI: the project's, else the
+    /// default agent's type.
+    pub agents: Vec<String>,
 }
 
 /// OpenShell settings of a project whose remote is its own sandbox.
@@ -1092,6 +1101,12 @@ pub struct OpenshellProject {
     /// OpenShell providers attached to the sandbox, for credentials.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub providers: Vec<String>,
+
+    /// Agents the sandbox's image installs, by type such as `claude` or
+    /// `codex`; the first is remote workmux's default agent (default: the
+    /// default agent's type).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agents: Vec<String>,
 }
 
 /// OpenShell's limit on sandbox name length.
@@ -2860,6 +2875,15 @@ pub fn validate_layouts_config(layouts: &HashMap<String, LayoutConfig>) -> anyho
     Ok(())
 }
 
+/// The agent the image at `named` names, an OpenShell sandbox's, for
+/// when no config names one.
+fn image_agent(named: &Path) -> Option<String> {
+    std::fs::read_to_string(named)
+        .ok()
+        .map(|agent| agent.trim().to_string())
+        .filter(|agent| !agent.is_empty())
+}
+
 /// Get the path to the global config file.
 ///
 /// Resolves via `$XDG_CONFIG_HOME/workmux/` (default `~/.config/workmux/`).
@@ -3096,13 +3120,35 @@ impl Config {
         cli_agent: Option<&str>,
         defaults_root: &std::path::Path,
     ) -> anyhow::Result<Self> {
-        let has_explicit_agent =
-            cli_agent.is_some() || project_config.agent.is_some() || global_config.agent.is_some();
+        Self::merge_and_apply_defaults_with_image_agent(
+            global_config,
+            project_config,
+            cli_agent,
+            image_agent(Path::new(crate::remote::openshell::image::DEFAULT_AGENT)),
+            defaults_root,
+        )
+    }
+
+    /// [`Self::merge_and_apply_defaults`], where `image_agent` is the agent
+    /// an OpenShell sandbox's image names: the project chose it, so it
+    /// counts as configured.
+    fn merge_and_apply_defaults_with_image_agent(
+        global_config: Self,
+        project_config: Self,
+        cli_agent: Option<&str>,
+        image_agent: Option<String>,
+        defaults_root: &std::path::Path,
+    ) -> anyhow::Result<Self> {
+        let has_explicit_agent = cli_agent.is_some()
+            || project_config.agent.is_some()
+            || global_config.agent.is_some()
+            || image_agent.is_some();
 
         let final_agent = cli_agent
             .map(|s| s.to_string())
             .or_else(|| project_config.agent.clone())
             .or_else(|| global_config.agent.clone())
+            .or(image_agent)
             .unwrap_or_else(|| "claude".to_string());
 
         let mut config = global_config.merge(project_config);
@@ -3193,6 +3239,7 @@ impl Config {
     /// named after the project, reaching its sandbox. A registered remote
     /// of the same name wins, with a warning.
     pub fn with_implicit_remotes(mut self) -> Self {
+        let default_agent = self.default_agent_type();
         for (name, entry) in &mut self.projects {
             let Some(settings) = &entry.openshell else {
                 continue;
@@ -3215,17 +3262,47 @@ impl Config {
                         .unwrap_or_else(|| openshell_sandbox_name(name)),
                     builtin_shims: None,
                     host_commands: Vec::new(),
+                    upload_workmux: None,
                     openshell: Some(OpenshellRemote {
                         project: name.clone(),
                         git_url: entry.git_url.clone(),
                         path: entry.path.clone().unwrap_or_else(|| format!("~/{name}")),
                         settings: settings.clone(),
+                        agents: if settings.agents.is_empty() {
+                            default_agent.iter().cloned().collect()
+                        } else {
+                            settings.agents.clone()
+                        },
                     }),
                 },
             );
             entry.remote = Some(name.clone());
         }
         self
+    }
+
+    /// The type of this config's default agent, such as `claude` for a
+    /// command at a workstation path or a named agent of that type; `None`
+    /// when it is no agent workmux knows.
+    fn default_agent_type(&self) -> Option<String> {
+        let selected = self.agent.as_deref().unwrap_or("claude");
+        let (command, agent_type) = match self.agents.get(selected) {
+            Some(entry) => (
+                entry.command_or_default(selected),
+                entry.agent_type.as_deref(),
+            ),
+            None => (selected.to_string(), None),
+        };
+        let profile = crate::multiplexer::agent::resolve_profile_for_display(Some(&command)).name();
+        if profile != "default" {
+            return Some(profile.to_string());
+        }
+        agent_type.and_then(|t| {
+            crate::multiplexer::agent::resolve_profile_with_type(None, Some(t))
+                .name()
+                .ne("default")
+                .then(|| t.to_string())
+        })
     }
 
     /// Load the global configuration file.
@@ -4289,6 +4366,72 @@ projects:
         );
         assert_eq!(openshell.settings.providers, ["github", "anthropic"]);
         assert_eq!(config.projects["api"].remote.as_deref(), Some("api"));
+    }
+
+    #[test]
+    fn an_openshell_projects_agents_default_to_the_default_agents_type() {
+        let agents = |yaml: &str| {
+            let global: Config = serde_yaml::from_str(yaml).unwrap();
+            global.with_implicit_remotes().remotes["api"]
+                .openshell
+                .clone()
+                .unwrap()
+                .agents
+        };
+
+        assert_eq!(agents("projects:\n  api:\n    openshell: {}\n"), ["claude"]);
+        // A workstation path or a named agent means its plain CLI.
+        assert_eq!(
+            agents(
+                "agent: /Users/me/.local/bin/codex --yolo\nprojects:\n  api:\n    openshell: {}\n"
+            ),
+            ["codex"]
+        );
+        assert_eq!(
+            agents(
+                "agent: cc\nagents:\n  cc:\n    command: ~/bin/my-claude\n    type: claude\n\
+                 projects:\n  api:\n    openshell: {}\n"
+            ),
+            ["claude"]
+        );
+        assert_eq!(
+            agents("projects:\n  api:\n    openshell:\n      agents: [codex, claude]\n"),
+            ["codex", "claude"]
+        );
+        // An agent workmux knows no type of names none.
+        assert!(agents("agent: my-agent\nprojects:\n  api:\n    openshell: {}\n").is_empty());
+    }
+
+    #[test]
+    fn with_no_agent_configured_an_openshell_sandbox_runs_the_one_its_image_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let named = dir.path().join("default-agent");
+        assert_eq!(super::image_agent(&named), None);
+        std::fs::write(&named, "codex\n").unwrap();
+        let root = tempfile::tempdir().unwrap();
+
+        let config = Config::merge_and_apply_defaults_with_image_agent(
+            Config::default(),
+            Config::default(),
+            None,
+            super::image_agent(&named),
+            root.path(),
+        )
+        .unwrap();
+
+        assert_eq!(config.agent.as_deref(), Some("codex"));
+        // Its first pane runs the agent, as with a configured one.
+        assert_eq!(config.panes.unwrap()[0].command.as_deref(), Some("<agent>"));
+        let project: Config = serde_yaml::from_str("agent: claude").unwrap();
+        let config = Config::merge_and_apply_defaults_with_image_agent(
+            Config::default(),
+            project,
+            None,
+            Some("codex".to_string()),
+            root.path(),
+        )
+        .unwrap();
+        assert_eq!(config.agent.as_deref(), Some("claude"));
     }
 
     #[test]

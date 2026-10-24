@@ -1,4 +1,4 @@
-//! `workmux project`: register projects that live on a remote.
+//! `workmux project`: register and unregister projects that live on a remote.
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand};
@@ -16,67 +16,84 @@ pub struct ProjectArgs {
 #[derive(Debug, Subcommand)]
 pub enum ProjectCommand {
     /// Register a project on a remote in your global config
-    Add {
-        /// Name commands use to refer to the project
+    Add(Box<AddArgs>),
+    /// Unregister a project from your global config, closing its workstation windows; the remote and its clone are kept
+    Rm {
         name: String,
-        /// Remote the project lives on
-        #[arg(
-            long,
-            required_unless_present = "openshell",
-            conflicts_with = "openshell"
-        )]
-        remote: Option<String>,
-        /// Give the project its own OpenShell sandbox as its remote, created on first use
-        #[arg(long)]
-        openshell: bool,
-        /// Image the sandbox runs; it must contain git (OpenShell only)
-        #[arg(long, requires = "openshell")]
-        image: Option<String>,
-        /// Policy file merged on top of workmux's base policy (OpenShell only)
-        #[arg(long, value_name = "FILE", requires = "openshell")]
-        policy: Option<std::path::PathBuf>,
-        /// OpenShell provider to attach to the sandbox, for credentials (repeatable)
-        #[arg(long = "provider", value_name = "PROVIDER", requires = "openshell")]
-        providers: Vec<String>,
-        /// Sandbox name (default: derived from the project name; OpenShell only)
-        #[arg(long, requires = "openshell")]
-        sandbox: Option<String>,
-        /// Git URL the remote clones the project from on first use
-        #[arg(long, value_name = "URL")]
-        repo: String,
-        /// Path of the clone on the remote (default: ~/<name>)
-        #[arg(long)]
-        path: Option<String>,
-        /// Workstation session for the project's windows (default: the project name)
-        #[arg(long)]
-        session: Option<String>,
-        /// Where the project's windows go in window mode
-        #[arg(long, value_enum)]
-        placement: Option<ProjectPlacement>,
+        /// Don't ask for confirmation
+        #[arg(short, long)]
+        yes: bool,
     },
+}
+
+#[derive(Debug, Args)]
+pub struct AddArgs {
+    /// Name commands use to refer to the project
+    pub name: String,
+    /// Remote the project lives on
+    #[arg(
+        long,
+        required_unless_present = "openshell",
+        conflicts_with = "openshell"
+    )]
+    pub remote: Option<String>,
+    /// Give the project its own OpenShell sandbox as its remote, created on first use
+    #[arg(long)]
+    pub openshell: bool,
+    /// Image the sandbox runs; it must contain git (OpenShell only)
+    #[arg(long, requires = "openshell")]
+    pub image: Option<String>,
+    /// Policy file merged on top of workmux's base policy (OpenShell only)
+    #[arg(long, value_name = "FILE", requires = "openshell")]
+    pub policy: Option<std::path::PathBuf>,
+    /// OpenShell provider to attach to the sandbox, for credentials (repeatable)
+    #[arg(long = "provider", value_name = "PROVIDER", requires = "openshell")]
+    pub providers: Vec<String>,
+    /// Agent the sandbox's image installs, such as claude or codex; the first is its
+    /// default agent (repeatable; default: your default agent's type; OpenShell only)
+    #[arg(long = "agent", value_name = "AGENT", requires = "openshell")]
+    pub agents: Vec<String>,
+    /// Sandbox name (default: derived from the project name; OpenShell only)
+    #[arg(long, requires = "openshell")]
+    pub sandbox: Option<String>,
+    /// Git URL the remote clones the project from on first use
+    #[arg(long, value_name = "URL")]
+    pub repo: String,
+    /// Path of the clone on the remote (default: ~/<name>)
+    #[arg(long)]
+    pub path: Option<String>,
+    /// Workstation session for the project's windows (default: the project name)
+    #[arg(long)]
+    pub session: Option<String>,
+    /// Where the project's windows go in window mode
+    #[arg(long, value_enum)]
+    pub placement: Option<ProjectPlacement>,
 }
 
 pub fn run(args: ProjectArgs) -> Result<()> {
     match args.command {
-        ProjectCommand::Add {
-            name,
-            remote,
-            openshell,
-            image,
-            policy,
-            providers,
-            sandbox,
-            repo,
-            path,
-            session,
-            placement,
-        } => {
+        ProjectCommand::Add(args) => {
+            let AddArgs {
+                name,
+                remote,
+                openshell,
+                image,
+                policy,
+                providers,
+                agents,
+                sandbox,
+                repo,
+                path,
+                session,
+                placement,
+            } = *args;
             let openshell = if openshell {
                 Some(OpenshellProject {
                     sandbox,
                     image,
                     policy: policy.map(absolute_policy).transpose()?,
                     providers,
+                    agents,
                 })
             } else {
                 None
@@ -93,6 +110,7 @@ pub fn run(args: ProjectArgs) -> Result<()> {
                 },
             )
         }
+        ProjectCommand::Rm { name, yes } => rm(&name, yes),
     }
 }
 
@@ -122,6 +140,17 @@ fn add(name: &str, project: ProjectEntry) -> Result<()> {
             "Note: only a flake devshell (flake.nix) is baked into an OpenShell sandbox's image; \
              a devbox project gets no devshell there, so put its toolchain in the image (--image)"
         );
+        let remote = &config.remotes[name];
+        let sandbox =
+            crate::remote::openshell::OpenShell::new(&remote.target, remote.openshell.clone());
+        if let Some(report) = sandbox.agent_report() {
+            for note in report.notes {
+                println!("Agent {note}");
+            }
+            for warning in report.warnings {
+                eprintln!("warning: {warning}");
+            }
+        }
         return Ok(());
     }
     println!(
@@ -151,6 +180,50 @@ fn add_project_to(content: &str, name: &str, project: &ProjectEntry) -> Result<S
         );
     }
     global_config::add_entry(content, &PROJECTS, name, project)
+}
+
+/// Unregister project `name`, closing its workstation windows. Nothing on
+/// its remote is touched.
+fn rm(name: &str, yes: bool) -> Result<()> {
+    let (path, content) = global_config::read()?;
+    let updated = remove_project_from(&content, name)?;
+    let entry = &global_config::parse(&content)?.projects[name];
+    let remote = entry.remote.as_deref().unwrap_or_default();
+    let mut prompt = format!(
+        "Remove project {name} from {}? Its workstation windows are closed",
+        path.display()
+    );
+    if !remote.is_empty() {
+        prompt.push_str(&format!(
+            "; remote {remote} and the clone at {} are kept",
+            entry.path.clone().unwrap_or_else(|| format!("~/{name}"))
+        ));
+    }
+    prompt.push('.');
+    if !yes && !crate::ui::confirm::confirm(&prompt, crate::ui::confirm::ConfirmDefault::No)? {
+        println!("Kept project {name}");
+        return Ok(());
+    }
+    super::remote::close_workstation_windows(remote, name);
+    global_config::write(&path, &updated)?;
+    println!("Removed project {name} from {}", path.display());
+    Ok(())
+}
+
+/// Remove project `name` from a global config file's text. An OpenShell
+/// project is refused: its sandbox is its own remote, which `remote rm`
+/// deletes along with the project.
+fn remove_project_from(content: &str, name: &str) -> Result<String> {
+    if global_config::parse(content)?
+        .projects
+        .get(name)
+        .is_some_and(|project| project.openshell.is_some())
+    {
+        bail!(
+            "project {name} is an OpenShell project, whose sandbox is its remote; remove both with: workmux remote rm {name}"
+        );
+    }
+    global_config::remove_entry(content, &PROJECTS, name)
 }
 
 #[cfg(test)]
@@ -231,6 +304,41 @@ remotes:
         assert_eq!(
             error.to_string(),
             "remote api already exists; an OpenShell project's sandbox is its remote, named after it"
+        );
+    }
+
+    #[test]
+    fn removing_a_project_keeps_the_rest_of_the_file() {
+        let content = format!(
+            "{WITH_REMOTE}projects:\n  # the api\n  api:\n    remote: devbox\n    git_url: git@github.com:me/api.git\n  web:\n    remote: devbox\n    git_url: git@github.com:me/web.git\n"
+        );
+
+        let updated = remove_project_from(&content, "api").unwrap();
+
+        assert_eq!(
+            updated,
+            format!(
+                "{WITH_REMOTE}projects:\n  # the api\n  web:\n    remote: devbox\n    git_url: git@github.com:me/web.git\n"
+            )
+        );
+    }
+
+    #[test]
+    fn removing_an_unknown_project_is_an_error() {
+        let error = remove_project_from(WITH_REMOTE, "api").unwrap_err();
+
+        assert_eq!(error.to_string(), "no project named api");
+    }
+
+    #[test]
+    fn an_openshell_project_is_removed_with_its_sandbox_by_remote_rm() {
+        let content = add_project_to("", "api", &openshell_api()).unwrap();
+
+        let error = remove_project_from(&content, "api").unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "project api is an OpenShell project, whose sandbox is its remote; remove both with: workmux remote rm api"
         );
     }
 
