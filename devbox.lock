@@ -1,6 +1,44 @@
 {
   "lockfile_version": "1",
   "packages": {
+    "dtach@latest": {
+      "last_modified": "2026-10-20T14:23:57Z",
+      "resolved": "github:NixOS/nixpkgs/5adc50831c259f87faeb09ddf930d43597197473#dtach",
+      "source": "devbox-search",
+      "version": "0.9-unstable-2025-06-21",
+      "systems": {
+        "aarch64-darwin": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/f8zbcabv4bd7d61gsc6zx9zalnlchij6-dtach-0.9-unstable-2025-06-21",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/f8zbcabv4bd7d61gsc6zx9zalnlchij6-dtach-0.9-unstable-2025-06-21"
+        },
+        "aarch64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/prj4acrs946q9paks6p5x32vgr369q7b-dtach-0.9-unstable-2025-06-21",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/prj4acrs946q9paks6p5x32vgr369q7b-dtach-0.9-unstable-2025-06-21"
+        },
+        "x86_64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/sn5fzlymkc9pcldgkdyahcnjf665fr56-dtach-0.9-unstable-2025-06-21",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/sn5fzlymkc9pcldgkdyahcnjf665fr56-dtach-0.9-unstable-2025-06-21"
+        }
+      }
+    },
     "github:NixOS/nixpkgs/nixpkgs-unstable": {
       "last_modified": "2026-02-04T01:49:30Z",
       "resolved": "github:NixOS/nixpkgs/aa290c9891fa4ebe88f8889e59633d20cc06a5f2?lastModified=1770169770"

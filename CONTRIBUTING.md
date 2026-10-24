@@ -16,6 +16,7 @@ To avoid wasted effort, open an issue first to discuss your proposed change.
 - Python 3.10+ with a virtual environment at `tests/venv/`
 - [just](https://github.com/casey/just) command runner
 - tmux (required for tests)
+- dtach (required for remote-pane tests; included in `devbox.json`)
 - WezTerm (optional, for testing WezTerm backend)
 - Zellij (optional, for testing Zellij backend)
 
