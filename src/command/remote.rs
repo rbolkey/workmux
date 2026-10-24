@@ -486,9 +486,18 @@ fn recreate(name: &str, yes: bool) -> Result<()> {
     Ok(())
 }
 
-/// Show an OpenShell remote's effective policy, read from the sandbox, and
-/// its agents with the providers that give them credentials.
+/// Show an OpenShell remote's repository, its effective policy, read from
+/// the sandbox, and its agents with the providers that give them
+/// credentials.
 fn print_policy(name: &str, remote: &RemoteConfig) {
+    if let Some(origin) = &remote.openshell
+        && let Some(git_url) = &origin.git_url
+    {
+        println!(
+            "  repo:     {}",
+            crate::remote::openshell::repo::describe(git_url, origin.ssh_git_url.as_deref())
+        );
+    }
     let sandbox =
         crate::remote::openshell::OpenShell::new(&remote.target, remote.openshell.clone());
     match sandbox.policy_report() {

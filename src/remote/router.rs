@@ -70,6 +70,7 @@ pub fn remote_project(config: &Config, name: &str) -> Result<RemoteProject> {
             name: name.to_string(),
             path: entry.path.clone().unwrap_or_else(|| format!("~/{name}")),
             git_url: entry.git_url.clone(),
+            ssh_git_url: entry.ssh_git_url.clone(),
             session: match entry.placement.unwrap_or_default() {
                 ProjectPlacement::ProjectSession => {
                     Some(entry.session.clone().unwrap_or_else(|| name.to_string()))

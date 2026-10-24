@@ -12,6 +12,7 @@
 pub mod agents;
 pub mod image;
 pub mod policy;
+pub mod repo;
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::Value;
@@ -335,9 +336,11 @@ impl OpenShell {
     /// Build the sandbox's image, returning its tag.
     fn build_image(&self, origin: &OpenshellRemote, context: &std::path::Path) -> Result<String> {
         let checkout = context.join("project");
+        // The workstation has SSH: clone the way the user gave the URL.
         let devshell = origin
-            .git_url
+            .ssh_git_url
             .as_deref()
+            .or(origin.git_url.as_deref())
             .is_some_and(|url| self.fetch_flake(url, &checkout))
             .then_some(checkout);
         let workmux = image::Workmux::current();
@@ -649,6 +652,7 @@ mod tests {
         OpenshellRemote {
             project: "api".to_string(),
             git_url: None,
+            ssh_git_url: None,
             path: "~/api".to_string(),
             settings: OpenshellProject {
                 providers: vec!["github".to_string(), "anthropic".to_string()],
@@ -1044,6 +1048,7 @@ mod contract {
         let origin = OpenshellRemote {
             project: name.clone(),
             git_url: None,
+            ssh_git_url: None,
             path: "~/api".to_string(),
             settings: crate::config::OpenshellProject {
                 image: Some(fixture_image()),
