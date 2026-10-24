@@ -23,6 +23,7 @@ workmux project add api --openshell --repo https://github.com/me/api.git \
 | `--image`         | Image the sandbox is built from. It must contain git and dtach. Default: workmux's own image |
 | `--policy FILE`   | Policy file merged on top of workmux's [base policy](#policy). Stored as an absolute path    |
 | `--provider NAME` | OpenShell provider to attach, for credentials (repeatable). No other provider is attached    |
+| `--agent NAME`    | Agent the image installs (repeatable); the first is the sandbox's default agent              |
 | `--sandbox NAME`  | Sandbox name. Default: the project name                                                      |
 | `--path`          | The clone's path in the sandbox. Default: `~/<name>`                                         |
 
@@ -39,6 +40,7 @@ projects:
       image: ghcr.io/me/api-dev:1
       policy: /Users/me/api-policy.yaml
       providers: [github]
+      agents: [claude]
 ```
 
 The project's remote is implicit and has the project's name, so commands such as `workmux remote status api` work without a `remote add`.
@@ -90,6 +92,7 @@ If the restore fails, run `workmux remote recreate` again. It resumes from the k
 workmux builds the sandbox image with `docker build` on the Docker daemon your OpenShell gateway uses, so it is native to the sandbox's architecture. The image is tagged `workmux-openshell-<sandbox>:<hash>`, and is rebuilt when its inputs change.
 
 - **Default image:** `ubuntu:24.04` with git, dtach, curl and workmux.
+- **Agents:** every image gets the project's [agents](#agents-in-the-sandbox) that workmux can install.
 - **Your image (`--image`):** used as the base as it is. It must contain git and dtach, because nothing can be installed in a running sandbox.
 
 Every image gets a workmux matching yours at `/usr/local/bin/workmux`:
@@ -106,9 +109,25 @@ Published workmux releases don't include remote support yet, so a release workmu
 
 ### Agents in the sandbox
 
-workmux's default image contains no agent CLI, and the agent command comes from the sandbox's own workmux config, not your workstation's. To run Claude Code, Codex or another agent, put it in your `--image`. OpenShell's provider profiles for agents expect the binary at a standard path such as `/usr/local/bin/claude`.
+The image installs the agents the project names, and the first one is the sandbox's default agent. Name them with `--agent` (repeatable) or `agents:` under the project's `openshell:` key. By default the sandbox gets your default agent's type: a workstation path such as `~/.local/bin/claude`, or a named agent with `type: claude`, means `claude`.
 
-<!-- Update this section when OpenShell images install the project's agents (ticket 33). -->
+| Agent    | Installed at            | Provider type it needs |
+| -------- | ----------------------- | ---------------------- |
+| `claude` | `/usr/local/bin/claude` | `claude-code`          |
+| `codex`  | `/usr/local/bin/codex`  | `codex`                |
+
+These are the paths OpenShell's example provider profiles allow, so a provider made from one of those profiles gives the agent its credentials. Each agent is installed in a build stage of its own, so your `--image` needs no curl. Claude Code is the glibc build, so it needs a glibc base image. Codex is a static musl build and runs on any base. workmux can't install other agents, so `project add` warns and your `--image` must already contain them.
+
+The sandbox runs the agent's plain CLI, not your workstation's agent command. The image records the default agent in `/etc/workmux/default-agent`. Remote workmux uses it when no config in the sandbox names an agent, and counts it as a configured agent, so a project without panes of its own gets an agent pane. A `--agent` given to `add` is passed to remote workmux as it is, so give it the agent's plain CLI (`-a codex`) rather than a workstation alias.
+
+`project add --openshell` and `remote status` list each agent with the provider type it needs and which attached providers have that type. Both warn when none has it, and so does creating the sandbox:
+
+```text
+Agent claude: installed at /usr/local/bin/claude; its credentials come from a provider of type claude-code
+warning: no provider of type claude-code is attached to the sandbox, so claude has no credentials there; create one with `openshell provider create --type claude-code` and list it in the project's `openshell: providers:`
+```
+
+The agent still starts without one, but it can't authenticate. The sandbox's network policy reaches the agent's endpoints only through its provider.
 
 ## Nix devshells
 
