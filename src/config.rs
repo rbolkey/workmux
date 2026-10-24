@@ -3293,7 +3293,13 @@ impl Config {
     /// command at a workstation path or a named agent of that type; `None`
     /// when it is no agent workmux knows.
     fn default_agent_type(&self) -> Option<String> {
-        let selected = self.agent.as_deref().unwrap_or("claude");
+        self.agent_type_of(self.agent.as_deref().unwrap_or("claude"))
+    }
+
+    /// The type of the agent `selected` names, a named agent from `agents:`
+    /// or a command, such as `claude` for a command at a workstation path;
+    /// `None` when it is no agent workmux knows.
+    pub fn agent_type_of(&self, selected: &str) -> Option<String> {
         let (command, agent_type) = match self.agents.get(selected) {
             Some(entry) => (
                 entry.command_or_default(selected),
