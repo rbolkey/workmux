@@ -1214,6 +1214,7 @@ mod tests {
             ]
             .to_vec(),
             invoking_window_token: None,
+            prompt_file: None,
         };
         let (env, received) = mpsc::channel();
         let session = std::thread::spawn(move || {

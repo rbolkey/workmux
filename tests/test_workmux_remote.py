@@ -977,6 +977,63 @@ def test_commands_that_would_open_an_editor_refuse_for_a_remote_project(
             os.kill(daemon_pid, signal.SIGTERM)
 
 
+@pytest.mark.tmux_only
+def test_a_prompt_file_is_read_on_the_workstation_for_a_remote_project(
+    mux_server: MuxEnvironment,
+    workmux_exe_path: Path,
+    repo_path: Path,
+    short_tmp: dict,
+    remote_root: Path,
+):
+    """`add -P FILE` and `open -P FILE` for a remote project use the
+    workstation's FILE, though the remote has a file at the same path, and
+    a missing FILE fails on the workstation without reaching the remote."""
+    env = mux_server
+    assert isinstance(env, TmuxEnvironment)
+    origin = make_origin(env, env.tmp_path / "origin", "panes:\n  - command: sh\n")
+    clone = remote_root / "home" / "code" / "api"
+    worktrees = remote_root / "home" / "code" / "api__worktrees"
+
+    def wm(command, expect_fail=False):
+        return run_workmux_command(
+            env,
+            workmux_exe_path,
+            repo_path,
+            command,
+            pre_run_env=short_tmp,
+            expect_fail=expect_fail,
+            timeout=60.0,
+        )
+
+    def prompt_of(branch):
+        return (worktrees / branch / ".workmux" / f"PROMPT-{branch}.md").read_text()
+
+    wm(f"remote add lb --transport loopback --target {remote_root}")
+    wm(f"project add api --remote lb --repo {origin} --path code/api")
+    daemon_pid = None
+    try:
+        missing = wm("add feature -P missing.md --project api", expect_fail=True)
+        assert "Failed to read prompt file: missing.md" in missing.stderr
+        assert not clone.exists()
+
+        wm("add first --project api")
+        daemon_pid = remote_daemon_ping(env, workmux_exe_path, repo_path, short_tmp)[
+            "pid"
+        ]
+        env.tmux(["select-window", "-t", env.runner_pane_id or "test:0"])
+        (repo_path / "prompt.md").write_text("Use the workstation's prompt\n")
+        (clone / "prompt.md").write_text("Not the remote's prompt\n")
+
+        wm("add feature -P prompt.md --prompt-file-only --project api")
+        assert "Use the workstation's prompt" in prompt_of("feature")
+
+        wm("open first -n --prompt-file=prompt.md --prompt-file-only --project api")
+        assert "Use the workstation's prompt" in prompt_of("first")
+    finally:
+        if daemon_pid is not None:
+            os.kill(daemon_pid, signal.SIGTERM)
+
+
 def pid_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
