@@ -133,6 +133,13 @@ export default defineConfig({
           ],
         },
         {
+          label: "Remote projects",
+          items: [
+            { label: "Overview", slug: "guide/remote-projects" },
+            { label: "OpenShell", slug: "guide/remote-projects/openshell" },
+          ],
+        },
+        {
           label: "Alternative backends",
           items: [
             { label: "kitty", slug: "guide/kitty" },
@@ -177,6 +184,8 @@ export default defineConfig({
             { label: "init", slug: "reference/commands/init" },
             { label: "claude prune", slug: "reference/commands/claude" },
             { label: "sandbox", slug: "reference/commands/sandbox" },
+            { label: "remote", slug: "reference/commands/remote" },
+            { label: "project", slug: "reference/commands/project" },
             { label: "completions", slug: "reference/commands/completions" },
             { label: "docs", slug: "reference/commands/docs" },
             { label: "update", slug: "reference/commands/update" },
