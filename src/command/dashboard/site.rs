@@ -128,7 +128,7 @@ impl WorktreeSite {
         else {
             return Ok(None);
         };
-        let resolved = crate::config::Config::load_global_only()
+        let resolved = crate::remote::router::global_config()
             .and_then(|config| crate::remote::router::remote_project(&config, project))
             .map_err(|error| format!("{error:#}"))?;
         if resolved.site.remote != *remote {
@@ -348,7 +348,7 @@ impl ProjectScope {
             Self::Workstation(_) => Ok(None),
             Self::Remote { remote, project } => {
                 let resolved = crate::remote::router::remote_project(
-                    &crate::config::Config::load_global_only()?,
+                    &*crate::remote::router::global_config()?,
                     project,
                 )?;
                 if resolved.site.remote != *remote {

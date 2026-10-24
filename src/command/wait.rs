@@ -100,9 +100,18 @@ fn unstarted_remote_target(name: &str) -> Result<Option<WaitTarget>> {
     let Some(project) = project else {
         return Ok(None);
     };
-    crate::remote::router::ready(&project, true)?;
-    if crate::remote::router::quietly(&project, &["workmux", "path", handle])? != 0 {
-        return Ok(None);
+    // A missing or stopped remote is never created or started to look: its
+    // worktree counts as not found yet. Nor is an unreachable one an error.
+    let found = crate::remote::router::ready(&project, false).and_then(|running| {
+        Ok(running && crate::remote::router::quietly(&project, &["workmux", "path", handle])? == 0)
+    });
+    match found {
+        Ok(true) => {}
+        Ok(false) => return Ok(None),
+        Err(error) => {
+            tracing::debug!(error = %format!("{error:#}"), "remote unreachable");
+            return Ok(None);
+        }
     }
     Ok(Some(WaitTarget::Remote {
         remote: project.site.remote.clone(),
@@ -310,6 +319,63 @@ pub fn run(
 mod tests {
     use super::*;
     use crate::multiplexer::RemoteAgentPane;
+
+    #[test]
+    fn waiting_on_an_unstarted_remote_worktree_never_creates_or_starts_its_sandbox() {
+        const TEST_NAME: &str = "command::wait::tests::waiting_on_an_unstarted_remote_worktree_never_creates_or_starts_its_sandbox";
+        if !crate::test_support::is_isolated_child(TEST_NAME) {
+            use std::os::unix::fs::PermissionsExt;
+            let temp = tempfile::tempdir().unwrap();
+            let bin = temp.path().join("bin");
+            let config = temp.path().join("config/workmux");
+            std::fs::create_dir_all(&bin).unwrap();
+            std::fs::create_dir_all(&config).unwrap();
+            std::fs::write(
+                config.join("config.yaml"),
+                "projects:\n  api:\n    git_url: https://example.com/api.git\n    openshell: {}\n",
+            )
+            .unwrap();
+            // The sandbox is missing; every call is logged.
+            let openshell = bin.join("openshell");
+            std::fs::write(
+                &openshell,
+                format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\necho 'Error: sandbox not found' >&2\nexit 1\n",
+                    temp.path().join("log").display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&openshell, std::fs::Permissions::from_mode(0o755)).unwrap();
+            // Nothing may build an image either.
+            let docker = bin.join("docker");
+            std::fs::write(&docker, "#!/bin/sh\nexit 1\n").unwrap();
+            std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let path = std::env::join_paths(
+                std::iter::once(bin.clone())
+                    .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+            )
+            .unwrap();
+            crate::test_support::run_isolated_test(
+                TEST_NAME,
+                temp.path(),
+                &[
+                    ("XDG_CONFIG_HOME", &temp.path().join("config")),
+                    ("XDG_STATE_HOME", temp.path()),
+                    ("HOME", temp.path()),
+                    ("PATH", std::path::Path::new(&path)),
+                ],
+            );
+            let log = std::fs::read_to_string(temp.path().join("log")).unwrap_or_default();
+            assert!(
+                !log.contains("sandbox create") && !log.contains("sandbox start"),
+                "{log}"
+            );
+            return;
+        }
+        println!("{}", crate::test_support::ISOLATED_TEST_CANARY);
+
+        assert!(unstarted_remote_target("api:feature").unwrap().is_none());
+    }
 
     fn remote_agent(worktree: &str, status: AgentStatus, stale: bool) -> AgentPane {
         let mut agent: AgentPane = serde_json::from_value(serde_json::json!({

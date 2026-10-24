@@ -5,8 +5,8 @@
 //! from the session's invocation context. Panes only ever run
 //! `workmux remote attach`, a view onto a remote pane the remote started. Every
 //! request that targets a window or pane is refused unless that window
-//! belongs to a project on the requesting remote, which workmux records by
-//! tagging the windows it creates for remote projects.
+//! belongs to the requesting project on the requesting remote, which workmux
+//! records by tagging the windows it creates for remote projects.
 
 use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
@@ -62,6 +62,43 @@ pub fn parse_project_tag(tag: &str) -> Option<(&str, &str)> {
     tag.trim()
         .split_once(':')
         .filter(|(remote, name)| !remote.is_empty() && !name.is_empty())
+}
+
+/// Close every window of project `name` on `remote` in `tmux`, returning
+/// how many. A session left holding other windows loses the project's tag,
+/// so it is no longer taken for the project's.
+pub fn close_project_windows(tmux: &TmuxBackend, remote: &str, name: &str) -> Result<usize> {
+    let tag = project_tag(remote, name);
+    let windows = tmux.query(&[
+        "list-windows",
+        "-a",
+        "-F",
+        &format!("#{{window_id}}\t#{{{WINDOW_TAG}}}"),
+    ])?;
+    let mut closed = 0;
+    for (window, _) in windows
+        .lines()
+        .filter_map(|line| line.split_once('\t'))
+        .filter(|(_, window_tag)| window_tag.trim() == tag)
+    {
+        tmux.query(&["kill-window", "-t", window])?;
+        closed += 1;
+    }
+    let sessions = tmux
+        .query(&[
+            "list-sessions",
+            "-F",
+            &format!("#{{session_id}}\t#{{{SESSION_TAG}}}"),
+        ])
+        .unwrap_or_default();
+    for (session, _) in sessions
+        .lines()
+        .filter_map(|line| line.split_once('\t'))
+        .filter(|(_, session_tag)| session_tag.trim() == tag)
+    {
+        tmux.query(&["set-option", "-qu", "-t", session, SESSION_TAG])?;
+    }
+    Ok(closed)
 }
 
 /// Answer `request` from `scope`'s remote, against `tmux`. Panes attach to
@@ -353,17 +390,22 @@ impl Workstation<'_> {
 
     fn refusal(&self, what: &str) -> anyhow::Error {
         anyhow!(
-            "refused: {what} does not belong to a project on remote {}",
+            "refused: {what} does not belong to project {} on remote {}",
+            self.scope.project,
             self.scope.remote
         )
     }
 
+    /// Whether `tag` names the session's own project: another project on
+    /// the same remote may have windows of the same names.
     fn belongs(&self, tag: &str) -> bool {
-        parse_project_tag(tag).is_some_and(|(remote, _)| remote == self.scope.remote)
+        parse_project_tag(tag).is_some_and(|(remote, project)| {
+            remote == self.scope.remote && project == self.scope.project
+        })
     }
 
     /// Refuse unless the window holding `target` (a pane or window) was
-    /// created for a project on this remote.
+    /// created for this project.
     fn check_window(&self, target: &str) -> Result<()> {
         let tag = self
             .tmux
@@ -396,7 +438,7 @@ impl Workstation<'_> {
     }
 
     /// Use `session` for the project: an untagged session of the project's
-    /// name is adopted and tagged; any other must already be this remote's.
+    /// name is adopted and tagged; any other must already be this project's.
     fn adopt_session(&self, session: &str) -> Result<()> {
         let tag = self.session_tag(session);
         if tag.trim().is_empty() {
@@ -477,7 +519,7 @@ impl Workstation<'_> {
         )
     }
 
-    /// The window id of this remote's window named `name`.
+    /// The window id of this project's window named `name`.
     fn window_named(&self, name: &str) -> Result<String> {
         let windows = self.tmux.query(&[
             "list-windows",
@@ -560,6 +602,10 @@ mod tests {
 
         fn tmux(&self, args: &[&str]) -> String {
             self.server.query(args)
+        }
+
+        fn server_tmux(&self) -> TmuxBackend {
+            TmuxBackend::for_socket(&self.server.socket)
         }
     }
 
@@ -713,13 +759,126 @@ mod tests {
         for request in refusals {
             let error = ws.ask(&scope, request.clone()).unwrap_err().to_string();
             assert!(
-                error.contains("does not belong to a project on remote devbox"),
+                error.contains("does not belong to project api on remote devbox"),
                 "{request:?}: {error}"
             );
         }
         assert_eq!(
             ws.tmux(&["display-message", "-p", "-t", &others_pane, "#{pane_id}"]),
             others_pane
+        );
+    }
+
+    #[test]
+    fn a_project_acts_only_on_its_own_windows_when_another_on_its_remote_shares_a_name() {
+        let Some(ws) = Workstation::start() else {
+            return;
+        };
+        let invoking = ws.server.new_session("mine", ws.remote_root.path());
+        let window_of = |project: &str| {
+            let scope = ws.scope("devbox", project, &invoking);
+            let pane_id = pane(
+                ws.ask(
+                    &scope,
+                    MuxRequest::CreateSession {
+                        name: project.to_string(),
+                        initial_window_name: Some("wm-feature".to_string()),
+                        pane: remote_pane(),
+                    },
+                )
+                .unwrap(),
+            );
+            let window = ws.tmux(&["display-message", "-p", "-t", &pane_id, "#{window_id}"]);
+            (pane_id, window)
+        };
+        // The other project's window comes first in tmux's listing.
+        let (web_pane, web_window) = window_of("web");
+        let (_, api_window) = window_of("api");
+        let api = ws.scope("devbox", "api", &invoking);
+
+        ws.ask(
+            &api,
+            MuxRequest::RenameWindow {
+                old: "wm-feature".to_string(),
+                new: "wm-renamed".to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            ws.tmux(&["display-message", "-p", "-t", &web_window, "#{window_name}"]),
+            "wm-feature"
+        );
+        ws.ask(
+            &api,
+            MuxRequest::KillWindow {
+                name: "wm-renamed".to_string(),
+            },
+        )
+        .unwrap();
+        let error = ws
+            .ask(
+                &api,
+                MuxRequest::KillWindow {
+                    name: "wm-feature".to_string(),
+                },
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("refused"), "{error}");
+        for request in [
+            MuxRequest::KillPane {
+                pane_id: web_pane.clone(),
+            },
+            MuxRequest::KillSession {
+                name: "web".to_string(),
+            },
+        ] {
+            let error = ws.ask(&api, request.clone()).unwrap_err().to_string();
+            assert!(
+                error.contains("does not belong to project api on remote devbox"),
+                "{request:?}: {error}"
+            );
+        }
+        let windows = ws.tmux(&["list-windows", "-a", "-F", "#{window_id}"]);
+        assert!(!windows.lines().any(|id| id == api_window), "{windows}");
+        assert!(windows.lines().any(|id| id == web_window), "{windows}");
+    }
+
+    #[test]
+    fn closing_a_projects_windows_leaves_every_other_window() {
+        let Some(ws) = Workstation::start() else {
+            return;
+        };
+        let invoking = ws.server.new_session("mine", ws.remote_root.path());
+        let create = |project: &str, session: &str| {
+            pane(
+                ws.ask(
+                    &ws.scope("devbox", project, &invoking),
+                    MuxRequest::CreateSession {
+                        name: session.to_string(),
+                        initial_window_name: Some("wm-feature".to_string()),
+                        pane: remote_pane(),
+                    },
+                )
+                .unwrap(),
+            )
+        };
+        create("api", "api");
+        let web = create("web", "web");
+        // The user's own window in the project's session.
+        let own = ws.server.new_window("api");
+
+        let closed = close_project_windows(&ws.server_tmux(), "devbox", "api").unwrap();
+
+        assert_eq!(closed, 1);
+        let windows = ws.tmux(&["list-windows", "-a", "-F", "#{pane_id}"]);
+        assert!(windows.lines().any(|pane| pane == web), "{windows}");
+        let window_ids = ws.tmux(&["list-windows", "-a", "-F", "#{window_id}"]);
+        assert!(window_ids.lines().any(|id| id == own), "{window_ids}");
+        assert!(windows.lines().any(|pane| pane == invoking), "{windows}");
+        assert_eq!(
+            ws.tmux(&["show-options", "-qv", "-t", "api", SESSION_TAG]),
+            ""
         );
     }
 
@@ -809,7 +968,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            error.contains("does not belong to a project on remote devbox"),
+            error.contains("does not belong to project api on remote devbox"),
             "{error}"
         );
         ws.ask(
@@ -906,7 +1065,7 @@ mod tests {
                 refusal
                     .unwrap_err()
                     .to_string()
-                    .contains("does not belong to a project on remote"),
+                    .contains("does not belong to project"),
             );
         }
     }

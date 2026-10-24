@@ -215,7 +215,7 @@ pub fn request<T: DeserializeOwned>(
     request: &DashboardRequest,
     connect: bool,
 ) -> Result<T> {
-    let answer = match super::router::daemon_socket() {
+    let answer = match super::router::recent_daemon_socket() {
         Some(socket) => crate::workstation_daemon::call_with_timeout(
             &socket,
             DAEMON_METHOD,
@@ -226,7 +226,8 @@ pub fn request<T: DeserializeOwned>(
                 "connect": connect,
             }),
             TIMEOUT + Duration::from_secs(5),
-        )?,
+        )
+        .inspect_err(|_| super::router::forget_recent_daemon_socket())?,
         None => super::channels().dashboard(
             &project.site.remote,
             &project.remote,

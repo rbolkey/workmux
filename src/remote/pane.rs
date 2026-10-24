@@ -164,9 +164,22 @@ impl SessionHolder {
         self.dir.join(project).join(worktree)
     }
 
-    /// Start `argv` in a new remote pane for `project`, in `workdir`.
-    /// The pane's worktree is the git worktree holding `workdir`.
+    /// [`create_with_env`](Self::create_with_env) with no added environment.
+    #[cfg(test)]
     pub fn create(&self, project: &str, workdir: &Path, argv: &[String]) -> Result<RemotePaneId> {
+        self.create_with_env(project, workdir, argv, &[])
+    }
+
+    /// Start `argv` in a new remote pane for `project`, in `workdir`, with
+    /// `env` added to its environment. The pane's worktree is the git
+    /// worktree holding `workdir`.
+    pub fn create_with_env(
+        &self,
+        project: &str,
+        workdir: &Path,
+        argv: &[String],
+        env: &[(&str, &str)],
+    ) -> Result<RemotePaneId> {
         if argv.is_empty() {
             bail!("no command for the remote pane");
         }
@@ -190,6 +203,7 @@ impl SessionHolder {
             .args(argv)
             .current_dir(workdir)
             .env(PANE_ENV, id.to_string())
+            .envs(env.iter().copied())
             .env_remove(super::forwarding::SOCKET_ENV)
             .env_remove(super::forwarding::SESSION_ENV)
             // The holder outlives this process: it must not hold our stdio.
@@ -353,19 +367,29 @@ impl SessionHolder {
     }
 
     /// End remote pane `id`: hang up its process, as closing a terminal
-    /// would, and kill it if it does not exit.
+    /// would, and kill it if it does not exit. Only a running pane's
+    /// process is signalled: an ended pane's pid file may name a process
+    /// that reused its pid, and is removed instead.
     pub fn kill(&self, id: &RemotePaneId) -> Result<()> {
         // A pane just created may not have recorded its pid yet.
         let deadline = Instant::now() + Duration::from_secs(2);
         let pid = loop {
+            if self.state(id)? == PaneState::Ended {
+                return Ok(());
+            }
             match self.pid(id) {
                 Some(pid) => break pid,
-                None if Instant::now() < deadline && self.state(id)? == PaneState::Running => {
+                None if Instant::now() < deadline => {
                     std::thread::sleep(Duration::from_millis(20));
                 }
                 None => return Ok(()),
             }
         };
+        if !self.holds(id, pid) {
+            bail!(
+                "the pid file of remote pane {id} names process {pid}, which the pane does not run; not signalling it"
+            );
+        }
         unsafe { libc::kill(pid, libc::SIGHUP) };
         let deadline = Instant::now() + Duration::from_secs(2);
         while self.state(id)? == PaneState::Running {
@@ -376,6 +400,20 @@ impl SessionHolder {
             std::thread::sleep(Duration::from_millis(20));
         }
         Ok(())
+    }
+
+    /// Whether `pid` is the process remote pane `id`'s holder runs: its
+    /// parent is the dtach master serving the pane's socket. Where the
+    /// process table cannot be read, the pane's live socket vouches for it.
+    fn holds(&self, id: &RemotePaneId, pid: i32) -> bool {
+        let socket = self.socket(id);
+        match parent_command(pid) {
+            Some(Some(parent)) => {
+                parent.contains("dtach") && parent.contains(&*socket.to_string_lossy())
+            }
+            Some(None) => false,
+            None => true,
+        }
     }
 
     /// The command that attaches this terminal to remote pane `id`. The
@@ -408,6 +446,36 @@ pub fn end_served_worktree_panes(worktree_path: &Path) {
     });
     if let Err(error) = ended {
         tracing::warn!(error = %format!("{error:#}"), "failed to end the worktree's remote panes");
+    }
+}
+
+/// The command line of `pid`'s parent: `Some(None)` when there is no such
+/// process, `None` when the process table cannot be read.
+fn parent_command(pid: i32) -> Option<Option<String>> {
+    let proc = Path::new("/proc");
+    if proc.join("self").exists() {
+        let Ok(stat) = std::fs::read_to_string(proc.join(pid.to_string()).join("stat")) else {
+            return Some(None);
+        };
+        // The command name, in parentheses, may itself hold spaces.
+        let ppid = stat
+            .rsplit_once(')')
+            .and_then(|(_, rest)| rest.split_whitespace().nth(1))?;
+        let cmdline = std::fs::read(proc.join(ppid).join("cmdline")).ok()?;
+        return Some(Some(String::from_utf8_lossy(&cmdline).replace('\0', " ")));
+    }
+    let ps = |field: &str, pid: &str| -> Option<Option<String>> {
+        let output = Command::new("ps")
+            .args(["-o", field, "-p", pid])
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        Some((output.status.success() && !text.is_empty()).then_some(text))
+    };
+    match ps("ppid=", &pid.to_string())? {
+        Some(ppid) => ps("command=", &ppid),
+        None => Some(None),
     }
 }
 
@@ -688,6 +756,51 @@ pub mod tests {
 
         wait_ended(&holder, &id);
         assert!(!socket.exists());
+    }
+
+    /// A live process that is not a remote pane's.
+    fn bystander() -> std::process::Child {
+        Command::new("sleep").arg("30").spawn().unwrap()
+    }
+
+    fn alive(child: &mut std::process::Child) -> bool {
+        std::thread::sleep(Duration::from_millis(100));
+        child.try_wait().unwrap().is_none()
+    }
+
+    #[test]
+    fn ending_an_ended_pane_signals_no_process_its_stale_pid_file_names() {
+        let temp = tempfile::tempdir().unwrap();
+        let holder = SessionHolder::new(temp.path().join("panes"));
+        let id: RemotePaneId = "api/feature/0".parse().unwrap();
+        let mut bystander = bystander();
+        std::fs::create_dir_all(holder.worktree_dir("api", "feature")).unwrap();
+        std::fs::write(holder.pid_file(&id), format!("{}\n", bystander.id())).unwrap();
+
+        holder.kill(&id).unwrap();
+
+        assert!(alive(&mut bystander));
+        assert!(!holder.pid_file(&id).exists());
+        bystander.kill().unwrap();
+    }
+
+    #[test]
+    fn ending_a_pane_signals_only_the_process_its_holder_runs() {
+        let Some((temp, holder)) = holder() else {
+            return;
+        };
+        let feature = worktree(&temp, "feature");
+        let id = holder
+            .create("api", &feature, &argv(&["sleep", "30"]))
+            .unwrap();
+        wait_for_file(&holder.pid_file(&id));
+        let mut bystander = bystander();
+        std::fs::write(holder.pid_file(&id), format!("{}\n", bystander.id())).unwrap();
+
+        assert!(holder.kill(&id).is_err());
+
+        assert!(alive(&mut bystander));
+        bystander.kill().unwrap();
     }
 
     #[test]

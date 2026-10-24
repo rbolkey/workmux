@@ -136,6 +136,142 @@ pub fn own_argv() -> Vec<String> {
     std::env::args().skip(1).collect()
 }
 
+/// An option a relayed agent command may carry: its long and short names,
+/// and the check on its value when it takes one.
+struct RelayedOption {
+    long: &'static str,
+    short: Option<char>,
+    value: Option<fn(&str) -> bool>,
+}
+
+/// What a relayed agent command may carry: no option that reads a
+/// workstation file or runs anything (text to send comes inline or on
+/// stdin), and how many targets it names.
+struct RelayedShape {
+    options: &'static [RelayedOption],
+    positionals: std::ops::RangeInclusive<usize>,
+}
+
+fn relayed_shape(command: &str) -> Option<RelayedShape> {
+    fn any(_: &str) -> bool {
+        true
+    }
+    fn number(value: &str) -> bool {
+        value.parse::<u64>().is_ok()
+    }
+    fn lines(value: &str) -> bool {
+        value.parse::<u16>().is_ok()
+    }
+    match command {
+        "send" => Some(RelayedShape {
+            options: &[],
+            positionals: 1..=2,
+        }),
+        "capture" => Some(RelayedShape {
+            options: &[RelayedOption {
+                long: "lines",
+                short: Some('n'),
+                value: Some(lines),
+            }],
+            positionals: 1..=1,
+        }),
+        "wait" => Some(RelayedShape {
+            options: &[
+                RelayedOption {
+                    long: "status",
+                    short: None,
+                    value: Some(any),
+                },
+                RelayedOption {
+                    long: "timeout",
+                    short: None,
+                    value: Some(number),
+                },
+                RelayedOption {
+                    long: "any",
+                    short: None,
+                    value: None,
+                },
+            ],
+            positionals: 1..=usize::MAX,
+        }),
+        _ => None,
+    }
+}
+
+/// `argv` as the workstation runs it for a remote: its command and only
+/// the options that command allows, rebuilt with its targets after `--`,
+/// or refused.
+fn allowed_argv(argv: &[String]) -> Result<Vec<String>> {
+    let command = argv.first().map(String::as_str).unwrap_or_default();
+    let shape = relayed_shape(command).filter(|_| RELAYED_COMMANDS.contains(&command));
+    let Some(shape) = shape else {
+        bail!("refused: workmux {command} does not run on the workstation for a remote");
+    };
+    let refuse = |arg: &str| -> anyhow::Error {
+        anyhow::anyhow!(
+            "refused: workmux {command} {arg} does not run on the workstation for a remote"
+        )
+    };
+    let mut options = Vec::new();
+    let mut positionals = Vec::new();
+    let mut args = argv[1..].iter();
+    while let Some(arg) = args.next() {
+        if arg == "--" {
+            positionals.extend(args.by_ref().cloned());
+            break;
+        }
+        let (option, attached) = if let Some(long) = arg.strip_prefix("--") {
+            let (name, value) = match long.split_once('=') {
+                Some((name, value)) => (name, Some(value.to_string())),
+                None => (long, None),
+            };
+            let option = shape.options.iter().find(|option| option.long == name);
+            (option.ok_or_else(|| refuse(arg))?, value)
+        } else if let Some(short) = arg.strip_prefix('-').filter(|short| !short.is_empty()) {
+            let mut chars = short.chars();
+            let name = chars.next();
+            let option = shape
+                .options
+                .iter()
+                .find(|option| option.short.is_some() && option.short == name);
+            let rest = chars.as_str();
+            (
+                option.ok_or_else(|| refuse(arg))?,
+                (!rest.is_empty()).then(|| rest.to_string()),
+            )
+        } else {
+            positionals.push(arg.clone());
+            continue;
+        };
+        options.push(format!("--{}", option.long));
+        match (option.value, attached) {
+            (None, None) => {}
+            (None, Some(_)) => return Err(refuse(arg)),
+            (Some(valid), value) => {
+                let value = match value {
+                    Some(value) => value,
+                    None => args.next().cloned().ok_or_else(|| refuse(arg))?,
+                };
+                if !valid(&value) {
+                    return Err(refuse(&format!("{arg} {value}")));
+                }
+                options.push(value);
+            }
+        }
+    }
+    if !shape.positionals.contains(&positionals.len()) {
+        bail!(
+            "refused: workmux {command} with these arguments does not run on the workstation for a remote"
+        );
+    }
+    Ok(std::iter::once(command.to_string())
+        .chain(options)
+        .chain(std::iter::once("--".to_string()))
+        .chain(positionals)
+        .collect())
+}
+
 /// The workstation's answer to `command.relay` from remote `name`: run the
 /// agent command with workstation workmux `workmux` against tmux server
 /// `tmux_socket`, limited to the remote's agents.
@@ -146,10 +282,7 @@ pub fn answer_relay(
     params: Value,
 ) -> Result<Value> {
     let Relay { argv, stdin } = serde_json::from_value(params)?;
-    let command = argv.first().map(String::as_str).unwrap_or_default();
-    if !RELAYED_COMMANDS.contains(&command) {
-        bail!("refused: workmux {command} does not run on the workstation for a remote");
-    }
+    let argv = allowed_argv(&argv)?;
     let stdin = stdin
         .map(|stdin| base64::engine::general_purpose::STANDARD.decode(stdin))
         .transpose()?;
@@ -288,7 +421,7 @@ mod tests {
         assert_eq!(exited.exit_code, 3);
         assert_eq!(
             String::from_utf8(exited.stdout().unwrap()).unwrap(),
-            "send feature hello for devbox\npiped\n"
+            "send -- feature hello for devbox\npiped\n"
         );
         assert_eq!(exited.stderr().unwrap(), b"oops\n");
     }
@@ -338,6 +471,71 @@ mod tests {
             seen.iter().map(|a| a.pane_id.as_str()).collect::<Vec<_>>(),
             [ours.as_str()]
         );
+    }
+
+    #[test]
+    fn a_relayed_send_cannot_read_a_workstation_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let (transport, _channels) = shell_on_devbox(temp.path());
+
+        for args in [
+            &["send", "--file", "~/.ssh/id_ed25519", "feature"][..],
+            &["send", "feature", "-f", "~/.ssh/id_ed25519"],
+            &["send", "--file=~/.ssh/id_ed25519", "feature"],
+            &["send", "-f~/.ssh/id_ed25519", "feature"],
+        ] {
+            let error = relay(&transport.shell_socket(), &argv(args), None)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("refused"), "{args:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn a_relayed_command_runs_only_with_its_allowed_flags() {
+        let temp = tempfile::tempdir().unwrap();
+        let (transport, _channels) = shell_on_devbox(temp.path());
+        let stdout = |args: &[&str]| {
+            String::from_utf8(
+                relay(&transport.shell_socket(), &argv(args), None)
+                    .unwrap()
+                    .stdout()
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+
+        assert_eq!(
+            stdout(&["send", "--", "feature", "--file text"]),
+            "send -- feature --file text for devbox\n"
+        );
+        assert_eq!(
+            stdout(&["capture", "-n", "50", "feature"]),
+            "capture --lines 50 -- feature for devbox\n"
+        );
+        assert_eq!(
+            stdout(&[
+                "wait",
+                "a",
+                "--status=working",
+                "--any",
+                "--timeout",
+                "5",
+                "b"
+            ]),
+            "wait --status working --any --timeout 5 -- a b for devbox\n"
+        );
+        for refused in [
+            &["capture", "--help", "feature"][..],
+            &["wait", "--config", "x", "feature"],
+            &["send", "feature", "hello", "extra"],
+            &["capture", "--lines", "lots", "feature"],
+        ] {
+            let error = relay(&transport.shell_socket(), &argv(refused), None)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("refused"), "{refused:?}: {error}");
+        }
     }
 
     #[test]
