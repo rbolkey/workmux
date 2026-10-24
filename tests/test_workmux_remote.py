@@ -1162,6 +1162,63 @@ def test_a_prompt_file_is_read_on_the_workstation_for_a_remote_project(
             os.kill(daemon_pid, signal.SIGTERM)
 
 
+@requires_dtach
+@pytest.mark.tmux_only
+def test_a_workstation_agent_alias_runs_its_agent_type_on_a_remote_project(
+    mux_server: MuxEnvironment,
+    workmux_exe_path: Path,
+    repo_path: Path,
+    short_tmp: dict,
+    remote_root: Path,
+):
+    """`add -a ALIAS` for a remote project runs the alias's agent type on
+    the remote, where the alias's workstation path means nothing. An alias
+    with no known type is refused on the workstation."""
+    env = mux_server
+    assert isinstance(env, TmuxEnvironment)
+    path = env.fake_bin_dir / "claude"
+    path.write_text(FAKE_CLAUDE)
+    path.chmod(0o755)
+    origin = make_origin(env, env.tmp_path / "origin", "panes:\n  - command: <agent>\n")
+    clone = remote_root / "home" / "code" / "api"
+    worktrees = remote_root / "home" / "code" / "api__worktrees"
+
+    def wm(command, expect_fail=False):
+        return run_workmux_command(
+            env,
+            workmux_exe_path,
+            repo_path,
+            command,
+            pre_run_env=short_tmp,
+            expect_fail=expect_fail,
+            timeout=60.0,
+        )
+
+    wm(f"remote add lb --transport loopback --target {remote_root}")
+    wm(f"project add api --remote lb --repo {origin} --path code/api")
+    config_path = env.home_path / ".config" / "workmux" / "config.yaml"
+    with config_path.open("a") as config:
+        config.write(
+            "agents:\n"
+            "  cc: /nowhere/on/the/remote/claude --dangerously-skip-permissions\n"
+            "  mine: /nowhere/on/the/remote/run-agent\n"
+        )
+    daemon_pid = None
+    try:
+        refused = wm("add feature -a mine --project api", expect_fail=True)
+        assert "Agent 'mine' is a workstation alias" in refused.stderr
+        assert not clone.exists()
+
+        wm("add feature -a cc --project api")
+        daemon_pid = remote_daemon_ping(env, workmux_exe_path, repo_path, short_tmp)[
+            "pid"
+        ]
+        assert wait_for(worktrees / "feature" / "agent-args.txt").strip() == "args:"
+    finally:
+        if daemon_pid is not None:
+            os.kill(daemon_pid, signal.SIGTERM)
+
+
 def pid_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)

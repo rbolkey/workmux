@@ -517,8 +517,66 @@ fn without_project(args: impl IntoIterator<Item = String>) -> Vec<String> {
 /// `argv`, a relayed `workmux <subcommand> ...` defined by `command`, less
 /// its `--prompt-file`/`-P` option, however it was spelled.
 fn without_prompt_file(argv: Vec<String>, command: &clap::Command) -> Vec<String> {
+    rewrite_option(argv, command, "prompt_file", |_| Ok(Rewrite::Drop))
+        .expect("dropping an option cannot fail")
+}
+
+/// `argv`, a relayed `workmux <subcommand> ...` defined by `command`, with
+/// each `--agent`/`-a` that names a workstation alias from `config`'s
+/// `agents:` replaced by the alias's agent type, which the remote can run
+/// where the alias means nothing. Any other agent is relayed as typed.
+fn with_agent_types(
+    argv: Vec<String>,
+    command: &clap::Command,
+    config: &Config,
+) -> Result<Vec<String>> {
+    rewrite_option(argv, command, "agent", |agent| {
+        if !config.agents.contains_key(agent) {
+            return Ok(Rewrite::Keep);
+        }
+        config.agent_type_of(agent).map(Rewrite::Replace).ok_or_else(|| {
+            anyhow!(
+                "Agent '{agent}' is a workstation alias with no agent type a remote project can run. \
+                 Set its type: in agents: (claude, codex, ...) or pass the agent's plain CLI."
+            )
+        })
+    })
+}
+
+/// What [`rewrite_option`] does with one of an option's values.
+enum Rewrite {
+    Keep,
+    Replace(String),
+    Drop,
+}
+
+/// `argv`, a relayed `workmux <subcommand> ...` defined by `command`, with
+/// each value of its option `id`, however it was spelled, kept, replaced or
+/// dropped (with the option) as `rewrite` says. A replaced value is spelled
+/// `--long=value`.
+fn rewrite_option(
+    argv: Vec<String>,
+    command: &clap::Command,
+    id: &str,
+    mut rewrite: impl FnMut(&str) -> Result<Rewrite>,
+) -> Result<Vec<String>> {
+    let option = command
+        .get_arguments()
+        .find(|a| a.get_id() == id)
+        .expect("the relayed command has the option");
+    let (short, long) = (option.get_short(), option.get_long());
     let takes_value =
         |found: Option<&clap::Arg>| found.is_some_and(|arg| arg.get_action().takes_values());
+    // The option as typed, `typed`, for its value `value`, after any
+    // flags clustered `before` it, respelled as `rewrite` says.
+    let mut respelled = |before: Option<String>, typed: Vec<String>, value: &str| {
+        let option = match rewrite(value)? {
+            Rewrite::Keep => return Ok::<_, anyhow::Error>(typed),
+            Rewrite::Replace(value) => Some(format!("--{}={value}", long.unwrap_or(id))),
+            Rewrite::Drop => None,
+        };
+        Ok(before.into_iter().chain(option).collect())
+    };
     let mut args = argv.into_iter();
     let mut kept: Vec<String> = args.by_ref().take(2).collect();
     while let Some(arg) = args.next() {
@@ -527,16 +585,23 @@ fn without_prompt_file(argv: Vec<String>, command: &clap::Command) -> Vec<String
             kept.extend(args.by_ref());
             break;
         }
-        if arg == "--prompt-file" {
-            args.next();
-            continue;
-        }
-        if arg.starts_with("--prompt-file=") {
-            continue;
-        }
-        if let Some(long) = arg.strip_prefix("--") {
-            let wants_next = !long.contains('=')
-                && takes_value(command.get_arguments().find(|a| a.get_long() == Some(long)));
+        if let Some(long_arg) = arg.strip_prefix("--") {
+            let (name, inline) = match long_arg.split_once('=') {
+                Some((name, value)) => (name, Some(value.to_string())),
+                None => (long_arg, None),
+            };
+            if long == Some(name) {
+                let mut typed = vec![arg.clone()];
+                let value = inline.unwrap_or_else(|| {
+                    let value = args.next().unwrap_or_default();
+                    typed.push(value.clone());
+                    value
+                });
+                kept.extend(respelled(None, typed, &value)?);
+                continue;
+            }
+            let wants_next = inline.is_none()
+                && takes_value(command.get_arguments().find(|a| a.get_long() == Some(name)));
             kept.push(arg);
             if wants_next {
                 kept.extend(args.next());
@@ -550,7 +615,7 @@ fn without_prompt_file(argv: Vec<String>, command: &clap::Command) -> Vec<String
         // A cluster of short flags: the first one that takes a value takes
         // the rest of the cluster, or the next argument when none is left.
         let mut wants_next = false;
-        let mut kept_cluster = arg.clone();
+        let mut kept_cluster = vec![arg.clone()];
         for (at, flag) in cluster.char_indices() {
             if !takes_value(
                 command
@@ -559,25 +624,29 @@ fn without_prompt_file(argv: Vec<String>, command: &clap::Command) -> Vec<String
             ) {
                 continue;
             }
-            let value = &cluster[at + flag.len_utf8()..];
-            wants_next = value.is_empty();
-            if flag == 'P' {
-                kept_cluster = format!("-{}", &cluster[..at]);
-                if wants_next {
-                    args.next();
+            let inline = &cluster[at + flag.len_utf8()..];
+            wants_next = inline.is_empty();
+            if Some(flag) == short {
+                let mut typed = vec![arg.clone()];
+                let value = if wants_next {
                     wants_next = false;
-                }
+                    let value = args.next().unwrap_or_default();
+                    typed.push(value.clone());
+                    value
+                } else {
+                    inline.to_string()
+                };
+                let before = (at > 0).then(|| format!("-{}", &cluster[..at]));
+                kept_cluster = respelled(before, typed, &value)?;
             }
             break;
         }
-        if kept_cluster != "-" {
-            kept.push(kept_cluster);
-        }
+        kept.extend(kept_cluster);
         if wants_next {
             kept.extend(args.next());
         }
     }
-    kept
+    Ok(kept)
 }
 
 /// Relay this command, as it was typed, to `project`'s remote and exit
@@ -594,17 +663,23 @@ const MAX_PROMPT_FILE_BYTES: u64 = 1024 * 1024;
 
 /// Relay this command, `command` as it was typed, to `project`'s remote like
 /// [`relay`], with its prompt file, `prompt_file`, read here on the
-/// workstation, where the user means it, rather than on the remote.
+/// workstation, where the user means it, rather than on the remote, and
+/// any workstation agent alias it names translated to its agent type.
 pub fn relay_with_prompt_file(
     project: &RemoteProject,
     prompt_file: Option<&Path>,
     command: &clap::Command,
 ) -> Result<()> {
+    let mut argv = relayed_argv();
+    if command.get_arguments().any(|a| a.get_id() == "agent") {
+        argv = with_agent_types(argv, command, &*global_config()?)?;
+    }
     let Some(path) = prompt_file else {
-        return relay(project);
+        let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+        return exit_with(run(project, &argv)?);
     };
     let contents = read_prompt_file(path)?;
-    let argv = without_prompt_file(relayed_argv(), command);
+    let argv = without_prompt_file(argv, command);
     let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
     exit_with(session(
         project,
@@ -792,6 +867,77 @@ projects:
         assert_eq!(relayed(&untouched), args(&untouched));
         let untouched = ["workmux", "add", "feature", "--", "-P", "p.md"];
         assert_eq!(relayed(&untouched), args(&untouched));
+    }
+
+    #[test]
+    fn a_relayed_agent_alias_becomes_its_agent_type() {
+        let args = |list: &[&str]| list.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+        let add = crate::cli::subcommand("add").unwrap();
+        let config = config(
+            "\
+agents:
+  cc: /opt/wrappers/claude --dangerously-skip-permissions
+  cx:
+    command: /opt/wrappers/run-agent
+    type: codex
+",
+        );
+        let relayed = |list: &[&str]| with_agent_types(args(list), &add, &config).unwrap();
+
+        for (spelled, typed) in [
+            (&["-a", "cc"][..], &["--agent=claude"][..]),
+            (&["-acc"], &["--agent=claude"]),
+            (&["--agent", "cx"], &["--agent=codex"]),
+            (&["--agent=cx"], &["--agent=codex"]),
+            (&["-ba", "cc"], &["-b", "--agent=claude"]),
+            (&["-bacc"], &["-b", "--agent=claude"]),
+        ] {
+            let typed_argv = [&["workmux", "add", "feature"][..], typed, &["-w"]].concat();
+            let spelled_argv = [&["workmux", "add", "feature"][..], spelled, &["-w"]].concat();
+            assert_eq!(relayed(&spelled_argv), args(&typed_argv), "{spelled:?}");
+        }
+        // Several agents each translate; a plain CLI is relayed as typed, as
+        // is an alias's name inside another flag's value or after `--`.
+        assert_eq!(
+            relayed(&[
+                "workmux", "add", "f", "-a", "cc", "-a", "gemini", "-a", "cx"
+            ]),
+            args(&[
+                "workmux",
+                "add",
+                "f",
+                "--agent=claude",
+                "-a",
+                "gemini",
+                "--agent=codex"
+            ])
+        );
+        let untouched = ["workmux", "add", "f", "-p", "-a cc", "--", "-a", "cc"];
+        assert_eq!(relayed(&untouched), args(&untouched));
+    }
+
+    #[test]
+    fn a_relayed_agent_alias_without_a_known_type_is_refused() {
+        let args = |list: &[&str]| list.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+        let add = crate::cli::subcommand("add").unwrap();
+        let config = config(
+            "\
+agents:
+  mine: /opt/wrappers/run-agent
+  odd:
+    command: /opt/wrappers/run-agent
+    type: notanagent
+",
+        );
+
+        for alias in ["mine", "odd"] {
+            let refused =
+                with_agent_types(args(&["workmux", "add", "f", "-a", alias]), &add, &config)
+                    .unwrap_err()
+                    .to_string();
+            assert!(refused.contains(&format!("'{alias}'")), "{refused}");
+            assert!(refused.contains("type:"), "{refused}");
+        }
     }
 
     #[test]
