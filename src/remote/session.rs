@@ -753,6 +753,7 @@ mod tests {
                     Stream::Stderr => captured.stderr.push_str(&text),
                 }
             },
+            false,
         );
         (exit, captured)
     }
@@ -843,6 +844,7 @@ mod tests {
             &request(project.path(), None, script),
             &InvocationContext::default(),
             &mut Interrupting::default(),
+            false,
         );
 
         assert_eq!(exit.unwrap(), 130);
@@ -910,6 +912,7 @@ mod tests {
             &request,
             &InvocationContext::default(),
             &mut terminal,
+            false,
         );
 
         assert_eq!(exit.unwrap(), 0, "{}", terminal.stdout);

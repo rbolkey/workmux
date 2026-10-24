@@ -7,6 +7,7 @@ pub mod carry;
 pub mod channel;
 pub mod channels;
 pub mod connection;
+pub mod daemon;
 pub mod dashboard;
 pub mod forwarded;
 pub mod forwarding;

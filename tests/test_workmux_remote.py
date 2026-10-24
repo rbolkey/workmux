@@ -38,9 +38,26 @@ def remote_root():
     shutil.rmtree(path, ignore_errors=True)
 
 
+@pytest.fixture
+def outage(mux_server: MuxEnvironment, short_tmp: dict):
+    """A file that, while it exists, makes every loopback remote unreachable,
+    standing in for a network outage. The test-only
+    WORKMUX_TEST_LOOPBACK_OFFLINE names it to workmux run from the test and
+    from tmux panes."""
+    marker = Path(short_tmp["TMPDIR"]) / "outage"
+    short_tmp["WORKMUX_TEST_LOOPBACK_OFFLINE"] = str(marker)
+    assert isinstance(mux_server, TmuxEnvironment)
+    mux_server.set_session_env("WORKMUX_TEST_LOOPBACK_OFFLINE", str(marker))
+    yield marker
+    marker.unlink(missing_ok=True)
+
+
 requires_dtach = pytest.mark.skipif(
     shutil.which("dtach") is None,
-    reason="remote panes need the session holder dtach on PATH",
+    reason=(
+        "remote panes need the session holder dtach on PATH: use `devbox shell`, "
+        "`nix shell nixpkgs#dtach`, or `apt-get install dtach`"
+    ),
 )
 
 
@@ -1618,6 +1635,7 @@ def test_remote_agent_status_shows_live_turns_stale_and_catches_up_on_reconnect(
     repo_path: Path,
     short_tmp: dict,
     remote_root: Path,
+    outage: Path,
 ):
     """A remote agent's hooks reach the workstation sidebar, tagged with its
     remote. While the remote is unreachable its entry stays, stale, with its
@@ -1691,7 +1709,7 @@ def test_remote_agent_status_shows_live_turns_stale_and_catches_up_on_reconnect(
 
         # Snoozed on the workstation, then the remote becomes unreachable.
         env.tmux(["set-option", "-g", "@workmux_sleeping_panes", pane])
-        (remote_root / "offline").write_text("")
+        outage.write_text("")
         serves = subprocess.run(
             ["pgrep", "-P", str(daemon_pid), "-f", "remote serve"],
             capture_output=True,
@@ -1715,7 +1733,7 @@ def test_remote_agent_status_shows_live_turns_stale_and_catches_up_on_reconnect(
         hook_runs("waiting")
         waiting_since = json.loads(status_file.read_text())["event_ts"]
         time.sleep(1.1)
-        (remote_root / "offline").unlink()
+        outage.unlink()
 
         snapshot = feed.wait(
             lambda s: (
@@ -1736,7 +1754,6 @@ def test_remote_agent_status_shows_live_turns_stale_and_catches_up_on_reconnect(
     finally:
         if feed is not None:
             feed.close()
-        (remote_root / "offline").unlink(missing_ok=True)
         if daemon_pid is not None:
             os.kill(daemon_pid, signal.SIGTERM)
 
@@ -2302,6 +2319,7 @@ def test_agent_commands_reach_remote_agents_from_the_workstation(
     repo_path: Path,
     short_tmp: dict,
     remote_root: Path,
+    outage: Path,
 ):
     """send, capture, status, wait, last-done and last-agent act on a remote
     agent through its workstation view and the state store. While its remote
@@ -2402,7 +2420,7 @@ def test_agent_commands_reach_remote_agents_from_the_workstation(
         wm("wait feature --timeout 20")
 
         # The remote becomes unreachable: its entry is stale, done as last seen.
-        (remote_root / "offline").write_text("")
+        outage.write_text("")
         for pid in subprocess.run(
             ["pgrep", "-P", str(daemon_pid), "-f", "remote serve"],
             capture_output=True,
@@ -2456,7 +2474,7 @@ def test_agent_commands_reach_remote_agents_from_the_workstation(
             )
 
         set_local_status("done")
-        (remote_root / "offline").unlink()
+        outage.unlink()
         wm("wait feature --timeout 60", timeout=75.0)
         assert not remote_entry()["remote"]["stale"]
 
@@ -2481,7 +2499,6 @@ def test_agent_commands_reach_remote_agents_from_the_workstation(
     finally:
         if feed is not None:
             feed.close()
-        (remote_root / "offline").unlink(missing_ok=True)
         if daemon_pid is not None:
             os.kill(daemon_pid, signal.SIGTERM)
 
@@ -2498,6 +2515,7 @@ def test_dashboard_reviews_stages_and_closes_a_remote_worktree(
     repo_path: Path,
     short_tmp: dict,
     remote_root: Path,
+    outage: Path,
 ):
     """The dashboard, filtered to the project's session, lists the remote
     agent with its remote worktree's changes and not an agent of another
@@ -2641,7 +2659,7 @@ def test_dashboard_reviews_stages_and_closes_a_remote_worktree(
         env.send_keys("=api:dash", "q", enter=False)
 
         # A disconnected remote's entry stays, stale, with its last status.
-        (remote_root / "offline").write_text("")
+        outage.write_text("")
         for pid in subprocess.run(
             ["pgrep", "-P", str(daemon_pid), "-f", "remote serve"],
             capture_output=True,
@@ -2654,7 +2672,7 @@ def test_dashboard_reviews_stages_and_closes_a_remote_worktree(
             "the remote entry to turn stale",
         )
         assert "💬" in dashboard_row(screen(), "feature")
-        (remote_root / "offline").unlink()
+        outage.unlink()
         wait_for_screen(
             lambda shown: (
                 "feature" in shown and stale_icon not in dashboard_row(shown, "feature")
@@ -2675,7 +2693,6 @@ def test_dashboard_reviews_stages_and_closes_a_remote_worktree(
     finally:
         if feed is not None:
             feed.close()
-        (remote_root / "offline").unlink(missing_ok=True)
         if daemon_pid is not None:
             os.kill(daemon_pid, signal.SIGTERM)
 
@@ -2820,6 +2837,7 @@ def test_dashboard_shows_pr_status_for_a_remote_projects_branches_while_unreacha
     repo_path: Path,
     short_tmp: dict,
     remote_root: Path,
+    outage: Path,
 ):
     """The Worktrees tab lists a remote project's worktrees from the last
     list the workstation saw while the remote cannot be reached, so their
@@ -2906,7 +2924,7 @@ def test_dashboard_shows_pr_status_for_a_remote_projects_branches_while_unreacha
                 }
             )
         )
-        (remote_root / "offline").write_text("")
+        outage.write_text("")
         for pid in subprocess.run(
             ["pgrep", "-P", str(daemon_pid), "-f", "remote serve"],
             capture_output=True,
@@ -2921,7 +2939,6 @@ def test_dashboard_shows_pr_status_for_a_remote_projects_branches_while_unreacha
         )
         keys("q")
     finally:
-        (remote_root / "offline").unlink(missing_ok=True)
         if daemon_pid is not None:
             os.kill(daemon_pid, signal.SIGTERM)
 
@@ -3056,10 +3073,10 @@ def test_a_command_for_every_project_checks_each_remotes_state_once(
     short_tmp: dict,
 ):
     """A command relayed to every remote project asks each OpenShell
-    sandbox for its state once, then reconciles a running one's policy
-    (which reads the sandbox again), and asks nothing more of a sandbox
-    whose channel is already open. A stopped sandbox is skipped, not
-    started. `openshell` is a fake on PATH."""
+    sandbox for its state once, whether or not the workstation daemon has
+    its channel open yet, and reconciles a running one's policy from that
+    same state. A stopped sandbox is skipped, not started. `openshell` is
+    a fake on PATH."""
     env = mux_server
     assert isinstance(env, TmuxEnvironment)
     state = Path(tempfile.mkdtemp(prefix="wmo", dir="/tmp"))
@@ -3108,11 +3125,15 @@ def test_a_command_for_every_project_checks_each_remotes_state_once(
         first = calls()
         assert first["web"] == ["sandbox get"], first
         assert "sandbox exec" in first["api"], first
+        assert [call for call in first["api"] if call != "sandbox exec"] == [
+            "sandbox get",
+            "policy set",
+        ], first
 
         wm("reap-agents")
 
         assert calls() == {
-            "api": ["sandbox get", "sandbox get", "policy set"],
+            "api": ["sandbox get", "policy set"],
             "web": ["sandbox get"],
         }
         assert (state / "web.phase").read_text() == "Stopped"

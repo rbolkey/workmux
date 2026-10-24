@@ -1338,133 +1338,6 @@ fn next_audit_path(
 /// Watches Git metadata and, where efficient, worktree roots. Events are debounced
 /// per worktree before status refresh. Polling covers platforms or roots without
 /// complete worktree watches, and a rolling audit detects silent event loss.
-/// A remote agent's worktree, whose git status remote workmux reports.
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
-struct RemoteGitPath {
-    /// The agent's `AgentPane::git_key`.
-    key: PathBuf,
-    remote: String,
-    project: String,
-    /// The worktree's path on the remote.
-    worktree: PathBuf,
-}
-
-impl RemoteGitPath {
-    fn for_agent(agent: &AgentPane) -> Option<Self> {
-        let remote = agent.remote.as_ref()?;
-        Some(Self {
-            key: agent.git_key(),
-            remote: remote.remote.clone(),
-            project: remote.project.clone(),
-            worktree: agent.path.clone(),
-        })
-    }
-}
-
-/// How often remote worktrees' git status is asked for: there is no
-/// filesystem to watch on a remote.
-const REMOTE_GIT_INTERVAL: Duration = Duration::from_secs(5);
-
-/// Ask for each remote worktree's git status through `ask`, keeping the
-/// last known status of one that cannot be reached and dropping worktrees
-/// no longer shown. Returns whether the cache changed.
-fn refresh_remote_git_statuses(
-    entries: &[RemoteGitPath],
-    cache: &GitCache,
-    ask: &mut dyn FnMut(&RemoteGitPath) -> Result<GitStatus>,
-) -> bool {
-    let fetched: Vec<(PathBuf, GitStatus)> = entries
-        .iter()
-        .filter_map(|entry| match ask(entry) {
-            Ok(status) => Some((entry.key.clone(), status)),
-            Err(error) => {
-                tracing::debug!(remote = %entry.remote, error = %format!("{error:#}"), "remote git status unavailable");
-                None
-            }
-        })
-        .collect();
-    let Ok(mut cache) = cache.lock() else {
-        return false;
-    };
-    let before = cache.len();
-    cache.retain(|key, _| entries.iter().any(|entry| entry.key == *key));
-    let mut changed = cache.len() != before;
-    for (key, status) in fetched {
-        if cache
-            .get(&key)
-            .is_some_and(|old| git_status_semantically_equal(old, &status))
-        {
-            continue;
-        }
-        cache.insert(key, status);
-        changed = true;
-    }
-    changed
-}
-
-/// Remote workmux's git status for `entry`, over its remote's control
-/// channel only when it is already open: a disconnected or stopped remote
-/// is never dialled for this.
-fn ask_remote_git_status(entry: &RemoteGitPath) -> Result<GitStatus> {
-    let project =
-        crate::remote::router::remote_project(&Config::load_global_only()?, &entry.project)?;
-    if project.site.remote != entry.remote {
-        anyhow::bail!(
-            "project {} is not on remote {}",
-            entry.project,
-            entry.remote
-        );
-    }
-    let answer = crate::remote::channels().dashboard(
-        project.host(),
-        &project.site,
-        &crate::remote::dashboard::DashboardRequest::GitStatus {
-            worktree: entry.worktree.clone(),
-        },
-        false,
-    )?;
-    Ok(serde_json::from_value(answer)?)
-}
-
-fn spawn_remote_git_worker(
-    term: Arc<AtomicBool>,
-    dirty_flag: Arc<AtomicBool>,
-    wake_tx: std::sync::mpsc::SyncSender<()>,
-) -> (GitCache, std::sync::mpsc::Sender<Vec<RemoteGitPath>>) {
-    let cache: GitCache = Arc::new(Mutex::new(HashMap::new()));
-    let worker_cache = cache.clone();
-    let (tx, rx) = std::sync::mpsc::channel::<Vec<RemoteGitPath>>();
-    thread::spawn(move || {
-        let mut entries: Vec<RemoteGitPath> = Vec::new();
-        let mut last_refresh = Instant::now() - REMOTE_GIT_INTERVAL;
-        while !term.load(Ordering::Relaxed) {
-            let mut changed_entries = false;
-            match rx.recv_timeout(Duration::from_secs(1)) {
-                Ok(mut latest) => {
-                    while let Ok(newer) = rx.try_recv() {
-                        latest = newer;
-                    }
-                    latest.sort();
-                    latest.dedup();
-                    changed_entries = latest != entries;
-                    entries = latest;
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-            }
-            if !changed_entries && last_refresh.elapsed() < REMOTE_GIT_INTERVAL {
-                continue;
-            }
-            last_refresh = Instant::now();
-            if refresh_remote_git_statuses(&entries, &worker_cache, &mut ask_remote_git_status) {
-                dirty_flag.store(true, Ordering::Relaxed);
-                let _ = wake_tx.try_send(());
-            }
-        }
-    });
-    (cache, tx)
-}
-
 fn spawn_git_worker(
     term: Arc<AtomicBool>,
     dirty_flag: Arc<AtomicBool>,
@@ -2424,21 +2297,16 @@ pub fn run() -> Result<()> {
     );
     let (git_cache, git_path_tx) =
         spawn_git_worker(term.clone(), publication_dirty.clone(), wake_tx.clone());
-    let (remote_git_cache, remote_git_tx) =
-        spawn_remote_git_worker(term.clone(), publication_dirty.clone(), wake_tx.clone());
+    let remote_git = crate::remote::daemon::RemoteGit::spawn(
+        term.clone(),
+        publication_dirty.clone(),
+        wake_tx.clone(),
+        git_status_semantically_equal,
+    );
     let (pr_cache, check_cache, github_path_tx) =
         spawn_github_worker(term.clone(), publication_dirty.clone(), wake_tx);
 
-    // Remote agents' status arrives over the control channels this daemon
-    // holds (ADR 0002).
-    match crate::remote::status::StatusApplier::for_tmux(&instance_id, &config.lock().unwrap()) {
-        Ok(applier) => crate::remote::channels().set_status_sink(Arc::new(
-            move |remote: &str, records: Vec<crate::remote::status::StatusRecord>| {
-                applier.apply(remote, &records)
-            },
-        )),
-        Err(error) => tracing::warn!(%error, "remote agent status unavailable"),
-    }
+    crate::remote::daemon::install_status_sink(&instance_id, &config.lock().unwrap());
 
     tmux.set_global_option(
         "@workmux_sidebar_daemon_pid",
@@ -2505,10 +2373,7 @@ pub fn run() -> Result<()> {
                         tmux_state.server_boot_id.as_deref(),
                     ) {
                         Ok((mut agents, stats)) => {
-                            mark_stale_remote_agents(
-                                &mut agents,
-                                &crate::remote::channels().connected_remotes(),
-                            );
+                            crate::remote::daemon::mark_stale_agents(&mut agents);
                             tracing::trace!(
                                 listed = stats.listed,
                                 metadata = stats.metadata,
@@ -2611,8 +2476,10 @@ pub fn run() -> Result<()> {
                     expanded_groups: read_expanded_groups(tmux_state.expanded_groups.as_deref()),
                     git_statuses: {
                         let mut statuses = snapshot_status_cache(git_status_enabled, &git_cache);
-                        statuses
-                            .extend(snapshot_status_cache(git_status_enabled, &remote_git_cache));
+                        statuses.extend(snapshot_status_cache(
+                            git_status_enabled,
+                            remote_git.statuses(),
+                        ));
                         statuses
                     },
                     pr_statuses: snapshot_status_cache(git_status_enabled, &pr_cache),
@@ -2635,19 +2502,11 @@ pub fn run() -> Result<()> {
             server.broadcast(&output.snapshot);
 
             let stale_threshold = output.snapshot.stale_threshold_secs;
-            // Workstation git never runs on a remote agent's path: remote
-            // workmux reports those worktrees.
-            let remote_entries: Vec<RemoteGitPath> = if git_status_enabled {
-                output
-                    .snapshot
-                    .agents
-                    .iter()
-                    .filter_map(RemoteGitPath::for_agent)
-                    .collect()
+            remote_git.follow(if git_status_enabled {
+                output.snapshot.agents.as_slice()
             } else {
-                Vec::new()
-            };
-            let _ = remote_git_tx.send(remote_entries);
+                &[]
+            });
             let entries: Vec<GitWorkerPath> = if git_status_enabled {
                 output
                     .snapshot
@@ -2742,10 +2601,8 @@ pub fn run() -> Result<()> {
         if scheduler.maintenance_due(now) {
             scheduler.finish_maintenance(now);
             let client_count = server.client_count();
-            // Open control channels keep the daemon alive; idle ones close.
-            let channels = crate::remote::channels();
-            channels.close_idle();
-            if client_count > 0 || server.take_request_activity() || channels.open_count() > 0 {
+            let channels_open = crate::remote::daemon::close_idle_channels();
+            if client_count > 0 || server.take_request_activity() || channels_open {
                 last_client_seen = now;
             } else if now.duration_since(last_client_seen) > Duration::from_secs(10) {
                 tracing::info!("workstation daemon exiting: no clients for 10s");
@@ -2803,17 +2660,6 @@ struct TickInput {
 struct AgentWrite {
     pane_id: String,
     resumed_ts: u64,
-}
-
-/// Mark the agents of remotes whose control channel is down stale: shown
-/// with their last known status.
-fn mark_stale_remote_agents(
-    agents: &mut [crate::multiplexer::AgentPane],
-    connected: &HashSet<String>,
-) {
-    for remote in agents.iter_mut().filter_map(|agent| agent.remote.as_mut()) {
-        remote.stale = !connected.contains(&remote.remote);
-    }
 }
 
 /// Output of a single tick computation.
@@ -2882,12 +2728,7 @@ fn compute_tick(
     }
 
     // Remotes whose agents are not stale, before the snapshot filters any.
-    let connected_remotes: HashSet<String> = agents
-        .iter()
-        .filter_map(|agent| agent.remote.as_ref())
-        .filter(|remote| !remote.stale)
-        .map(|remote| remote.remote.clone())
-        .collect();
+    let connected_remotes = crate::remote::daemon::connected_remotes(&agents);
 
     // Phase 3: Build snapshot from already-mutated agents. Interruption is
     // known from phase 1, so priority ordering sees the same state clients do.
@@ -4450,40 +4291,8 @@ mod tests {
         agent
     }
 
-    fn status_on(branch: &str) -> GitStatus {
-        GitStatus {
-            branch: Some(branch.to_string()),
-            ..GitStatus::default()
-        }
-    }
-
     #[test]
-    fn remote_git_status_keeps_the_last_known_while_unreachable_and_drops_gone_worktrees() {
-        let cache: GitCache = Arc::new(Mutex::new(HashMap::new()));
-        let shown = RemoteGitPath::for_agent(&remote_agent(Path::new("/w/feature"))).unwrap();
-        let gone = RemoteGitPath::for_agent(&remote_agent(Path::new("/w/gone"))).unwrap();
-        let both = [shown.clone(), gone];
-
-        assert!(refresh_remote_git_statuses(&both, &cache, &mut |_| Ok(
-            status_on("feature")
-        )));
-        let unchanged = refresh_remote_git_statuses(&both, &cache, &mut |_| {
-            Err(anyhow::anyhow!("remote devbox is not connected"))
-        });
-        let dropped =
-            refresh_remote_git_statuses(std::slice::from_ref(&shown), &cache, &mut |_| {
-                Err(anyhow::anyhow!("remote devbox is not connected"))
-            });
-
-        assert!(!unchanged);
-        assert!(dropped);
-        let cache = cache.lock().unwrap();
-        assert_eq!(cache.len(), 1);
-        assert_eq!(cache[&shown.key], status_on("feature"));
-    }
-
-    #[test]
-    fn a_remote_agents_git_and_github_entries_never_use_its_path() {
+    fn a_remote_agents_github_entry_never_uses_its_path() {
         // The remote worktree's path is also a checkout on the workstation.
         let temp = tempfile::tempdir().unwrap();
         crate::test_support::init_repo(temp.path());
@@ -4493,12 +4302,10 @@ mod tests {
         )
         .unwrap();
 
-        let git = RemoteGitPath::for_agent(&agent).unwrap();
         let github = GithubWorkerPath::for_agent(&config, &agent, "feature").unwrap();
 
-        assert_ne!(git.key, temp.path());
-        assert_eq!(git.worktree, temp.path());
-        assert_eq!(github.path, git.key);
+        assert_ne!(github.path, temp.path());
+        assert_eq!(github.path, agent.git_key());
         assert_eq!(
             github.source,
             crate::github::RepoSource::GitUrl("git@github.com:me/api.git".to_string())
@@ -4507,7 +4314,6 @@ mod tests {
             github_repo_key(&github),
             Some(PathBuf::from("remote/devbox/api"))
         );
-        assert!(RemoteGitPath::for_agent(&working_agent("%1", 1)).is_none());
     }
 
     fn local_github_entry(path: PathBuf, branch: &str) -> GithubWorkerPath {

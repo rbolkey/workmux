@@ -16,6 +16,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde_json::Value;
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use super::transport::{Provisioning, RemoteState, StdioProcess, Transport, TtyExec};
@@ -37,6 +38,10 @@ pub struct OpenShell {
     openshell: PathBuf,
     docker: PathBuf,
     phase_poll: Duration,
+    /// The sandbox as the last state check described it, kept for the one
+    /// policy read that follows, so a command asks OpenShell about the
+    /// sandbox once.
+    last_get: Mutex<Option<Value>>,
 }
 
 /// A sandbox's phase, as `sandbox get` reports it.
@@ -54,6 +59,7 @@ impl OpenShell {
             openshell: PathBuf::from("openshell"),
             docker: PathBuf::from("docker"),
             phase_poll: Duration::from_secs(1),
+            last_get: Mutex::new(None),
         }
     }
 
@@ -128,11 +134,16 @@ impl OpenShell {
         )?))
     }
 
+    /// The sandbox's phase, keeping its description for the policy read
+    /// that follows.
     fn phase(&self) -> Result<Phase> {
-        Ok(match self.get()? {
+        let sandbox = self.get()?;
+        let phase = match &sandbox {
             None => Phase::Missing,
             Some(sandbox) => Phase::Is(sandbox["phase"].as_str().unwrap_or_default().to_string()),
-        })
+        };
+        *self.last_get.lock().unwrap() = sandbox;
+        Ok(phase)
     }
 
     /// Wait until the sandbox's phase is `wanted` (`None`: until it is gone).
@@ -195,9 +206,14 @@ impl OpenShell {
         policy::effective(user.as_deref())
     }
 
-    /// The sandbox's effective policy, as OpenShell reports it.
+    /// The sandbox's effective policy, as OpenShell reports it: from the
+    /// state check just made, else from a new `sandbox get`.
     pub fn current_policy(&self) -> Result<Option<Value>> {
-        Ok(self.get()?.map(|sandbox| sandbox["policy"].clone()))
+        let sandbox = match self.last_get.lock().unwrap().take() {
+            Some(sandbox) => Some(sandbox),
+            None => self.get()?,
+        };
+        Ok(sandbox.map(|sandbox| sandbox["policy"].clone()))
     }
 
     fn write_policy(&self, dir: &std::path::Path) -> Result<PathBuf> {
@@ -208,13 +224,19 @@ impl OpenShell {
 
     /// Build the sandbox's image, returning its tag.
     fn build_image(&self, origin: &OpenshellRemote, context: &std::path::Path) -> Result<String> {
-        let workmux = std::env::var_os(image::BINARY_ENV).map(PathBuf::from);
         let checkout = context.join("project");
         let devshell = origin
             .git_url
             .as_deref()
             .is_some_and(|url| self.fetch_flake(url, &checkout))
             .then_some(checkout);
+        let workmux = image::Workmux::current();
+        if let image::Workmux::Source(source) = &workmux {
+            eprintln!(
+                "This workmux is a dev build: building a Linux workmux from {} into the sandbox image",
+                source.display()
+            );
+        }
         let recipe = image::Recipe {
             base: origin.settings.image.clone(),
             workmux,
@@ -768,8 +790,8 @@ mod contract {
     }
 
     /// The image the contract tests run: the learning tests' fixture image
-    /// (git, dtach, python3), plus the Linux workmux named by
-    /// `WORKMUX_OPENSHELL_WORKMUX` when it is set.
+    /// (git, dtach, python3), to which workmux adds a Linux workmux built
+    /// from this checkout, or the one `WORKMUX_OPENSHELL_WORKMUX` names.
     fn fixture_image() -> String {
         let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/openshell");
         let status = Command::new("docker")
@@ -1000,7 +1022,7 @@ mod contract {
 
     #[test]
     fn remote_workmux_serves_a_control_channel_through_exec() {
-        if !enabled() || std::env::var_os(image::BINARY_ENV).is_none() {
+        if !enabled() {
             return;
         }
         let owned = sandbox("serve");

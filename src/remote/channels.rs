@@ -366,13 +366,25 @@ impl Channels {
     /// `use_now` marks the channel used; a background reconnect does not, so
     /// it never extends the linger period by itself.
     fn channel_for(&self, remote: Remote<'_>, use_now: bool) -> Result<Arc<Connection>> {
+        self.channel_checked(remote, use_now, false)
+    }
+
+    /// Like [`Self::channel_for`]; `running` says the caller has just found
+    /// the remote running, so its state is not checked again.
+    fn channel_checked(
+        &self,
+        remote: Remote<'_>,
+        use_now: bool,
+        running: bool,
+    ) -> Result<Arc<Connection>> {
         // An open channel needs no word from the transport: a remote that
         // stopped has closed it.
         if let Some(connection) = self.open_channel_for(remote, use_now) {
             return Ok(connection);
         }
         let transport = (self.shared.factory)(remote.name, remote.config)?;
-        if let Some(provisioning) = transport.provisioning()
+        if !running
+            && let Some(provisioning) = transport.provisioning()
             && provisioning.status()? != RemoteState::Running
         {
             return Err(anyhow!("remote {} is stopped", remote.name));
@@ -531,6 +543,7 @@ impl Channels {
     /// Run a command session on `remote`, passing its output to `terminal`
     /// as it arrives and reading its prompts' answers there. Multiplexer
     /// requests the command forwards are answered from `invocation`.
+    /// `running` says the caller has just found the remote running.
     /// Returns the command's exit code.
     pub fn run_command(
         &self,
@@ -538,8 +551,9 @@ impl Channels {
         request: &CommandRequest,
         invocation: &InvocationContext,
         terminal: &mut dyn Terminal,
+        running: bool,
     ) -> Result<i32> {
-        let connection = self.channel(remote)?;
+        let connection = self.channel_checked(remote, true, running)?;
         self.hold(remote.name, 1);
         let exit = self
             .shared

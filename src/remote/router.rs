@@ -253,28 +253,42 @@ pub fn forget_recent_daemon_socket() {
     *RECENT_DAEMON.lock().unwrap() = None;
 }
 
+/// What a command session does about its remote's state before it runs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Readiness {
+    /// Make the remote ready with [`ready`], starting it.
+    Start,
+    /// The caller has just found the remote running with [`ready`].
+    Running,
+    /// Leave the remote as it is; the channel's opener checks its state.
+    AsItIs,
+}
+
 /// Run a command session for `project`, through the workstation daemon,
 /// which holds the control channels, or directly when no daemon can run.
+/// A remote found running is not checked again on the way.
 fn session(
     project: &RemoteProject,
     argv: &[&str],
     prompt_file: Option<String>,
     terminal: &mut dyn Terminal,
-    start: bool,
+    readiness: Readiness,
 ) -> Result<i32> {
-    if start {
-        ready(project, true)?;
-    }
-    match session_once(project, argv, prompt_file.clone(), terminal) {
+    let running = match readiness {
+        Readiness::Start => ready(project, true)?,
+        Readiness::Running => true,
+        Readiness::AsItIs => false,
+    };
+    match session_once(project, argv, prompt_file.clone(), terminal, running) {
         // The channel never opened, so the command never ran: run it again
         // once the remote has a workmux that can serve it. Only a command
         // the user runs at this terminal (one that may start its remote)
         // offers the install; polls and captured commands don't.
         Err(error)
-            if start
+            if readiness == Readiness::Start
                 && super::upload::offer_on_terminal(project.host(), &format!("{error:#}"))? =>
         {
-            session_once(project, argv, prompt_file, terminal)
+            session_once(project, argv, prompt_file, terminal, running)
         }
         result => result,
     }
@@ -285,6 +299,7 @@ fn session_once(
     argv: &[&str],
     prompt_file: Option<String>,
     terminal: &mut dyn Terminal,
+    running: bool,
 ) -> Result<i32> {
     let request = CommandRequest {
         project: project.site.clone(),
@@ -298,6 +313,7 @@ fn session_once(
             &request,
             InvocationContext::current(),
             terminal,
+            running,
         );
     };
     let mut undelivered = None;
@@ -308,6 +324,7 @@ fn session_once(
             "remote": project.site.remote,
             "request": request,
             "invocation": InvocationContext::current(),
+            "running": running,
         }),
         None,
         &mut |method, params| match method {
@@ -380,7 +397,7 @@ pub fn run(project: &RemoteProject, argv: &[&str]) -> Result<i32> {
         argv,
         None,
         &mut Invoking { output: write_to },
-        true,
+        Readiness::Start,
     )
 }
 
@@ -412,7 +429,7 @@ pub fn capture_running(project: &RemoteProject, argv: &[&str]) -> Result<(i32, V
                 Stream::Stderr => write_to(stream, data),
             },
         },
-        false,
+        Readiness::Running,
     )?;
     Ok((exit, stdout))
 }
@@ -427,7 +444,7 @@ pub fn quietly(project: &RemoteProject, argv: &[&str]) -> Result<i32> {
         &mut Invoking {
             output: |_, _: &[u8]| {},
         },
-        false,
+        Readiness::AsItIs,
     )
 }
 
@@ -465,7 +482,7 @@ impl Terminal for Collecting {
 /// terminal: output is kept and prompts read end of input.
 pub fn captured(project: &RemoteProject, argv: &[&str]) -> Result<Captured> {
     let mut terminal = Collecting::default();
-    let exit_code = session(project, argv, None, &mut terminal, false)?;
+    let exit_code = session(project, argv, None, &mut terminal, Readiness::AsItIs)?;
     Ok(Captured {
         exit_code,
         stdout: terminal.stdout,
@@ -594,7 +611,7 @@ pub fn relay_with_prompt_file(
         &argv,
         Some(contents),
         &mut Invoking { output: write_to },
-        true,
+        Readiness::Start,
     )?)
 }
 
