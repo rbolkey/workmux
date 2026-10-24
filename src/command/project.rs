@@ -38,6 +38,10 @@ pub enum ProjectCommand {
         /// OpenShell provider to attach to the sandbox, for credentials (repeatable)
         #[arg(long = "provider", value_name = "PROVIDER", requires = "openshell")]
         providers: Vec<String>,
+        /// Agent the sandbox's image installs, such as claude or codex; the first is its
+        /// default agent (repeatable; default: your default agent's type; OpenShell only)
+        #[arg(long = "agent", value_name = "AGENT", requires = "openshell")]
+        agents: Vec<String>,
         /// Sandbox name (default: derived from the project name; OpenShell only)
         #[arg(long, requires = "openshell")]
         sandbox: Option<String>,
@@ -65,6 +69,7 @@ pub fn run(args: ProjectArgs) -> Result<()> {
             image,
             policy,
             providers,
+            agents,
             sandbox,
             repo,
             path,
@@ -77,6 +82,7 @@ pub fn run(args: ProjectArgs) -> Result<()> {
                     image,
                     policy: policy.map(absolute_policy).transpose()?,
                     providers,
+                    agents,
                 })
             } else {
                 None
@@ -122,6 +128,17 @@ fn add(name: &str, project: ProjectEntry) -> Result<()> {
             "Note: only a flake devshell (flake.nix) is baked into an OpenShell sandbox's image; \
              a devbox project gets no devshell there, so put its toolchain in the image (--image)"
         );
+        let remote = &config.remotes[name];
+        let sandbox =
+            crate::remote::openshell::OpenShell::new(&remote.target, remote.openshell.clone());
+        if let Some(report) = sandbox.agent_report() {
+            for note in report.notes {
+                println!("Agent {note}");
+            }
+            for warning in report.warnings {
+                eprintln!("warning: {warning}");
+            }
+        }
         return Ok(());
     }
     println!(
