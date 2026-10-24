@@ -18,14 +18,15 @@ workmux project add api --openshell --repo https://github.com/me/api.git \
   --provider github
 ```
 
-| Option            | Meaning                                                                                      |
-| ----------------- | -------------------------------------------------------------------------------------------- |
-| `--image`         | Image the sandbox is built from. It must contain git and dtach. Default: workmux's own image |
-| `--policy FILE`   | Policy file merged on top of workmux's [base policy](#policy). Stored as an absolute path    |
-| `--provider NAME` | OpenShell provider to attach, for credentials (repeatable). No other provider is attached    |
-| `--agent NAME`    | Agent the image installs (repeatable); the first is the sandbox's default agent              |
-| `--sandbox NAME`  | Sandbox name. Default: the project name                                                      |
-| `--path`          | The clone's path in the sandbox. Default: `~/<name>`                                         |
+| Option            | Meaning                                                                                         |
+| ----------------- | ----------------------------------------------------------------------------------------------- |
+| `--image`         | Image the sandbox is built from. It must contain git and dtach. Default: workmux's own image    |
+| `--policy FILE`   | Policy file merged on top of workmux's [base policy](#policy). Stored as an absolute path       |
+| `--provider NAME` | OpenShell provider to attach, for credentials (repeatable). No other provider is attached       |
+| `--github host`   | Give the sandbox your workstation's `gh` login. See [Your gh login](#your-gh-login-github-host) |
+| `--agent NAME`    | Agent the image installs (repeatable); the first is the sandbox's default agent                 |
+| `--sandbox NAME`  | Sandbox name. Default: the project name                                                         |
+| `--path`          | The clone's path in the sandbox. Default: `~/<name>`                                            |
 
 OpenShell sandbox names allow only lowercase letters, digits and hyphens, up to 19 characters. When the project name doesn't fit, the sandbox is named with a prefix of it plus a short hash.
 
@@ -43,6 +44,8 @@ projects:
       agents: [claude]
 ```
 
+A project added with `--github host` has `github: host` there instead of a GitHub provider.
+
 The project's remote is implicit and has the project's name, so commands such as `workmux remote status api` work without a `remote add`.
 
 Git credentials and agent API keys should come from OpenShell providers, so that secrets never sit in the sandbox environment. See [Git and GitHub](#git-and-github) for git.
@@ -58,7 +61,56 @@ When an attached provider's profile reaches `github.com`, workmux's image sets a
 What git and agents may do on GitHub is set by the provider's profile and the token's scope:
 
 - **OpenShell's stock `github` profile is read-only:** clone and fetch work; push (`git-receive-pack`) and API writes, such as creating a pull request, are denied. The stock profiles aren't installed in a gateway by default; import one with `openshell provider profile import`.
-- **Push and pull requests** need a profile that allows `git-receive-pack` and API writes. The easy path is `--github host`, which gives the sandbox your workstation's `gh` login. For tighter access, create a provider from a fine-grained personal access token limited to the repositories the agent needs, and attach it with `--provider`. A `--policy` file can also allow push for just the project's repository on top of a read-only profile.
+- **Push and pull requests** need a profile that allows `git-receive-pack` and API writes. The easy path is [`--github host`](#your-gh-login-github-host), which gives the sandbox your workstation's `gh` login. For tighter access, [bring your own provider](#bring-your-own-provider) made from a fine-grained personal access token.
+
+### Your gh login (`--github host`)
+
+```bash
+workmux project add api --openshell --github host --repo https://github.com/me/api.git
+```
+
+The sandbox gets your workstation's `gh` login, with nothing else to create: no token, profile or provider.
+
+- workmux ships a GitHub profile, `workmux-github`, that allows clone, fetch and push, and read-write REST and GraphQL, for git and `gh` (including nix's, from a baked devshell). It imports the profile into the gateway when it's missing or differs from the shipped one.
+- On first use, workmux creates the provider `workmux-gh-host` from that profile, holding the token `gh auth token` prints. It passes the token to `openshell` in the environment, never on its command line, and never logs it.
+- OpenShell's proxy can only read credentials from the gateway, so the gateway keeps a copy of the token. workmux updates it from `gh` each time it creates the sandbox, runs a command in it (such as `workmux add`) or attaches a pane to it, so a new `gh` login reaches a running sandbox at the next attach. It skips the update when the token hasn't changed.
+- `gh` missing or logged out is an error naming `gh auth login`, at `project add` and whenever the token is refreshed. workmux never falls back to no credentials.
+- `--github host` beside a `--provider` whose profile reaches github.com is an error: use one or the other.
+
+The gateway normally runs on your workstation, so the copy stays there. If your OpenShell gateway runs on another machine, the token is stored on that machine.
+
+**What it grants.** Everything your `gh` login can do. Its token usually has the `repo` and `workflow` scopes: every repository you can reach, public or private, including pushing changes to GitHub Actions workflows. The agent can also open pull requests and call the API as you. workmux doesn't narrow it; to limit access, use a fine-grained personal access token instead (below).
+
+**Protect your default branch.** OpenShell can't restrict pushes by branch, so with push allowed, an agent can push to `main`. Protect it with a GitHub ruleset or branch protection.
+
+**Revoking access.** Run `gh auth logout` on your workstation: the next attach or command that refreshes the token fails, and the copy is no longer updated. To remove the copy at once, delete the provider (after deleting the sandboxes it is attached to): `openshell provider delete workmux-gh-host`.
+
+### Bring your own provider
+
+A fine-grained personal access token limits the agent to the repositories and permissions you grant it (a GitHub App can later do the same). The token's own scope is the limit:
+
+1. Import a GitHub profile into the gateway. OpenShell's stock profiles aren't preinstalled, so even the stock `github` profile must be imported first (`openshell provider profile import --global -f github.yaml`). The stock profile is read-only.
+2. Create a provider from the token, passing it through the environment: `GITHUB_TOKEN=… openshell provider create --name api-github --type github --global-profile --credential GITHUB_TOKEN`.
+3. Attach it with `--provider api-github`.
+4. To allow push for just the project's repository on top of the read-only profile, add a `--policy` file:
+
+   ```yaml
+   network_policies:
+     api_push:
+       endpoints:
+         - host: github.com
+           port: 443
+           protocol: rest
+           enforcement: enforce
+           rules:
+             - allow: { method: GET, path: /me/api.git/info/refs* }
+             - allow: { method: POST, path: /me/api.git/git-upload-pack }
+             - allow: { method: POST, path: /me/api.git/git-receive-pack }
+       binaries:
+         - path: /usr/bin/git
+   ```
+
+   The proxy swaps in the provider's credential on the paths the policy allows; a push to any other repository is denied.
 
 ### SSH is not supported in OpenShell sandboxes
 
@@ -71,6 +123,7 @@ The proxy substitutes credentials only in HTTPS, and no profile allows SSH. work
   ```
 
   The sandbox's identity is the provider's, which may not be your SSH key's: a work-account key and a personal `gh` login reach different repositories. With no GitHub provider attached, the note adds that public repositories will clone, but private ones and push need `--github host` or a GitHub `--provider`. workmux can't tell whether a repository is private, so it doesn't fail.
+
 - An SSH `--repo` on any other host fails at `project add`.
 - `remote status` and the first-use clone show the URL as `https://github.com/me/api.git (rewritten from SSH: git@github.com:me/api.git)`.
 - Inside the sandbox, the image rewrites `git@github.com:` and `ssh://git@github.com/` to `https://github.com/` with git's `url.<base>.insteadOf`, so submodules and URLs an agent types go over HTTPS too. On your workstation, workmux still clones the original URL to look for a flake devshell.
