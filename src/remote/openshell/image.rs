@@ -59,13 +59,13 @@ impl Workmux {
             return Workmux::Binary(binary);
         }
         let checkout = source.join("Cargo.toml").is_file()
-            && Command::new("git")
-                .args(["rev-parse", "--is-inside-work-tree"])
-                .current_dir(source)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .is_ok_and(|status| status.success());
+            && crate::git::unattended_git(Some(source)).is_ok_and(|mut git| {
+                git.args(["rev-parse", "--is-inside-work-tree"])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .is_ok_and(|status| status.success())
+            });
         if checkout {
             Workmux::Source(source.to_path_buf())
         } else {
@@ -238,7 +238,7 @@ pub fn prepare(recipe: &Recipe, sandbox: &str, clone: &str, context: &Path) -> R
 /// it ignores (such as `target`). Each file's path and digest go into
 /// `digest`.
 fn copy_working_tree(source: &Path, dest: &Path, digest: &mut Vec<u8>) -> Result<()> {
-    let output = Command::new("git")
+    let output = crate::git::unattended_git(Some(source))?
         .args([
             "ls-files",
             "-z",
@@ -246,7 +246,6 @@ fn copy_working_tree(source: &Path, dest: &Path, digest: &mut Vec<u8>) -> Result
             "--others",
             "--exclude-standard",
         ])
-        .current_dir(source)
         .stderr(Stdio::inherit())
         .output()
         .context("failed to run git")?;
