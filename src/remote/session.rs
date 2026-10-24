@@ -73,6 +73,12 @@ pub struct ProjectSite {
     pub session: Option<String>,
 }
 
+impl ProjectSite {
+    pub fn id(&self) -> crate::project::RemoteProjectId {
+        crate::project::RemoteProjectId::new(&self.remote, &self.name)
+    }
+}
+
 /// One command to run in a remote project. In `argv`, `workmux` means
 /// remote workmux.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

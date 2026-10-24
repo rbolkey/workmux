@@ -24,17 +24,6 @@ pub const DAEMON_METHOD: &str = "remote.dashboard";
 /// How long one dashboard operation may take on the remote.
 pub const TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Key of a remote worktree's git status and PR entries in the
-/// workstation's caches. It is relative and starts with the remote and
-/// project, so it never equals a workstation path or another remote's
-/// worktree, even when the remote path also exists on the workstation.
-pub fn worktree_key(remote: &str, project: &str, worktree: &Path) -> PathBuf {
-    Path::new("remote")
-        .join(remote)
-        .join(project)
-        .join(worktree.strip_prefix("/").unwrap_or(worktree))
-}
-
 /// Where to ask GitHub about `agent`'s branch: its workstation checkout,
 /// or for a remote agent its project's registered git URL, never its path.
 /// `None` for a remote agent whose project has no git URL.

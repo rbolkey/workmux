@@ -24,6 +24,7 @@ use super::transport::{RemoteState, Transport};
 use super::{shell, shims};
 use crate::config::{RemoteConfig, TransportKind};
 use crate::multiplexer::{InvocationContext, TmuxBackend};
+use crate::project::RemoteProjectId;
 
 /// Builds the transport for a configured remote.
 pub type TransportFactory =
@@ -163,7 +164,7 @@ impl WorkstationHandler {
     /// it, else none in the workstation's tmux.
     fn viewing(&self, pane: &RemotePaneId) -> InvocationContext {
         let socket = self.tmux_socket.as_deref().unwrap_or("default");
-        let tag = forwarded::project_tag(&self.remote, &pane.project);
+        let tag = RemoteProjectId::new(&self.remote, &pane.project).tag();
         let listing = TmuxBackend::for_socket(socket)
             .query(&[
                 "list-panes",

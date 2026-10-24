@@ -340,8 +340,8 @@ pub fn agents_of_remote(
             ])
             .ok()
             .as_deref()
-            .and_then(super::forwarded::parse_project_tag)
-            .is_some_and(|(tagged, _)| tagged == remote)
+            .and_then(crate::project::RemoteProjectId::from_tag)
+            .is_some_and(|tagged| tagged.remote == remote)
         })
         .collect()
 }

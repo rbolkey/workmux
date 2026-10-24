@@ -13,10 +13,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::channel::Peer;
-use super::forwarded::project_tag;
 use super::pane::RemotePaneId;
 use crate::config::{Config, StatusIcons};
 use crate::multiplexer::{AgentStatus, Multiplexer, TmuxBackend};
+use crate::project::RemoteProjectId;
 use crate::state::{AgentState, PaneKey, RemoteAgent, StateStore};
 
 /// Notification remote workmux sends with status records: every file on
@@ -216,7 +216,7 @@ impl StatusApplier {
         };
         let mut changed = false;
         for record in records {
-            let tag = project_tag(remote, &record.pane.project);
+            let tag = RemoteProjectId::new(remote, &record.pane.project).tag();
             for (pane_id, _) in views
                 .iter()
                 .filter(|(_, view)| view.0 == tag && view.1 == record.pane)
