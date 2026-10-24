@@ -47,6 +47,9 @@ jobs:
         with:
           key: ${{ matrix.target }}
       - name: Build
+        env:
+          # Lets a workstation install this release's artifacts on remotes.
+          WORKMUX_RELEASE_BUILD: "1"
         run: |
           if [ "${{ matrix.use_cross }}" == "true" ]; then
             cross build --release --locked --target ${{ matrix.target }}

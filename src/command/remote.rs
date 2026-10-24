@@ -14,8 +14,9 @@ use crate::config::{RemoteConfig, TransportKind};
 use crate::remote::carry::AtRisk;
 use crate::remote::channels::{Reach, RemoteStatus};
 use crate::remote::pane::{RemotePaneId, SessionHolder};
-use crate::remote::registry;
+use crate::remote::ssh::Ssh;
 use crate::remote::transport::{Provisioning, RemoteState, Transport, ensure_running};
+use crate::remote::{Remote, registry, upload};
 use std::sync::Arc;
 
 /// How long a status call may take: opening a channel can wait on a slow
@@ -46,6 +47,13 @@ pub enum RemoteCommand {
         /// Allow the remote to run this command on the workstation (repeatable)
         #[arg(long = "host-command", value_name = "COMMAND")]
         host_commands: Vec<String>,
+    },
+    /// Install a workmux matching this one on an SSH remote, in its cache directory
+    Upload {
+        name: String,
+        /// A workmux built for the remote's platform (default: this build, or its release for the remote's platform)
+        #[arg(long, value_name = "PATH")]
+        binary: Option<std::path::PathBuf>,
     },
     /// List remotes and whether each is reachable
     #[command(visible_alias = "ls")]
@@ -122,9 +130,11 @@ pub fn run(args: RemoteArgs) -> Result<()> {
                 target,
                 builtin_shims: no_builtin_shims.then_some(false),
                 host_commands,
+                upload_workmux: None,
                 openshell: None,
             },
         ),
+        RemoteCommand::Upload { name, binary } => upload(&name, binary.as_deref()),
         RemoteCommand::List => list(),
         RemoteCommand::Status { name } => {
             if !status(name.as_deref())? {
@@ -183,6 +193,35 @@ fn add(name: &str, remote: RemoteConfig) -> Result<()> {
         remote.target,
         path.display()
     );
+    Ok(())
+}
+
+/// Install a matching workmux on the SSH remote `name`, or `binary` when
+/// given, and use it from now on.
+fn upload(name: &str, binary: Option<&std::path::Path>) -> Result<()> {
+    let remote = registry::remotes()?
+        .remove(name)
+        .ok_or_else(|| anyhow!("no remote named {name}"))?;
+    if remote.transport != TransportKind::Ssh {
+        bail!(
+            "remote {name} is reached over {}; workmux installs itself only on SSH remotes",
+            remote.transport
+        );
+    }
+    let ssh = Ssh::new(&remote.target);
+    match binary {
+        Some(binary) => ssh.upload_workmux(binary)?,
+        None => upload::install(name, &ssh, &upload::Builds::current())?,
+    }
+    upload::remember(Remote::new(name, &remote), true)?;
+    println!(
+        "Installed workmux {} on {name} in {}",
+        env!("CARGO_PKG_VERSION"),
+        crate::remote::ssh::uploaded_workmux_dir()
+    );
+    for status in fetch_statuses_once(Some(name))? {
+        println!("{name}: {}", summary(&status.reach));
+    }
     Ok(())
 }
 
@@ -500,9 +539,26 @@ fn rm(name: &str, yes: bool) -> Result<()> {
     Ok(())
 }
 
+/// Fetch statuses, offering to install a matching workmux on each SSH
+/// remote that lacks one and checking those that got one again.
+fn fetch_statuses(name: Option<&str>) -> Result<Vec<RemoteStatus>> {
+    let mut statuses = fetch_statuses_once(name)?;
+    let remotes = registry::remotes()?;
+    for status in &mut statuses {
+        if let Reach::Unreachable { error } = &status.reach
+            && let Some(config) = remotes.get(&status.name)
+            && upload::offer_on_terminal(Remote::new(&status.name, config), error)?
+            && let Some(checked) = fetch_statuses_once(Some(&status.name))?.pop()
+        {
+            *status = checked;
+        }
+    }
+    Ok(statuses)
+}
+
 /// Fetch statuses through the workstation daemon, which holds the control
 /// channels, or directly when no daemon can run.
-fn fetch_statuses(name: Option<&str>) -> Result<Vec<RemoteStatus>> {
+fn fetch_statuses_once(name: Option<&str>) -> Result<Vec<RemoteStatus>> {
     let remotes = registry::remotes()?;
     if let Some(name) = name
         && !remotes.contains_key(name)
@@ -735,6 +791,7 @@ mod tests {
             transport: TransportKind::Ssh,
             target: target.to_string(),
             builtin_shims: None,
+            upload_workmux: None,
             host_commands: vec![],
             openshell: None,
         }
@@ -835,6 +892,7 @@ nerdfont: true
             &REMOTES,
             "gpu",
             &RemoteConfig {
+                upload_workmux: None,
                 builtin_shims: Some(false),
                 host_commands: vec!["just".to_string()],
                 openshell: None,
@@ -883,6 +941,33 @@ nerdfont: true
         let config = parse(&updated);
         assert!(!config.remotes.contains_key("devbox"));
         assert_eq!(config.remotes["gpu"].host_commands, vec!["just"]);
+        assert_eq!(config.nerdfont, Some(true));
+        assert!(updated.starts_with("# top comment\n"));
+    }
+
+    #[test]
+    fn remembering_an_upload_answer_changes_only_that_remote() {
+        let content = "\
+# top comment
+remotes:
+  devbox:
+    transport: ssh
+    target: devbox
+  gpu:
+    transport: ssh
+    target: gpu-box
+    host_commands:
+      - just
+nerdfont: true
+";
+        let mut gpu = parse(content).remotes["gpu"].clone();
+        gpu.upload_workmux = Some(true);
+
+        let updated = global_config::replace_entry(content, &REMOTES, "gpu", &gpu).unwrap();
+
+        let config = parse(&updated);
+        assert_eq!(config.remotes["gpu"], gpu);
+        assert_eq!(config.remotes["devbox"].upload_workmux, None);
         assert_eq!(config.nerdfont, Some(true));
         assert!(updated.starts_with("# top comment\n"));
     }
