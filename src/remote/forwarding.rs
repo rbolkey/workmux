@@ -1214,12 +1214,12 @@ mod tests {
             ]
             .to_vec(),
             invoking_window_token: None,
+            prompt_file: None,
         };
         let (env, received) = mpsc::channel();
         let session = std::thread::spawn(move || {
             channels.run_command(
-                "devbox",
-                &remote(),
+                crate::remote::Remote::new("devbox", &remote()),
                 &request,
                 &invocation,
                 &mut |stream, data: &[u8]| {
@@ -1427,7 +1427,9 @@ mod tests {
             temp.path(),
             Duration::from_secs(60),
         );
-        channels.channel("devbox", &remote()).unwrap();
+        channels
+            .channel(crate::remote::Remote::new("devbox", &remote()))
+            .unwrap();
         let viewing = viewing_pane(&server, "api", temp.path(), "api/feature/0");
         let shell: RemotePaneId = "api/feature/0".parse().unwrap();
         let mux = ForwardingMux::for_shell(transport.shell_socket(), shell.clone(), holder);
@@ -1477,7 +1479,9 @@ mod tests {
             temp.path(),
             Duration::from_secs(60),
         );
-        channels.channel("devbox", &remote()).unwrap();
+        channels
+            .channel(crate::remote::Remote::new("devbox", &remote()))
+            .unwrap();
         let mux = ForwardingMux::for_shell(
             transport.shell_socket(),
             "web/feature/0".parse().unwrap(),
@@ -1500,7 +1504,9 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let transport = Arc::new(ServeTransport::default());
         let channels = shell_channels(&server, transport.clone(), temp.path(), Duration::ZERO);
-        channels.channel("devbox", &remote()).unwrap();
+        channels
+            .channel(crate::remote::Remote::new("devbox", &remote()))
+            .unwrap();
         let mux = ForwardingMux::for_shell(
             transport.shell_socket(),
             "api/feature/0".parse().unwrap(),

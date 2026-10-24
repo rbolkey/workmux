@@ -24,17 +24,6 @@ pub const DAEMON_METHOD: &str = "remote.dashboard";
 /// How long one dashboard operation may take on the remote.
 pub const TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Key of a remote worktree's git status and PR entries in the
-/// workstation's caches. It is relative and starts with the remote and
-/// project, so it never equals a workstation path or another remote's
-/// worktree, even when the remote path also exists on the workstation.
-pub fn worktree_key(remote: &str, project: &str, worktree: &Path) -> PathBuf {
-    Path::new("remote")
-        .join(remote)
-        .join(project)
-        .join(worktree.strip_prefix("/").unwrap_or(worktree))
-}
-
 /// Where to ask GitHub about `agent`'s branch: its workstation checkout,
 /// or for a remote agent its project's registered git URL, never its path.
 /// `None` for a remote agent whose project has no git URL.
@@ -228,13 +217,7 @@ pub fn request<T: DeserializeOwned>(
             TIMEOUT + Duration::from_secs(5),
         )
         .inspect_err(|_| super::router::forget_recent_daemon_socket())?,
-        None => super::channels().dashboard(
-            &project.site.remote,
-            &project.remote,
-            &project.site,
-            request,
-            connect,
-        )?,
+        None => super::channels().dashboard(project.host(), &project.site, request, connect)?,
     };
     Ok(serde_json::from_value(answer)?)
 }
@@ -310,7 +293,12 @@ mod tests {
         clone: &Path,
         request: DashboardRequest,
     ) -> Result<T> {
-        let answer = channels.dashboard("devbox", &remote(), &site(clone), &request, true)?;
+        let answer = channels.dashboard(
+            crate::remote::Remote::new("devbox", &remote()),
+            &site(clone),
+            &request,
+            true,
+        )?;
         Ok(serde_json::from_value(answer)?)
     }
 
@@ -453,7 +441,12 @@ mod tests {
         let request = DashboardRequest::GitStatus { worktree };
 
         let error = channels
-            .dashboard("devbox", &remote(), &site(&clone), &request, false)
+            .dashboard(
+                crate::remote::Remote::new("devbox", &remote()),
+                &site(&clone),
+                &request,
+                false,
+            )
             .unwrap_err();
 
         assert_eq!(error.to_string(), "remote devbox is not connected");

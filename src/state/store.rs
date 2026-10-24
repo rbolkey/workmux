@@ -1346,10 +1346,7 @@ impl StateStore {
             strict_server_identity,
             prune_stale,
         )?;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        let now = crate::util::now_unix_secs();
         self.mark_stale_remote_agents(&mut agents, mux.name(), instance, now);
         Ok(agents)
     }

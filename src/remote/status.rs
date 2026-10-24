@@ -13,10 +13,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::channel::Peer;
-use super::forwarded::project_tag;
 use super::pane::RemotePaneId;
 use crate::config::{Config, StatusIcons};
 use crate::multiplexer::{AgentStatus, Multiplexer, TmuxBackend};
+use crate::project::RemoteProjectId;
 use crate::state::{AgentState, PaneKey, RemoteAgent, StateStore};
 
 /// Notification remote workmux sends with status records: every file on
@@ -72,10 +72,7 @@ pub fn this_remote_pane() -> Option<RemotePaneId> {
 /// Record a hook's `status` for `pane` in its status file. Remote workmux
 /// sends the change on to the workstation.
 pub fn record(pane: &RemotePaneId, status: Option<AgentStatus>) -> Result<()> {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let now = crate::util::now_unix_secs();
     StatusFiles::for_this_remote()?.write(pane, status, std::env::current_dir().ok(), now)?;
     Ok(())
 }
@@ -216,7 +213,7 @@ impl StatusApplier {
         };
         let mut changed = false;
         for record in records {
-            let tag = project_tag(remote, &record.pane.project);
+            let tag = RemoteProjectId::new(remote, &record.pane.project).tag();
             for (pane_id, _) in views
                 .iter()
                 .filter(|(_, view)| view.0 == tag && view.1 == record.pane)
@@ -315,10 +312,7 @@ impl StatusApplier {
                 None => self.tmux.clear_status(pane_id)?,
             }
 
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
+            let now = crate::util::now_unix_secs();
             let activity_ts = match &existing {
                 Some(existing) if existing.status == record.status => existing.activity_ts,
                 _ => Some(record.event_ts),
