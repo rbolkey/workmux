@@ -1,6 +1,6 @@
 ---
 title: "project"
-description: Register a project on a remote or in its own OpenShell sandbox
+description: Register and unregister projects on a remote or in their own OpenShell sandbox
 ---
 
 ## project add
@@ -35,6 +35,20 @@ The repository is cloned on the remote by the first command that needs it.
 
 See [OpenShell projects](/guide/remote-projects/openshell/).
 
+## project rm
+
+Unregister a project from your global config, keeping the rest of the file, comments included. After confirmation, it closes the project's workstation windows and untags a session it adopted. Nothing on the remote is touched: the remote stays registered and the clone stays where it is.
+
+```bash
+workmux project rm <name> [-y]
+```
+
+An OpenShell project is refused: its sandbox is its own remote, so remove both with [`workmux remote rm <name>`](/reference/commands/remote/#remote-rm).
+
+**Options:**
+
+- `-y, --yes`: Don't ask for confirmation.
+
 ## Examples
 
 ```bash
@@ -42,4 +56,6 @@ workmux remote add devbox --transport ssh --target devbox
 workmux project add api --remote devbox --repo git@github.com:me/api.git
 
 workmux project add web --openshell --repo https://github.com/me/web.git --provider github
+
+workmux project rm api
 ```

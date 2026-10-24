@@ -84,7 +84,7 @@ workmux remote recreate <name> [-y]
 
 ## remote rm
 
-Remove a remote from your global config. Refused while a project uses the remote.
+Remove a remote from your global config. Refused while a project uses the remote; unregister those with [`project rm`](/reference/commands/project/#project-rm) first.
 
 For an OpenShell project's remote, this deletes the sandbox and the project. It first lists work that is unmerged or exists only in the sandbox and asks for confirmation, then closes the project's workstation windows. See [Deleting a sandbox](/guide/remote-projects/openshell/#deleting-a-sandbox).
 

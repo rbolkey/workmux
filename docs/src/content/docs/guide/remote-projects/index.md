@@ -142,7 +142,7 @@ projects:
       providers: [github]
 ```
 
-There is no `workmux project rm` yet. To unregister a project on an SSH remote, delete its entry with [`workmux config edit`](/reference/commands/config/). `workmux remote rm` refuses while a project uses the remote.
+To unregister a project, run [`workmux project rm <name>`](/reference/commands/project/#project-rm). It closes the project's workstation windows and leaves the remote and its clone alone. `workmux remote rm` refuses while a project uses the remote. An OpenShell project is removed together with its sandbox by `workmux remote rm <name>`.
 
 ## Commands typed in a remote pane
 
