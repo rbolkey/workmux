@@ -265,9 +265,10 @@ struct Shared {
     factory: TransportFactory,
     policy: ChannelPolicy,
     slots: Mutex<HashMap<String, Slot>>,
-    /// Serializes connection attempts, so a burst of requests opens one
-    /// channel per remote.
-    connecting: Mutex<()>,
+    /// Serializes connection attempts to each remote, so a burst of
+    /// requests opens one channel per remote while a remote that hangs
+    /// holds up no other.
+    connecting: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     sessions: Arc<Sessions>,
     /// Receives the status records remotes send.
     status: Arc<Mutex<Option<StatusSink>>>,
@@ -299,7 +300,7 @@ impl Channels {
                 factory,
                 policy,
                 slots: Mutex::new(HashMap::new()),
-                connecting: Mutex::new(()),
+                connecting: Mutex::new(HashMap::new()),
                 sessions: Arc::new(Sessions::default()),
                 status: Arc::new(Mutex::new(None)),
             }),
@@ -325,20 +326,25 @@ impl Channels {
         let unreachable = |error: anyhow::Error| Reach::Unreachable {
             error: format!("{error:#}"),
         };
-        let transport = match (self.shared.factory)(name, config) {
-            Ok(transport) => transport,
-            Err(error) => return unreachable(error),
-        };
-        if let Some(provisioning) = transport.provisioning() {
-            match provisioning.status() {
-                Ok(RemoteState::Running) => {}
-                Ok(RemoteState::Stopped | RemoteState::Missing) => return Reach::Stopped,
-                Err(error) => return unreachable(error),
+        let connection = match self.open_channel_for(name, config, true) {
+            Some(connection) => connection,
+            None => {
+                let transport = match (self.shared.factory)(name, config) {
+                    Ok(transport) => transport,
+                    Err(error) => return unreachable(error),
+                };
+                if let Some(provisioning) = transport.provisioning() {
+                    match provisioning.status() {
+                        Ok(RemoteState::Running) => {}
+                        Ok(RemoteState::Stopped | RemoteState::Missing) => return Reach::Stopped,
+                        Err(error) => return unreachable(error),
+                    }
+                }
+                match self.channel_with(name, config, transport, true) {
+                    Ok(connection) => connection,
+                    Err(error) => return unreachable(error),
+                }
             }
-        }
-        let connection = match self.channel_with(name, config, transport, true) {
-            Ok(connection) => connection,
-            Err(error) => return unreachable(error),
         };
         match connection.ping() {
             Ok(ping) => Reach::Reachable {
@@ -364,6 +370,11 @@ impl Channels {
         config: &RemoteConfig,
         use_now: bool,
     ) -> Result<Arc<Connection>> {
+        // An open channel needs no word from the transport: a remote that
+        // stopped has closed it.
+        if let Some(connection) = self.open_channel_for(name, config, use_now) {
+            return Ok(connection);
+        }
         let transport = (self.shared.factory)(name, config)?;
         if let Some(provisioning) = transport.provisioning()
             && provisioning.status()? != RemoteState::Running
@@ -380,25 +391,24 @@ impl Channels {
         transport: Arc<dyn Transport>,
         use_now: bool,
     ) -> Result<Arc<Connection>> {
-        let _connecting = self.shared.connecting.lock().unwrap();
+        let lock = self
+            .shared
+            .connecting
+            .lock()
+            .unwrap()
+            .entry(name.to_string())
+            .or_default()
+            .clone();
+        let _connecting = lock.lock().unwrap();
+        if let Some(connection) = self.open_channel_for(name, config, use_now) {
+            return Ok(connection);
+        }
+        if let Some(slot) = self.shared.slots.lock().unwrap().get_mut(name)
+            && slot.config != *config
         {
-            let mut slots = self.shared.slots.lock().unwrap();
-            if let Some(slot) = slots.get_mut(name) {
-                if slot.config == *config
-                    && let Some(connection) = &slot.connection
-                    && !connection.is_closed()
-                {
-                    if use_now {
-                        slot.last_used = Instant::now();
-                    }
-                    return Ok(connection.clone());
-                }
-                // Re-registered under different settings: drop the old channel.
-                if slot.config != *config {
-                    slot.connection = None;
-                    slot.config = config.clone();
-                }
-            }
+            // Re-registered under different settings: drop the old channel.
+            slot.connection = None;
+            slot.config = config.clone();
         }
 
         let connection = Arc::new(Connection::open(
@@ -565,6 +575,26 @@ impl Channels {
             dashboard::params(project, request),
             dashboard::TIMEOUT,
         )
+    }
+
+    /// `name`'s channel, when it is open under `config`; `use_now` marks it
+    /// used.
+    fn open_channel_for(
+        &self,
+        name: &str,
+        config: &RemoteConfig,
+        use_now: bool,
+    ) -> Option<Arc<Connection>> {
+        let mut slots = self.shared.slots.lock().unwrap();
+        let slot = slots.get_mut(name).filter(|slot| slot.config == *config)?;
+        let connection = slot
+            .connection
+            .clone()
+            .filter(|connection| !connection.is_closed())?;
+        if use_now {
+            slot.last_used = Instant::now();
+        }
+        Some(connection)
     }
 
     /// `name`'s channel, when it is open.
@@ -914,5 +944,96 @@ mod tests {
         assert_eq!(transport.exec_count(), 2);
         assert_eq!(replayed.status, Some(AgentStatus::Done));
         assert_eq!((replayed.event_ts, replayed.work_gen), (130, 2));
+    }
+
+    #[test]
+    fn a_hanging_remote_does_not_hold_up_requests_to_another() {
+        let serving = Arc::new(ServeTransport::default());
+        let hanging = Arc::new(ScriptTransport::new(["exec sleep 30"]));
+        let channels = Channels::new(
+            Arc::new(move |name, _| {
+                Ok(match name {
+                    "hanging" => hanging.clone() as Arc<dyn Transport>,
+                    _ => serving.clone() as Arc<dyn Transport>,
+                })
+            }),
+            ChannelPolicy {
+                hello_timeout: Duration::from_secs(20),
+                ..fast_policy()
+            },
+        );
+        channels.channel("devbox", &config()).unwrap();
+        let connecting = channels.clone();
+        std::thread::spawn(move || connecting.channel("hanging", &config()));
+        std::thread::sleep(Duration::from_millis(200));
+
+        let started = Instant::now();
+        channels.channel("devbox", &config()).unwrap();
+        assert!(channels.status("devbox", &config()).reach != Reach::Stopped);
+        // A remote not yet connected connects meanwhile too.
+        channels.channel("buildbox", &config()).unwrap();
+
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A running remote that counts how often its state is asked for.
+    #[derive(Default)]
+    struct CountingRunning {
+        serving: ServeTransport,
+        statuses: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Transport for CountingRunning {
+        fn exec_captured(&self, argv: &[String]) -> Result<std::process::Output> {
+            self.serving.exec_captured(argv)
+        }
+        fn exec_stdio(&self, argv: &[String]) -> Result<crate::remote::transport::StdioProcess> {
+            self.serving.exec_stdio(argv)
+        }
+        fn tty_command(
+            &self,
+            exec: &crate::remote::transport::TtyExec,
+        ) -> Result<std::process::Command> {
+            self.serving.tty_command(exec)
+        }
+        fn provisioning(&self) -> Option<&dyn crate::remote::transport::Provisioning> {
+            Some(self)
+        }
+    }
+
+    impl crate::remote::transport::Provisioning for CountingRunning {
+        fn status(&self) -> Result<RemoteState> {
+            self.statuses.fetch_add(1, Ordering::SeqCst);
+            Ok(RemoteState::Running)
+        }
+        fn create(&self) -> Result<()> {
+            unimplemented!()
+        }
+        fn start(&self) -> Result<()> {
+            unimplemented!()
+        }
+        fn stop(&self) -> Result<()> {
+            unimplemented!()
+        }
+        fn delete(&self) -> Result<()> {
+            unimplemented!()
+        }
+    }
+
+    #[test]
+    fn an_open_channel_is_used_without_asking_the_remote_for_its_state() {
+        let transport = Arc::new(CountingRunning::default());
+        let channels = channels_over(transport.clone(), fast_policy());
+
+        for _ in 0..3 {
+            channels.channel("sandbox", &config()).unwrap();
+        }
+        channels.status("sandbox", &config());
+
+        assert_eq!(transport.statuses.load(Ordering::SeqCst), 1);
     }
 }
