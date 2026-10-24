@@ -201,7 +201,10 @@ mod tests {
     #[test]
     fn a_provider_whose_profile_allows_the_agents_binary_gives_it_credentials_whatever_its_type() {
         let providers = BTreeMap::from([
-            ("gh".to_string(), provider("github-dev", Some(&["/usr/bin/gh"]))),
+            (
+                "gh".to_string(),
+                provider("github-dev", Some(&["/usr/bin/gh"])),
+            ),
             (
                 "claude".to_string(),
                 provider(

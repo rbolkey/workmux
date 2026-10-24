@@ -263,8 +263,7 @@ impl OpenShell {
         let mut providers = std::collections::BTreeMap::new();
         let mut token = String::new();
         loop {
-            let output =
-                self.run(&["provider", "list", "-o", "json", "--page-token", &token])?;
+            let output = self.run(&["provider", "list", "-o", "json", "--page-token", &token])?;
             let page: Value = serde_json::from_slice(&output.stdout)
                 .context("openshell sent an unreadable provider list")?;
             for provider in page["providers"].as_array().into_iter().flatten() {
