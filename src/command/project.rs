@@ -16,48 +16,7 @@ pub struct ProjectArgs {
 #[derive(Debug, Subcommand)]
 pub enum ProjectCommand {
     /// Register a project on a remote in your global config
-    Add {
-        /// Name commands use to refer to the project
-        name: String,
-        /// Remote the project lives on
-        #[arg(
-            long,
-            required_unless_present = "openshell",
-            conflicts_with = "openshell"
-        )]
-        remote: Option<String>,
-        /// Give the project its own OpenShell sandbox as its remote, created on first use
-        #[arg(long)]
-        openshell: bool,
-        /// Image the sandbox runs; it must contain git (OpenShell only)
-        #[arg(long, requires = "openshell")]
-        image: Option<String>,
-        /// Policy file merged on top of workmux's base policy (OpenShell only)
-        #[arg(long, value_name = "FILE", requires = "openshell")]
-        policy: Option<std::path::PathBuf>,
-        /// OpenShell provider to attach to the sandbox, for credentials (repeatable)
-        #[arg(long = "provider", value_name = "PROVIDER", requires = "openshell")]
-        providers: Vec<String>,
-        /// Agent the sandbox's image installs, such as claude or codex; the first is its
-        /// default agent (repeatable; default: your default agent's type; OpenShell only)
-        #[arg(long = "agent", value_name = "AGENT", requires = "openshell")]
-        agents: Vec<String>,
-        /// Sandbox name (default: derived from the project name; OpenShell only)
-        #[arg(long, requires = "openshell")]
-        sandbox: Option<String>,
-        /// Git URL the remote clones the project from on first use
-        #[arg(long, value_name = "URL")]
-        repo: String,
-        /// Path of the clone on the remote (default: ~/<name>)
-        #[arg(long)]
-        path: Option<String>,
-        /// Workstation session for the project's windows (default: the project name)
-        #[arg(long)]
-        session: Option<String>,
-        /// Where the project's windows go in window mode
-        #[arg(long, value_enum)]
-        placement: Option<ProjectPlacement>,
-    },
+    Add(Box<AddArgs>),
     /// Unregister a project from your global config, closing its workstation windows; the remote and its clone are kept
     Rm {
         name: String,
@@ -67,22 +26,67 @@ pub enum ProjectCommand {
     },
 }
 
+#[derive(Debug, Args)]
+pub struct AddArgs {
+    /// Name commands use to refer to the project
+    pub name: String,
+    /// Remote the project lives on
+    #[arg(
+        long,
+        required_unless_present = "openshell",
+        conflicts_with = "openshell"
+    )]
+    pub remote: Option<String>,
+    /// Give the project its own OpenShell sandbox as its remote, created on first use
+    #[arg(long)]
+    pub openshell: bool,
+    /// Image the sandbox runs; it must contain git (OpenShell only)
+    #[arg(long, requires = "openshell")]
+    pub image: Option<String>,
+    /// Policy file merged on top of workmux's base policy (OpenShell only)
+    #[arg(long, value_name = "FILE", requires = "openshell")]
+    pub policy: Option<std::path::PathBuf>,
+    /// OpenShell provider to attach to the sandbox, for credentials (repeatable)
+    #[arg(long = "provider", value_name = "PROVIDER", requires = "openshell")]
+    pub providers: Vec<String>,
+    /// Agent the sandbox's image installs, such as claude or codex; the first is its
+    /// default agent (repeatable; default: your default agent's type; OpenShell only)
+    #[arg(long = "agent", value_name = "AGENT", requires = "openshell")]
+    pub agents: Vec<String>,
+    /// Sandbox name (default: derived from the project name; OpenShell only)
+    #[arg(long, requires = "openshell")]
+    pub sandbox: Option<String>,
+    /// Git URL the remote clones the project from on first use
+    #[arg(long, value_name = "URL")]
+    pub repo: String,
+    /// Path of the clone on the remote (default: ~/<name>)
+    #[arg(long)]
+    pub path: Option<String>,
+    /// Workstation session for the project's windows (default: the project name)
+    #[arg(long)]
+    pub session: Option<String>,
+    /// Where the project's windows go in window mode
+    #[arg(long, value_enum)]
+    pub placement: Option<ProjectPlacement>,
+}
+
 pub fn run(args: ProjectArgs) -> Result<()> {
     match args.command {
-        ProjectCommand::Add {
-            name,
-            remote,
-            openshell,
-            image,
-            policy,
-            providers,
-            agents,
-            sandbox,
-            repo,
-            path,
-            session,
-            placement,
-        } => {
+        ProjectCommand::Add(args) => {
+            let AddArgs {
+                name,
+                remote,
+                openshell,
+                image,
+                policy,
+                providers,
+                agents,
+                sandbox,
+                repo,
+                path,
+                session,
+                placement,
+            } = *args;
             let openshell = if openshell {
                 Some(OpenshellProject {
                     sandbox,
