@@ -335,11 +335,18 @@ fn recreate(name: &str, yes: bool) -> Result<()> {
     })?;
     let transport = registry::transport(name, &project.remote)?;
     let provisioning = lifecycle(transport.as_ref());
-    if provisioning.status()? == RemoteState::Missing {
+    let keep = crate::xdg::state_dir()?
+        .join("recreate")
+        .join(&project.remote.target);
+    // An earlier recreate that failed after deleting the sandbox kept the
+    // work; this one creates the sandbox if need be and restores it.
+    let resuming = crate::remote::carry::has_kept_work(&keep);
+    if provisioning.status()? == RemoteState::Missing && !resuming {
         return ensure_running(name, transport.as_ref(), true, &mut print_notice).map(|_| ());
     }
     ensure_running(name, transport.as_ref(), true, &mut print_notice)?;
-    if !confirmed(
+    if !resuming
+        && !confirmed(
         &format!(
             "Recreate sandbox {} of project {}? Agents running in it are ended and their remote panes lost; committed work on every branch is carried across.
  ",
@@ -350,9 +357,6 @@ fn recreate(name: &str, yes: bool) -> Result<()> {
         println!("Kept remote {name} as it is");
         return Ok(());
     }
-    let keep = crate::xdg::state_dir()?
-        .join("recreate")
-        .join(&project.remote.target);
     crate::remote::carry::recreate(
         transport.as_ref(),
         &project.site.path,
