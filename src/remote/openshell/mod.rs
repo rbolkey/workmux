@@ -224,13 +224,19 @@ impl OpenShell {
 
     /// Build the sandbox's image, returning its tag.
     fn build_image(&self, origin: &OpenshellRemote, context: &std::path::Path) -> Result<String> {
-        let workmux = std::env::var_os(image::BINARY_ENV).map(PathBuf::from);
         let checkout = context.join("project");
         let devshell = origin
             .git_url
             .as_deref()
             .is_some_and(|url| self.fetch_flake(url, &checkout))
             .then_some(checkout);
+        let workmux = image::Workmux::current();
+        if let image::Workmux::Source(source) = &workmux {
+            eprintln!(
+                "This workmux is a dev build: building a Linux workmux from {} into the sandbox image",
+                source.display()
+            );
+        }
         let recipe = image::Recipe {
             base: origin.settings.image.clone(),
             workmux,
@@ -784,8 +790,8 @@ mod contract {
     }
 
     /// The image the contract tests run: the learning tests' fixture image
-    /// (git, dtach, python3), plus the Linux workmux named by
-    /// `WORKMUX_OPENSHELL_WORKMUX` when it is set.
+    /// (git, dtach, python3), to which workmux adds a Linux workmux built
+    /// from this checkout, or the one `WORKMUX_OPENSHELL_WORKMUX` names.
     fn fixture_image() -> String {
         let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/openshell");
         let status = Command::new("docker")
@@ -1016,7 +1022,7 @@ mod contract {
 
     #[test]
     fn remote_workmux_serves_a_control_channel_through_exec() {
-        if !enabled() || std::env::var_os(image::BINARY_ENV).is_none() {
+        if !enabled() {
             return;
         }
         let owned = sandbox("serve");
