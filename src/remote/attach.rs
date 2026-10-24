@@ -11,6 +11,7 @@
 use anyhow::{Result, anyhow};
 use std::io::{Read, Write};
 use std::process::Stdio;
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use super::pane::{ATTACHED, PaneState, RemotePaneId};
@@ -92,8 +93,12 @@ fn attach_once(transport: &dyn Transport, pane: &RemotePaneId) -> Result<()> {
 /// pane's process sees a real size change and repaints. A dtach client that
 /// has only just attached can hold the first change back until something
 /// else wakes it, and then reports the size as it is by then; the second
-/// shrink is that wake, and still a change.
+/// shrink is that wake, and still a change. One resize runs at a time: one
+/// started mid-way through another would take the shrunk size for the real
+/// one.
 fn force_resize() {
+    static RESIZING: Mutex<()> = Mutex::new(());
+    let _resizing = RESIZING.lock().unwrap_or_else(PoisonError::into_inner);
     let mut size: libc::winsize = unsafe { std::mem::zeroed() };
     // SAFETY: TIOCGWINSZ and TIOCSWINSZ read and write a winsize.
     if unsafe { libc::ioctl(libc::STDIN_FILENO, libc::TIOCGWINSZ, &mut size) } != 0
