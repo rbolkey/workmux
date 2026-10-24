@@ -21,7 +21,9 @@ pub fn transport(_name: &str, remote: &RemoteConfig) -> Result<Arc<dyn Transport
         TransportKind::Loopback => Ok(Arc::new(Loopback::new(crate::util::expand_tilde(
             &remote.target,
         ))?)),
-        TransportKind::Ssh => Ok(Arc::new(Ssh::new(&remote.target))),
+        TransportKind::Ssh => Ok(Arc::new(
+            Ssh::new(&remote.target).with_uploaded_workmux(remote.upload_workmux == Some(true)),
+        )),
         TransportKind::Openshell => Ok(Arc::new(OpenShell::new(
             &remote.target,
             remote.openshell.clone(),

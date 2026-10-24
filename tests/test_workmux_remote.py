@@ -259,8 +259,16 @@ def test_remote_add_status_rm_against_ssh_to_localhost(
         ).stdout.split()
         assert len(children) == 1
 
-        failed = remote(
-            env, workmux_exe_path, repo_path, "status nowm", short_tmp, expect_fail=True
+        # End of input declines the offer to install workmux there.
+        failed = run_workmux_command(
+            env,
+            workmux_exe_path,
+            repo_path,
+            "remote status nowm",
+            pre_run_env=short_tmp,
+            stdin_input="",
+            expect_fail=True,
+            timeout=30.0,
         )
         assert "status:   unreachable" in failed.stdout
         assert (
@@ -273,6 +281,107 @@ def test_remote_add_status_rm_against_ssh_to_localhost(
         listing = remote(env, workmux_exe_path, repo_path, "list", short_tmp).stdout
         assert "box" not in listing
         assert "nowm" not in listing
+    finally:
+        if daemon_pid is not None:
+            os.kill(daemon_pid, signal.SIGTERM)
+
+
+@pytest.mark.tmux_only
+def test_a_remote_without_workmux_gets_one_installed_on_yes_and_remembers(
+    mux_server: MuxEnvironment,
+    workmux_exe_path: Path,
+    repo_path: Path,
+    short_tmp: dict,
+    local_sshd: Path,
+):
+    """Checking an SSH remote without workmux offers to install this build
+    in the remote's cache directory; on yes the remote serves from there,
+    and the answer is kept so the next check asks nothing."""
+    env = mux_server
+    version = env.run_command([str(workmux_exe_path), "--version"]).stdout.split()[-1]
+    env.install_script(
+        env.fake_bin_dir / "ssh", f'#!/bin/sh\nexec /usr/bin/ssh -F {local_sshd} "$@"\n'
+    )
+    remote_home = local_sshd.parent / "remote-home"
+
+    def wm(command, stdin_input=None, expect_fail=False):
+        return run_workmux_command(
+            env,
+            workmux_exe_path,
+            repo_path,
+            command,
+            pre_run_env=short_tmp,
+            stdin_input=stdin_input,
+            expect_fail=expect_fail,
+            timeout=60.0,
+        )
+
+    wm("remote add nowm --transport ssh --target wmx-nowm")
+    daemon_pid = None
+    try:
+        # End of input answers nothing, and nothing is remembered.
+        unanswered = wm("remote status nowm", stdin_input="", expect_fail=True)
+        assert f"Install workmux {version} on nowm" in unanswered.stderr
+        assert "workmux remote upload nowm" in unanswered.stderr
+        assert "status:   unreachable" in unanswered.stdout
+
+        installed = wm("remote status nowm", stdin_input="y\n")
+        assert f"Install workmux {version} on nowm" in installed.stderr
+        assert "status:   reachable" in installed.stdout
+        assert f"workmux:  {version}" in installed.stdout
+        uploaded = remote_home / ".cache" / "workmux" / "bin" / version / "workmux"
+        assert uploaded.is_file()
+        config = (env.home_path / ".config" / "workmux" / "config.yaml").read_text()
+        assert "upload_workmux: true" in config
+
+        again = wm("remote status nowm")
+        assert "Install workmux" not in again.stderr
+        assert "status:   reachable" in again.stdout
+        daemon_pid = remote_daemon_ping(env, workmux_exe_path, repo_path, short_tmp)[
+            "pid"
+        ]
+    finally:
+        if daemon_pid is not None:
+            os.kill(daemon_pid, signal.SIGTERM)
+
+
+@pytest.mark.tmux_only
+def test_a_project_command_on_a_remote_without_workmux_runs_once_it_is_installed(
+    mux_server: MuxEnvironment,
+    workmux_exe_path: Path,
+    repo_path: Path,
+    short_tmp: dict,
+    local_sshd: Path,
+):
+    """A command for a project on an SSH remote without workmux offers the
+    install and, on yes, runs there."""
+    env = mux_server
+    env.install_script(
+        env.fake_bin_dir / "ssh", f'#!/bin/sh\nexec /usr/bin/ssh -F {local_sshd} "$@"\n'
+    )
+    origin = make_origin(env, env.tmp_path / "origin", "")
+
+    def wm(command, stdin_input=None):
+        return run_workmux_command(
+            env,
+            workmux_exe_path,
+            repo_path,
+            command,
+            pre_run_env=short_tmp,
+            stdin_input=stdin_input,
+            timeout=60.0,
+        )
+
+    wm("remote add nowm --transport ssh --target wmx-nowm")
+    wm(f"project add api --remote nowm --repo {origin} --path code/api")
+    daemon_pid = None
+    try:
+        listing = wm("list --project api", stdin_input="y\n")
+        assert "Install workmux" in listing.stderr
+        assert listing.stdout.splitlines()[1].split()[:2] == ["api@nowm", "main"]
+        daemon_pid = remote_daemon_ping(env, workmux_exe_path, repo_path, short_tmp)[
+            "pid"
+        ]
     finally:
         if daemon_pid is not None:
             os.kill(daemon_pid, signal.SIGTERM)

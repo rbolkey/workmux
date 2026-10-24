@@ -1057,6 +1057,12 @@ pub struct RemoteConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub host_commands: Vec<String>,
 
+    /// Whether workmux may install a matching workmux in the remote's cache
+    /// directory and run that one: the user's answer the first time a
+    /// remote lacked a compatible workmux. Unset until asked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upload_workmux: Option<bool>,
+
     /// For an OpenShell project's implicit remote: what its sandbox is
     /// created from. Never written to config.
     #[serde(skip)]
@@ -3215,6 +3221,7 @@ impl Config {
                         .unwrap_or_else(|| openshell_sandbox_name(name)),
                     builtin_shims: None,
                     host_commands: Vec::new(),
+                    upload_workmux: None,
                     openshell: Some(OpenshellRemote {
                         project: name.clone(),
                         git_url: entry.git_url.clone(),

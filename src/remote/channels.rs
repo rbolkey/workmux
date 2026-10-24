@@ -668,6 +668,7 @@ mod tests {
             target: "/remote".to_string(),
             builtin_shims: None,
             host_commands: vec![],
+            upload_workmux: None,
             openshell: None,
         }
     }
