@@ -303,7 +303,10 @@ def test_an_openshell_projects_sandbox_runs_claude_code(project: Project):
     assert "Agent claude: installed at /usr/local/bin/claude" in added.stdout, (
         added.stdout
     )
-    assert "no provider of type claude-code is attached" in added.stderr, added.stderr
+    assert (
+        "no provider attached to the sandbox has a profile that allows /usr/local/bin/claude"
+        in added.stderr
+    ), added.stderr
     project.wm(f"remote start {project.name}", timeout=900.0)
     # A project with no panes of its own: its agent pane runs the agent.
     project.sh(

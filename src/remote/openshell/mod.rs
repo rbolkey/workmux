@@ -229,34 +229,63 @@ impl OpenShell {
     pub fn agent_report(&self) -> Option<agents::Report> {
         let origin = self.origin.as_ref()?;
         let providers = &origin.settings.providers;
-        let types = if providers.is_empty() {
+        let found = if providers.is_empty() {
             Ok(Default::default())
         } else {
-            self.provider_types().map_err(|error| format!("{error:#}"))
+            self.providers().map_err(|error| format!("{error:#}"))
         };
         Some(agents::report(
             &origin.agents,
             providers,
-            types.as_ref().map_err(String::as_str),
+            found.as_ref().map_err(String::as_str),
         ))
     }
 
-    /// Every provider's type, by provider name.
-    fn provider_types(&self) -> Result<std::collections::BTreeMap<String, String>> {
-        let output = self.run(&["provider", "list", "-o", "json"])?;
-        let list: Value = serde_json::from_slice(&output.stdout)
-            .context("openshell sent an unreadable provider list")?;
-        Ok(list["providers"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|provider| {
-                Some((
-                    provider["name"].as_str()?.to_string(),
-                    provider["type"].as_str()?.to_string(),
-                ))
-            })
-            .collect())
+    /// Every provider on the gateway by name, with the binaries its
+    /// profile allows.
+    fn providers(&self) -> Result<std::collections::BTreeMap<String, agents::Provider>> {
+        let output = self.run(&["provider", "profile", "list", "-o", "json"])?;
+        let profiles: Value = serde_json::from_slice(&output.stdout)
+            .context("openshell sent an unreadable profile list")?;
+        let binaries = |provider_type: &str| {
+            profiles
+                .as_array()?
+                .iter()
+                .find(|profile| profile["id"] == provider_type)?["binaries"]
+                .as_array()
+                .map(|binaries| {
+                    binaries
+                        .iter()
+                        .filter_map(|binary| Some(binary.as_str()?.to_string()))
+                        .collect()
+                })
+        };
+        let mut providers = std::collections::BTreeMap::new();
+        let mut token = String::new();
+        loop {
+            let output =
+                self.run(&["provider", "list", "-o", "json", "--page-token", &token])?;
+            let page: Value = serde_json::from_slice(&output.stdout)
+                .context("openshell sent an unreadable provider list")?;
+            for provider in page["providers"].as_array().into_iter().flatten() {
+                let (Some(name), Some(provider_type)) =
+                    (provider["name"].as_str(), provider["type"].as_str())
+                else {
+                    continue;
+                };
+                providers.insert(
+                    name.to_string(),
+                    agents::Provider {
+                        provider_type: provider_type.to_string(),
+                        binaries: binaries(provider_type),
+                    },
+                );
+            }
+            match page["next_page_token"].as_str() {
+                Some(next) if !next.is_empty() && next != token => token = next.to_string(),
+                _ => return Ok(providers),
+            }
+        }
     }
 
     /// Build the sandbox's image, returning its tag.
@@ -604,7 +633,9 @@ mod tests {
                  'sandbox create'|'sandbox start') echo Ready > \"$dir/phase\" ;;\n\
                  'sandbox stop') echo Stopped > \"$dir/phase\" ;;\n\
                  'sandbox delete') rm -f \"$dir/phase\" ;;\n\
-                 'provider list') cat \"$dir/providers\" ;;\n\
+                 'provider list') token=; while [ $# -gt 0 ]; do [ \"$1\" = --page-token ] && token=$2; shift; done;\n\
+                   cat \"$dir/providers$token\" ;;\n\
+                 'provider profile') cat \"$dir/profiles\" ;;\n\
                  'sandbox exec') shift 2; while [ \"$1\" != -- ]; do shift; done; shift; exec \"$@\" ;;\n\
                  esac\n",
                 dir = dir.path().display()
@@ -747,33 +778,47 @@ mod tests {
     }
 
     #[test]
-    fn the_agent_report_looks_up_the_attached_providers_types() {
+    fn the_agent_report_matches_attached_providers_by_what_their_profiles_allow() {
         let fake = FakeOpenShell::new();
+        let dir = fake.dir.path();
         std::fs::write(
-            fake.dir.path().join("providers"),
-            r#"{"next_page_token":"","providers":[
+            dir.join("providers"),
+            r#"{"next_page_token":"page2","providers":[
                 {"name":"github","type":"github"},
-                {"name":"anthropic","type":"claude-code"},
                 {"name":"other","type":"claude-code"}]}"#,
         )
         .unwrap();
+        std::fs::write(
+            dir.join("providerspage2"),
+            r#"{"next_page_token":"","providers":[
+                {"name":"anthropic","type":"claude-code-oauth"},
+                {"name":"openai","type":"codex"}]}"#,
+        )
+        .unwrap();
+        // A stock profile and a custom one; the stock codex profile is
+        // not installed.
+        std::fs::write(
+            dir.join("profiles"),
+            r#"[{"id":"claude-code","binaries":["/usr/local/bin/claude"]},
+                {"id":"claude-code-oauth","binaries":["/usr/local/bin/claude","/usr/bin/claude"],
+                 "endpoints":[{"host":"api.anthropic.com","port":443}]},
+                {"id":"github","binaries":["/usr/bin/gh"]}]"#,
+        )
+        .unwrap();
         let mut origin = origin();
-        origin.agents = vec!["claude".to_string()];
+        origin.settings.providers = ["github", "anthropic", "openai"].map(String::from).to_vec();
+        origin.agents = vec!["claude".to_string(), "codex".to_string()];
 
         let report = fake.transport(Some(origin)).agent_report().unwrap();
 
         assert_eq!(
             report.notes,
             [
-                "claude: installed at /usr/local/bin/claude; its credentials come from a provider of type claude-code (attached: anthropic)"
+                "claude: installed at /usr/local/bin/claude; its credentials come from a provider whose profile allows it, such as one of type claude-code (attached: anthropic)",
+                "codex: installed at /usr/local/bin/codex; its credentials come from a provider whose profile allows it, such as one of type codex (attached: openai)",
             ]
         );
         assert!(report.warnings.is_empty(), "{:?}", report.warnings);
-        assert!(
-            fake.log().contains(&"provider list -o json".to_string()),
-            "{:?}",
-            fake.log()
-        );
     }
 
     #[test]
