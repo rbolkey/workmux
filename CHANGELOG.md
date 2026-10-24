@@ -23,6 +23,7 @@ editUrl: https://github.com/raine/workmux/edit/main/CHANGELOG.md
 
 ## Unreleased
 
+- New: Remote projects. Keep a project's repository, worktrees and agents on an SSH host or in its own OpenShell sandbox, while tmux, the sidebar and the dashboard stay on your workstation. Register them with `workmux remote add` and `workmux project add`; every project command works on them with `--project` or from the project's session. See [Remote projects](https://workmux.raine.dev/guide/remote-projects/).
 - Show which project each agent belongs to in `workmux status --all`, plus its tmux session when the session name differs from the project.
 
 ## v0.1.276 (2026-10-14)

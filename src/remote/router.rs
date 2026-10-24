@@ -279,6 +279,28 @@ fn session(
         Readiness::Running => true,
         Readiness::AsItIs => false,
     };
+    match session_once(project, argv, prompt_file.clone(), terminal, running) {
+        // The channel never opened, so the command never ran: run it again
+        // once the remote has a workmux that can serve it. Only a command
+        // the user runs at this terminal (one that may start its remote)
+        // offers the install; polls and captured commands don't.
+        Err(error)
+            if readiness == Readiness::Start
+                && super::upload::offer_on_terminal(project.host(), &format!("{error:#}"))? =>
+        {
+            session_once(project, argv, prompt_file, terminal, running)
+        }
+        result => result,
+    }
+}
+
+fn session_once(
+    project: &RemoteProject,
+    argv: &[&str],
+    prompt_file: Option<String>,
+    terminal: &mut dyn Terminal,
+    running: bool,
+) -> Result<i32> {
     let request = CommandRequest {
         project: project.site.clone(),
         argv: argv.iter().map(|arg| arg.to_string()).collect(),

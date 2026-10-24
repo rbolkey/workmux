@@ -26,6 +26,7 @@ pub mod status;
 #[cfg(test)]
 pub mod testing;
 pub mod transport;
+pub mod upload;
 
 use anyhow::{Result, anyhow};
 use std::collections::BTreeMap;
