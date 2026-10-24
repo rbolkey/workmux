@@ -486,7 +486,8 @@ fn recreate(name: &str, yes: bool) -> Result<()> {
     Ok(())
 }
 
-/// Show an OpenShell remote's effective policy, read from the sandbox.
+/// Show an OpenShell remote's effective policy, read from the sandbox, and
+/// its agents with the providers that give them credentials.
 fn print_policy(name: &str, remote: &RemoteConfig) {
     let sandbox =
         crate::remote::openshell::OpenShell::new(&remote.target, remote.openshell.clone());
@@ -508,6 +509,14 @@ fn print_policy(name: &str, remote: &RemoteConfig) {
             }
         }
         Err(error) => println!("  policy:   unknown ({error:#}) for {name}"),
+    }
+    if let Some(report) = sandbox.agent_report() {
+        for note in report.notes {
+            println!("  agent:    {note}");
+        }
+        for warning in report.warnings {
+            println!("  warning:  {warning}");
+        }
     }
 }
 

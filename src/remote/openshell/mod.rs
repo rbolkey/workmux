@@ -9,6 +9,7 @@
 //! with `HOME` and workdir `/sandbox`, and policy changes that apply in
 //! place only when they widen a grant.
 
+pub mod agents;
 pub mod image;
 pub mod policy;
 
@@ -222,6 +223,42 @@ impl OpenShell {
         Ok(path)
     }
 
+    /// What the user is told about the project's agents: where each is
+    /// installed and which attached provider gives it credentials. `None`
+    /// for a sandbox that belongs to no project.
+    pub fn agent_report(&self) -> Option<agents::Report> {
+        let origin = self.origin.as_ref()?;
+        let providers = &origin.settings.providers;
+        let types = if providers.is_empty() {
+            Ok(Default::default())
+        } else {
+            self.provider_types().map_err(|error| format!("{error:#}"))
+        };
+        Some(agents::report(
+            &origin.agents,
+            providers,
+            types.as_ref().map_err(String::as_str),
+        ))
+    }
+
+    /// Every provider's type, by provider name.
+    fn provider_types(&self) -> Result<std::collections::BTreeMap<String, String>> {
+        let output = self.run(&["provider", "list", "-o", "json"])?;
+        let list: Value = serde_json::from_slice(&output.stdout)
+            .context("openshell sent an unreadable provider list")?;
+        Ok(list["providers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|provider| {
+                Some((
+                    provider["name"].as_str()?.to_string(),
+                    provider["type"].as_str()?.to_string(),
+                ))
+            })
+            .collect())
+    }
+
     /// Build the sandbox's image, returning its tag.
     fn build_image(&self, origin: &OpenshellRemote, context: &std::path::Path) -> Result<String> {
         let checkout = context.join("project");
@@ -240,6 +277,7 @@ impl OpenShell {
         let recipe = image::Recipe {
             base: origin.settings.image.clone(),
             workmux,
+            agents: origin.agents.clone(),
             devshell,
         };
         let tag = image::prepare(&recipe, &self.sandbox, &sandbox_path(&origin.path), context)?;
@@ -483,6 +521,9 @@ impl Provisioning for OpenShell {
         let origin = self.origin()?;
         let context = tempfile::tempdir()?;
         let image = self.build_image(origin, context.path())?;
+        for warning in self.agent_report().map(|r| r.warnings).unwrap_or_default() {
+            eprintln!("warning: {warning}");
+        }
         let policy = self.write_policy(context.path())?;
         let args = self.create_args(origin, &image, &policy.to_string_lossy());
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -539,6 +580,7 @@ mod tests {
                 providers: vec!["github".to_string(), "anthropic".to_string()],
                 ..OpenshellProject::default()
             },
+            agents: Vec::new(),
         }
     }
 
@@ -562,6 +604,7 @@ mod tests {
                  'sandbox create'|'sandbox start') echo Ready > \"$dir/phase\" ;;\n\
                  'sandbox stop') echo Stopped > \"$dir/phase\" ;;\n\
                  'sandbox delete') rm -f \"$dir/phase\" ;;\n\
+                 'provider list') cat \"$dir/providers\" ;;\n\
                  'sandbox exec') shift 2; while [ \"$1\" != -- ]; do shift; done; shift; exec \"$@\" ;;\n\
                  esac\n",
                 dir = dir.path().display()
@@ -701,6 +744,36 @@ mod tests {
         for flag in ["--upload", "--mount", "--driver-config-json", "-v"] {
             assert!(!words.contains(&flag), "{create}");
         }
+    }
+
+    #[test]
+    fn the_agent_report_looks_up_the_attached_providers_types() {
+        let fake = FakeOpenShell::new();
+        std::fs::write(
+            fake.dir.path().join("providers"),
+            r#"{"next_page_token":"","providers":[
+                {"name":"github","type":"github"},
+                {"name":"anthropic","type":"claude-code"},
+                {"name":"other","type":"claude-code"}]}"#,
+        )
+        .unwrap();
+        let mut origin = origin();
+        origin.agents = vec!["claude".to_string()];
+
+        let report = fake.transport(Some(origin)).agent_report().unwrap();
+
+        assert_eq!(
+            report.notes,
+            [
+                "claude: installed at /usr/local/bin/claude; its credentials come from a provider of type claude-code (attached: anthropic)"
+            ]
+        );
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+        assert!(
+            fake.log().contains(&"provider list -o json".to_string()),
+            "{:?}",
+            fake.log()
+        );
     }
 
     #[test]
@@ -848,6 +921,7 @@ mod contract {
                 image: Some(fixture_image()),
                 ..Default::default()
             },
+            agents: Vec::new(),
         };
         Owned(OpenShell::new(name, Some(origin)))
     }

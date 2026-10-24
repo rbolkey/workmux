@@ -32,7 +32,7 @@ workmux remote list
 
 ## remote status
 
-Show whether a remote is reachable, with its workmux and protocol versions, warnings, and the transport's error when it is unreachable. For an OpenShell project, it also shows the sandbox's effective policy.
+Show whether a remote is reachable, with its workmux and protocol versions, warnings, and the transport's error when it is unreachable. For an OpenShell project, it also shows the sandbox's effective policy and its agents, each with the provider type that gives it credentials, and warns when no attached provider has that type.
 
 ```bash
 workmux remote status [name]
