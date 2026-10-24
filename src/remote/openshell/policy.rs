@@ -132,8 +132,7 @@ pub fn narrowed(current: &Value, desired: &Value) -> Vec<String> {
         }
     }
     for path in paths(current, "read_only") {
-        if !desired_ro.contains(&path) && !desired_rw.contains(&path) && !narrowed.contains(&path)
-        {
+        if !desired_ro.contains(&path) && !desired_rw.contains(&path) && !narrowed.contains(&path) {
             narrowed.push(path);
         }
     }
@@ -173,7 +172,17 @@ mod tests {
         );
         assert_eq!(
             list(&policy, FILESYSTEM, "read_only"),
-            ["/bin", "/usr", "/lib", "/proc", "/dev/urandom", "/etc", "/var/log", "/nix", "/opt/tools"]
+            [
+                "/bin",
+                "/usr",
+                "/lib",
+                "/proc",
+                "/dev/urandom",
+                "/etc",
+                "/var/log",
+                "/nix",
+                "/opt/tools"
+            ]
         );
         assert_eq!(policy[FILESYSTEM]["include_workdir"], true);
     }
@@ -185,7 +194,10 @@ mod tests {
         ))
         .unwrap();
 
-        assert_eq!(policy[NETWORK]["github"]["endpoints"][0]["host"], "github.com");
+        assert_eq!(
+            policy[NETWORK]["github"]["endpoints"][0]["host"],
+            "github.com"
+        );
         assert_eq!(policy["landlock"]["compatibility"], "hard_requirement");
     }
 
@@ -212,10 +224,8 @@ mod tests {
             "filesystem_policy:\n  read_only: [/opt]\n  read_write: [/data, /cache]\n",
         ))
         .unwrap();
-        let desired = effective(Some(
-            "filesystem_policy:\n  read_only: [/cache, /more]\n",
-        ))
-        .unwrap();
+        let desired =
+            effective(Some("filesystem_policy:\n  read_only: [/cache, /more]\n")).unwrap();
 
         assert_eq!(narrowed(&current, &desired), ["/data", "/cache", "/opt"]);
         assert!(narrowed(&current, &current).is_empty());

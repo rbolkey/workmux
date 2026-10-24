@@ -12,11 +12,11 @@ use tabled::{
 use super::global_config::{self, PROJECTS, REMOTES};
 use crate::config::{RemoteConfig, TransportKind};
 use crate::remote::carry::AtRisk;
-use crate::remote::transport::{Provisioning, RemoteState, Transport, ensure_running};
-use std::sync::Arc;
 use crate::remote::channels::{Reach, RemoteStatus};
 use crate::remote::pane::{RemotePaneId, SessionHolder};
 use crate::remote::registry;
+use crate::remote::transport::{Provisioning, RemoteState, Transport, ensure_running};
+use std::sync::Arc;
 
 /// How long a status call may take: opening a channel can wait on a slow
 /// transport.
@@ -256,24 +256,32 @@ fn confirmed(prompt: &str, yes: bool) -> Result<bool> {
 
 /// The confirmation for deleting `sandbox`, naming the work only it holds.
 fn delete_prompt(name: &str, sandbox: &str, risks: Option<&[AtRisk]>) -> String {
-    let mut prompt = format!(
-        "Delete sandbox {sandbox} of project {name}? Its clone and worktrees are lost."
-    );
+    let mut prompt =
+        format!("Delete sandbox {sandbox} of project {name}? Its clone and worktrees are lost.");
     match risks {
-        None => prompt.push_str("
-  Its worktrees could not be checked for unpushed work."),
+        None => prompt.push_str(
+            "
+  Its worktrees could not be checked for unpushed work.",
+        ),
         Some([]) => {}
         Some(risks) => {
-            prompt.push_str("
-  These have work that exists only in the sandbox:");
+            prompt.push_str(
+                "
+  These have work that exists only in the sandbox:",
+            );
             for risk in risks {
-                prompt.push_str(&format!("
-    {}", risk.describe()));
+                prompt.push_str(&format!(
+                    "
+    {}",
+                    risk.describe()
+                ));
             }
         }
     }
-    prompt.push_str("
- ");
+    prompt.push_str(
+        "
+ ",
+    );
     prompt
 }
 
@@ -284,11 +292,15 @@ fn rm_openshell(project: &crate::remote::router::RemoteProject, yes: bool) -> Re
     let provisioning = lifecycle(transport.as_ref());
     if provisioning.status()? != RemoteState::Missing {
         if provisioning.status()? == RemoteState::Stopped {
-            eprintln!("Starting remote {name} to check its worktrees for work that exists only there…");
+            eprintln!(
+                "Starting remote {name} to check its worktrees for work that exists only there…"
+            );
             provisioning.start()?;
         }
-        let risks = match crate::remote::carry::remote_at_risk(transport.as_ref(), &project.site.path)
-        {
+        let risks = match crate::remote::carry::remote_at_risk(
+            transport.as_ref(),
+            &project.site.path,
+        ) {
             Ok(risks) => Some(risks),
             Err(error) => {
                 tracing::warn!(error = %format!("{error:#}"), "checking worktrees before delete");
@@ -354,7 +366,8 @@ fn recreate(name: &str, yes: bool) -> Result<()> {
         &mut print_notice,
     )
     .with_context(|| format!("recreating remote {name}"))?;
-    let hooks = transport.exec_captured(&["workmux", "setup", "--hooks", "--yes"].map(String::from))?;
+    let hooks =
+        transport.exec_captured(&["workmux", "setup", "--hooks", "--yes"].map(String::from))?;
     if !hooks.status.success() {
         eprintln!(
             "warning: installing agent hooks on {name} failed ({}); run `workmux setup --hooks` there",
@@ -369,12 +382,18 @@ fn recreate(name: &str, yes: bool) -> Result<()> {
 
 /// Show an OpenShell remote's effective policy, read from the sandbox.
 fn print_policy(name: &str, remote: &RemoteConfig) {
-    let sandbox = crate::remote::openshell::OpenShell::new(&remote.target, remote.openshell.clone());
+    let sandbox =
+        crate::remote::openshell::OpenShell::new(&remote.target, remote.openshell.clone());
     match sandbox.policy_report() {
-        Ok(None) => println!("  sandbox:  not created yet; the first command that needs it creates it"),
+        Ok(None) => {
+            println!("  sandbox:  not created yet; the first command that needs it creates it")
+        }
         Ok(Some((policy, warnings))) => {
             let mut lines = policy.iter();
-            println!("  policy:   {}", lines.next().map(String::as_str).unwrap_or_default());
+            println!(
+                "  policy:   {}",
+                lines.next().map(String::as_str).unwrap_or_default()
+            );
             for line in lines {
                 println!("            {line}");
             }

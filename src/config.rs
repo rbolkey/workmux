@@ -3184,7 +3184,9 @@ impl Config {
     /// For workstation-wide settings such as remotes, which no project
     /// config may set.
     pub fn load_global_only() -> anyhow::Result<Self> {
-        Ok(Self::load_global()?.unwrap_or_default().with_implicit_remotes())
+        Ok(Self::load_global()?
+            .unwrap_or_default()
+            .with_implicit_remotes())
     }
 
     /// This config with each OpenShell project's implicit remote: a remote
@@ -4281,7 +4283,10 @@ projects:
             openshell.git_url.as_deref(),
             Some("https://github.com/me/api.git")
         );
-        assert_eq!(openshell.settings.image.as_deref(), Some("ghcr.io/me/api-dev:1"));
+        assert_eq!(
+            openshell.settings.image.as_deref(),
+            Some("ghcr.io/me/api-dev:1")
+        );
         assert_eq!(openshell.settings.providers, ["github", "anthropic"]);
         assert_eq!(config.projects["api"].remote.as_deref(), Some("api"));
     }
@@ -4289,11 +4294,12 @@ projects:
     #[test]
     fn an_openshell_sandbox_name_fits_openshells_rules() {
         let name = |project: &str| {
-            let global: Config = serde_yaml::from_str(&format!(
-                "projects:\n  {project}:\n    openshell: {{}}\n"
-            ))
-            .unwrap();
-            global.with_implicit_remotes().remotes[project].target.clone()
+            let global: Config =
+                serde_yaml::from_str(&format!("projects:\n  {project}:\n    openshell: {{}}\n"))
+                    .unwrap();
+            global.with_implicit_remotes().remotes[project]
+                .target
+                .clone()
         };
 
         assert_eq!(name("api"), "api");
@@ -4316,12 +4322,14 @@ projects:
 
     #[test]
     fn an_openshell_project_may_name_its_sandbox() {
-        let global: Config = serde_yaml::from_str(
-            "projects:\n  api:\n    openshell:\n      sandbox: wm-api-dev\n",
-        )
-        .unwrap();
+        let global: Config =
+            serde_yaml::from_str("projects:\n  api:\n    openshell:\n      sandbox: wm-api-dev\n")
+                .unwrap();
 
-        assert_eq!(global.with_implicit_remotes().remotes["api"].target, "wm-api-dev");
+        assert_eq!(
+            global.with_implicit_remotes().remotes["api"].target,
+            "wm-api-dev"
+        );
     }
 
     #[test]

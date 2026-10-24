@@ -262,9 +262,12 @@ pub fn run(project: &RemoteProject, argv: &[&str]) -> Result<i32> {
 /// and a stopped one started. Returns whether it is running.
 pub fn ready(project: &RemoteProject, start: bool) -> Result<bool> {
     let transport = super::registry::transport(&project.site.remote, &project.remote)?;
-    super::transport::ensure_running(&project.site.remote, transport.as_ref(), start, &mut |notice| {
-        eprintln!("{notice}")
-    })
+    super::transport::ensure_running(
+        &project.site.remote,
+        transport.as_ref(),
+        start,
+        &mut |notice| eprintln!("{notice}"),
+    )
 }
 
 /// Run `argv` for `project` on its remote, streaming its stderr to this

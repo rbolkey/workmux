@@ -20,7 +20,11 @@ pub enum ProjectCommand {
         /// Name commands use to refer to the project
         name: String,
         /// Remote the project lives on
-        #[arg(long, required_unless_present = "openshell", conflicts_with = "openshell")]
+        #[arg(
+            long,
+            required_unless_present = "openshell",
+            conflicts_with = "openshell"
+        )]
         remote: Option<String>,
         /// Give the project its own OpenShell sandbox as its remote, created on first use
         #[arg(long)]
@@ -206,7 +210,9 @@ remotes:
     fn an_openshell_project_needs_no_registered_remote() {
         let updated = add_project_to("", "api", &openshell_api()).unwrap();
 
-        let config = global_config::parse(&updated).unwrap().with_implicit_remotes();
+        let config = global_config::parse(&updated)
+            .unwrap()
+            .with_implicit_remotes();
         assert_eq!(config.projects["api"].openshell, openshell_api().openshell);
         assert_eq!(config.remotes["api"].transport, TransportKind::Openshell);
         assert!(!updated.contains("remotes:"), "{updated}");

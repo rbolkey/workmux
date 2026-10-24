@@ -9,7 +9,9 @@ project and sandbox, and deletes the sandbox and the images built for it.
 import json
 import os
 import shlex
+import shutil
 import subprocess
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -22,7 +24,6 @@ from .test_workmux_remote import (
     SidebarFeed,
     agent_in,
     remote_daemon_ping,
-    short_tmp,  # noqa: F401 (a fixture)
     tmux_value,
     wait_until,
 )
@@ -112,8 +113,10 @@ class Project:
         before = self.sh("cat /sandbox/control/done 2>/dev/null | wc -l").strip()
         self.sh(f"echo {status} > /sandbox/control/next")
         wait_until(
-            lambda: self.sh("cat /sandbox/control/done 2>/dev/null | wc -l").strip()
-            != before,
+            lambda: (
+                self.sh("cat /sandbox/control/done 2>/dev/null | wc -l").strip()
+                != before
+            ),
             f"the {status} hook",
             timeout=30.0,
         )
@@ -130,6 +133,14 @@ class Project:
         ).stdout.split()
         for image in images:
             subprocess.run(["docker", "rmi", "-f", image], capture_output=True)
+
+
+@pytest.fixture
+def short_tmp():
+    """A short TMPDIR, for the workstation daemon's socket."""
+    path = tempfile.mkdtemp(prefix="wm-", dir="/tmp")
+    yield {"TMPDIR": path}
+    shutil.rmtree(path, ignore_errors=True)
 
 
 @pytest.fixture
@@ -168,14 +179,15 @@ def test_an_openshell_project_lives_stops_resumes_and_is_removed_with_its_sandbo
     feed = None
     try:
         project.wm(f"add feature --project {project.name}", timeout=120.0)
-        daemon_pid = remote_daemon_ping(
-            env, project.exe, project.repo, project.tmp
-        )["pid"]
+        daemon_pid = remote_daemon_ping(env, project.exe, project.repo, project.tmp)[
+            "pid"
+        ]
         pane = tmux_value(env, f"={project.name}:wm-feature", "#{pane_id}")
         feed = SidebarFeed(project.tmp["TMPDIR"])
         wait_until(
-            lambda: project.sh("test -f /sandbox/control/started && echo yes || true")
-            != "",
+            lambda: (
+                project.sh("test -f /sandbox/control/started && echo yes || true") != ""
+            ),
             "the agent to start",
             timeout=60.0,
         )
@@ -193,8 +205,10 @@ def test_an_openshell_project_lives_stops_resumes_and_is_removed_with_its_sandbo
         stopped = project.wm(f"remote stop {project.name}", timeout=300.0)
         assert "Stopped remote" in stopped.stdout
         feed.wait(
-            lambda s: agent_in(s, pane).get("remote", {}).get("stale")
-            or not agent_in(s, pane),
+            lambda s: (
+                agent_in(s, pane).get("remote", {}).get("stale")
+                or not agent_in(s, pane)
+            ),
             "the entry to turn stale",
             timeout=60.0,
         )

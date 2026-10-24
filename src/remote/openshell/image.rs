@@ -128,8 +128,8 @@ pub fn prepare(recipe: &Recipe, sandbox: &str, clone: &str, context: &Path) -> R
         digest.extend(base.as_bytes());
     }
     if let Some(binary) = &recipe.workmux {
-        let bytes =
-            std::fs::read(binary).with_context(|| format!("failed to read {}", binary.display()))?;
+        let bytes = std::fs::read(binary)
+            .with_context(|| format!("failed to read {}", binary.display()))?;
         digest.extend(sha256_hex(&bytes).into_bytes());
         std::fs::write(context.join("workmux"), bytes)?;
     }
@@ -187,10 +187,7 @@ mod tests {
 
         assert!(dockerfile.contains("FROM docker.io/library/ubuntu:24.04 AS base"));
         assert!(dockerfile.contains("git dtach"));
-        assert!(dockerfile.contains(&format!(
-            "WORKMUX_VERSION=v{}",
-            env!("CARGO_PKG_VERSION")
-        )));
+        assert!(dockerfile.contains(&format!("WORKMUX_VERSION=v{}", env!("CARGO_PKG_VERSION"))));
         assert!(dockerfile.ends_with("FROM base\n"), "{dockerfile}");
     }
 

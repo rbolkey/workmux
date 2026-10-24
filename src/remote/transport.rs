@@ -27,7 +27,6 @@ pub struct TtyExec {
 }
 
 /// Lifecycle of a remote as its transport reports it.
-#[allow(dead_code)] // Stopped and Missing come from the OpenShell transport
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RemoteState {
     Running,
@@ -37,7 +36,6 @@ pub enum RemoteState {
 
 /// Optional lifecycle hooks for transports that manage their remote, such as
 /// an OpenShell sandbox.
-#[allow(dead_code)] // Lifecycle calls arrive with the OpenShell transport
 pub trait Provisioning: Send + Sync {
     fn status(&self) -> Result<RemoteState>;
     fn create(&self) -> Result<()>;
@@ -187,7 +185,10 @@ impl StdioProcess {
             .read_to_end(&mut out)
             .context("failed to read the remote command's output")?;
         let written = writer.join().expect("stdin writer panicked");
-        let status = self.child.wait().context("failed to wait for the remote command")?;
+        let status = self
+            .child
+            .wait()
+            .context("failed to wait for the remote command")?;
         while !self.stderr_done.load(Ordering::Acquire) {
             std::thread::sleep(Duration::from_millis(10));
         }

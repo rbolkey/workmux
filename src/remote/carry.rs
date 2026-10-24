@@ -98,7 +98,9 @@ fn git(dir: &Path, args: &[&str]) -> Result<String> {
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim_end().to_string())
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .trim_end()
+        .to_string())
 }
 
 /// `git worktree list --porcelain`: each worktree's path and head, the
@@ -131,10 +133,13 @@ fn worktrees(clone: &Path) -> Result<Vec<Worktree>> {
 }
 
 fn local_branches(clone: &Path) -> Result<Vec<String>> {
-    Ok(git(clone, &["for-each-ref", "--format=%(refname:short)", "refs/heads"])?
-        .lines()
-        .map(str::to_string)
-        .collect())
+    Ok(git(
+        clone,
+        &["for-each-ref", "--format=%(refname:short)", "refs/heads"],
+    )?
+    .lines()
+    .map(str::to_string)
+    .collect())
 }
 
 fn unpushed(clone: &Path, rev: &str) -> Result<usize> {
@@ -196,7 +201,11 @@ pub fn manifest(clone: &Path) -> Result<Manifest> {
     for branch in local_branches(clone)? {
         if let Ok(upstream) = git(
             clone,
-            &["rev-parse", "--abbrev-ref", &format!("{branch}@{{upstream}}")],
+            &[
+                "rev-parse",
+                "--abbrev-ref",
+                &format!("{branch}@{{upstream}}"),
+            ],
         ) {
             upstreams.insert(branch, upstream);
         }
@@ -216,7 +225,10 @@ pub fn manifest(clone: &Path) -> Result<Manifest> {
 pub fn restore(bundle: &Path, manifest: &Manifest) -> Result<()> {
     let clone = &manifest.clone;
     if clone.exists() {
-        bail!("{} already exists; a restore needs a fresh remote", clone.display());
+        bail!(
+            "{} already exists; a restore needs a fresh remote",
+            clone.display()
+        );
     }
     std::fs::create_dir_all(clone)
         .with_context(|| format!("failed to create {}", clone.display()))?;
@@ -245,15 +257,19 @@ pub fn restore(bundle: &Path, manifest: &Manifest) -> Result<()> {
         git(clone, &["symbolic-ref", "refs/remotes/origin/HEAD", target])?;
     }
     for (branch, upstream) in &manifest.upstreams {
-        git(clone, &["branch", "--quiet", "--set-upstream-to", upstream, branch])?;
+        git(
+            clone,
+            &["branch", "--quiet", "--set-upstream-to", upstream, branch],
+        )?;
     }
     for worktree in &manifest.worktrees {
         let path = worktree.path.to_string_lossy();
         match &worktree.head {
             Head::Branch(branch) => git(clone, &["worktree", "add", "--quiet", &path, branch])?,
-            Head::Detached(commit) => {
-                git(clone, &["worktree", "add", "--quiet", "--detach", &path, commit])?
-            }
+            Head::Detached(commit) => git(
+                clone,
+                &["worktree", "add", "--quiet", "--detach", &path, commit],
+            )?,
         };
     }
     Ok(())
@@ -408,7 +424,10 @@ mod tests {
             std::fs::create_dir(&origin).unwrap();
             init_repo(&origin);
             let clone = root.join("api");
-            run_git(&root, &["clone", "--quiet", origin.to_str().unwrap(), "api"]);
+            run_git(
+                &root,
+                &["clone", "--quiet", origin.to_str().unwrap(), "api"],
+            );
             run_git(&clone, &["config", "user.email", "test@example.com"]);
             run_git(&clone, &["config", "user.name", "Test User"]);
             Self {
@@ -422,7 +441,14 @@ mod tests {
             let path = self.clone.with_file_name("api__worktrees").join(branch);
             run_git(
                 &self.clone,
-                &["worktree", "add", "--quiet", "-b", branch, path.to_str().unwrap()],
+                &[
+                    "worktree",
+                    "add",
+                    "--quiet",
+                    "-b",
+                    branch,
+                    path.to_str().unwrap(),
+                ],
             );
             path
         }
@@ -456,7 +482,10 @@ mod tests {
             risks,
             [
                 format!("{} (branch dirty): uncommitted changes", dirty.display()),
-                format!("{} (branch feature): 2 commits not on any remote", feature.display()),
+                format!(
+                    "{} (branch feature): 2 commits not on any remote",
+                    feature.display()
+                ),
                 "branch spike: 2 commits not on any remote".to_string(),
             ]
         );
@@ -473,7 +502,14 @@ mod tests {
         let detached = project.clone.with_file_name("api__worktrees").join("look");
         run_git(
             &project.clone,
-            &["worktree", "add", "--quiet", "--detach", detached.to_str().unwrap(), "HEAD"],
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                detached.to_str().unwrap(),
+                "HEAD",
+            ],
         );
         let before = manifest(&project.clone).unwrap();
         let bundle_bytes = bundle(&project.clone).unwrap();
@@ -487,8 +523,14 @@ mod tests {
         restore(&bundle_file, &before).unwrap();
 
         assert_eq!(manifest(&project.clone).unwrap(), before);
-        assert_eq!(run_git_output(&feature, &["rev-parse", "HEAD"]), feature_head);
-        assert_eq!(std::fs::read_to_string(feature.join("b.txt")).unwrap(), "b.txt");
+        assert_eq!(
+            run_git_output(&feature, &["rev-parse", "HEAD"]),
+            feature_head
+        );
+        assert_eq!(
+            std::fs::read_to_string(feature.join("b.txt")).unwrap(),
+            "b.txt"
+        );
         assert_eq!(
             run_git_output(&project.clone, &["rev-parse", "spike"]),
             feature_head

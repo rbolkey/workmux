@@ -66,7 +66,13 @@ impl OpenShell {
 
     /// `openshell sandbox exec` for `argv`. `workmux` is remote workmux,
     /// which the sandbox image puts on PATH.
-    fn exec(&self, tty: bool, workdir: Option<&str>, env: &[(String, String)], argv: &[String]) -> Result<Command> {
+    fn exec(
+        &self,
+        tty: bool,
+        workdir: Option<&str>,
+        env: &[(String, String)],
+        argv: &[String],
+    ) -> Result<Command> {
         if argv.is_empty() {
             return Err(anyhow!("no command to run on the remote"));
         }
@@ -113,16 +119,19 @@ impl OpenShell {
             bail!("{error}");
         }
         Ok(Some(serde_json::from_slice(&output.stdout).with_context(
-            || format!("openshell sent an unreadable description of {}", self.sandbox),
+            || {
+                format!(
+                    "openshell sent an unreadable description of {}",
+                    self.sandbox
+                )
+            },
         )?))
     }
 
     fn phase(&self) -> Result<Phase> {
         Ok(match self.get()? {
             None => Phase::Missing,
-            Some(sandbox) => Phase::Is(
-                sandbox["phase"].as_str().unwrap_or_default().to_string(),
-            ),
+            Some(sandbox) => Phase::Is(sandbox["phase"].as_str().unwrap_or_default().to_string()),
         })
     }
 
@@ -138,7 +147,10 @@ impl OpenShell {
                     bail!("sandbox {} is in phase Error", self.sandbox)
                 }
                 (Phase::Missing, Some(wanted)) => {
-                    bail!("sandbox {} disappeared while waiting for {wanted}", self.sandbox)
+                    bail!(
+                        "sandbox {} disappeared while waiting for {wanted}",
+                        self.sandbox
+                    )
                 }
                 _ => {}
             }
@@ -166,16 +178,20 @@ impl OpenShell {
     /// The policy the sandbox should have: the base policy with the
     /// project's policy file merged on top.
     pub fn desired_policy(&self) -> Result<serde_yaml::Value> {
-        let user = match self.origin.as_ref().and_then(|o| o.settings.policy.as_deref()) {
-            Some(path) => {
-                let path = crate::util::expand_tilde(path);
-                Some(
-                    std::fs::read_to_string(&path)
-                        .with_context(|| format!("failed to read policy file {}", path.display()))?,
-                )
-            }
-            None => None,
-        };
+        let user =
+            match self
+                .origin
+                .as_ref()
+                .and_then(|o| o.settings.policy.as_deref())
+            {
+                Some(path) => {
+                    let path = crate::util::expand_tilde(path);
+                    Some(std::fs::read_to_string(&path).with_context(|| {
+                        format!("failed to read policy file {}", path.display())
+                    })?)
+                }
+                None => None,
+            };
         policy::effective(user.as_deref())
     }
 
@@ -212,13 +228,14 @@ impl OpenShell {
     /// Shallow-clone the project into `checkout` on the workstation and
     /// report whether it has a flake devshell to bake into the image.
     fn fetch_flake(&self, url: &str, checkout: &std::path::Path) -> bool {
-        let cloned = Command::new("git")
-            .args(["clone", "--quiet", "--depth", "1", url])
-            .arg(checkout)
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .status();
+        let cloned = crate::git::unattended_git(None).and_then(|mut git| {
+            git.args(["clone", "--quiet", "--depth", "1", url])
+                .arg(checkout)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .status()
+                .context("failed to run git")
+        });
         if !cloned.is_ok_and(|status| status.success()) {
             eprintln!(
                 "warning: could not clone {url} on this machine to look for a flake devshell; the sandbox gets none"
@@ -237,7 +254,14 @@ impl OpenShell {
     /// inside the sandbox.
     fn create_args(&self, origin: &OpenshellRemote, image: &str, policy: &str) -> Vec<String> {
         let mut args: Vec<String> = [
-            "sandbox", "create", "--name", &self.sandbox, "--from", image, "--policy", policy,
+            "sandbox",
+            "create",
+            "--name",
+            &self.sandbox,
+            "--from",
+            image,
+            "--policy",
+            policy,
         ]
         .map(str::to_string)
         .to_vec();
@@ -250,9 +274,7 @@ impl OpenShell {
             "--annotation".to_string(),
             format!("{IMAGE_ANNOTATION}={image}"),
         ]);
-        args.extend(
-            ["--no-tty", "--no-auto-providers", "--detach"].map(str::to_string),
-        );
+        args.extend(["--no-tty", "--no-auto-providers", "--detach"].map(str::to_string));
         args
     }
 
@@ -275,7 +297,9 @@ impl OpenShell {
                 "the policy of sandbox {} no longer grants {}, which OpenShell cannot take away from a sandbox; run `workmux remote recreate {}` to apply it",
                 self.sandbox,
                 narrowed.join(", "),
-                self.origin.as_ref().map_or(self.sandbox.as_str(), |o| o.project.as_str())
+                self.origin
+                    .as_ref()
+                    .map_or(self.sandbox.as_str(), |o| o.project.as_str())
             )]);
         }
         let dir = tempfile::tempdir()?;
@@ -286,7 +310,8 @@ impl OpenShell {
             args.push("--wait");
         }
         self.run(&args)?;
-        let filesystem_changed = current_yaml.get("filesystem_policy") != desired.get("filesystem_policy");
+        let filesystem_changed =
+            current_yaml.get("filesystem_policy") != desired.get("filesystem_policy");
         Ok(if running && filesystem_changed {
             vec![format!(
                 "updated the policy of sandbox {}; its new filesystem grants apply after `workmux remote stop` and `workmux remote start`",
@@ -519,7 +544,10 @@ mod tests {
                  esac\n",
                 dir = dir.path().display()
             );
-            for (name, body) in [("openshell", script.as_str()), ("docker", "#!/bin/sh\nexit 0\n")] {
+            for (name, body) in [
+                ("openshell", script.as_str()),
+                ("docker", "#!/bin/sh\nexit 0\n"),
+            ] {
                 let path = dir.path().join(name);
                 std::fs::write(&path, body).unwrap();
                 std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -561,8 +589,16 @@ mod tests {
         assert_eq!(
             args,
             argv(&[
-                "sandbox", "exec", "-n", "api", "--no-login-shell", "--no-tty", "--", "workmux",
-                "remote", "serve"
+                "sandbox",
+                "exec",
+                "-n",
+                "api",
+                "--no-login-shell",
+                "--no-tty",
+                "--",
+                "workmux",
+                "remote",
+                "serve"
             ])
         );
     }
@@ -652,10 +688,16 @@ mod tests {
         let error = fake.transport(None).create().unwrap_err();
 
         assert!(
-            error.to_string().contains("workmux creates sandboxes only for projects"),
+            error
+                .to_string()
+                .contains("workmux creates sandboxes only for projects"),
             "{error}"
         );
-        assert!(fake.log().iter().all(|line| !line.starts_with("sandbox create")));
+        assert!(
+            fake.log()
+                .iter()
+                .all(|line| !line.starts_with("sandbox create"))
+        );
     }
 
     #[test]
@@ -747,7 +789,12 @@ mod contract {
             let _ = self.0.wait_for(None);
             // The images workmux built for the sandbox.
             let images = Command::new("docker")
-                .args(["image", "ls", "-q", &format!("workmux-openshell-{}", self.0.sandbox)])
+                .args([
+                    "image",
+                    "ls",
+                    "-q",
+                    &format!("workmux-openshell-{}", self.0.sandbox),
+                ])
                 .output()
                 .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
                 .unwrap_or_default();
@@ -857,7 +904,11 @@ mod contract {
                 "dtach -n /sandbox/s.sock -E sh -c 'sleep 30' && sleep 0.5 && test -S /sandbox/s.sock && echo held",
             ]))
             .unwrap();
-        assert_eq!(String::from_utf8_lossy(&output.stdout), "held\n", "{output:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "held\n",
+            "{output:?}"
+        );
 
         transport.delete().unwrap();
         assert_eq!(transport.status().unwrap(), RemoteState::Missing);
@@ -870,7 +921,10 @@ mod contract {
         }
         // The project, as the workstation clones it from its git URL.
         let repo = tempfile::tempdir().unwrap();
-        let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/openshell/devshell");
+        let fixture = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/openshell/devshell"
+        );
         for file in ["flake.nix", "flake.lock"] {
             std::fs::copy(format!("{fixture}/{file}"), repo.path().join(file)).unwrap();
         }
@@ -904,7 +958,10 @@ mod contract {
             .unwrap();
         let source: image::DevshellSource = serde_json::from_slice(&source.stdout).unwrap();
         assert_eq!(source.clone, "/sandbox/api");
-        assert_eq!(source.flake_lock_sha256, image::flake_lock_digest(repo.path()));
+        assert_eq!(
+            source.flake_lock_sha256,
+            image::flake_lock_digest(repo.path())
+        );
     }
 
     #[test]
