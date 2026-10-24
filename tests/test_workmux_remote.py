@@ -390,7 +390,7 @@ def test_a_project_command_on_a_remote_without_workmux_runs_once_it_is_installed
         )
 
     wm("remote add nowm --transport ssh --target wmx-nowm")
-    wm(f"project add api --remote nowm --repo {origin} --path code/api")
+    wm(f"project add remote api --remote nowm --repo {origin} --path code/api")
     daemon_pid = None
     try:
         listing = wm("list --project api", stdin_input="y\n")
@@ -444,9 +444,11 @@ def test_remote_project_is_cloned_on_first_use_and_answers_list_and_path(
         )
 
     wm(f"remote add lb --transport loopback --target {root}")
-    added = wm(f"project add api --remote lb --repo {origin} --path code/api")
+    added = wm(f"project add remote api --remote lb --repo {origin} --path code/api")
     assert "Added project api on remote lb" in added.stdout
-    duplicate = wm(f"project add api --remote lb --repo {origin}", expect_fail=True)
+    duplicate = wm(
+        f"project add remote api --remote lb --repo {origin}", expect_fail=True
+    )
     assert "project api already exists" in duplicate.stderr
 
     clone = root / "home" / "code" / "api"
@@ -609,12 +611,12 @@ def test_remote_add_places_windows_in_the_project_session(
         )
 
     wm(f"remote add lb --transport loopback --target {root}")
-    wm(f"project add api --remote lb --repo {origin} --path code/api")
+    wm(f"project add remote api --remote lb --repo {origin} --path code/api")
     wm(
-        f"project add web --remote lb --repo {origin} --path code/web --session frontend"
+        f"project add remote web --remote lb --repo {origin} --path code/web --session frontend"
     )
     wm(
-        f"project add docs --remote lb --repo {origin} --path code/docs"
+        f"project add remote docs --remote lb --repo {origin} --path code/docs"
         " --placement current-session"
     )
     daemon_pid = None
@@ -720,7 +722,7 @@ def test_remote_git_commands_act_on_the_remote_repository(
         return result
 
     wm(f"remote add lb --transport loopback --target {root}")
-    wm(f"project add api --remote lb --repo {origin} --path code/api")
+    wm(f"project add remote api --remote lb --repo {origin} --path code/api")
     clone = root / "home" / "code" / "api"
     worktrees = root / "home" / "code" / "api__worktrees"
     daemon_pid = None
@@ -826,7 +828,7 @@ def test_remote_add_and_remove_over_ssh_to_localhost(
         )
 
     wm("remote add box --transport ssh --target wmx-test")
-    wm(f"project add api --remote box --repo {origin} --path code/api")
+    wm(f"project add remote api --remote box --repo {origin} --path code/api")
     daemon_pid = None
     try:
         added = wm("add feature --project api")
@@ -905,7 +907,7 @@ def test_remote_remove_cleans_up_the_remote_worktree_branch_and_window(
         return env.tmux(["list-windows", "-a", "-F", "#{window_name}"]).stdout.split()
 
     wm(f"remote add lb --transport loopback --target {root}")
-    wm(f"project add api --remote lb --repo {origin} --path code/api")
+    wm(f"project add remote api --remote lb --repo {origin} --path code/api")
     daemon_pid = None
     try:
         wm("add feature --project api")
@@ -990,7 +992,7 @@ def test_remote_merge_merges_in_the_remotes_clone_without_pushing(
         return env.run_command(["git", "rev-parse", "main"], cwd=repo).stdout.strip()
 
     wm(f"remote add lb --transport loopback --target {root}")
-    wm(f"project add api --remote lb --repo {origin} --path code/api")
+    wm(f"project add remote api --remote lb --repo {origin} --path code/api")
     workstation_head = head(repo_path)
     daemon_pid = None
     try:
@@ -1062,7 +1064,7 @@ def test_commands_that_would_open_an_editor_refuse_for_a_remote_project(
         )
 
     wm(f"remote add lb --transport loopback --target {root}")
-    wm(f"project add api --remote lb --repo {origin} --path code/api")
+    wm(f"project add remote api --remote lb --repo {origin} --path code/api")
     daemon_pid = None
     try:
         # Refused on the workstation: the remote is never even cloned.
@@ -1137,7 +1139,7 @@ def test_a_prompt_file_is_read_on_the_workstation_for_a_remote_project(
         return (worktrees / branch / ".workmux" / f"PROMPT-{branch}.md").read_text()
 
     wm(f"remote add lb --transport loopback --target {remote_root}")
-    wm(f"project add api --remote lb --repo {origin} --path code/api")
+    wm(f"project add remote api --remote lb --repo {origin} --path code/api")
     daemon_pid = None
     try:
         missing = wm("add feature -P missing.md --project api", expect_fail=True)
@@ -1195,7 +1197,7 @@ def test_a_workstation_agent_alias_runs_its_agent_type_on_a_remote_project(
         )
 
     wm(f"remote add lb --transport loopback --target {remote_root}")
-    wm(f"project add api --remote lb --repo {origin} --path code/api")
+    wm(f"project add remote api --remote lb --repo {origin} --path code/api")
     config_path = env.home_path / ".config" / "workmux" / "config.yaml"
     with config_path.open("a") as config:
         config.write(
@@ -1261,7 +1263,7 @@ def test_ctrl_c_cancels_a_remote_command_during_a_long_hook(
         )
 
     wm(f"remote add lb --transport loopback --target {root}")
-    wm(f"project add api --remote lb --repo {origin} --path code/api")
+    wm(f"project add remote api --remote lb --repo {origin} --path code/api")
     daemon_pid = None
     try:
         daemon_pid = remote_daemon_ping(env, workmux_exe_path, repo_path, short_tmp)[
@@ -1397,7 +1399,7 @@ def test_remote_panes_survive_drops_and_reattach(
         )
 
     wm(f"remote add lb --transport loopback --target {remote_root}")
-    wm(f"project add api --remote lb --repo {origin} --path code/api")
+    wm(f"project add remote api --remote lb --repo {origin} --path code/api")
     daemon_pid = None
     try:
         wm("add feature --project api")
@@ -1549,7 +1551,7 @@ def test_remote_agents_start_in_the_devshell_and_resume_conversations(
         )
 
     wm(f"remote add lb --transport loopback --target {root}")
-    wm(f"project add api --remote lb --repo {origin} --path code/api")
+    wm(f"project add remote api --remote lb --repo {origin} --path code/api")
     worktrees = home / "code" / "api__worktrees"
     daemon_pid = None
     try:
@@ -1619,7 +1621,7 @@ def test_provisioning_installs_agent_hooks_and_status_warns_without_them(
 
     wm(f"remote add lb --transport loopback --target {provisioned}")
     wm(f"remote add bare --transport loopback --target {bare}")
-    wm(f"project add api --remote lb --repo {origin} --path code/api")
+    wm(f"project add remote api --remote lb --repo {origin} --path code/api")
     daemon_pid = None
     try:
         listing = wm("list --project api")
@@ -1753,7 +1755,7 @@ def test_remote_agent_status_shows_live_turns_stale_and_catches_up_on_reconnect(
         )
 
     wm(f"remote add lb --transport loopback --target {remote_root}")
-    wm(f"project add api --remote lb --repo {origin} --path code/api")
+    wm(f"project add remote api --remote lb --repo {origin} --path code/api")
     daemon_pid = None
     feed = None
     try:
@@ -1879,7 +1881,7 @@ def test_open_and_resurrect_reattach_to_surviving_remote_panes(
         return env.tmux(["list-panes", "-t", window], check=False).returncode != 0
 
     wm(f"remote add lb --transport loopback --target {remote_root}")
-    wm(f"project add api --remote lb --repo {origin} --path code/api")
+    wm(f"project add remote api --remote lb --repo {origin} --path code/api")
     daemons = []
     try:
         wm("add feature --project api")
@@ -1962,7 +1964,7 @@ def test_remote_run_executes_in_the_remote_worktree(
         )
 
     wm(f"remote add lb --transport loopback --target {remote_root}")
-    wm(f"project add api --remote lb --repo {origin} --path code/api")
+    wm(f"project add remote api --remote lb --repo {origin} --path code/api")
     daemon_pid = None
     try:
         wm("add feature --project api")
@@ -2057,7 +2059,7 @@ def test_reap_agents_reaps_aged_agents_on_the_remote(
         )
 
     wm(f"remote add lb --transport loopback --target {remote_root}")
-    wm(f"project add api --remote lb --repo {origin} --path code/api")
+    wm(f"project add remote api --remote lb --repo {origin} --path code/api")
     daemon_pid = None
     try:
         busy = add_agent("busy")
@@ -2141,7 +2143,7 @@ def test_close_and_remove_end_the_worktrees_unshown_remote_panes_too(
         return len(pids(holders))
 
     wm(f"remote add lb --transport loopback --target {remote_root}")
-    wm(f"project add api --remote lb --repo {origin} --path code/api")
+    wm(f"project add remote api --remote lb --repo {origin} --path code/api")
     daemon_pid = None
     try:
         wm("add feature --project api")
@@ -2274,7 +2276,7 @@ def test_commands_typed_in_a_remote_pane_reach_the_workstation(
         ).stdout.split()
 
     wm(f"remote add lb --transport loopback --target {root} --host-command pwd")
-    wm(f"project add api --remote lb --repo {origin} --path code/api")
+    wm(f"project add remote api --remote lb --repo {origin} --path code/api")
     daemon_pid = None
     try:
         wm("add feature --project api")
@@ -2450,7 +2452,7 @@ def test_agent_commands_reach_remote_agents_from_the_workstation(
         ).stdout.strip()
 
     wm(f"remote add lb --transport loopback --target {remote_root}")
-    wm(f"project add api --remote lb --repo {origin} --path code/api")
+    wm(f"project add remote api --remote lb --repo {origin} --path code/api")
     daemon_pid = None
     feed = None
     try:
@@ -2631,7 +2633,7 @@ def test_dashboard_reviews_stages_and_closes_a_remote_worktree(
         )
 
     wm(f"remote add lb --transport loopback --target {remote_root}")
-    wm(f"project add api --remote lb --repo {origin} --path code/api")
+    wm(f"project add remote api --remote lb --repo {origin} --path code/api")
     daemon_pid = None
     feed = None
     try:
@@ -2803,7 +2805,7 @@ def test_dashboard_worktrees_tab_lists_adds_closes_and_removes_remote_worktrees(
         )
 
     wm(f"remote add lb --transport loopback --target {remote_root}")
-    wm(f"project add api --remote lb --repo {origin} --path code/api")
+    wm(f"project add remote api --remote lb --repo {origin} --path code/api")
     clone = remote_root / "home" / "code" / "api"
     worktrees = remote_root / "home" / "code" / "api__worktrees"
     daemon_pid = None
@@ -2935,7 +2937,7 @@ def test_dashboard_shows_pr_status_for_a_remote_projects_branches_while_unreacha
         )
 
     wm(f"remote add lb --transport loopback --target {remote_root}")
-    wm(f"project add api --remote lb --repo {origin} --path code/api")
+    wm(f"project add remote api --remote lb --repo {origin} --path code/api")
     daemon_pid = None
     try:
         wm("add feature --project api")
@@ -3059,7 +3061,7 @@ esac
             timeout=30.0,
         )
 
-    wm("project add api --openshell --repo https://example.com/api.git")
+    wm("project add openshell api --repo https://example.com/api.git")
     env.tmux(["new-session", "-d", "-s", "api", "-n", "wm-feature"])
     env.tmux(["set-option", "-t", "=api:", "@workmux_project", "api:api"])
     env.tmux(
@@ -3122,7 +3124,7 @@ def test_removing_a_project_closes_its_workstation_windows_and_keeps_its_remote(
         )
 
     wm("remote add devbox --transport ssh --target devbox")
-    wm("project add api --remote devbox --repo git@example.com:me/api.git")
+    wm("project add remote api --remote devbox --repo git@example.com:me/api.git")
     env.tmux(["new-window", "-d", "-t", "test:", "-n", "wm-feature"])
     env.tmux(
         [
@@ -3251,7 +3253,7 @@ def test_a_command_for_every_project_checks_each_remotes_state_once(
     try:
         for name in ("api", "web"):
             wm(
-                f"project add {name} --openshell --repo {origin} "
+                f"project add openshell {name} --repo {origin} "
                 f"--path {state}/{name}/{name}"
             )
         cold = wm("reap-agents")

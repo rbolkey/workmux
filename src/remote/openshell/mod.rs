@@ -188,7 +188,7 @@ impl OpenShell {
     fn origin(&self) -> Result<&OpenshellRemote> {
         self.origin.as_ref().ok_or_else(|| {
             anyhow!(
-                "sandbox {} does not exist; workmux creates sandboxes only for projects added with `workmux project add --openshell`",
+                "sandbox {} does not exist; workmux creates sandboxes only for projects added with `workmux project add openshell`",
                 self.sandbox
             )
         })

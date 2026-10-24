@@ -12,7 +12,7 @@ An OpenShell project lives in an [OpenShell](https://github.com/NVIDIA/OpenShell
 ## Add a project
 
 ```bash
-workmux project add api --openshell --repo https://github.com/me/api.git \
+workmux project add openshell api --repo https://github.com/me/api.git \
   --image ghcr.io/me/api-dev:1 \
   --policy ./api-policy.yaml \
   --provider github
@@ -66,7 +66,7 @@ What git and agents may do on GitHub is set by the provider's profile and the to
 ### Your gh login (`--github host`)
 
 ```bash
-workmux project add api --openshell --github host --repo https://github.com/me/api.git
+workmux project add openshell api --github host --repo https://github.com/me/api.git
 ```
 
 The sandbox gets your workstation's `gh` login, with nothing else to create: no token, profile or provider.
@@ -116,7 +116,7 @@ A fine-grained personal access token limits the agent to the repositories and pe
 
 The proxy substitutes credentials only in HTTPS, and no profile allows SSH. workmux doesn't put an SSH key in the sandbox or forward your SSH agent, because either would hand the sandbox a real secret. Instead, SSH GitHub URLs are rewritten to HTTPS, visibly:
 
-- `project add --openshell` with an SSH `--repo` on github.com (`git@github.com:me/api.git` or `ssh://git@github.com/me/api.git`) stores the HTTPS form as the project's `git_url` and the original as `ssh_git_url`, and says so:
+- `project add openshell` with an SSH `--repo` on github.com (`git@github.com:me/api.git` or `ssh://git@github.com/me/api.git`) stores the HTTPS form as the project's `git_url` and the original as `ssh_git_url`, and says so:
 
   ```text
   Note: `--repo` uses SSH, which OpenShell sandboxes don't support; the sandbox reaches github.com over HTTPS with `github` credentials instead.
@@ -204,7 +204,7 @@ These are the paths OpenShell's example provider profiles allow, so a provider m
 
 The sandbox runs the agent's plain CLI, not your workstation's agent command. The image records the default agent in `/etc/workmux/default-agent`. Remote workmux uses it when no config in the sandbox names an agent, and counts it as a configured agent, so a project without panes of its own gets an agent pane. A `--agent` given to `add` is passed to remote workmux as it is, so give it the agent's plain CLI (`-a codex`) rather than a workstation alias.
 
-`project add --openshell` and `remote status` list each agent with which attached providers have a profile that allows its binary, whatever their type. Both warn when none does, and so does creating the sandbox:
+`project add openshell` and `remote status` list each agent with which attached providers have a profile that allows its binary, whatever their type. Both warn when none does, and so does creating the sandbox:
 
 ```text
 Agent claude: installed at /usr/local/bin/claude; its credentials come from a provider whose profile allows it, such as one of type claude-code
@@ -223,7 +223,7 @@ Nix cannot install or build inside an OpenShell sandbox. Instead, for a project 
 
 The image is fixed when the sandbox is created. When the clone's `flake.lock` no longer matches the baked one, `remote status` warns, and `workmux remote recreate` rebuilds the image.
 
-A devbox project gets no devshell in a sandbox. Put its toolchain in your `--image`. `project add --openshell` and `remote status` both say so.
+A devbox project gets no devshell in a sandbox. Put its toolchain in your `--image`. `project add openshell` and `remote status` both say so.
 
 ## Policy
 
@@ -253,4 +253,4 @@ When you edit the policy file, the next command brings a running sandbox in line
 
 ## Registering an OpenShell remote yourself
 
-`workmux remote add NAME --transport openshell --target SANDBOX` registers an existing sandbox that you manage. workmux can start and stop it, but never creates it, and `remote rm` only unregisters it. To have workmux create and own the sandbox, use `project add --openshell` instead.
+`workmux remote add NAME --transport openshell --target SANDBOX` registers an existing sandbox that you manage. workmux can start and stop it, but never creates it, and `remote rm` only unregisters it. To have workmux create and own the sandbox, use `project add openshell` instead.

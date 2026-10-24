@@ -20,7 +20,7 @@ workmux remote add <name> --transport <ssh|openshell> --target <target> [options
 - `--no-builtin-shims`: Disable the built-in shims (sound playback, clipboard read) for this remote.
 - `--host-command <command>`: Allow the remote to run this command on the workstation (repeatable).
 
-An OpenShell project needs no `remote add`: [`project add --openshell`](/reference/commands/project/) gives it a remote of its own.
+An OpenShell project needs no `remote add`: [`project add openshell`](/reference/commands/project/) gives it a remote of its own.
 
 ## remote list
 

@@ -152,7 +152,7 @@ def project(mux_server, workmux_exe_path, repo_path, short_tmp):
 
 def add_project(project: Project):
     added = project.wm(
-        f"project add {project.name} --openshell --repo /sandbox/origin "
+        f"project add openshell {project.name} --repo /sandbox/origin "
         f"--image {LEARNING_IMAGE}"
     )
     assert "the sandbox is created on first use" in added.stdout
@@ -297,7 +297,7 @@ def test_an_openshell_projects_sandbox_runs_claude_code(project: Project):
     sandbox with no credentials attached."""
     env = project.env
     added = project.wm(
-        f"project add {project.name} --openshell --repo /sandbox/origin "
+        f"project add openshell {project.name} --repo /sandbox/origin "
         f"--image {LEARNING_IMAGE}"
     )
     assert "Agent claude: installed at /usr/local/bin/claude" in added.stdout, (
@@ -400,7 +400,7 @@ def test_a_private_ssh_github_repo_clones_over_https_with_the_providers_credenti
     ssh = f"git@github.com:{PRIVATE_REPO}.git"
     https = f"https://github.com/{PRIVATE_REPO}.git"
     added = project.wm(
-        f"project add {project.name} --openshell --repo {ssh} "
+        f"project add openshell {project.name} --repo {ssh} "
         f"--image {LEARNING_IMAGE} --provider {github_provider}"
     )
     assert (
@@ -464,7 +464,7 @@ def test_a_projects_sandbox_gets_the_workstations_gh_login(
     of a private repository succeeds and push is authorised."""
     https = f"https://github.com/{PRIVATE_REPO}.git"
     added = project.wm(
-        f"project add {project.name} --openshell --github host --repo {https} "
+        f"project add openshell {project.name} --github host --repo {https} "
         f"--image {LEARNING_IMAGE}"
     )
     assert "the sandbox gets your gh login's GitHub access" in added.stdout, (

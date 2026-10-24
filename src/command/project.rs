@@ -15,8 +15,9 @@ pub struct ProjectArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum ProjectCommand {
-    /// Register a project on a remote in your global config
-    Add(Box<AddArgs>),
+    /// Register a project in your global config
+    #[command(subcommand)]
+    Add(AddCommand),
     /// Unregister a project from your global config, closing its workstation windows; the remote and its clone are kept
     Rm {
         name: String,
@@ -26,84 +27,109 @@ pub enum ProjectCommand {
     },
 }
 
+/// `project add`, one subcommand per kind of project.
+#[derive(Debug, Subcommand)]
+pub enum AddCommand {
+    /// Register a project on a remote added with `workmux remote add`
+    Remote(RemoteAddArgs),
+    /// Register a project whose remote is its own OpenShell sandbox, created on first use
+    Openshell(Box<OpenshellAddArgs>),
+}
+
+const PROJECT_OPTIONS: &str = "Project options";
+
+/// What every `project add` takes.
 #[derive(Debug, Args)]
-pub struct AddArgs {
+pub struct ProjectAddArgs {
     /// Name commands use to refer to the project
     pub name: String,
-    /// Remote the project lives on
-    #[arg(
-        long,
-        required_unless_present = "openshell",
-        conflicts_with = "openshell"
-    )]
-    pub remote: Option<String>,
-    /// Give the project its own OpenShell sandbox as its remote, created on first use
-    #[arg(long)]
-    pub openshell: bool,
-    /// Image the sandbox runs; it must contain git (OpenShell only)
-    #[arg(long, requires = "openshell")]
-    pub image: Option<String>,
-    /// Policy file merged on top of workmux's base policy (OpenShell only)
-    #[arg(long, value_name = "FILE", requires = "openshell")]
-    pub policy: Option<std::path::PathBuf>,
-    /// OpenShell provider to attach to the sandbox, for credentials (repeatable)
-    #[arg(long = "provider", value_name = "PROVIDER", requires = "openshell")]
-    pub providers: Vec<String>,
-    /// Where the sandbox's GitHub credentials come from besides its providers:
-    /// `host` gives it your `gh` login (OpenShell only)
-    #[arg(long, value_enum, value_name = "SOURCE", requires = "openshell")]
-    pub github: Option<GithubCredentials>,
-    /// Agent the sandbox's image installs, such as claude or codex; the first is its
-    /// default agent (repeatable; default: your default agent's type; OpenShell only)
-    #[arg(long = "agent", value_name = "AGENT", requires = "openshell")]
-    pub agents: Vec<String>,
-    /// Sandbox name (default: derived from the project name; OpenShell only)
-    #[arg(long, requires = "openshell")]
-    pub sandbox: Option<String>,
     /// Git URL the remote clones the project from on first use
-    #[arg(long, value_name = "URL")]
+    #[arg(long, value_name = "URL", help_heading = PROJECT_OPTIONS)]
     pub repo: String,
     /// Path of the clone on the remote (default: ~/<name>)
-    #[arg(long)]
+    #[arg(long, help_heading = PROJECT_OPTIONS)]
     pub path: Option<String>,
     /// Workstation session for the project's windows (default: the project name)
-    #[arg(long)]
+    #[arg(long, help_heading = PROJECT_OPTIONS)]
     pub session: Option<String>,
     /// Where the project's windows go in window mode
-    #[arg(long, value_enum)]
+    #[arg(long, value_enum, help_heading = PROJECT_OPTIONS)]
     pub placement: Option<ProjectPlacement>,
+}
+
+#[derive(Debug, Args)]
+pub struct RemoteAddArgs {
+    #[command(flatten)]
+    pub project: ProjectAddArgs,
+    /// Remote the project lives on
+    #[arg(long)]
+    pub remote: String,
+}
+
+#[derive(Debug, Args)]
+pub struct OpenshellAddArgs {
+    #[command(flatten)]
+    pub project: ProjectAddArgs,
+    #[command(flatten)]
+    pub openshell: OpenshellOptions,
+}
+
+#[derive(Debug, Args)]
+#[command(next_help_heading = "OpenShell options")]
+pub struct OpenshellOptions {
+    /// Image the sandbox runs; it must contain git
+    #[arg(long)]
+    pub image: Option<String>,
+    /// Policy file merged on top of workmux's base policy
+    #[arg(long, value_name = "FILE")]
+    pub policy: Option<std::path::PathBuf>,
+    /// OpenShell provider to attach to the sandbox, for credentials (repeatable)
+    #[arg(long = "provider", value_name = "PROVIDER")]
+    pub providers: Vec<String>,
+    /// Where the sandbox's GitHub credentials come from besides its providers:
+    /// `host` gives it your `gh` login
+    #[arg(long, value_enum, value_name = "SOURCE")]
+    pub github: Option<GithubCredentials>,
+    /// Agent the sandbox's image installs, such as claude or codex; the first is its
+    /// default agent (repeatable; default: your default agent's type)
+    #[arg(long = "agent", value_name = "AGENT")]
+    pub agents: Vec<String>,
+    /// Sandbox name (default: derived from the project name)
+    #[arg(long)]
+    pub sandbox: Option<String>,
 }
 
 pub fn run(args: ProjectArgs) -> Result<()> {
     match args.command {
-        ProjectCommand::Add(args) => {
-            let name = args.name.clone();
-            add(&name, project_entry(*args)?)
+        ProjectCommand::Add(command) => {
+            let (name, entry) = project_entry(command)?;
+            add(&name, entry)
         }
         ProjectCommand::Rm { name, yes } => rm(&name, yes),
     }
 }
 
-/// The global config entry for `project add`'s arguments. An OpenShell
-/// project's SSH `--repo` on github.com is stored as its HTTPS form, with
-/// the original beside it; on another host, it is refused.
-fn project_entry(args: AddArgs) -> Result<ProjectEntry> {
-    let AddArgs {
+/// The project's name and global config entry for `project add`'s
+/// arguments. An OpenShell project's SSH `--repo` on github.com is stored
+/// as its HTTPS form, with the original beside it; on another host, it is
+/// refused.
+fn project_entry(command: AddCommand) -> Result<(String, ProjectEntry)> {
+    let (project, remote, openshell) = match command {
+        AddCommand::Remote(args) => (args.project, Some(args.remote), None),
+        AddCommand::Openshell(args) => {
+            let OpenshellAddArgs { project, openshell } = *args;
+            (project, None, Some(openshell))
+        }
+    };
+    let ProjectAddArgs {
         name,
-        remote,
-        openshell,
-        image,
-        policy,
-        providers,
-        github,
-        agents,
-        sandbox,
         repo,
         path,
         session,
         placement,
-    } = args;
+    } = project;
     let (git_url, ssh_git_url) = match openshell
+        .is_some()
         .then(|| crate::remote::openshell::repo::https_for_ssh(&repo))
         .transpose()?
         .flatten()
@@ -111,19 +137,19 @@ fn project_entry(args: AddArgs) -> Result<ProjectEntry> {
         Some(https) => (https, Some(repo)),
         None => (repo, None),
     };
-    let openshell = if openshell {
-        Some(OpenshellProject {
-            sandbox,
-            image,
-            policy: policy.map(absolute_policy).transpose()?,
-            providers,
-            github,
-            agents,
+    let openshell = openshell
+        .map(|options| -> Result<OpenshellProject> {
+            Ok(OpenshellProject {
+                sandbox: options.sandbox,
+                image: options.image,
+                policy: options.policy.map(absolute_policy).transpose()?,
+                providers: options.providers,
+                github: options.github,
+                agents: options.agents,
+            })
         })
-    } else {
-        None
-    };
-    Ok(ProjectEntry {
+        .transpose()?;
+    let entry = ProjectEntry {
         path: Some(path.unwrap_or_else(|| format!("~/{name}"))),
         remote,
         git_url: Some(git_url),
@@ -131,7 +157,8 @@ fn project_entry(args: AddArgs) -> Result<ProjectEntry> {
         session,
         placement,
         openshell,
-    })
+    };
+    Ok((name, entry))
 }
 
 /// A policy file's absolute path, so the project resolves it from anywhere.
@@ -389,27 +416,123 @@ remotes:
         );
     }
 
-    fn add_args(repo: &str, openshell: bool) -> AddArgs {
-        AddArgs {
-            name: "api".to_string(),
-            remote: (!openshell).then(|| "devbox".to_string()),
-            openshell,
-            image: None,
-            policy: None,
-            providers: Vec::new(),
-            github: None,
-            agents: Vec::new(),
-            sandbox: None,
-            repo: repo.to_string(),
-            path: None,
-            session: None,
-            placement: None,
+    #[derive(clap::Parser)]
+    struct Cli {
+        #[command(subcommand)]
+        command: ProjectCommand,
+    }
+
+    fn parse(args: &str) -> Result<ProjectCommand, clap::Error> {
+        use clap::Parser;
+        Cli::try_parse_from(std::iter::once("project").chain(args.split_whitespace()))
+            .map(|cli| cli.command)
+    }
+
+    fn add_command(args: &str) -> AddCommand {
+        match parse(&format!("add {args}")).unwrap() {
+            ProjectCommand::Add(command) => command,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn help(args: &str) -> String {
+        parse(&format!("add {args} --help"))
+            .unwrap_err()
+            .to_string()
+    }
+
+    #[test]
+    fn project_add_remote_takes_a_registered_remote_and_the_common_options() {
+        let (name, entry) = project_entry(add_command(
+            "remote api --remote devbox --repo git@github.com:me/api.git --path code/api \
+             --session work --placement current-session",
+        ))
+        .unwrap();
+
+        assert_eq!(name, "api");
+        assert_eq!(
+            entry,
+            ProjectEntry {
+                remote: Some("devbox".to_string()),
+                git_url: Some("git@github.com:me/api.git".to_string()),
+                path: Some("code/api".to_string()),
+                session: Some("work".to_string()),
+                placement: Some(ProjectPlacement::CurrentSession),
+                ..ProjectEntry::default()
+            }
+        );
+    }
+
+    #[test]
+    fn project_add_openshell_takes_the_openshell_options() {
+        let (name, entry) = project_entry(add_command(
+            "openshell api --repo https://github.com/me/api.git --image ghcr.io/me/api-dev:1 \
+             --provider work --provider anthropic --agent claude --agent codex --sandbox api-box",
+        ))
+        .unwrap();
+
+        assert_eq!(name, "api");
+        assert_eq!(
+            entry,
+            ProjectEntry {
+                git_url: Some("https://github.com/me/api.git".to_string()),
+                path: Some("~/api".to_string()),
+                openshell: Some(OpenshellProject {
+                    sandbox: Some("api-box".to_string()),
+                    image: Some("ghcr.io/me/api-dev:1".to_string()),
+                    providers: vec!["work".to_string(), "anthropic".to_string()],
+                    agents: vec!["claude".to_string(), "codex".to_string()],
+                    ..OpenshellProject::default()
+                }),
+                ..ProjectEntry::default()
+            }
+        );
+    }
+
+    #[test]
+    fn each_kind_of_project_takes_only_its_own_options() {
+        for args in [
+            "add remote api --remote devbox --repo u --image i",
+            "add remote api --remote devbox --repo u --provider p",
+            "add remote api --repo u",
+            "add openshell api --remote devbox --repo u",
+            "add openshell api",
+            "add api --remote devbox --repo u",
+            "add api --openshell --repo u",
+        ] {
+            assert!(parse(args).is_err(), "{args}");
         }
     }
 
     #[test]
+    fn project_add_help_groups_options_under_headings() {
+        let openshell = help("openshell");
+        let project = openshell.find("Project options:").expect(&openshell);
+        let sandbox = openshell.find("OpenShell options:").expect(&openshell);
+        assert!(
+            openshell[project..sandbox].contains("--repo <URL>"),
+            "{openshell}"
+        );
+        for option in ["--image", "--policy", "--provider", "--agent", "--sandbox"] {
+            assert!(
+                openshell[sandbox..].contains(option),
+                "{option}: {openshell}"
+            );
+        }
+
+        let remote = help("remote");
+        assert!(remote.contains("Project options:"), "{remote}");
+        assert!(remote.contains("--remote <REMOTE>"), "{remote}");
+        assert!(!remote.contains("OpenShell"), "{remote}");
+    }
+
+    #[test]
     fn an_openshell_projects_ssh_github_repo_is_stored_as_https_with_its_original() {
-        let entry = project_entry(add_args("git@github.com:me/api.git", true)).unwrap();
+        let entry = project_entry(add_command(
+            "openshell api --repo git@github.com:me/api.git",
+        ))
+        .unwrap()
+        .1;
 
         assert_eq!(
             entry.git_url.as_deref(),
@@ -420,14 +543,21 @@ remotes:
             Some("git@github.com:me/api.git")
         );
         // An SSH remote speaks SSH.
-        let entry = project_entry(add_args("git@github.com:me/api.git", false)).unwrap();
+        let entry = project_entry(add_command(
+            "remote api --remote devbox --repo git@github.com:me/api.git",
+        ))
+        .unwrap()
+        .1;
         assert_eq!(entry.git_url.as_deref(), Some("git@github.com:me/api.git"));
         assert_eq!(entry.ssh_git_url, None);
     }
 
     #[test]
     fn an_openshell_projects_ssh_repo_on_another_host_is_refused() {
-        let error = project_entry(add_args("git@gitlab.com:me/api.git", true)).unwrap_err();
+        let error = project_entry(add_command(
+            "openshell api --repo git@gitlab.com:me/api.git",
+        ))
+        .unwrap_err();
 
         assert!(
             error.to_string().contains(
