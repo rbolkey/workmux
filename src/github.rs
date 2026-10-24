@@ -404,10 +404,17 @@ pub struct PrListEntry {
 /// The `gh` arguments that pick the repository `source` names: none for a
 /// checkout, which `gh` reads from its working directory.
 fn repo_args(source: &RepoSource) -> Result<Vec<String>> {
+    repo_args_with(source, resolve_ssh_host)
+}
+
+fn repo_args_with(
+    source: &RepoSource,
+    resolve_ssh_host: impl Fn(&str) -> Option<String>,
+) -> Result<Vec<String>> {
     Ok(match source {
         RepoSource::Checkout(_) => Vec::new(),
         RepoSource::GitUrl(url) => {
-            let (owner, name, hostname) = url_repo_context(url)?;
+            let (owner, name, hostname) = url_repo_context_with(url, resolve_ssh_host)?;
             vec!["--repo".to_string(), format!("{hostname}/{owner}/{name}")]
         }
     })
@@ -699,18 +706,19 @@ fn list_branch_summaries_for_url(
     git_url: &str,
     branches: &[String],
 ) -> Result<HashMap<String, BranchSummary>> {
-    list_branch_summaries_for_url_with(git_url, branches, &mut run_graphql)
+    list_branch_summaries_for_url_with(git_url, branches, resolve_ssh_host, &mut run_graphql)
 }
 
 fn list_branch_summaries_for_url_with(
     git_url: &str,
     branches: &[String],
+    resolve_ssh_host: impl Fn(&str) -> Option<String>,
     run: &mut impl FnMut(&str, &[u8]) -> Result<GraphqlCommandResponse>,
 ) -> Result<HashMap<String, BranchSummary>> {
     if branches.is_empty() {
         return Ok(HashMap::new());
     }
-    let (owner, name, hostname) = url_repo_context(git_url)?;
+    let (owner, name, hostname) = url_repo_context_with(git_url, resolve_ssh_host)?;
     let remote = RemoteQuery {
         hostname,
         owner,
@@ -2192,16 +2200,28 @@ mod tests {
         );
     }
 
+    /// An SSH config with no aliases, so unit tests never run the real `ssh -G`.
+    fn no_ssh_alias(_: &str) -> Option<String> {
+        None
+    }
+
     #[test]
     fn gh_is_pointed_at_a_registered_git_urls_repository() {
         assert_eq!(
-            repo_args(&RepoSource::GitUrl("git@github.com:me/api.git".to_string())).unwrap(),
+            repo_args_with(
+                &RepoSource::GitUrl("git@github.com:me/api.git".to_string()),
+                no_ssh_alias
+            )
+            .unwrap(),
             ["--repo", "github.com/me/api"]
         );
         assert!(
-            repo_args(&RepoSource::Checkout(PathBuf::from("/src/api")))
-                .unwrap()
-                .is_empty()
+            repo_args_with(
+                &RepoSource::Checkout(PathBuf::from("/src/api")),
+                no_ssh_alias
+            )
+            .unwrap()
+            .is_empty()
         );
     }
 
@@ -2263,6 +2283,7 @@ mod tests {
         let summaries = list_branch_summaries_for_url_with(
             "ssh://git@github.example.com:22/me/api.git",
             &["feature".to_string()],
+            no_ssh_alias,
             &mut |hostname, body| {
                 let request: serde_json::Value = serde_json::from_slice(body).unwrap();
                 asked.push((
