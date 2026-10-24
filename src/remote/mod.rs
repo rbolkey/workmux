@@ -33,6 +33,20 @@ use std::sync::OnceLock;
 use crate::config::RemoteConfig;
 use channels::{ChannelPolicy, Channels, RemoteStatus};
 
+/// A remote as its control channel needs it: the name it is registered
+/// under and its settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Remote<'a> {
+    pub name: &'a str,
+    pub config: &'a RemoteConfig,
+}
+
+impl<'a> Remote<'a> {
+    pub fn new(name: &'a str, config: &'a RemoteConfig) -> Self {
+        Self { name, config }
+    }
+}
+
 /// The control channels of this process, when it is the workstation daemon
 /// or a command running without one.
 pub fn channels() -> &'static Channels {
@@ -58,7 +72,7 @@ pub fn statuses(
     Ok(std::thread::scope(|scope| {
         let checks: Vec<_> = selected
             .into_iter()
-            .map(|(name, remote)| scope.spawn(move || channels.status(name, remote)))
+            .map(|(name, remote)| scope.spawn(move || channels.status(Remote::new(name, remote))))
             .collect();
         checks
             .into_iter()

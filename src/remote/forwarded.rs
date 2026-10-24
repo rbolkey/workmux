@@ -18,6 +18,7 @@ use crate::multiplexer::types::{
     CreateSessionParams, CreateWindowInSessionParams, CreateWindowParams,
 };
 use crate::multiplexer::{InvocationContext, Multiplexer, TmuxBackend};
+use crate::project::RemoteProjectId;
 
 /// Session option naming the project a workstation session holds.
 pub const SESSION_TAG: &str = "@workmux_project";
@@ -41,7 +42,12 @@ pub struct SessionScope {
 impl SessionScope {
     /// The tag workmux puts on the project's sessions and windows.
     pub fn tag(&self) -> String {
-        project_tag(&self.remote, &self.project)
+        self.id().tag()
+    }
+
+    /// The project the session runs for.
+    pub fn id(&self) -> RemoteProjectId {
+        RemoteProjectId::new(&self.remote, &self.project)
     }
 
     /// The workstation's tmux, answering context questions from the
@@ -52,23 +58,11 @@ impl SessionScope {
     }
 }
 
-/// The tag of project `name` on `remote`.
-pub fn project_tag(remote: &str, name: &str) -> String {
-    format!("{remote}:{name}")
-}
-
-/// The remote and project name in a tag.
-pub fn parse_project_tag(tag: &str) -> Option<(&str, &str)> {
-    tag.trim()
-        .split_once(':')
-        .filter(|(remote, name)| !remote.is_empty() && !name.is_empty())
-}
-
 /// Close every window of project `name` on `remote` in `tmux`, returning
 /// how many. A session left holding other windows loses the project's tag,
 /// so it is no longer taken for the project's.
 pub fn close_project_windows(tmux: &TmuxBackend, remote: &str, name: &str) -> Result<usize> {
-    let tag = project_tag(remote, name);
+    let tag = RemoteProjectId::new(remote, name).tag();
     let windows = tmux.query(&[
         "list-windows",
         "-a",
@@ -399,9 +393,7 @@ impl Workstation<'_> {
     /// Whether `tag` names the session's own project: another project on
     /// the same remote may have windows of the same names.
     fn belongs(&self, tag: &str) -> bool {
-        parse_project_tag(tag).is_some_and(|(remote, project)| {
-            remote == self.scope.remote && project == self.scope.project
-        })
+        RemoteProjectId::from_tag(tag).is_some_and(|id| id == self.scope.id())
     }
 
     /// Refuse unless the window holding `target` (a pane or window) was

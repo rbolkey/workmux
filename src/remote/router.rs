@@ -16,7 +16,7 @@ use super::session::ServedProject;
 use super::session::{Answer, CommandRequest, OutputParams, ProjectSite, Stream, Terminal};
 use crate::config::{Config, ProjectPlacement, RemoteConfig};
 use crate::multiplexer::{InvocationContext, TmuxBackend, create_backend, detect_backend};
-use crate::project::Project;
+use crate::project::{Project, RemoteProjectId};
 
 /// A project registered on a remote, resolved from global config.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,6 +28,15 @@ pub struct RemoteProject {
 impl RemoteProject {
     pub fn project(&self) -> Project {
         Project::remote(&self.site.remote, &self.site.name)
+    }
+
+    pub fn id(&self) -> RemoteProjectId {
+        self.site.id()
+    }
+
+    /// The remote the project is on.
+    pub fn host(&self) -> super::Remote<'_> {
+        super::Remote::new(&self.site.remote, &self.remote)
     }
 }
 
@@ -187,15 +196,15 @@ fn invoking_window_token(project: &RemoteProject) -> Option<String> {
 /// The token in a `<window tag>\t<token>` line, when the tag is `project`'s.
 fn window_token_for(project: &RemoteProject, window: &str) -> Option<String> {
     let (tag, token) = window.trim_end_matches('\n').split_once('\t')?;
-    let own = forwarded::project_tag(&project.site.remote, &project.site.name);
+    let own = project.id().tag();
     (tag.trim() == own && !token.trim().is_empty()).then(|| token.trim().to_string())
 }
 
 /// The registered remote project `tag` names, if it still is one.
 fn project_tagged(config: &Config, tag: &str) -> Option<RemoteProject> {
-    let (remote, name) = forwarded::parse_project_tag(tag)?;
-    match remote_project(config, name) {
-        Ok(project) if project.site.remote == remote => Some(project),
+    let id = RemoteProjectId::from_tag(tag)?;
+    match remote_project(config, &id.name) {
+        Ok(project) if project.site.remote == id.remote => Some(project),
         _ => {
             tracing::warn!(tag, "session is tagged with a project no longer registered");
             None
@@ -264,8 +273,7 @@ fn session(
     };
     let Some(socket) = daemon_socket() else {
         return super::channels().run_command(
-            &project.site.remote,
-            &project.remote,
+            project.host(),
             &request,
             InvocationContext::current(),
             terminal,

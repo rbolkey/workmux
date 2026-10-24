@@ -213,7 +213,9 @@ mod tests {
     fn shell_on(remote: RemoteConfig) -> (Arc<ServeTransport>, Channels) {
         let transport = Arc::new(ServeTransport::default());
         let channels = channels(transport.clone());
-        channels.channel("devbox", &remote).unwrap();
+        channels
+            .channel(crate::remote::Remote::new("devbox", &remote))
+            .unwrap();
         (transport, channels)
     }
 
@@ -298,7 +300,10 @@ mod tests {
     fn a_remote_gets_the_built_in_shims_and_its_allowlisted_host_commands() {
         let transport = Arc::new(ServeTransport::default());
         channels(transport.clone())
-            .channel("devbox", &remote(None, &["just"]))
+            .channel(crate::remote::Remote::new(
+                "devbox",
+                &remote(None, &["just"]),
+            ))
             .unwrap();
 
         assert_eq!(
@@ -311,7 +316,10 @@ mod tests {
     fn a_remote_with_the_built_in_shims_off_gets_only_its_allowlist() {
         let transport = Arc::new(ServeTransport::default());
         channels(transport.clone())
-            .channel("devbox", &remote(Some(false), &["just"]))
+            .channel(crate::remote::Remote::new(
+                "devbox",
+                &remote(Some(false), &["just"]),
+            ))
             .unwrap();
 
         assert_eq!(

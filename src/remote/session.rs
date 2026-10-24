@@ -73,6 +73,12 @@ pub struct ProjectSite {
     pub session: Option<String>,
 }
 
+impl ProjectSite {
+    pub fn id(&self) -> crate::project::RemoteProjectId {
+        crate::project::RemoteProjectId::new(&self.remote, &self.name)
+    }
+}
+
 /// One command to run in a remote project. In `argv`, `workmux` means
 /// remote workmux.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -733,8 +739,7 @@ mod tests {
     fn run(request: &CommandRequest, mut on_stdout: impl FnMut(&str)) -> (Result<i32>, Captured) {
         let mut captured = Captured::default();
         let exit = channels().run_command(
-            "devbox",
-            &remote(),
+            crate::remote::Remote::new("devbox", &remote()),
             request,
             &InvocationContext::default(),
             &mut |stream, data: &[u8]| {
@@ -833,8 +838,7 @@ mod tests {
         let started = std::time::Instant::now();
 
         let exit = channels().run_command(
-            "devbox",
-            &remote(),
+            crate::remote::Remote::new("devbox", &remote()),
             &request(project.path(), None, script),
             &InvocationContext::default(),
             &mut Interrupting::default(),
@@ -901,8 +905,7 @@ mod tests {
         };
 
         let exit = channels().run_command(
-            "devbox",
-            &remote(),
+            crate::remote::Remote::new("devbox", &remote()),
             &request,
             &InvocationContext::default(),
             &mut terminal,

@@ -159,9 +159,8 @@ impl AgentPane {
     /// agent, whose path is a path on the remote.
     pub fn git_key(&self) -> PathBuf {
         match &self.remote {
-            Some(remote) => {
-                crate::remote::dashboard::worktree_key(&remote.remote, &remote.project, &self.path)
-            }
+            Some(remote) => crate::project::RemoteProjectId::new(&remote.remote, &remote.project)
+                .worktree_key(&self.path),
             None => self.path.clone(),
         }
     }

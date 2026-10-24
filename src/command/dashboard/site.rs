@@ -110,7 +110,7 @@ impl WorktreeSite {
                 remote,
                 project,
                 worktree,
-            } => crate::remote::dashboard::worktree_key(remote, project, worktree),
+            } => crate::project::RemoteProjectId::new(remote, project).worktree_key(worktree),
         }
     }
 

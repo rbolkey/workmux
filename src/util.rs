@@ -242,6 +242,18 @@ pub(crate) fn truncate_with_ellipsis(s: &str, max_width: usize) -> String {
     result
 }
 
+/// Whole seconds from the Unix epoch to `time`; `None` before the epoch.
+pub fn unix_secs(time: SystemTime) -> Option<u64> {
+    time.duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|since| since.as_secs())
+}
+
+/// Whole seconds from the Unix epoch to now; 0 on a clock set before it.
+pub fn now_unix_secs() -> u64 {
+    unix_secs(SystemTime::now()).unwrap_or(0)
+}
+
 /// Format an age in seconds as a compact relative string (e.g., "2h", "3d", "1w", "2mo").
 pub fn format_compact_age(secs: u64) -> String {
     let mins = secs / 60;
@@ -306,6 +318,14 @@ pub fn format_elapsed_duration(d: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unix_secs_counts_whole_seconds_since_the_epoch() {
+        let epoch = std::time::UNIX_EPOCH;
+        assert_eq!(unix_secs(epoch + Duration::from_millis(42_900)), Some(42));
+        assert_eq!(unix_secs(epoch - Duration::from_secs(1)), None);
+        assert!(now_unix_secs() > 1_700_000_000);
+    }
 
     #[test]
     fn write_atomic_replaces_target_and_removes_temp() {

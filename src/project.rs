@@ -69,9 +69,17 @@ impl Project {
     /// agents. A remote project's label names its remote, so it never merges
     /// with a same-named project on another project host.
     pub fn group_label(&self) -> String {
+        match self.remote_id() {
+            None => self.name.clone(),
+            Some(id) => id.label(),
+        }
+    }
+
+    /// This project's identity on its remote; `None` on the workstation.
+    pub fn remote_id(&self) -> Option<RemoteProjectId> {
         match &self.host {
-            ProjectHost::Workstation => self.name.clone(),
-            ProjectHost::Remote(remote) => format!("{}@{}", self.name, remote),
+            ProjectHost::Workstation => None,
+            ProjectHost::Remote(remote) => Some(RemoteProjectId::new(remote, &self.name)),
         }
     }
 
@@ -80,10 +88,61 @@ impl Project {
     /// every worktree; a remote project uses its remote and project names,
     /// which no absolute git common dir can equal.
     pub fn cache_key(&self, worktree: &Path) -> anyhow::Result<PathBuf> {
-        match &self.host {
-            ProjectHost::Workstation => crate::git::get_repository_key_in(Some(worktree)),
-            ProjectHost::Remote(remote) => Ok(Path::new("remote").join(remote).join(&self.name)),
+        match self.remote_id() {
+            None => crate::git::get_repository_key_in(Some(worktree)),
+            Some(id) => Ok(id.cache_key()),
         }
+    }
+}
+
+/// A project on a remote, named by its remote and the name it is
+/// registered under in global config.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct RemoteProjectId {
+    pub remote: String,
+    pub name: String,
+}
+
+impl RemoteProjectId {
+    pub fn new(remote: impl Into<String>, name: impl Into<String>) -> Self {
+        Self {
+            remote: remote.into(),
+            name: name.into(),
+        }
+    }
+
+    /// The project named by `tag`, the tag on its sessions and windows.
+    pub fn from_tag(tag: &str) -> Option<Self> {
+        tag.trim()
+            .split_once(':')
+            .filter(|(remote, name)| !remote.is_empty() && !name.is_empty())
+            .map(|(remote, name)| Self::new(remote, name))
+    }
+
+    /// The tag workmux puts on the project's sessions and windows.
+    pub fn tag(&self) -> String {
+        format!("{}:{}", self.remote, self.name)
+    }
+
+    /// How the project is shown: its name and its remote, so it never reads
+    /// as a same-named project on another project host.
+    pub fn label(&self) -> String {
+        format!("{}@{}", self.name, self.remote)
+    }
+
+    /// Key the git and PR caches file the project under. It is relative and
+    /// names the remote and project, so no absolute git common dir and no
+    /// other remote's project can equal it.
+    pub fn cache_key(&self) -> PathBuf {
+        Path::new("remote").join(&self.remote).join(&self.name)
+    }
+
+    /// Key of the project's `worktree` in the workstation's caches. It
+    /// never equals a workstation path or another remote's worktree, even
+    /// when the remote path also exists on the workstation.
+    pub fn worktree_key(&self, worktree: &Path) -> PathBuf {
+        self.cache_key()
+            .join(worktree.strip_prefix("/").unwrap_or(worktree))
     }
 }
 
@@ -149,6 +208,29 @@ mod tests {
         let other = Project::remote("other", "api").cache_key(worktree).unwrap();
         assert_eq!(devbox, Path::new("remote/devbox/api"));
         assert_ne!(devbox, other);
+    }
+
+    #[test]
+    fn a_remote_project_is_spelled_as_tag_label_and_cache_key() {
+        let id = RemoteProjectId::new("devbox", "api");
+        assert_eq!(id.tag(), "devbox:api");
+        assert_eq!(id.label(), "api@devbox");
+        assert_eq!(id.cache_key(), Path::new("remote/devbox/api"));
+        assert_eq!(
+            id.worktree_key(Path::new("/home/me/api__worktrees/feature")),
+            Path::new("remote/devbox/api/home/me/api__worktrees/feature")
+        );
+    }
+
+    #[test]
+    fn a_tag_names_its_remote_project() {
+        assert_eq!(
+            RemoteProjectId::from_tag(" devbox:api\n"),
+            Some(RemoteProjectId::new("devbox", "api"))
+        );
+        assert_eq!(RemoteProjectId::from_tag("garbage"), None);
+        assert_eq!(RemoteProjectId::from_tag(":api"), None);
+        assert_eq!(RemoteProjectId::from_tag("devbox:"), None);
     }
 
     #[test]
