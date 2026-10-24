@@ -7,7 +7,9 @@
 
 use anyhow::{Context, Result, anyhow};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime};
 
 use super::forwarded;
 use super::session::ServedProject;
@@ -57,6 +59,57 @@ pub fn remote_project(config: &Config, name: &str) -> Result<RemoteProject> {
         },
         remote: remote.clone(),
     })
+}
+
+/// What a file last held, read again only once the file changes (its
+/// modification time or length), for long-lived processes such as the
+/// dashboard that would otherwise read it for every operation.
+pub struct FileMemo<T> {
+    held: Mutex<Option<(FileVersion, Arc<T>)>>,
+}
+
+/// A file's modification time and length, or `None` when there is none.
+type FileVersion = Option<(SystemTime, u64)>;
+
+impl<T> Default for FileMemo<T> {
+    fn default() -> Self {
+        Self {
+            held: Mutex::new(None),
+        }
+    }
+}
+
+impl<T> FileMemo<T> {
+    /// What `read` makes of the file at `path` (`None`: no file), read
+    /// again only once the file changes.
+    pub fn get(&self, path: Option<&Path>, read: impl FnOnce() -> Result<T>) -> Result<Arc<T>> {
+        let version = path
+            .and_then(|path| std::fs::metadata(path).ok())
+            .map(|meta| {
+                (
+                    meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+                    meta.len(),
+                )
+            });
+        let mut held = self.held.lock().unwrap();
+        if let Some((seen, value)) = held.as_ref()
+            && *seen == version
+        {
+            return Ok(value.clone());
+        }
+        let value = Arc::new(read()?);
+        *held = Some((version, value.clone()));
+        Ok(value)
+    }
+}
+
+/// Global config, read again only once its file changes.
+pub fn global_config() -> Result<Arc<Config>> {
+    static GLOBAL: OnceLock<FileMemo<Config>> = OnceLock::new();
+    GLOBAL.get_or_init(FileMemo::default).get(
+        crate::config::global_config_path().as_deref(),
+        Config::load_global_only,
+    )
 }
 
 /// Every project registered on a remote, by name.
@@ -152,6 +205,32 @@ pub fn daemon_socket() -> Option<PathBuf> {
             None
         }
     }
+}
+
+/// How long the dashboard reuses the workstation daemon's socket before
+/// checking it again: about one refresh.
+const DAEMON_REUSE: Duration = Duration::from_secs(2);
+
+static RECENT_DAEMON: Mutex<Option<(Instant, Option<PathBuf>)>> = Mutex::new(None);
+
+/// [`daemon_socket`], reused for [`DAEMON_REUSE`]: for a long-lived
+/// process making many requests, such as the dashboard.
+pub fn recent_daemon_socket() -> Option<PathBuf> {
+    let mut recent = RECENT_DAEMON.lock().unwrap();
+    if let Some((at, socket)) = recent.as_ref()
+        && at.elapsed() < DAEMON_REUSE
+    {
+        return socket.clone();
+    }
+    let socket = daemon_socket();
+    *recent = Some((Instant::now(), socket.clone()));
+    socket
+}
+
+/// Forget the socket [`recent_daemon_socket`] reuses, after a call to it
+/// failed.
+pub fn forget_recent_daemon_socket() {
+    *RECENT_DAEMON.lock().unwrap() = None;
 }
 
 /// Run a command session for `project`, through the workstation daemon,
@@ -271,8 +350,9 @@ pub fn ready(project: &RemoteProject, start: bool) -> Result<bool> {
 }
 
 /// Run `argv` for `project` on its remote, streaming its stderr to this
-/// terminal and returning its exit code and stdout.
-pub fn capture(project: &RemoteProject, argv: &[&str]) -> Result<(i32, Vec<u8>)> {
+/// terminal and returning its exit code and stdout. The caller has just
+/// found the remote running with [`ready`]; it is not checked again.
+pub fn capture_running(project: &RemoteProject, argv: &[&str]) -> Result<(i32, Vec<u8>)> {
     let mut stdout = Vec::new();
     let exit = session(
         project,
@@ -283,7 +363,7 @@ pub fn capture(project: &RemoteProject, argv: &[&str]) -> Result<(i32, Vec<u8>)>
                 Stream::Stderr => write_to(stream, data),
             },
         },
-        true,
+        false,
     )?;
     Ok((exit, stdout))
 }
@@ -399,7 +479,7 @@ pub fn relay_to_every_project() -> Result<usize> {
                 continue;
             }
         }
-        match capture(&project, &argv) {
+        match capture_running(&project, &argv) {
             Ok((code, stdout)) => {
                 if !stdout.is_empty() {
                     println!("\n{name} (on {remote}):");
@@ -522,6 +602,30 @@ projects:
         assert_eq!(window_token_for(&api, "devbox:web\tf00d\n"), None);
         assert_eq!(window_token_for(&api, "\tf00d\n"), None);
         assert_eq!(window_token_for(&api, "devbox:api\t\n"), None);
+    }
+
+    #[test]
+    fn a_file_is_read_again_only_once_it_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(&path, "one").unwrap();
+        let reads = std::cell::Cell::new(0);
+        let memo = FileMemo::default();
+        let read = || {
+            memo.get(Some(&path), || {
+                reads.set(reads.get() + 1);
+                Ok(std::fs::read_to_string(&path)?)
+            })
+            .unwrap()
+        };
+
+        assert_eq!(*read(), "one");
+        assert_eq!(*read(), "one");
+        assert_eq!(reads.get(), 1);
+
+        std::fs::write(&path, "two!").unwrap();
+        assert_eq!(*read(), "two!");
+        assert_eq!(reads.get(), 2);
     }
 
     #[test]

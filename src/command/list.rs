@@ -248,11 +248,12 @@ fn list_project(
         .collect())
 }
 
-/// List a remote project's worktrees through remote workmux.
+/// List a remote project's worktrees through remote workmux, on a remote
+/// already found running.
 fn list_remote_project(remote: &RemoteProject, filter: &[String]) -> Result<Vec<ProjectWorktree>> {
     let mut argv = vec!["workmux", "list", "--json"];
     argv.extend(filter.iter().map(String::as_str));
-    let (exit, stdout) = router::capture(remote, &argv)?;
+    let (exit, stdout) = router::capture_running(remote, &argv)?;
     if exit != 0 {
         bail!("workmux list exited with {exit}");
     }
