@@ -5,6 +5,7 @@ use clap::{Args, Subcommand};
 
 use super::global_config::{self, PROJECTS};
 use crate::config::{OpenshellProject, ProjectEntry, ProjectPlacement};
+use crate::remote::git_url::GitUrl;
 use crate::remote::openshell::github::GH_LOGIN;
 use crate::remote::registry;
 
@@ -129,14 +130,17 @@ fn project_entry(command: AddCommand) -> Result<(String, ProjectEntry)> {
         session,
         placement,
     } = project;
-    let (git_url, ssh_git_url) = match openshell
+    let git_url = match openshell
         .is_some()
         .then(|| crate::remote::openshell::repo::https_for_ssh(&repo))
         .transpose()?
         .flatten()
     {
-        Some(https) => (https, Some(repo)),
-        None => (repo, None),
+        Some(https) => GitUrl {
+            url: https,
+            ssh: Some(repo),
+        },
+        None => GitUrl::new(repo),
     };
     let openshell = openshell
         .map(|options| -> Result<OpenshellProject> {
@@ -153,7 +157,6 @@ fn project_entry(command: AddCommand) -> Result<(String, ProjectEntry)> {
         path: Some(path.unwrap_or_else(|| format!("~/{name}"))),
         remote,
         git_url: Some(git_url),
-        ssh_git_url,
         session,
         placement,
         openshell,
@@ -205,7 +208,11 @@ fn add(name: &str, project: ProjectEntry) -> Result<()> {
                  that provider on the gateway and updates it whenever it creates or attaches to the sandbox"
             );
         }
-        if project.ssh_git_url.is_some() {
+        if project
+            .git_url
+            .as_ref()
+            .is_some_and(|url| url.ssh.is_some())
+        {
             let notice = crate::remote::openshell::repo::ssh_notice(
                 github.as_deref().map_err(String::as_str),
             );
@@ -311,8 +318,7 @@ remotes:
     fn api() -> ProjectEntry {
         ProjectEntry {
             remote: Some("devbox".to_string()),
-            git_url: Some("git@github.com:me/api.git".to_string()),
-            ssh_git_url: None,
+            git_url: Some(GitUrl::new("git@github.com:me/api.git")),
             path: Some("~/code/api".to_string()),
             session: None,
             placement: Some(ProjectPlacement::CurrentSession),
@@ -342,7 +348,7 @@ remotes:
     fn openshell_api() -> ProjectEntry {
         ProjectEntry {
             remote: None,
-            git_url: Some("https://github.com/me/api.git".to_string()),
+            git_url: Some(GitUrl::new("https://github.com/me/api.git")),
             path: Some("~/api".to_string()),
             openshell: Some(OpenshellProject {
                 image: Some("ghcr.io/me/api-dev:1".to_string()),
@@ -450,7 +456,7 @@ remotes:
             entry,
             ProjectEntry {
                 remote: Some("devbox".to_string()),
-                git_url: Some("git@github.com:me/api.git".to_string()),
+                git_url: Some(GitUrl::new("git@github.com:me/api.git")),
                 path: Some("code/api".to_string()),
                 session: Some("work".to_string()),
                 placement: Some(ProjectPlacement::CurrentSession),
@@ -471,7 +477,7 @@ remotes:
         assert_eq!(
             entry,
             ProjectEntry {
-                git_url: Some("https://github.com/me/api.git".to_string()),
+                git_url: Some(GitUrl::new("https://github.com/me/api.git")),
                 path: Some("~/api".to_string()),
                 openshell: Some(OpenshellProject {
                     sandbox: Some("api-box".to_string()),
@@ -531,12 +537,11 @@ remotes:
         .1;
 
         assert_eq!(
-            entry.git_url.as_deref(),
-            Some("https://github.com/me/api.git")
-        );
-        assert_eq!(
-            entry.ssh_git_url.as_deref(),
-            Some("git@github.com:me/api.git")
+            entry.git_url,
+            Some(GitUrl {
+                url: "https://github.com/me/api.git".to_string(),
+                ssh: Some("git@github.com:me/api.git".to_string()),
+            })
         );
         // An SSH remote speaks SSH.
         let entry = project_entry(add_command(
@@ -544,8 +549,10 @@ remotes:
         ))
         .unwrap()
         .1;
-        assert_eq!(entry.git_url.as_deref(), Some("git@github.com:me/api.git"));
-        assert_eq!(entry.ssh_git_url, None);
+        assert_eq!(
+            entry.git_url,
+            Some(GitUrl::new("git@github.com:me/api.git"))
+        );
     }
 
     #[test]

@@ -348,10 +348,9 @@ impl OpenShell {
         let checkout = context.join("project");
         // The workstation has SSH: clone the way the user gave the URL.
         let devshell = origin
-            .ssh_git_url
-            .as_deref()
-            .or(origin.git_url.as_deref())
-            .is_some_and(|url| self.fetch_flake(url, &checkout))
+            .git_url
+            .as_ref()
+            .is_some_and(|url| self.fetch_flake(url.original(), &checkout))
             .then_some(checkout);
         let workmux = image::Workmux::current();
         if let image::Workmux::Source(source) = &workmux {
@@ -669,7 +668,6 @@ pub(super) mod tests {
         OpenshellRemote {
             project: "api".to_string(),
             git_url: None,
-            ssh_git_url: None,
             path: "~/api".to_string(),
             settings: OpenshellProject {
                 providers: vec!["github".to_string(), "anthropic".to_string()],
@@ -1085,7 +1083,6 @@ mod contract {
         let origin = OpenshellRemote {
             project: name.clone(),
             git_url: None,
-            ssh_git_url: None,
             path: "~/api".to_string(),
             settings: crate::config::OpenshellProject {
                 image: Some(fixture_image()),
@@ -1199,7 +1196,9 @@ mod contract {
         crate::test_support::run_git(repo.path(), &["commit", "-q", "-m", "flake"]);
         let mut owned = sandbox("nix");
         if let Some(origin) = owned.0.origin.as_mut() {
-            origin.git_url = Some(repo.path().display().to_string());
+            origin.git_url = Some(crate::remote::git_url::GitUrl::new(
+                repo.path().display().to_string(),
+            ));
         }
         let transport = &owned.0;
 

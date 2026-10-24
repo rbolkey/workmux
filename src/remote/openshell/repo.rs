@@ -80,15 +80,6 @@ pub fn ssh_notice(github: Result<&[String], &str>) -> String {
     }
 }
 
-/// A project's git URL as workmux shows it: with the SSH URL it was
-/// rewritten from, if any.
-pub fn describe(git_url: &str, ssh_git_url: Option<&str>) -> String {
-    match ssh_git_url {
-        Some(ssh) => format!("{git_url} (rewritten from SSH: {ssh})"),
-        None => git_url.to_string(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,21 +178,6 @@ mod tests {
             "`--repo` uses SSH, which OpenShell sandboxes don't support; \
              the sandbox reaches github.com over HTTPS instead, with the GitHub credentials its providers give \
              (could not check which do: gateway down)."
-        );
-    }
-
-    #[test]
-    fn a_rewritten_url_is_shown_with_its_original() {
-        assert_eq!(
-            describe(
-                "https://github.com/me/api.git",
-                Some("git@github.com:me/api.git")
-            ),
-            "https://github.com/me/api.git (rewritten from SSH: git@github.com:me/api.git)"
-        );
-        assert_eq!(
-            describe("https://github.com/me/api.git", None),
-            "https://github.com/me/api.git"
         );
     }
 }

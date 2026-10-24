@@ -13,6 +13,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+use crate::remote::git_url::GitUrl;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -66,10 +68,8 @@ pub struct ProjectSite {
     /// Path of the clone on the remote; `~` and relative paths are taken
     /// from the remote's home directory.
     pub path: String,
-    pub git_url: Option<String>,
-    /// The SSH URL `git_url` was rewritten from, shown beside it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ssh_git_url: Option<String>,
+    #[serde(flatten)]
+    pub git_url: Option<GitUrl>,
     /// Workstation session for the project's windows in window mode; `None`
     /// places them in the invoking session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -507,17 +507,25 @@ fn ensure_cloned(
         Stream::Stderr,
         format!(
             "Cloning {} into {} on {}\n",
-            crate::remote::openshell::repo::describe(git_url, project.ssh_git_url.as_deref()),
+            git_url.describe(),
             path.display(),
             project.remote
         )
         .as_bytes(),
     );
     let mut clone = crate::git::unattended_git(None)?;
-    clone.arg("clone").arg("--quiet").arg(git_url).arg(path);
+    clone
+        .arg("clone")
+        .arg("--quiet")
+        .arg(&git_url.url)
+        .arg(path);
     let status = run_streamed(clone, tracked, emit)?;
     if !status.success() {
-        bail!("git clone of {git_url} into {} failed", path.display());
+        bail!(
+            "git clone of {} into {} failed",
+            git_url.url,
+            path.display()
+        );
     }
     Ok(true)
 }
@@ -726,8 +734,7 @@ mod tests {
                 remote: "devbox".to_string(),
                 name: "api".to_string(),
                 path: path.display().to_string(),
-                git_url: git_url.map(|url| url.display().to_string()),
-                ssh_git_url: None,
+                git_url: git_url.map(|url| GitUrl::new(url.display().to_string())),
                 session: None,
             },
             argv: ["sh", "-c", script].map(String::from).to_vec(),
@@ -1016,7 +1023,9 @@ mod tests {
         crate::test_support::init_repo(&origin);
         let path = temp.path().join("api");
         let mut request = request(&path, Some(&origin), "true");
-        request.project.ssh_git_url = Some("git@github.com:me/api.git".to_string());
+        if let Some(git_url) = &mut request.project.git_url {
+            git_url.ssh = Some("git@github.com:me/api.git".to_string());
+        }
 
         let (exit, captured) = run(&request, |_| {});
 

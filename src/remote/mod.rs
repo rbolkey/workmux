@@ -11,6 +11,7 @@ pub mod daemon;
 pub mod dashboard;
 pub mod forwarded;
 pub mod forwarding;
+pub mod git_url;
 pub mod handshake;
 pub mod openshell;
 pub mod pane;

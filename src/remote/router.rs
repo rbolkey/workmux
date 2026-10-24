@@ -70,7 +70,6 @@ pub fn remote_project(config: &Config, name: &str) -> Result<RemoteProject> {
             name: name.to_string(),
             path: entry.path.clone().unwrap_or_else(|| format!("~/{name}")),
             git_url: entry.git_url.clone(),
-            ssh_git_url: entry.ssh_git_url.clone(),
             session: match entry.placement.unwrap_or_default() {
                 ProjectPlacement::ProjectSession => {
                     Some(entry.session.clone().unwrap_or_else(|| name.to_string()))
@@ -799,8 +798,10 @@ projects:
         assert_eq!(api.project(), Project::remote("devbox", "api"));
         assert_eq!(api.site.path, "~/code/api");
         assert_eq!(
-            api.site.git_url.as_deref(),
-            Some("git@github.com:me/api.git")
+            api.site.git_url,
+            Some(crate::remote::git_url::GitUrl::new(
+                "git@github.com:me/api.git"
+            ))
         );
         assert_eq!(api.remote.target, "me@devbox");
     }

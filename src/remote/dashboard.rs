@@ -37,7 +37,12 @@ pub fn repo_source(
         Some(remote) => {
             let entry = config.projects.get(&remote.project)?;
             (entry.remote.as_deref() == Some(remote.remote.as_str()))
-                .then(|| entry.git_url.clone().map(RepoSource::GitUrl))
+                .then(|| {
+                    entry
+                        .git_url
+                        .clone()
+                        .map(|git_url| RepoSource::GitUrl(git_url.url))
+                })
                 .flatten()
         }
     }
@@ -257,7 +262,6 @@ mod tests {
             name: "api".to_string(),
             path: clone.display().to_string(),
             git_url: None,
-            ssh_git_url: None,
             session: None,
         }
     }

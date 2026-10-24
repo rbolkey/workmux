@@ -493,10 +493,7 @@ fn print_policy(name: &str, remote: &RemoteConfig) {
     if let Some(origin) = &remote.openshell
         && let Some(git_url) = &origin.git_url
     {
-        println!(
-            "  repo:     {}",
-            crate::remote::openshell::repo::describe(git_url, origin.ssh_git_url.as_deref())
-        );
+        println!("  repo:     {}", git_url.describe());
     }
     let sandbox =
         crate::remote::openshell::OpenShell::new(&remote.target, remote.openshell.clone());
