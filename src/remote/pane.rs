@@ -402,6 +402,34 @@ impl SessionHolder {
         }
     }
 
+    /// Type `input` into remote pane `id`, as a terminal attached to it
+    /// would.
+    pub fn push(&self, id: &RemotePaneId, input: &[u8]) -> Result<()> {
+        use std::io::Write;
+        let mut child = Command::new("dtach")
+            .arg("-p")
+            .arg(self.socket(id))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("failed to run dtach")?;
+        child
+            .stdin
+            .take()
+            .expect("piped stdin")
+            .write_all(input)
+            .with_context(|| format!("failed to type into remote pane {id}"))?;
+        let output = child.wait_with_output()?;
+        if !output.status.success() {
+            bail!(
+                "typing into remote pane {id} failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(())
+    }
+
     /// The command that attaches this terminal to remote pane `id`. The
     /// detach and suspend keys are off, so every keystroke reaches the pane.
     pub fn attach_command(&self, id: &RemotePaneId) -> Command {

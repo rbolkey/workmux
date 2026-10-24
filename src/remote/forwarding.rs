@@ -954,6 +954,21 @@ impl Multiplexer for ForwardingMux {
         })
     }
 
+    /// A command for a pane this process started goes straight to its
+    /// remote pane, so it runs even while the workstation pane's view is
+    /// not attached (its first attach failed and it waits to reconnect,
+    /// reading keystrokes it would swallow).
+    fn send_keys(&self, pane_id: &str, command: &str) -> Result<()> {
+        let remote = self.panes.lock().unwrap().get(pane_id).cloned();
+        match remote {
+            Some(remote) => self.holder.push(&remote, format!("{command}\r").as_bytes()),
+            None => {
+                self.send_text_fragment(pane_id, command)?;
+                self.send_enter(pane_id)
+            }
+        }
+    }
+
     fn send_key(&self, _pane_id: &str, _key: &str) -> Result<()> {
         Err(unsupported("sending a key"))
     }
@@ -1160,6 +1175,59 @@ mod tests {
 
     fn start_command(server: &PrivateTmuxServer, pane: &str) -> String {
         server.query(&["display-message", "-p", "-t", pane, "#{pane_start_command}"])
+    }
+
+    #[test]
+    fn a_command_typed_into_a_new_pane_reaches_its_remote_pane_even_when_no_view_attaches() {
+        let Some(server) = PrivateTmuxServer::start() else {
+            return;
+        };
+        let Some((panes, _holder)) = crate::remote::pane::tests::holder() else {
+            return;
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let worktree = panes.path().join("feature");
+        std::fs::create_dir_all(worktree.join(".git")).unwrap();
+        let invoking = server.new_session("mine", temp.path());
+        let release = temp.path().join("release");
+        let invocation = InvocationContext {
+            pane_id: Some(invoking),
+            tmux: Some(format!("{},1,0", server.socket)),
+            cwd: None,
+        };
+        // The workstation pane's view never attaches (it only sleeps), as
+        // when the first attach fails and the view waits to reconnect.
+        let (mux, session) = command_session(
+            Arc::new(ServeTransport::default()),
+            invocation,
+            temp.path(),
+            &release,
+            SessionHolder::new(panes.path().join("panes")),
+        );
+        let pane = mux
+            .create_session(CreateSessionParams {
+                prefix: "",
+                name: "api",
+                cwd: &worktree,
+                initial_window_name: Some("wm-feature"),
+            })
+            .unwrap();
+        let started = temp.path().join("agent-started");
+
+        mux.send_keys(&pane, &format!("echo yes > '{}'", started.display()))
+            .unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !started.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the agent command never ran"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        mux.kill_session("api").unwrap();
+        std::fs::write(&release, "").unwrap();
+        session.join().unwrap().unwrap();
     }
 
     #[test]
