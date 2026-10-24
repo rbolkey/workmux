@@ -215,11 +215,7 @@ fn reconnecting_screen(remote: &str, reason: &str, wait: Duration) -> Choice {
 
 /// Copy an attachment's output from `from` to `to`, calling `attached` once
 /// the session holder says the client is attached.
-fn relay(
-    mut from: impl Read,
-    mut to: impl Write,
-    attached: impl FnOnce(),
-) -> std::io::Result<()> {
+fn relay(mut from: impl Read, mut to: impl Write, attached: impl FnOnce()) -> std::io::Result<()> {
     let mut attached = Some(attached);
     // The end of the output so far, to spot the marker across reads.
     let mut tail = Vec::new();
@@ -237,7 +233,10 @@ fn relay(
             continue;
         }
         tail.extend_from_slice(read);
-        if tail.windows(ATTACHED.len()).any(|window| window == ATTACHED) {
+        if tail
+            .windows(ATTACHED.len())
+            .any(|window| window == ATTACHED)
+        {
             attached.take().expect("not yet attached")();
         } else {
             tail.drain(..tail.len().saturating_sub(ATTACHED.len() - 1));
@@ -264,11 +263,7 @@ mod tests {
 
     #[test]
     fn relay_passes_output_through_and_notices_the_attach_once() {
-        let chunks = [
-            &b"motd\r\n\x1b[H"[..],
-            b"\x1b[J",
-            b"interface\x1b[H\x1b[J",
-        ];
+        let chunks = [&b"motd\r\n\x1b[H"[..], b"\x1b[J", b"interface\x1b[H\x1b[J"];
         let mut out = Vec::new();
         let mut attached = 0;
 
@@ -287,9 +282,11 @@ mod tests {
     fn relay_without_an_attach_never_calls_it_attached() {
         let mut attached = false;
 
-        relay(&b"dtach: No such file or directory\r\n"[..], std::io::sink(), || {
-            attached = true
-        })
+        relay(
+            &b"dtach: No such file or directory\r\n"[..],
+            std::io::sink(),
+            || attached = true,
+        )
         .unwrap();
 
         assert!(!attached);
