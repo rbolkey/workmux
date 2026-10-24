@@ -33,6 +33,17 @@ pub fn merge(
         "merge:start"
     );
 
+    // A command remote workmux runs has no terminal to open an editor in.
+    let served = crate::remote::session::ServedProject::current();
+    if squash && let Some(served) = &served {
+        return Err(anyhow!(
+            "A --squash merge (or merge_strategy: squash) asks for a commit message, and workmux \
+            cannot open an editor for remote project '{}'. Merge without squashing, or squash \
+            the branch's commits in its worktree first.",
+            served.name
+        ));
+    }
+
     // Change CWD to main worktree to prevent errors if the command is run from within
     // the worktree that is about to be deleted.
     context.chdir_to_main_worktree()?;
@@ -175,6 +186,18 @@ pub fn merge(
     }
 
     let had_staged_changes = git::has_staged_changes(&worktree_path)?;
+    if had_staged_changes
+        && !ignore_uncommitted
+        && let Some(served) = &served
+    {
+        return Err(anyhow!(
+            "Worktree for '{}' has staged changes, and workmux cannot open an editor for remote \
+            project '{}' to commit them. Commit them in the worktree first (git commit -m \
+            MESSAGE), or use --ignore-uncommitted.",
+            branch_to_merge,
+            served.name
+        ));
+    }
     if had_staged_changes && !ignore_uncommitted {
         // Commit using git's editor (respects $EDITOR or git config)
         info!(path = %worktree_path.display(), "merge:committing staged changes");

@@ -898,6 +898,85 @@ def test_remote_merge_merges_in_the_remotes_clone_without_pushing(
             os.kill(daemon_pid, signal.SIGTERM)
 
 
+@pytest.mark.tmux_only
+def test_commands_that_would_open_an_editor_refuse_for_a_remote_project(
+    mux_server: MuxEnvironment,
+    workmux_exe_path: Path,
+    repo_path: Path,
+    short_tmp: dict,
+    remote_root: Path,
+):
+    """`add --prompt-editor`, `add --auto-name` with no prompt, and a merge
+    that would ask for a commit message refuse with a clear message and
+    launch no editor; the merge leaves the worktree and its staged change
+    in place."""
+    env = mux_server
+    assert isinstance(env, TmuxEnvironment)
+    root = remote_root
+    (root / "home" / ".zshrc").write_text("")
+    origin = make_origin(env, env.tmp_path / "origin", "panes:\n  - command: sh\n")
+    clone = root / "home" / "code" / "api"
+    worktree = root / "home" / "code" / "api__worktrees" / "feature"
+    opened = env.tmp_path / "editor-opened"
+    editor = env.tmp_path / "editor.sh"
+    editor.write_text(f"#!/bin/sh\ntouch {opened}\necho message > \"$1\"\n")
+    editor.chmod(0o755)
+    tmp_env = {**short_tmp, "EDITOR": str(editor), "GIT_EDITOR": str(editor)}
+
+    def wm(command, expect_fail=False):
+        return run_workmux_command(
+            env,
+            workmux_exe_path,
+            repo_path,
+            command,
+            pre_run_env=tmp_env,
+            expect_fail=expect_fail,
+            timeout=60.0,
+        )
+
+    wm(f"remote add lb --transport loopback --target {root}")
+    wm(f"project add api --remote lb --repo {origin} --path code/api")
+    daemon_pid = None
+    try:
+        # Refused on the workstation: the remote is never even cloned.
+        refused = wm("add other --project api --prompt-editor", expect_fail=True)
+        assert "cannot open an editor for remote project 'api'" in refused.stderr
+        assert "-p" in refused.stderr
+        refused = wm("add --auto-name --project api", expect_fail=True)
+        assert "cannot open an editor for remote project 'api'" in refused.stderr
+        assert not clone.exists()
+
+        wm("add feature --project api")
+        daemon_pid = remote_daemon_ping(env, workmux_exe_path, repo_path, short_tmp)[
+            "pid"
+        ]
+        env.tmux(["select-window", "-t", env.runner_pane_id or "test:0"])
+        (worktree / "work.txt").write_text("done\n")
+        env.run_command(["git", "add", "work.txt"], cwd=worktree)
+
+        refused = wm("merge feature --project api", expect_fail=True)
+        assert "has staged changes" in refused.stderr
+        assert "cannot open an editor" in refused.stderr
+        assert "git commit -m" in refused.stderr
+
+        env.run_command(
+            ["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q"]
+            + ["-m", "remote work"],
+            cwd=worktree,
+        )
+        refused = wm("merge feature --project api --squash", expect_fail=True)
+        assert "--squash" in refused.stderr
+        assert "cannot open an editor" in refused.stderr
+
+        assert not opened.exists()
+        assert worktree.exists()
+        log = env.run_command(["git", "log", "--format=%s", "main"], cwd=clone)
+        assert "remote work" not in log.stdout
+    finally:
+        if daemon_pid is not None:
+            os.kill(daemon_pid, signal.SIGTERM)
+
+
 def pid_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
