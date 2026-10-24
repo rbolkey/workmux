@@ -317,7 +317,11 @@ impl Loopback {
                 self.root.display()
             ));
         }
-        if self.offline_marker.as_ref().is_some_and(|marker| marker.exists()) {
+        if self
+            .offline_marker
+            .as_ref()
+            .is_some_and(|marker| marker.exists())
+        {
             return Err(anyhow!("loopback remote is offline"));
         }
         let (program, args) = argv
