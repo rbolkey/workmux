@@ -864,6 +864,50 @@ mod contract {
     }
 
     #[test]
+    fn a_flake_projects_devshell_is_baked_into_the_image_and_runs_in_the_sandbox() {
+        if !enabled() {
+            return;
+        }
+        // The project, as the workstation clones it from its git URL.
+        let repo = tempfile::tempdir().unwrap();
+        let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/openshell/devshell");
+        for file in ["flake.nix", "flake.lock"] {
+            std::fs::copy(format!("{fixture}/{file}"), repo.path().join(file)).unwrap();
+        }
+        crate::test_support::init_repo(repo.path());
+        crate::test_support::run_git(repo.path(), &["add", "flake.nix", "flake.lock"]);
+        crate::test_support::run_git(repo.path(), &["commit", "-q", "-m", "flake"]);
+        let mut owned = sandbox("nix");
+        if let Some(origin) = owned.0.origin.as_mut() {
+            origin.git_url = Some(repo.path().display().to_string());
+        }
+        let transport = &owned.0;
+
+        transport.create().unwrap();
+
+        let output = transport
+            .exec_captured(&argv(&[
+                crate::remote::provision::BAKED_DEVSHELL,
+                "sh",
+                "-c",
+                "jq --version && rg --version | head -1 && echo devshell=$WM_LEARN_DEVSHELL && git --version",
+            ]))
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "{output:?}");
+        assert!(stdout.contains("jq-"), "{stdout}");
+        assert!(stdout.contains("ripgrep"), "{stdout}");
+        assert!(stdout.contains("devshell=1"), "{stdout}");
+        assert!(stdout.contains("git version"), "{stdout}");
+        let source = transport
+            .exec_captured(&argv(&["cat", image::DEVSHELL_SOURCE]))
+            .unwrap();
+        let source: image::DevshellSource = serde_json::from_slice(&source.stdout).unwrap();
+        assert_eq!(source.clone, "/sandbox/api");
+        assert_eq!(source.flake_lock_sha256, image::flake_lock_digest(repo.path()));
+    }
+
+    #[test]
     fn a_tty_exec_has_its_workdir_and_env() {
         if !enabled() {
             return;
