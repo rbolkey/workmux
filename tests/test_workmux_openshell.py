@@ -297,6 +297,37 @@ def test_a_recreate_carries_a_worktree_and_its_commit_across(project: Project):
     )
 
 
+def test_a_projects_lima_sandbox_is_ignored_inside_its_openshell_sandbox(
+    project: Project,
+):
+    """A committed `.workmux.yaml` enabling workmux's Lima sandbox still adds
+    a worktree and its agent pane: the OpenShell sandbox is the sandbox."""
+    add_project(project)
+    project.sh(
+        "set -e; "
+        "printf 'sandbox:\\n  enabled: true\\n  backend: lima\\n' "
+        ">> /sandbox/origin/.workmux.yaml; "
+        "git -C /sandbox/origin -c user.name=t -c user.email=t@t "
+        "commit -q -am 'lima sandbox'"
+    )
+
+    added = project.wm(f"add feature --project {project.name}", timeout=120.0)
+
+    output = added.stdout + added.stderr
+    assert "limactl" not in output, output
+    assert (
+        "ignoring the project's sandbox: setting inside OpenShell sandbox "
+        f"{project.name}" in output
+    ), output
+    wait_until(
+        lambda: (
+            project.sh("test -f /sandbox/control/started && echo yes || true") != ""
+        ),
+        "the agent to start",
+        timeout=60.0,
+    )
+
+
 def test_an_openshell_projects_sandbox_runs_claude_code(project: Project):
     """The image installs the default agent, Claude Code, where OpenShell's
     claude-code provider profile expects it, and `add` starts it in the
