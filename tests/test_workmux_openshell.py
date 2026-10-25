@@ -325,10 +325,17 @@ def test_an_openshell_projects_sandbox_runs_claude_code(project: Project):
 
     daemon_pid = None
     try:
-        project.wm(f"add feature --project {project.name}", timeout=120.0)
+        added = project.wm(f"add feature --project {project.name}", timeout=120.0)
         daemon_pid = remote_daemon_ping(env, project.exe, project.repo, project.tmp)[
             "pid"
         ]
+        # Provisioning installs the status hooks before Claude Code has
+        # ever run, so before it has made its config directory.
+        assert "No agents detected" not in added.stdout + added.stderr
+        settings = json.loads(
+            project.sh('cat "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"')
+        )
+        assert "workmux set-window-status" in json.dumps(settings["hooks"]), settings
         wait_until(
             lambda: (
                 project.sh(
