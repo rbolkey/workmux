@@ -3014,13 +3014,26 @@ impl Config {
         config_override: Option<&Path>,
     ) -> anyhow::Result<(Self, Option<ConfigLocation>)> {
         let frozen_path = std::env::var_os(crate::frozen_config::FROZEN_CONFIG_ENV);
-        Self::load_with_location_from_sources(
+        let (mut config, location) = Self::load_with_location_from_sources(
             start_dir,
             cli_agent,
             config_override,
             frozen_path.as_deref().map(Path::new),
             crate::sandbox::guest::is_sandbox_guest(),
-        )
+        )?;
+        let openshell = std::env::var(crate::remote::openshell::SANDBOX_ENV).ok();
+        if openshell.is_some() {
+            // Say so once per command, however often it loads config.
+            static NOTE: std::sync::Once = std::sync::Once::new();
+            let mut note = Vec::new();
+            ignore_sandbox_in_openshell(&mut config, openshell.as_deref(), &mut note);
+            if !note.is_empty() {
+                NOTE.call_once(|| {
+                    let _ = std::io::Write::write_all(&mut std::io::stderr(), &note);
+                });
+            }
+        }
+        Ok((config, location))
     }
 
     fn load_with_location_from_sources(
@@ -4270,6 +4283,28 @@ pub fn is_agent_command(command_line: &str, agent_command: &str) -> bool {
     cmd_stem.is_some() && cmd_stem == agent_stem
 }
 
+/// Remote workmux in an OpenShell sandbox (`sandbox`, from the marker the
+/// OpenShell transport sets) never starts workmux's own sandbox: the
+/// OpenShell sandbox already is the project's sandbox. The project's or
+/// global `sandbox:` setting is ignored, with a note in `note` when it asked
+/// for one.
+fn ignore_sandbox_in_openshell(
+    config: &mut Config,
+    sandbox: Option<&str>,
+    note: &mut impl std::io::Write,
+) {
+    let Some(sandbox) = sandbox else {
+        return;
+    };
+    if config.sandbox.is_enabled() {
+        let _ = writeln!(
+            note,
+            "workmux: ignoring the project's sandbox: setting inside OpenShell sandbox {sandbox}"
+        );
+    }
+    config.sandbox.enabled = Some(false);
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -4287,6 +4322,44 @@ mod tests {
     use super::{DashboardConfig, InputExitKey};
     use crate::test_support;
     use tempfile::TempDir;
+
+    #[test]
+    fn an_openshell_sandbox_ignores_the_projects_sandbox_setting() {
+        let mut config = Config::default();
+        config.sandbox.enabled = Some(true);
+        let mut note = Vec::new();
+
+        super::ignore_sandbox_in_openshell(&mut config, Some("api"), &mut note);
+
+        assert!(!config.sandbox.is_enabled());
+        let note = String::from_utf8(note).unwrap();
+        assert_eq!(note.lines().count(), 1, "{note}");
+        assert!(note.contains("sandbox:"), "{note}");
+        assert!(note.contains("OpenShell sandbox api"), "{note}");
+    }
+
+    #[test]
+    fn outside_an_openshell_sandbox_the_sandbox_setting_stands() {
+        let mut config = Config::default();
+        config.sandbox.enabled = Some(true);
+        let mut note = Vec::new();
+
+        super::ignore_sandbox_in_openshell(&mut config, None, &mut note);
+
+        assert!(config.sandbox.is_enabled());
+        assert!(note.is_empty());
+    }
+
+    #[test]
+    fn an_openshell_sandbox_says_nothing_when_no_sandbox_is_configured() {
+        let mut config = Config::default();
+        let mut note = Vec::new();
+
+        super::ignore_sandbox_in_openshell(&mut config, Some("api"), &mut note);
+
+        assert!(!config.sandbox.is_enabled());
+        assert!(note.is_empty());
+    }
 
     /// Run `f`, returning its result and the log lines it emitted.
     fn capture_logs<T>(f: impl FnOnce() -> T) -> (T, String) {
