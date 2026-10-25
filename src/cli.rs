@@ -729,6 +729,9 @@ enum Commands {
         /// Install without asking, so setup runs without a terminal
         #[arg(short, long)]
         yes: bool,
+        /// Set up this agent even when it is not detected (repeatable)
+        #[arg(long = "agent", value_enum, hide = true)]
+        agents: Vec<crate::agent_setup::Agent>,
     },
 
     /// Remove agent status tracking hooks, skills, and cache/state dirs
@@ -1393,7 +1396,12 @@ pub fn run() -> Result<()> {
             }
             crate::config::Config::init()
         }
-        Commands::Setup { hooks, skills, yes } => command::setup::run(hooks, skills, yes),
+        Commands::Setup {
+            hooks,
+            skills,
+            yes,
+            agents,
+        } => command::setup::run(hooks, skills, yes, &agents),
         Commands::Uninstall { dry_run } => command::uninstall::run(dry_run),
         Commands::Docs => command::docs::run(),
         Commands::Changelog => command::changelog::run(),

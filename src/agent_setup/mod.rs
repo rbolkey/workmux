@@ -29,10 +29,23 @@ use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 
 /// An agent that supports status tracking.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    Serialize,
+    Deserialize,
+    clap::ValueEnum,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum Agent {
     #[serde(rename = "agy")]
+    #[value(name = "agy")]
     Antigravity,
     Claude,
     Codex,
@@ -42,6 +55,7 @@ pub enum Agent {
     OpenCode,
     Pi,
     #[serde(rename = "omp")]
+    #[value(name = "omp")]
     Omp,
 }
 
@@ -253,6 +267,38 @@ pub fn check_all() -> Vec<AgentCheck> {
 /// Check integrations for explicit setup, including OpenCode version detection.
 pub fn check_all_for_setup() -> Vec<AgentCheck> {
     check_all_with_opencode_check(opencode::check_for_setup)
+}
+
+/// [`check_all_for_setup`], plus `agents` even when they are not detected:
+/// an agent installed but never run has no config directory to detect it by.
+pub fn check_all_for_setup_with(agents: &[Agent]) -> Vec<AgentCheck> {
+    let mut checks = check_all_for_setup();
+    for &agent in agents {
+        if !checks.iter().any(|check| check.agent == agent) {
+            let status =
+                check_for_setup(agent).unwrap_or_else(|e| StatusCheck::Error(e.to_string()));
+            checks.push(AgentCheck {
+                agent,
+                reason: "asked for",
+                status,
+            });
+        }
+    }
+    checks
+}
+
+fn check_for_setup(agent: Agent) -> Result<StatusCheck> {
+    match agent {
+        Agent::Antigravity => antigravity::check(),
+        Agent::Claude => claude::check(),
+        Agent::Codex => codex::check(),
+        Agent::Copilot => copilot::check(),
+        Agent::Gemini => gemini::check(),
+        Agent::Grok => grok::check(),
+        Agent::OpenCode => opencode::check_for_setup(),
+        Agent::Pi => pi::check(),
+        Agent::Omp => omp::check(),
+    }
 }
 
 fn check_all_with_opencode_check(check_opencode: fn() -> Result<StatusCheck>) -> Vec<AgentCheck> {
@@ -657,6 +703,15 @@ mod tests {
             Some(&extensions.join("workmux-status.ts")),
             Some(&alias.join("workmux-status.ts")),
         ));
+    }
+
+    #[test]
+    fn an_agent_setup_is_asked_for_is_checked_once_whether_or_not_it_is_detected() {
+        let checks = check_all_for_setup_with(&[Agent::Claude, Agent::Codex]);
+
+        for agent in [Agent::Claude, Agent::Codex] {
+            assert_eq!(checks.iter().filter(|c| c.agent == agent).count(), 1);
+        }
     }
 
     #[test]
