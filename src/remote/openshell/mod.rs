@@ -579,6 +579,22 @@ fn failure(output: &Output) -> String {
     }
 }
 
+/// A sandbox create or start error, with a hint when it says the gateway's
+/// supervisor image is gone from Docker: the gateway resolves that image once
+/// at start, so every create fails until the gateway restarts and pulls it.
+fn with_supervisor_image_hint(error: anyhow::Error) -> anyhow::Error {
+    let message = error.to_string();
+    if !(message.contains("ControlSupervisorStartFailed") && message.contains("No such image")) {
+        return error;
+    }
+    anyhow!(
+        "{message}\n\nThe OpenShell gateway's supervisor image is no longer in Docker (removed by \
+         an image prune or by Kubernetes image garbage collection on a shared Docker engine); \
+         restarting the gateway pulls it again, e.g. `launchctl kickstart -k \
+         gui/$(id -u)/<gateway label>` for a launchd-managed gateway."
+    )
+}
+
 impl Transport for OpenShell {
     fn exec_captured(&self, argv: &[String]) -> Result<Output> {
         self.exec(false, None, &[], argv)?
@@ -621,7 +637,7 @@ impl Provisioning for OpenShell {
         let policy = self.write_policy(context.path())?;
         let args = self.create_args(origin, &image, &policy.to_string_lossy());
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
-        self.run(&args)?;
+        self.run(&args).map_err(with_supervisor_image_hint)?;
         self.wait_for(Some("Ready"))
     }
 
@@ -632,7 +648,8 @@ impl Provisioning for OpenShell {
             for notice in self.sync_policy(false)? {
                 eprintln!("{notice}");
             }
-            self.run(&["sandbox", "start", &self.sandbox])?;
+            self.run(&["sandbox", "start", &self.sandbox])
+                .map_err(with_supervisor_image_hint)?;
         }
         self.wait_for(Some("Ready"))
     }
@@ -701,7 +718,8 @@ pub(super) mod tests {
                  'sandbox get')\n\
                    if [ -f \"$dir/phase\" ]; then printf '{{\"phase\":\"%s\",\"policy\":{{}}}}' \"$(cat \"$dir/phase\")\";\n\
                    else echo \"Error:   × code: 'Some requested entity was not found', message: \\\"sandbox not found\\\"\" >&2; exit 1; fi ;;\n\
-                 'sandbox create'|'sandbox start') echo Ready > \"$dir/phase\" ;;\n\
+                 'sandbox create'|'sandbox start') if [ -f \"$dir/fail\" ]; then cat \"$dir/fail\" >&2; exit 1; fi;\n\
+                   echo Ready > \"$dir/phase\" ;;\n\
                  'sandbox stop') echo Stopped > \"$dir/phase\" ;;\n\
                  'sandbox delete') rm -f \"$dir/phase\" ;;\n\
                  'provider list') token=; while [ $# -gt 0 ]; do [ \"$1\" = --page-token ] && token=$2; shift; done;\n\
@@ -1035,6 +1053,47 @@ pub(super) mod tests {
         assert_eq!(transport.status().unwrap(), RemoteState::Running);
         transport.delete().unwrap();
         assert_eq!(transport.status().unwrap(), RemoteState::Missing);
+    }
+
+    /// What the gateway prints when its supervisor image is gone from
+    /// Docker (ticket 45).
+    const NO_SUPERVISOR_IMAGE: &str = "ControlSupervisorStartFailed create Docker supervisor staging container: Docker responded with status code 404: No such image: sha256:4efdb659add55a99e1bb6e5773d7b35a51770106a3d819c000fd078edfc098b3";
+
+    #[test]
+    fn a_missing_supervisor_image_fails_create_and_start_with_a_restart_hint() {
+        let fake = FakeOpenShell::new();
+        let transport = fake.transport(Some(origin()));
+        transport.create().unwrap();
+        transport.stop().unwrap();
+        std::fs::write(fake.path("fail"), NO_SUPERVISOR_IMAGE).unwrap();
+
+        let start = transport.start().unwrap_err();
+        transport.delete().unwrap();
+        let create = transport.create().unwrap_err();
+
+        for error in [start, create] {
+            let error = format!("{error:#}");
+            assert!(error.contains(NO_SUPERVISOR_IMAGE), "{error}");
+            assert!(
+                error.contains("supervisor image is no longer in Docker"),
+                "{error}"
+            );
+            assert!(error.contains("restarting the gateway"), "{error}");
+            assert!(error.contains("launchctl kickstart"), "{error}");
+        }
+    }
+
+    #[test]
+    fn other_create_errors_pass_through_unchanged() {
+        let fake = FakeOpenShell::new();
+        std::fs::write(fake.path("fail"), "Error:   × sandbox name already taken").unwrap();
+
+        let error = fake.transport(Some(origin())).create().unwrap_err();
+
+        assert_eq!(
+            format!("{error:#}"),
+            "Error:   × sandbox name already taken"
+        );
     }
 
     #[test]

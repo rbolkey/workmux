@@ -20,6 +20,7 @@ import pytest
 SANDBOX_PREFIX = "wm-learn-"
 LEARNING_IMAGE = "wm-learn-openshell:latest"
 DEVSHELL_IMAGE = "wm-learn-devshell:latest"
+GH_IMAGE = "wm-learn-gh:latest"
 FIXTURE_DIR = Path(__file__).parent.parent / "fixtures" / "openshell"
 READY_TIMEOUT = float(os.environ.get("WORKMUX_TEST_OPENSHELL_READY_TIMEOUT", "300"))
 
@@ -78,6 +79,18 @@ def build_devshell_image() -> str:
         capture_output=True,
     )
     return DEVSHELL_IMAGE
+
+
+@functools.cache
+def build_gh_image() -> str:
+    """Build the learning image with GitHub's `gh` installed."""
+    build_learning_image()
+    subprocess.run(
+        ["docker", "build", "-q", "-t", GH_IMAGE, str(FIXTURE_DIR / "gh")],
+        check=True,
+        capture_output=True,
+    )
+    return GH_IMAGE
 
 
 @dataclass

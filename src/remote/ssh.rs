@@ -97,7 +97,7 @@ impl Ssh {
         Ok(())
     }
 
-    /// `command` as sshd should hand it to the remote's login shell.
+    /// `command` as the remote's `sh` should run it.
     fn remote_command(&self, command: &str) -> String {
         if self.uploaded_workmux {
             format!(
@@ -109,7 +109,9 @@ impl Ssh {
         }
     }
 
-    /// `ssh [-F config] <options> -- <target> <remote command>`.
+    /// `ssh [-F config] <options> -- <target> <remote command>`. sshd hands
+    /// the command to the user's login shell, whatever it is, so it travels
+    /// as `exec sh -c <command>` and only `sh` parses `remote_command`.
     fn ssh(&self, options: &[&str], remote_command: &str) -> Command {
         let mut command = Command::new("ssh");
         if let Some(config) = &self.config {
@@ -119,13 +121,43 @@ impl Ssh {
             .args(options)
             .arg("--")
             .arg(&self.target)
-            .arg(self.remote_command(remote_command));
+            .arg(format!(
+                "exec sh -c {}",
+                login_shell_quote(&self.remote_command(remote_command))
+            ));
         command
     }
 }
 
-/// The remote command string for `argv`. sshd hands it to the user's login
-/// shell, so each argument is quoted.
+/// Quote `s` as one word that POSIX shells and fish read alike. Fish
+/// unescapes `\\` and `\'` inside single quotes, so backslashes and quotes
+/// are escaped outside them, where every such shell reads `\\` and `\'`
+/// the same way.
+fn login_shell_quote(s: &str) -> String {
+    if s.is_empty() {
+        return "''".to_string();
+    }
+    let mut quoted = String::new();
+    let mut in_quotes = false;
+    for c in s.chars() {
+        let special = c == '\\' || c == '\'';
+        if special == in_quotes {
+            quoted.push('\'');
+            in_quotes = !in_quotes;
+        }
+        if special {
+            quoted.push('\\');
+        }
+        quoted.push(c);
+    }
+    if in_quotes {
+        quoted.push('\'');
+    }
+    quoted
+}
+
+/// The remote command string for `argv`, for `sh` to parse, so each
+/// argument is quoted.
 fn command_line(argv: &[String]) -> Result<String> {
     if argv.is_empty() {
         return Err(anyhow!("no command to run on the remote"));
@@ -221,7 +253,7 @@ pub(crate) mod tests {
     use crate::remote::handshake::{Hello, PROTOCOL_VERSION, SENTINEL};
     use crate::remote::testing::SERVE_CHILD;
     use crate::ssh_learning::harness::{
-        LOCAL_BAD_KEY_HOST, Pty, Reaped, SshHarness, local_sshd, ssh_harness,
+        LOCAL_BAD_KEY_HOST, Pty, Reaped, SshHarness, fish_ssh_harness, local_sshd, ssh_harness,
     };
     use serde_json::Value;
     use std::time::Duration;
@@ -246,8 +278,19 @@ pub(crate) mod tests {
     /// Puts a `workmux` running `script` first on the remote's PATH, after
     /// shell startup that prints `noise`.
     pub(crate) fn install_remote_workmux(harness: &SshHarness, noise: &str, script: &str) {
-        let bin = format!("{}/bin", harness.remote_dir());
-        std::fs::create_dir_all(&bin).unwrap();
+        let bin = write_remote_workmux(&format!("{}/bin", harness.remote_dir()), script);
+        local_sshd!(harness).set_shell_startup(&format!("{noise}\nexport PATH={bin}:$PATH\n"));
+    }
+
+    /// [`install_remote_workmux`] for a remote whose login shell is fish.
+    fn install_remote_workmux_for_fish(harness: &SshHarness, noise: &str, script: &str) {
+        let bin = write_remote_workmux(&format!("{}/bin", harness.remote_dir()), script);
+        local_sshd!(harness).set_fish_startup(&format!("{noise}\nset -gx PATH {bin} $PATH\n"));
+    }
+
+    /// Writes a `workmux` running `script` into `bin` and returns `bin`.
+    fn write_remote_workmux(bin: &str, script: &str) -> String {
+        std::fs::create_dir_all(bin).unwrap();
         let workmux = format!("{bin}/workmux");
         std::fs::write(&workmux, format!("#!/bin/sh\n{script}\n")).unwrap();
         std::fs::set_permissions(
@@ -255,7 +298,7 @@ pub(crate) mod tests {
             std::os::unix::fs::PermissionsExt::from_mode(0o755),
         )
         .unwrap();
-        local_sshd!(harness).set_shell_startup(&format!("{noise}\nexport PATH={bin}:$PATH\n"));
+        bin.to_string()
     }
 
     /// A remote `workmux` that serves a real control channel: this test
@@ -310,6 +353,40 @@ pub(crate) mod tests {
         assert_eq!(output.status.code(), Some(3));
     }
 
+    /// Arguments a login shell's quoting could alter: backslashes (which
+    /// fish unescapes inside single quotes), quotes, spaces and expansions.
+    const AWKWARD_ARGS: &[&str] = &[
+        "back\\slash",
+        "two\\\\backslashes",
+        "trailing\\",
+        "it's",
+        "\\'",
+        "say \"hi\"",
+        "two words",
+        "$HOME (x) *",
+        "~",
+        "",
+        "line\nbreak",
+    ];
+
+    #[test]
+    fn captured_exec_on_a_fish_login_shell_passes_each_argument_intact() {
+        let harness = fish_ssh_harness!();
+        let mut command = argv(&["sh", "-c", "printf '%s|' \"$@\"; exit 3", "sh"]);
+        command.extend(argv(AWKWARD_ARGS));
+
+        let output = transport(&harness).exec_captured(&command).unwrap();
+
+        let expected: String = AWKWARD_ARGS.iter().map(|arg| format!("{arg}|")).collect();
+        assert_eq!(
+            stdout(&output),
+            expected,
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.status.code(), Some(3));
+    }
+
     #[test]
     fn captured_exec_output_excludes_shell_startup_noise() {
         let harness = ssh_harness!();
@@ -333,6 +410,36 @@ pub(crate) mod tests {
 
         assert_eq!(connection.hello, Hello::current());
         assert_eq!(ping.workmux, env!("CARGO_PKG_VERSION"));
+    }
+
+    /// Fish startup that prints to stdout, as a chatty `config.fish` does.
+    const NOISY_FISH_STARTUP: &str = "echo 'Welcome to devbox'; printf partial\n";
+
+    #[test]
+    fn a_control_channel_opens_through_a_chatty_fish_login_shell() {
+        let harness = fish_ssh_harness!();
+        install_remote_workmux_for_fish(&harness, NOISY_FISH_STARTUP, &serve_script());
+
+        let connection = open(&harness).unwrap();
+
+        assert!(connection.ping().is_ok());
+    }
+
+    #[test]
+    fn an_uploaded_workmux_runs_on_a_fish_login_shell() {
+        let harness = fish_ssh_harness!();
+        let cache = format!("{}/cache", harness.remote_dir());
+        local_sshd!(harness).set_fish_startup(&format!("set -gx XDG_CACHE_HOME {cache}\n"));
+        let script = harness.local().unwrap().file("uploaded-workmux");
+        std::fs::write(&script, "#!/bin/sh\nprintf 'uploaded %s|' \"$@\"\n").unwrap();
+        let ssh = transport(&harness).with_uploaded_workmux(true);
+
+        ssh.upload_workmux(&script).unwrap();
+        let output = ssh
+            .exec_captured(&argv(&["workmux", "a\\b", "it's"]))
+            .unwrap();
+
+        assert_eq!(stdout(&output), "uploaded a\\b|uploaded it's|");
     }
 
     #[test]
@@ -451,6 +558,36 @@ pub(crate) mod tests {
         );
 
         assert!(text.contains(&format!("pwd={home}\r\n")), "{text}");
+    }
+
+    #[test]
+    fn tty_exec_on_a_fish_login_shell_keeps_the_workdir_env_and_arguments() {
+        let harness = fish_ssh_harness!();
+        let workdir = format!("{}/my \\ repo", harness.remote_dir());
+        std::fs::create_dir(&workdir).unwrap();
+
+        let text = run_on_a_terminal(
+            &harness,
+            &TtyExec {
+                argv: argv(&[
+                    "sh",
+                    "-c",
+                    "echo \"pwd=$(pwd -P)\"; echo \"env=$WM_PANE\"; echo \"arg=$1\"; echo done",
+                    "sh",
+                    "a\\'b",
+                ]),
+                workdir: Some(workdir.clone()),
+                env: vec![("WM_PANE".to_string(), "it's \\ pane".to_string())],
+            },
+        );
+
+        let expected = std::fs::canonicalize(&workdir).unwrap();
+        assert!(
+            text.contains(&format!("pwd={}\r\n", expected.display())),
+            "{text}"
+        );
+        assert!(text.contains("env=it's \\ pane\r\n"), "{text}");
+        assert!(text.contains("arg=a\\'b\r\n"), "{text}");
     }
 
     /// The pid of the remote sshd session behind a control channel: the

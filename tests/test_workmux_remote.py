@@ -152,6 +152,23 @@ def local_sshd(workmux_exe_path: Path):
     Host `wmx-test` reaches a remote whose shell startup echoes noise and puts
     workmux on PATH; `wmx-nowm` reaches the same server without workmux.
     """
+    yield from start_local_sshd(workmux_exe_path)
+
+
+@pytest.fixture
+def fish_sshd(workmux_exe_path: Path):
+    """`local_sshd` whose remote login shell is fish (nix `fish` on PATH)."""
+    fish = shutil.which("fish")
+    if fish is None:
+        pytest.skip("put fish on PATH to run fish login shell tests")
+    yield from start_local_sshd(workmux_exe_path, fish=fish)
+
+
+def start_local_sshd(workmux_exe_path: Path, fish: str | None = None):
+    """Runs the sshd behind `local_sshd` and yields its `ssh_config`. With
+    `fish`, remote commands run in that fish as a fish login shell would run
+    them: the user's own login shell runs ForceCommand, which hands fish
+    $SSH_ORIGINAL_COMMAND unparsed."""
     if os.environ.get("WORKMUX_TEST_SSH") != "1":
         pytest.skip("set WORKMUX_TEST_SSH=1 to run SSH tests")
     d = Path(tempfile.mkdtemp(prefix="wmx", dir="/tmp"))
@@ -165,17 +182,35 @@ def local_sshd(workmux_exe_path: Path):
     remote_home.mkdir()
     rc = d / "rc"
     rc.mkdir()
+    dtach_dir = Path(shutil.which("dtach") or "/usr/bin/dtach").parent
     # A chatty shell startup must not break the control channel.
     startup = (
         "echo 'Welcome to the remote'; printf partial\n"
         f"export HOME={remote_home} XDG_CONFIG_HOME={remote_home}/.config\n"
         f"export XDG_STATE_HOME={remote_home}/.local/state\n"
-        f"export PATH={Path(shutil.which('dtach') or '/usr/bin/dtach').parent}:/usr/bin:/bin\n"
+        f"export PATH={dtach_dir}:/usr/bin:/bin\n"
         '[ -n "$WMX_NO_WORKMUX" ] || '
         f"export PATH={workmux_exe_path.parent}:$PATH\n"
     )
-    (rc / ".zshenv").write_text(startup)
-    (rc / ".bashrc").write_text(startup)
+    force_command = ""
+    if fish is None:
+        (rc / ".zshenv").write_text(startup)
+        (rc / ".bashrc").write_text(startup)
+    else:
+        (rc / ".zshenv").write_text("")
+        (rc / ".bashrc").write_text("")
+        (rc / "fish").mkdir()
+        (rc / "fish" / "config.fish").write_text(
+            "echo 'Welcome to the remote'; printf partial\n"
+            f"set -gx HOME {remote_home}; set -gx XDG_CONFIG_HOME {remote_home}/.config\n"
+            f"set -gx XDG_STATE_HOME {remote_home}/.local/state\n"
+            f"set -gx PATH {dtach_dir} /usr/bin /bin\n"
+            f"set -q WMX_NO_WORKMUX; or set -gx PATH {workmux_exe_path.parent} $PATH\n"
+        )
+        force_command = (
+            f"ForceCommand exec env XDG_CONFIG_HOME={rc} {fish}"
+            ' -c "$SSH_ORIGINAL_COMMAND"\n'
+        )
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
@@ -190,7 +225,7 @@ def local_sshd(workmux_exe_path: Path):
         "UsePAM no\n"
         "StrictModes no\n"
         "AcceptEnv WMX_*\n"
-        f"SetEnv ZDOTDIR={rc} BASH_ENV={rc}/.bashrc\n"
+        f"SetEnv ZDOTDIR={rc} BASH_ENV={rc}/.bashrc\n" + force_command
     )
     user = os.environ["USER"]
 
@@ -860,6 +895,68 @@ def test_remote_add_and_remove_over_ssh_to_localhost(
         assert branches.strip() == ""
         windows = env.tmux(["list-windows", "-a", "-F", "#{window_name}"]).stdout
         assert "wm-feature" not in windows.split()
+    finally:
+        if daemon_pid is not None:
+            os.kill(daemon_pid, signal.SIGTERM)
+
+
+@requires_dtach
+@pytest.mark.tmux_only
+def test_add_and_a_relayed_command_on_a_fish_login_shell_remote(
+    mux_server: MuxEnvironment,
+    workmux_exe_path: Path,
+    repo_path: Path,
+    short_tmp: dict,
+    fish_sshd: Path,
+):
+    """An SSH remote whose login shell is fish gets workmux installed, takes
+    `add`, and a relayed command's backslashes, quotes and spaces reach the
+    remote intact."""
+    env = mux_server
+    assert isinstance(env, TmuxEnvironment)
+    env.install_script(
+        env.fake_bin_dir / "ssh", f'#!/bin/sh\nexec /usr/bin/ssh -F {fish_sshd} "$@"\n'
+    )
+    remote_home = fish_sshd.parent / "remote-home"
+    origin = make_origin(
+        env, env.tmp_path / "origin", "panes:\n  - command: pwd -P > pane-ran.txt\n"
+    )
+
+    def wm(command, stdin_input=None):
+        return run_workmux_command(
+            env,
+            workmux_exe_path,
+            repo_path,
+            command,
+            pre_run_env=short_tmp,
+            stdin_input=stdin_input,
+            timeout=60.0,
+        )
+
+    # Without workmux on its PATH, the remote runs the one installed in its
+    # cache directory.
+    wm("remote add box --transport ssh --target wmx-nowm")
+    wm(f"project add remote api --remote box --repo {origin} --path code/api")
+    daemon_pid = None
+    try:
+        installed = wm("remote status box", stdin_input="y\n")
+        assert "status:   reachable" in installed.stdout
+        wm("add feature --project api")
+        daemon_pid = remote_daemon_ping(env, workmux_exe_path, repo_path, short_tmp)[
+            "pid"
+        ]
+        worktree = remote_home / "code" / "api__worktrees" / "feature"
+        assert wait_for(worktree / "pane-ran.txt", timeout=30).strip() == str(
+            worktree.resolve()
+        )
+
+        awkward = ["back\\slash", "two\\\\backslashes", "trailing\\", "it's"]
+        awkward += ["\\'", 'say "hi"', "two words", "$HOME *"]
+        ran = wm(
+            "run feature --project api -- "
+            + shlex.join(["printf", "%s|", *awkward, "end"])
+        )
+        assert "".join(f"{arg}|" for arg in awkward) + "end|" in ran.stdout
     finally:
         if daemon_pid is not None:
             os.kill(daemon_pid, signal.SIGTERM)

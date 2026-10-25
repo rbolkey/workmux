@@ -262,3 +262,11 @@ When you edit the policy file, the next command brings a running sandbox in line
 ## Registering an OpenShell remote yourself
 
 `workmux remote add NAME --transport openshell --target SANDBOX` registers an existing sandbox that you manage. workmux can start and stop it, but never creates it, and `remote rm` only unregisters it. To have workmux create and own the sandbox, use `project add openshell` instead.
+
+## Troubleshooting
+
+### Creating a sandbox fails with "No such image"
+
+If creating or starting a sandbox fails with `ControlSupervisorStartFailed … No such image: sha256:…`, the gateway's supervisor image is gone from Docker. The gateway looks the image up once, when it starts, so it keeps failing until you restart the gateway, which pulls the image again (for a gateway run by launchd: `launchctl kickstart -k gui/$(id -u)/<gateway label>`).
+
+An image prune can remove it, and so can Kubernetes image garbage collection when the Docker engine is shared with Kubernetes (OrbStack or Docker Desktop with Kubernetes turned on): once the Docker disk is over 85% full, the kubelet deletes images no container is using, the gateway's included. To avoid it, turn off the engine's Kubernetes if you don't use it (`orb config set k8s.enable false` in OrbStack), or keep the Docker disk under 85%.
