@@ -29,6 +29,22 @@ macro_rules! ssh_harness {
 }
 pub(crate) use ssh_harness;
 
+/// Yields an [`SshHarness`] whose remote login shell is fish, or returns
+/// from the test when SSH tests are off, the target is external, or fish is
+/// not on PATH.
+macro_rules! fish_ssh_harness {
+    () => {
+        match $crate::ssh_learning::harness::SshHarness::fish_from_env() {
+            Some(harness) => harness,
+            None => {
+                eprintln!("skipped: needs WORKMUX_TEST_SSH=1, the local sshd harness and fish on PATH");
+                return;
+            }
+        }
+    };
+}
+pub(crate) use fish_ssh_harness;
+
 /// Yields the harness's [`LocalSshd`], or returns from the test when running
 /// against an external target whose server configuration we cannot control.
 macro_rules! local_sshd {
@@ -70,17 +86,35 @@ impl SshHarness {
                 host,
                 config: std::env::var_os("WORKMUX_TEST_SSH_CONFIG").map(PathBuf::from),
             },
-            _ => Target::Local(LocalSshd::start()),
+            _ => Target::Local(LocalSshd::start(None)),
         };
+        Some(Self::with_target(target))
+    }
+
+    /// A local harness whose remote login shell is fish: the user's own
+    /// login shell hands every remote command to fish unchanged, as sshd
+    /// would hand it to a fish login shell.
+    pub fn fish_from_env() -> Option<Self> {
+        if std::env::var("WORKMUX_TEST_SSH").as_deref() != Ok("1")
+            || std::env::var("WORKMUX_TEST_SSH_TARGET").is_ok_and(|host| !host.is_empty())
+        {
+            return None;
+        }
+        let fish = which::which("fish").ok()?;
+        Some(Self::with_target(Target::Local(LocalSshd::start(Some(&fish)))))
+    }
+
+    fn with_target(target: Target) -> Self {
         let mut harness = Self {
             target,
             remote_dir: String::new(),
             control_dir: short_tempdir(),
         };
-        let out = harness.run(&[], r#"mktemp -d "${TMPDIR:-/tmp}/wmx-ssh.XXXXXX""#);
+        // Through sh, so it reads the same to any login shell.
+        let out = harness.run(&[], r#"sh -c 'mktemp -d "${TMPDIR:-/tmp}/wmx-ssh.XXXXXX"'"#);
         assert!(out.status.success(), "remote mktemp failed: {out:?}");
         harness.remote_dir = stdout_of(&out).trim().to_string();
-        Some(harness)
+        harness
     }
 
     pub fn host(&self) -> &str {
@@ -186,7 +220,9 @@ pub struct LocalSshd {
 }
 
 impl LocalSshd {
-    fn start() -> Self {
+    /// Starts the server. With `fish`, remote commands run in that fish
+    /// instead of the user's login shell.
+    fn start(fish: Option<&Path>) -> Self {
         let dir = short_tempdir();
         let path = |name: &str| dir.path().join(name);
         for key in ["host_key", "client_key", "bad_key"] {
@@ -203,10 +239,24 @@ impl LocalSshd {
         fs::create_dir(path("rc")).unwrap();
         fs::write(path("rc/.zshenv"), "").unwrap();
         fs::write(path("rc/.bashrc"), "").unwrap();
+        fs::create_dir(path("rc/fish")).unwrap();
+        fs::write(path("rc/fish/config.fish"), "").unwrap();
         fs::write(path("banner"), "WMX-BANNER\n").unwrap();
 
         let port = free_port();
         let d = dir.path().display();
+        // sshd runs ForceCommand through the user's login shell, which
+        // expands $SSH_ORIGINAL_COMMAND without parsing it: fish parses the
+        // command as a fish login shell would. XDG_CONFIG_HOME points fish
+        // at the temp dir's config.fish.
+        let force_command = fish
+            .map(|fish| {
+                format!(
+                    "ForceCommand exec env XDG_CONFIG_HOME={d}/rc {} -c \"$SSH_ORIGINAL_COMMAND\"\n",
+                    fish.display()
+                )
+            })
+            .unwrap_or_default();
         // ZDOTDIR and BASH_ENV point the login shell's startup files at the
         // temp dir, so tests control shell-startup output and the user's own
         // rc files stay out of the way.
@@ -223,7 +273,8 @@ impl LocalSshd {
              AcceptEnv WMX_ACCEPTED_*\n\
              Banner {d}/banner\n\
              SetEnv ZDOTDIR={d}/rc BASH_ENV={d}/rc/.bashrc\n\
-             LogLevel VERBOSE\n"
+             LogLevel VERBOSE\n\
+             {force_command}"
         );
         fs::write(path("sshd_config"), sshd_config).unwrap();
 
@@ -290,6 +341,11 @@ impl LocalSshd {
     pub fn set_shell_startup(&self, script: &str) {
         fs::write(self.dir.path().join("rc/.zshenv"), script).unwrap();
         fs::write(self.dir.path().join("rc/.bashrc"), script).unwrap();
+    }
+
+    /// Replaces what a fish login shell runs while starting up.
+    pub fn set_fish_startup(&self, script: &str) {
+        fs::write(self.dir.path().join("rc/fish/config.fish"), script).unwrap();
     }
 }
 
