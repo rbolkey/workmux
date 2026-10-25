@@ -7,7 +7,8 @@ use crate::skills;
 use crate::ui::confirm::{self, ConfirmDefault};
 
 /// With `yes`, installs without asking, so it runs without a terminal.
-pub fn run(hooks_only: bool, skills_only: bool, yes: bool) -> Result<()> {
+/// `agents` are set up even when they are not detected.
+pub fn run(hooks_only: bool, skills_only: bool, yes: bool, agents: &[Agent]) -> Result<()> {
     if !yes && !io::stdin().is_terminal() {
         anyhow::bail!("workmux setup requires an interactive terminal (or --yes)");
     }
@@ -17,7 +18,7 @@ pub fn run(hooks_only: bool, skills_only: bool, yes: bool) -> Result<()> {
     let do_skills = !hooks_only || skills_only;
 
     let checks = if do_hooks {
-        agent_setup::check_all_for_setup()
+        agent_setup::check_all_for_setup_with(agents)
     } else {
         agent_setup::check_all()
     };

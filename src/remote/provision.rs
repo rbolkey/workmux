@@ -105,14 +105,24 @@ fn plan_for(toolchain: &DetectedToolchain, devshell: Devshell, has: impl Fn(&str
     if needs_nix && *toolchain == DetectedToolchain::Devbox && !has("devbox") {
         plan.steps.push(shell("installing devbox", DEVBOX_INSTALL));
     }
+    let mut setup: Vec<String> = ["workmux", "setup", "--hooks", "--yes"]
+        .map(str::to_string)
+        .to_vec();
+    // Setup finds an agent by its config directory, which an agent that
+    // has never run on the remote (as in a fresh sandbox) has not made yet.
+    for cli in AGENT_CLIS.iter().filter(|cli| has(cli)) {
+        setup.extend(["--agent".to_string(), cli.to_string()]);
+    }
     plan.steps.push(Step {
         what: "installing agent hooks",
-        argv: ["workmux", "setup", "--hooks", "--yes"]
-            .map(str::to_string)
-            .to_vec(),
+        argv: setup,
     });
     plan
 }
+
+/// The agent CLIs whose hooks provisioning installs whenever the CLI is
+/// installed: those an OpenShell sandbox's image can carry.
+const AGENT_CLIS: &[&str] = &["claude", "codex"];
 
 /// A warning when the project's toolchain gets no devshell here: only a
 /// flake devshell is baked into an OpenShell image, and nix can neither be
@@ -254,6 +264,16 @@ mod tests {
         assert_eq!(steps(&plan), ["installing agent hooks"]);
         assert_eq!(plan.steps[0].argv, SETUP);
         assert!(plan.warnings.is_empty());
+    }
+
+    #[test]
+    fn agents_installed_on_the_remote_get_hooks_before_they_have_ever_run() {
+        let plan = plan(&DetectedToolchain::None, has(&["dtach", "claude", "codex"]));
+
+        assert_eq!(
+            plan.steps[0].argv,
+            [SETUP, &["--agent", "claude", "--agent", "codex"]].concat()
+        );
     }
 
     #[test]
