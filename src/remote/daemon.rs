@@ -207,7 +207,7 @@ fn ask_remote_git_status(entry: &RemoteGitPath) -> Result<GitStatus> {
     let project = super::router::remote_project(&Config::load_global_only()?, &entry.project)?;
     if project.site.remote != entry.remote {
         anyhow::bail!(
-            "project {} is not on remote {}",
+            "Project {} is not on remote {}",
             entry.project,
             entry.remote
         );

@@ -357,7 +357,7 @@ impl ProjectScope {
                     project,
                 )?;
                 if resolved.site.remote != *remote {
-                    anyhow::bail!("project {project} is no longer on remote {remote}");
+                    anyhow::bail!("Project {project} is no longer on remote {remote}");
                 }
                 Ok(Some(resolved))
             }
@@ -456,7 +456,7 @@ impl ProjectScope {
         };
         let source = self
             .repo_source(config, path)
-            .ok_or_else(|| anyhow::anyhow!("project {} has no git URL", self.project().name))?;
+            .ok_or_else(|| anyhow::anyhow!("Project {} has no git URL", self.project().name))?;
         crate::github::list_open_prs_from(&source)
     }
 
@@ -465,7 +465,7 @@ impl ProjectScope {
     pub fn remove_remote(&self, handle: &str, keep_branch: bool) -> anyhow::Result<()> {
         let project = self
             .remote_project()?
-            .ok_or_else(|| anyhow::anyhow!("not a remote project"))?;
+            .ok_or_else(|| anyhow::anyhow!("Not a remote project"))?;
         let mut args = vec!["remove", handle, "--force"];
         if keep_branch {
             args.push("--keep-branch");
@@ -483,7 +483,7 @@ impl ProjectScope {
     ) -> anyhow::Result<()> {
         let project = self
             .remote_project()?
-            .ok_or_else(|| anyhow::anyhow!("not a remote project"))?;
+            .ok_or_else(|| anyhow::anyhow!("Not a remote project"))?;
         let pr = pr.map(|pr| pr.to_string());
         let mut args = vec!["add", "--background"];
         args.extend(branch);
@@ -500,7 +500,7 @@ impl ProjectScope {
     pub fn close_remote(&self, handle: &str) -> anyhow::Result<()> {
         let project = self
             .remote_project()?
-            .ok_or_else(|| anyhow::anyhow!("not a remote project"))?;
+            .ok_or_else(|| anyhow::anyhow!("Not a remote project"))?;
         Self::relay(&project, &["close", handle])
     }
 
@@ -508,7 +508,7 @@ impl ProjectScope {
     pub fn open_remote(&self, handle: &str) -> anyhow::Result<()> {
         let project = self
             .remote_project()?
-            .ok_or_else(|| anyhow::anyhow!("not a remote project"))?;
+            .ok_or_else(|| anyhow::anyhow!("Not a remote project"))?;
         Self::relay(&project, &["open", handle])
     }
 }

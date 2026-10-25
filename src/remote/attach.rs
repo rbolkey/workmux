@@ -38,7 +38,7 @@ pub fn run(remote: &str, pane: &RemotePaneId) -> Result<()> {
     let remotes = registry::remotes()?;
     let config = remotes
         .get(remote)
-        .ok_or_else(|| anyhow!("no remote named {remote}"))?;
+        .ok_or_else(|| anyhow!("No remote named {remote}"))?;
     let transport = registry::transport(remote, config)?;
     hold_channel(remote);
 
@@ -131,7 +131,7 @@ fn pane_state(transport: &dyn Transport, pane: &RemotePaneId) -> Result<PaneStat
             .trim()
             .replace("\r\n", "\n");
         return Err(if stderr.is_empty() {
-            anyhow!("checking the remote pane failed with {}", output.status)
+            anyhow!("Checking the remote pane failed with {}", output.status)
         } else {
             anyhow!(stderr)
         });

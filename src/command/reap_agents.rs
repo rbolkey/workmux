@@ -19,7 +19,7 @@ pub fn run(older_than_secs: u64, force: bool) -> Result<()> {
     local?;
     if remote_failures > 0 {
         return Err(anyhow!(
-            "failed to reap agents in {} remote project(s)",
+            "Failed to reap agents in {} remote project(s)",
             remote_failures
         ));
     }
@@ -81,7 +81,7 @@ fn run_served(served: &ServedProject, older_than_secs: u64, force: bool) -> Resu
     if failures == 0 {
         Ok(())
     } else {
-        Err(anyhow!("failed to exit {} agent(s)", failures))
+        Err(anyhow!("Failed to exit {} agent(s)", failures))
     }
 }
 

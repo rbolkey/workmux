@@ -109,7 +109,7 @@ def test_remote_add_list_status_rm_against_a_loopback_remote(
             line.split()[0]: line for line in listing.splitlines()[1:] if line.strip()
         }
         assert rows["lb"].rstrip().endswith("reachable")
-        assert f"unreachable: loopback root {missing} does not exist" in rows["gone"]
+        assert f"unreachable: Loopback root {missing} does not exist" in rows["gone"]
 
         status = remote(env, workmux_exe_path, repo_path, "status lb", short_tmp).stdout
         assert "status:   reachable" in status
@@ -131,7 +131,7 @@ def test_remote_add_list_status_rm_against_a_loopback_remote(
             env, workmux_exe_path, repo_path, "status gone", short_tmp, expect_fail=True
         )
         assert "status:   unreachable" in failed.stdout
-        assert f"loopback root {missing} does not exist" in failed.stdout
+        assert f"Loopback root {missing} does not exist" in failed.stdout
 
         remote(env, workmux_exe_path, repo_path, "rm gone", short_tmp)
         listing = remote(env, workmux_exe_path, repo_path, "list", short_tmp).stdout
@@ -753,7 +753,7 @@ def test_remote_git_commands_act_on_the_remote_repository(
             expect_fail=expect_fail,
             timeout=60.0,
         )
-        assert "unsupported on remote" not in result.stderr, result.stderr
+        assert "not supported on a remote" not in result.stderr, result.stderr
         return result
 
     wm(f"remote add lb --transport loopback --target {root}")
@@ -2083,7 +2083,7 @@ def test_remote_run_executes_in_the_remote_worktree(
         assert lines[0] == str(worktree.resolve())
         assert lines[1].startswith("api/feature/"), lines
         assert "oops" in ran.stderr
-        assert "unsupported on remote" not in ran.stderr
+        assert "not supported on a remote" not in ran.stderr
     finally:
         if daemon_pid is not None:
             os.kill(daemon_pid, signal.SIGTERM)
@@ -2454,7 +2454,7 @@ def test_commands_typed_in_a_remote_pane_reach_the_workstation(
             env, third, with_workmux + "workmux add fourth", out
         )
         assert code != 0
-        assert "workstation not connected" in stderr
+        assert "Workstation not connected" in stderr
         assert not (worktrees / "fourth").exists()
     finally:
         if daemon_pid is not None:

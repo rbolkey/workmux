@@ -729,7 +729,7 @@ fn list_branch_summaries_for_url_with(
     execute_remote_chunk_with(std::slice::from_ref(&remote), run)
         .pop()
         .flatten()
-        .ok_or_else(|| anyhow!("GitHub has no answer for {git_url}"))
+        .ok_or_else(|| anyhow!("GitHub returned nothing for {git_url}"))
 }
 
 /// Owner, name and API hostname of the repository at `git_url`.
@@ -742,7 +742,7 @@ fn url_repo_context_with(
     resolve_ssh_host: impl Fn(&str) -> Option<String>,
 ) -> Result<ResolvedRepoContext> {
     let identity = crate::git::parse_repo_identity_from_git_url(git_url)
-        .ok_or_else(|| anyhow!("cannot tell the GitHub repository of {git_url}"))?;
+        .ok_or_else(|| anyhow!("Cannot tell which GitHub repository {git_url} is"))?;
     // An ssh:// URL may carry a port; the API host never does.
     let host = identity.host.split(':').next().unwrap_or(&identity.host);
     // An SSH URL's host may be an SSH config alias (`git@github-work:…`)

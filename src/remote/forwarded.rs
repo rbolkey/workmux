@@ -384,7 +384,7 @@ impl Workstation<'_> {
 
     fn refusal(&self, what: &str) -> anyhow::Error {
         anyhow!(
-            "refused: {what} does not belong to project {} on remote {}",
+            "Refused: {what} does not belong to project {} on remote {}",
             self.scope.project,
             self.scope.remote
         )
@@ -816,7 +816,7 @@ mod tests {
             )
             .unwrap_err()
             .to_string();
-        assert!(error.contains("refused"), "{error}");
+        assert!(error.contains("Refused"), "{error}");
         for request in [
             MuxRequest::KillPane {
                 pane_id: web_pane.clone(),

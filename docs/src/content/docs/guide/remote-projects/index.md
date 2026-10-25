@@ -50,7 +50,7 @@ A failed step is a warning; the command still runs. Agents in a project with a `
 - **workmux** of the same protocol version as yours, on the `PATH` of non-interactive shells. If it is missing or too old, workmux offers to install a matching one (see [Installing workmux on an SSH remote](#installing-workmux-on-an-ssh-remote)).
 - A POSIX login shell (sh, bash or zsh). Arguments with backslashes may be altered on a fish remote.
 
-Output your shell's startup files print on the remote does not break the control channel.
+Your shell's startup files may print output on the remote; it does not break the control channel.
 
 ### Installing workmux on an SSH remote
 
@@ -151,7 +151,7 @@ A remote pane's shell can run workmux too, so an agent on the remote can coordin
 - `add`, `open`, `close`, `remove`, `merge` and `rename` run on the remote. Their windows appear on your workstation.
 - `send`, `capture` and `wait` run on your workstation, limited to agents of projects on that remote. `send` takes only a name and text; `capture` only `--lines`; `wait` only `--status`, `--timeout` and `--any`.
 
-While the workstation daemon is not connected to the remote, these commands fail with `workstation not connected` before they do anything.
+While the workstation daemon is not connected to the remote, these commands fail with `Workstation not connected` before they do anything.
 
 ## Shims and host commands
 

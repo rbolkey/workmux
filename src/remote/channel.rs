@@ -73,8 +73,8 @@ impl Inner {
 
     fn closed_error(&self) -> anyhow::Error {
         match self.closed.lock().unwrap().as_deref() {
-            Some(reason) => anyhow!("control channel closed: {reason}"),
-            None => anyhow!("control channel closed"),
+            Some(reason) => anyhow!("Control channel closed: {reason}"),
+            None => anyhow!("Control channel closed"),
         }
     }
 
@@ -271,7 +271,7 @@ pub(crate) fn read_line(reader: &mut impl BufRead) -> Result<Option<Vec<u8>>> {
     }
     if line.len() > MAX_LINE_BYTES {
         return Err(anyhow!(
-            "control channel line exceeds {MAX_LINE_BYTES} bytes"
+            "Control channel line exceeds {MAX_LINE_BYTES} bytes"
         ));
     }
     if line.last() == Some(&b'\n') {

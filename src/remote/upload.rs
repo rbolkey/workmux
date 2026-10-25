@@ -61,7 +61,7 @@ impl Builds {
         let version = env!("CARGO_PKG_VERSION");
         let Some(base) = &self.releases else {
             bail!(
-                "this workmux {version} is a development build, so no release of it exists \
+                "This workmux {version} is a development build, so no release of it exists \
                  for {remote}'s platform ({platform}): build workmux for {platform} and run \
                  `workmux remote upload {remote} --binary <path>`"
             );
@@ -74,7 +74,7 @@ impl Builds {
             update::download(&format!("{url}.tar.gz"), &archive)?;
             update::download(&format!("{url}.sha256"), &checksum)?;
             let expected = std::fs::read_to_string(&checksum)
-                .context("failed to read the release checksum")?;
+                .context("Failed to read the release checksum")?;
             update::verify_checksum(&archive, &expected)?;
             update::extract_tar(&archive, dir)
         };
@@ -83,7 +83,7 @@ impl Builds {
         })?;
         let binary = dir.join("workmux");
         if !binary.exists() {
-            bail!("the workmux {version} release for {platform} holds no workmux binary");
+            bail!("The workmux {version} release for {platform} holds no workmux binary");
         }
         Ok(binary)
     }
@@ -252,7 +252,7 @@ pub fn needs_workmux(error: &str) -> bool {
 /// directory.
 pub fn install(remote: &str, ssh: &Ssh, builds: &Builds) -> Result<()> {
     let platform = remote_platform(remote, ssh)?;
-    let dir = tempfile::tempdir().context("failed to create a temp directory")?;
+    let dir = tempfile::tempdir().context("Failed to create a temp directory")?;
     let binary = builds.binary_for(remote, &platform, dir.path())?;
     eprintln!(
         "Installing workmux {} on {remote}…",
@@ -266,7 +266,7 @@ fn remote_platform(remote: &str, ssh: &Ssh) -> Result<String> {
     let output = ssh.exec_captured(&["uname".to_string(), "-sm".to_string()])?;
     if !output.status.success() {
         return Err(anyhow!(
-            "failed to find {remote}'s platform: {}",
+            "Failed to find {remote}'s platform: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }

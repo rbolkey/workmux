@@ -67,7 +67,7 @@ pub fn statuses(
         Some(name) => {
             let (name, remote) = remotes
                 .get_key_value(name)
-                .ok_or_else(|| anyhow!("no remote named {name}"))?;
+                .ok_or_else(|| anyhow!("No remote named {name}"))?;
             vec![(name, remote)]
         }
         None => remotes.iter().collect(),

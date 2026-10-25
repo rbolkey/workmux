@@ -134,7 +134,7 @@ impl StdioProcess {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .with_context(|| format!("failed to run {program}"))?;
+            .with_context(|| format!("Failed to run {program}"))?;
         let stderr_tail = Arc::new(Mutex::new(Vec::new()));
         let stderr_done = Arc::new(AtomicBool::new(false));
         if let Some(mut stderr) = child.stderr.take() {
@@ -189,19 +189,19 @@ impl StdioProcess {
         let mut out = Vec::new();
         stdout
             .read_to_end(&mut out)
-            .context("failed to read the remote command's output")?;
+            .context("Failed to read the remote command's output")?;
         let written = writer.join().expect("stdin writer panicked");
         let status = self
             .child
             .wait()
-            .context("failed to wait for the remote command")?;
+            .context("Failed to wait for the remote command")?;
         while !self.stderr_done.load(Ordering::Acquire) {
             std::thread::sleep(Duration::from_millis(10));
         }
         if let Err(error) = written
             && status.success()
         {
-            return Err(error).context("failed to send input to the remote command");
+            return Err(error).context("Failed to send input to the remote command");
         }
         let stderr = self.stderr_tail.lock().unwrap().clone();
         Ok(Output {
@@ -293,7 +293,7 @@ impl Loopback {
     pub fn new(root: impl Into<std::path::PathBuf>) -> Result<Self> {
         Ok(Self {
             root: root.into(),
-            workmux: std::env::current_exe().context("failed to locate the workmux binary")?,
+            workmux: std::env::current_exe().context("Failed to locate the workmux binary")?,
             offline_marker: std::env::var_os(OFFLINE_ENV).map(Into::into),
         })
     }
@@ -319,7 +319,7 @@ impl Loopback {
     fn command(&self, argv: &[String], workdir: Option<&str>) -> Result<Command> {
         if !self.root.is_dir() {
             return Err(anyhow!(
-                "loopback root {} does not exist",
+                "Loopback root {} does not exist",
                 self.root.display()
             ));
         }
@@ -328,14 +328,14 @@ impl Loopback {
             .as_ref()
             .is_some_and(|marker| marker.exists())
         {
-            return Err(anyhow!("loopback remote is offline"));
+            return Err(anyhow!("Loopback remote is offline"));
         }
         let (program, args) = argv
             .split_first()
-            .ok_or_else(|| anyhow!("no command to run on the remote"))?;
+            .ok_or_else(|| anyhow!("No command to run on the remote"))?;
         let home = self.root.join("home");
         std::fs::create_dir_all(&home)
-            .with_context(|| format!("failed to create {}", home.display()))?;
+            .with_context(|| format!("Failed to create {}", home.display()))?;
 
         let mut command = if program == "workmux" {
             Command::new(&self.workmux)
@@ -368,7 +368,7 @@ impl Transport for Loopback {
         command
             .stdin(Stdio::null())
             .output()
-            .with_context(|| format!("failed to run {}", argv[0]))
+            .with_context(|| format!("Failed to run {}", argv[0]))
     }
 
     fn exec_stdio(&self, argv: &[String]) -> Result<StdioProcess> {
@@ -581,7 +581,7 @@ mod tests {
 
         assert_eq!(
             error.to_string(),
-            "loopback root /nonexistent/wm-loopback does not exist"
+            "Loopback root /nonexistent/wm-loopback does not exist"
         );
     }
 
@@ -595,7 +595,7 @@ mod tests {
         std::fs::write(&marker, "").unwrap();
         let error = loopback.exec_stdio(&argv(&["workmux"])).err().unwrap();
 
-        assert_eq!(error.to_string(), "loopback remote is offline");
+        assert_eq!(error.to_string(), "Loopback remote is offline");
         std::fs::remove_file(&marker).unwrap();
         assert!(loopback.exec_stdio(&argv(&["workmux"])).is_ok());
     }

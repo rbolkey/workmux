@@ -75,7 +75,7 @@ workmux project add openshell api --provider gh-login --repo https://github.com/
 - A `gh-login` provider on the gateway without that label isn't workmux's: attaching it is an error, and workmux never changes it.
 - OpenShell's proxy can only read credentials from the gateway, so the gateway keeps a copy of the token. workmux updates it from `gh` each time it creates the sandbox, runs a command in it (such as `workmux add`) or attaches a pane to it, so a new `gh` login reaches a running sandbox at the next attach.
 - `gh` missing or logged out is an error naming `gh auth login`, at `project add` and whenever the token is refreshed. workmux never falls back to no credentials.
-- At most one attached provider may give GitHub credentials: `gh-login` beside another provider whose profile reaches github.com is an error, at `project add` and when the sandbox is created. So is a gateway workmux can't ask which providers do.
+- At most one attached provider may give GitHub credentials: `gh-login` beside another provider whose profile reaches github.com is an error, at `project add` and when the sandbox is created. It is also an error when workmux can't ask the gateway which providers give GitHub credentials.
 
 The gateway normally runs on your workstation, so the copy stays there. If your OpenShell gateway runs on another machine, the token is stored on that machine.
 
@@ -114,7 +114,7 @@ A fine-grained personal access token limits the agent to the repositories and pe
 
 ### SSH is not supported in OpenShell sandboxes
 
-The proxy substitutes credentials only in HTTPS, and no profile allows SSH. workmux doesn't put an SSH key in the sandbox or forward your SSH agent, because either would hand the sandbox a real secret. Instead, SSH GitHub URLs are rewritten to HTTPS, visibly:
+The proxy substitutes credentials only in HTTPS, and no profile allows SSH. workmux doesn't put an SSH key in the sandbox or forward your SSH agent, because either would hand the sandbox a real secret. Instead, workmux rewrites SSH GitHub URLs to HTTPS and says so:
 
 - `project add openshell` with an SSH `--repo` on github.com (`git@github.com:me/api.git` or `ssh://git@github.com/me/api.git`) stores the HTTPS form as the project's `git_url` and the original as `ssh_git_url`, and says so:
 
@@ -204,7 +204,7 @@ These are the paths OpenShell's example provider profiles allow, so a provider m
 
 The sandbox runs the agent's plain CLI, not your workstation's agent command. The image records the default agent in `/etc/workmux/default-agent`. Remote workmux uses it when no config in the sandbox names an agent, and counts it as a configured agent, so a project without panes of its own gets an agent pane. A `--agent` given to `add` is passed to remote workmux as it is, so give it the agent's plain CLI (`-a codex`) rather than a workstation alias.
 
-`project add openshell` and `remote status` list each agent with which attached providers have a profile that allows its binary, whatever their type. Both warn when none does, and so does creating the sandbox:
+`project add openshell` and `remote status` list each agent and the attached providers whose profile allows its binary, whatever the provider's type. Both warn when none does, and so does creating the sandbox:
 
 ```text
 Agent claude: installed at /usr/local/bin/claude; its credentials come from a provider whose profile allows it, such as one of type claude-code

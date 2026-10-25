@@ -262,7 +262,7 @@ fn list_remote_project(remote: &RemoteProject, filter: &[String]) -> Result<Vec<
 
 fn remote_entries(remote: &RemoteProject, stdout: &[u8]) -> Result<Vec<ProjectWorktree>> {
     let entries: Vec<JsonWorktree> =
-        serde_json::from_slice(stdout).context("remote workmux sent an unreadable list")?;
+        serde_json::from_slice(stdout).context("Remote workmux sent an unreadable list")?;
     let project = remote.project();
     Ok(entries
         .into_iter()

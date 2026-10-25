@@ -101,7 +101,7 @@ fn git(dir: &Path, args: &[&str]) -> Result<String> {
         .args(args)
         .stdin(std::process::Stdio::null())
         .output()
-        .context("failed to run git")?;
+        .context("Failed to run git")?;
     if !output.status.success() {
         bail!(
             "git {} in {} failed: {}",
@@ -159,7 +159,7 @@ fn unpushed(clone: &Path, rev: &str) -> Result<usize> {
     count
         .trim()
         .parse()
-        .with_context(|| format!("unreadable commit count {count:?}"))
+        .with_context(|| format!("Unreadable commit count {count:?}"))
 }
 
 /// The project's base branch: its configured `main_branch`, else the
@@ -296,11 +296,11 @@ pub fn restore(bundle: &Path, manifest: &Manifest) -> Result<Vec<String>> {
     let fresh = !clone.exists();
     if fresh {
         std::fs::create_dir_all(clone)
-            .with_context(|| format!("failed to create {}", clone.display()))?;
+            .with_context(|| format!("Failed to create {}", clone.display()))?;
         git(clone, &["init", "--quiet"])?;
     } else if !is_clone_root(clone) {
         bail!(
-            "{} already exists and is not a clone a restore began; a restore needs it gone",
+            "{} already exists and is not a clone left by an earlier restore; remove it so the restore can clone there",
             clone.display()
         );
     }
@@ -392,7 +392,7 @@ fn bundle_refs(bundle: &[u8]) -> Result<Vec<String>> {
     let mut lines = bundle.split(|&byte| byte == b'\n');
     match lines.next() {
         Some(b"# v2 git bundle" | b"# v3 git bundle") => {}
-        _ => bail!("the bundle is not a git bundle"),
+        _ => bail!("The bundle is not a git bundle"),
     }
     let mut refs = Vec::new();
     for line in lines {
@@ -407,7 +407,7 @@ fn bundle_refs(bundle: &[u8]) -> Result<Vec<String>> {
             refs.push(name.to_string());
         }
     }
-    bail!("the bundle's header is cut short")
+    bail!("The bundle's header is cut short")
 }
 
 /// Refuse a bundle that does not hold every branch `manifest` restores, so
@@ -429,7 +429,7 @@ fn check_bundle(bundle: &[u8], manifest: &Manifest) -> Result<()> {
         .collect();
     if !missing.is_empty() {
         bail!(
-            "the bundle of the project's work lacks branches {}; the sandbox was left as it is",
+            "The bundle of the project's work lacks branches {}; the sandbox was left as it is",
             missing
                 .iter()
                 .map(|branch| branch.as_str())
@@ -448,7 +448,7 @@ pub fn bundle(clone: &Path) -> Result<Vec<u8>> {
         .args(["bundle", "create", "--quiet", "-", "--all"])
         .stdin(std::process::Stdio::null())
         .output()
-        .context("failed to run git bundle")?;
+        .context("Failed to run git bundle")?;
     if !output.status.success() {
         bail!(
             "git bundle in {} failed: {}",
@@ -470,9 +470,9 @@ pub fn serve(action: &str, path: &str, manifest_json: Option<&str>) -> Result<()
         "bundle" => stdout.write_all(&bundle(&clone)?)?,
         "restore" => {
             let manifest: Manifest = serde_json::from_str(
-                manifest_json.ok_or_else(|| anyhow!("restore needs a manifest"))?,
+                manifest_json.ok_or_else(|| anyhow!("Restore needs a manifest"))?,
             )
-            .context("unreadable manifest")?;
+            .context("Unreadable manifest")?;
             let parent = manifest
                 .clone
                 .parent()
@@ -484,7 +484,7 @@ pub fn serve(action: &str, path: &str, manifest_json: Option<&str>) -> Result<()
             file.flush()?;
             serde_json::to_writer(&mut stdout, &restore(file.path(), &manifest)?)?;
         }
-        other => bail!("unknown carry action {other}"),
+        other => bail!("Unknown carry action {other}"),
     }
     stdout.flush()?;
     Ok(())
@@ -519,7 +519,7 @@ fn carry(
 /// The project at `path` on the remote: its work that exists only there.
 pub fn remote_at_risk(transport: &dyn Transport, path: &str) -> Result<Vec<AtRisk>> {
     serde_json::from_slice(&carry(transport, "at-risk", path, None, None)?)
-        .context("remote workmux sent an unreadable list of worktrees")
+        .context("Remote workmux sent an unreadable list of worktrees")
 }
 
 /// Recreate the remote behind `transport` with `rebuild` (delete it and
@@ -553,7 +553,7 @@ pub fn recreate(
             .collect();
         if !uncommitted.is_empty() {
             bail!(
-                "these worktrees have uncommitted changes, which a recreate would lose; commit or discard them first:\n  {}",
+                "These worktrees have uncommitted changes, which a recreate would lose; commit or discard them first:\n  {}",
                 uncommitted.join("\n  ")
             );
         }
@@ -561,7 +561,7 @@ pub fn recreate(
         let manifest = carry(transport, "manifest", path, None, None)?;
         let bundle = carry(transport, "bundle", path, None, None)?;
         let parsed: Manifest = serde_json::from_slice(&manifest)
-            .context("remote workmux sent an unreadable manifest")?;
+            .context("Remote workmux sent an unreadable manifest")?;
         check_bundle(&bundle, &parsed)?;
         std::fs::create_dir_all(keep)?;
         std::fs::write(&bundle_file, &bundle)?;
@@ -570,7 +570,7 @@ pub fn recreate(
         notice("Restoring every branch and worktree…");
         (
             bundle,
-            String::from_utf8(manifest).context("unreadable manifest")?,
+            String::from_utf8(manifest).context("Unreadable manifest")?,
         )
     };
     let warnings =

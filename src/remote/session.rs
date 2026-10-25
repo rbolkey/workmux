@@ -251,7 +251,7 @@ impl Sessions {
                 let open = self.open.lock().unwrap();
                 let session = open
                     .get(&params.session)
-                    .ok_or_else(|| anyhow!("no command session {}", params.session))?;
+                    .ok_or_else(|| anyhow!("No command session {}", params.session))?;
                 let _ = session.events.send(Event::Output(params.stream, data));
                 Ok(())
             });
@@ -268,10 +268,10 @@ impl Sessions {
             .lock()
             .unwrap()
             .get(&id)
-            .ok_or_else(|| anyhow!("no command session {id}"))?
+            .ok_or_else(|| anyhow!("No command session {id}"))?
             .events
             .send(Event::Prompt(reply))
-            .map_err(|_| anyhow!("command session {id} has ended"))?;
+            .map_err(|_| anyhow!("Command session {id} has ended"))?;
         Ok(answer.recv().unwrap_or(None))
     }
 
@@ -323,7 +323,7 @@ impl Sessions {
                 Ok(Event::Exit(answer)) => break answer,
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    break Err(anyhow!("command session ended without an exit code"));
+                    break Err(anyhow!("Command session ended without an exit code"));
                 }
             }
         };
@@ -415,7 +415,7 @@ pub fn serve_run(
 
 /// Where `path` from a project registration lives on this machine.
 pub(crate) fn clone_path(path: &str) -> Result<PathBuf> {
-    let home = home::home_dir().ok_or_else(|| anyhow!("remote has no home directory"))?;
+    let home = home::home_dir().ok_or_else(|| anyhow!("Remote has no home directory"))?;
     let expanded = crate::util::expand_tilde(path);
     Ok(if expanded.is_absolute() {
         expanded
@@ -445,7 +445,7 @@ fn run_streamed(
         .stderr(Stdio::piped())
         .process_group(0)
         .spawn()
-        .with_context(|| format!("failed to run {program}"))?;
+        .with_context(|| format!("Failed to run {program}"))?;
     if let Some(tracked) = tracked {
         tracked.running.start(tracked.session, child.id() as i32);
     }
@@ -493,7 +493,7 @@ fn ensure_cloned(
     }
     let Some(git_url) = &project.git_url else {
         bail!(
-            "project {} has no repository URL and {} does not exist on {}",
+            "Project {} has no repository URL and {} does not exist on {}",
             project.name,
             path.display(),
             project.remote
@@ -501,7 +501,7 @@ fn ensure_cloned(
     };
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
+            .with_context(|| format!("Failed to create {}", parent.display()))?;
     }
     emit(
         Stream::Stderr,
@@ -579,9 +579,9 @@ fn provision(
 fn remote_command(argv: &[String]) -> Result<Command> {
     let (program, args) = argv
         .split_first()
-        .ok_or_else(|| anyhow!("no command to run"))?;
+        .ok_or_else(|| anyhow!("No command to run"))?;
     let mut command = if program == "workmux" {
-        Command::new(std::env::current_exe().context("failed to locate the workmux binary")?)
+        Command::new(std::env::current_exe().context("Failed to locate the workmux binary")?)
     } else {
         Command::new(program)
     };
@@ -658,10 +658,10 @@ fn write_prompt_file(contents: &str) -> Result<tempfile::NamedTempFile> {
         .prefix("workmux-prompt-")
         .suffix(".md")
         .tempfile()
-        .context("failed to create a file for the workstation's prompt file")?;
+        .context("Failed to create a file for the workstation's prompt file")?;
     file.write_all(contents.as_bytes())
         .and_then(|()| file.flush())
-        .context("failed to write the workstation's prompt file")?;
+        .context("Failed to write the workstation's prompt file")?;
     Ok(file)
 }
 
@@ -1051,7 +1051,7 @@ mod tests {
         assert_eq!(
             exit.unwrap_err().to_string(),
             format!(
-                "project api has no repository URL and {} does not exist on devbox",
+                "Project api has no repository URL and {} does not exist on devbox",
                 path.display()
             )
         );

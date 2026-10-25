@@ -40,7 +40,7 @@ pub fn login_token(gh: &Path) -> Result<String> {
         .stdin(Stdio::null())
         .output();
     let unusable = |problem: &str, fix: &str| {
-        anyhow!("provider {GH_LOGIN} gives the sandbox your gh login, but {problem}; {fix}")
+        anyhow!("Provider {GH_LOGIN} gives the sandbox your gh login, but {problem}; {fix}")
     };
     let output = match output {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -49,7 +49,7 @@ pub fn login_token(gh: &Path) -> Result<String> {
                 "install it and run `gh auth login`",
             ));
         }
-        result => result.context("failed to run gh")?,
+        result => result.context("Failed to run gh")?,
     };
     let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if !output.status.success() || token.is_empty() {
@@ -86,7 +86,7 @@ pub fn gives_github(name: &str, provider: Option<&agents::Provider>) -> bool {
 pub fn refuse_two(github_providers: &[String]) -> Result<()> {
     if github_providers.len() > 1 {
         bail!(
-            "providers {} all give the sandbox GitHub credentials; attach only one",
+            "Providers {} all give the sandbox GitHub credentials; attach only one",
             github_providers.join(", ")
         );
     }
@@ -173,8 +173,8 @@ impl OpenShell {
         if self.attached_providers().len() > 1 {
             let github = self.github_providers().map_err(|error| {
                 anyhow!(
-                    "could not check which attached providers give GitHub credentials, \
-                     and at most one may: {error:#}"
+                    "{error:#}\n\nworkmux could not check which attached providers give \
+                     GitHub credentials; at most one may"
                 )
             })?;
             refuse_two(&github)?;
@@ -197,7 +197,7 @@ impl OpenShell {
             && !is_managed(provider)
         {
             bail!(
-                "the gateway already has a provider named {GH_LOGIN} that workmux did not create \
+                "The gateway already has a provider named {GH_LOGIN} that workmux did not create \
                  (it has no {}={} label); workmux leaves it alone. Rename or delete it, \
                  or attach your own GitHub provider instead of {GH_LOGIN}",
                 MANAGED_LABEL.0,
@@ -290,7 +290,7 @@ impl OpenShell {
             .env(CREDENTIAL, token)
             .stdin(Stdio::null())
             .output()
-            .context("failed to run openshell")?;
+            .context("Failed to run openshell")?;
         if !output.status.success() {
             bail!("{}", failure(&output));
         }
@@ -335,7 +335,7 @@ mod tests {
         let error = login_token(&logged_out).unwrap_err().to_string();
         assert_eq!(
             error,
-            "provider gh-login gives the sandbox your gh login, but gh is not logged in \
+            "Provider gh-login gives the sandbox your gh login, but gh is not logged in \
              to github.com (no oauth token found for github.com); run `gh auth login`"
         );
         let error = login_token(&dir.path().join("missing"))
@@ -415,7 +415,7 @@ mod tests {
 
         assert_eq!(
             error.to_string(),
-            "providers gh-login, work all give the sandbox GitHub credentials; attach only one"
+            "Providers gh-login, work all give the sandbox GitHub credentials; attach only one"
         );
     }
 
@@ -535,7 +535,7 @@ mod tests {
             .to_string();
         assert!(
             error.starts_with(
-                "the gateway already has a provider named gh-login that workmux did not create"
+                "The gateway already has a provider named gh-login that workmux did not create"
             ),
             "{error}"
         );
@@ -618,7 +618,7 @@ mod tests {
         let error = transport.check_github_credentials().unwrap_err();
         assert_eq!(
             error.to_string(),
-            "providers work, gh-login all give the sandbox GitHub credentials; attach only one"
+            "Providers work, gh-login all give the sandbox GitHub credentials; attach only one"
         );
         let error = transport.create().unwrap_err();
         assert!(
@@ -645,12 +645,16 @@ mod tests {
 
         let error = transport.check_github_credentials().unwrap_err();
 
+        // OpenShell's own error comes first: it says what to fix.
+        let message = error.to_string();
         assert!(
-            error.to_string().starts_with(
-                "could not check which attached providers give GitHub credentials, and at most one may: "
+            message.ends_with(
+                "\n\nworkmux could not check which attached providers give GitHub credentials; \
+                 at most one may"
             ),
             "{error}"
         );
+        assert!(!message.starts_with("workmux"), "{error}");
         // One provider has nothing to compare against.
         assert!(
             fake.transport(Some(attaching(&["work"])))

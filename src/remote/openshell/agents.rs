@@ -113,7 +113,7 @@ pub fn report(
     let mut report = Report::default();
     if agents.is_empty() {
         report.warnings.push(
-            "the default agent is none workmux can install, so the sandbox has no agent; \
+            "workmux cannot install the default agent, so the sandbox has no agent; \
              name the sandbox's agents under the project's `openshell: agents:`"
                 .to_string(),
         );
@@ -280,7 +280,7 @@ mod tests {
         assert_eq!(
             report.warnings,
             [
-                "the default agent is none workmux can install, so the sandbox has no agent; \
+                "workmux cannot install the default agent, so the sandbox has no agent; \
               name the sandbox's agents under the project's `openshell: agents:`"
             ]
         );

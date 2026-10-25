@@ -74,7 +74,7 @@ impl Ssh {
     /// replacing only a copy uploaded before.
     pub fn upload_workmux(&self, binary: &std::path::Path) -> Result<()> {
         let file = std::fs::File::open(binary)
-            .with_context(|| format!("failed to read {}", binary.display()))?;
+            .with_context(|| format!("Failed to read {}", binary.display()))?;
         // Written beside its final name and moved there, so a running copy
         // is never truncated and a failed upload leaves none half written.
         let remote_command = format!(
@@ -86,10 +86,10 @@ impl Ssh {
             .ssh(NON_INTERACTIVE, &remote_command)
             .stdin(file)
             .output()
-            .context("failed to run ssh")?;
+            .context("Failed to run ssh")?;
         if !output.status.success() {
             return Err(anyhow!(
-                "failed to upload workmux to {}: {}",
+                "Failed to upload workmux to {}: {}",
                 self.target,
                 String::from_utf8_lossy(&output.stderr).trim()
             ));
@@ -160,7 +160,7 @@ fn login_shell_quote(s: &str) -> String {
 /// argument is quoted.
 fn command_line(argv: &[String]) -> Result<String> {
     if argv.is_empty() {
-        return Err(anyhow!("no command to run on the remote"));
+        return Err(anyhow!("No command to run on the remote"));
     }
     Ok(argv
         .iter()
@@ -206,7 +206,7 @@ impl Transport for Ssh {
             .ssh(NON_INTERACTIVE, &remote_command)
             .stdin(Stdio::null())
             .output()
-            .context("failed to run ssh")?;
+            .context("Failed to run ssh")?;
         output.stdout = strip_startup_noise(output.stdout);
         Ok(output)
     }
