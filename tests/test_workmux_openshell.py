@@ -367,15 +367,11 @@ def test_an_openshell_projects_sandbox_runs_claude_code(project: Project):
             project.sh('cat "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"')
         )
         assert "workmux set-window-status" in json.dumps(settings["hooks"]), settings
+        # With no credentials Claude Code exits once it fails to reach
+        # Anthropic, so check it started: it records its first start.
         wait_until(
-            lambda: (
-                project.sh(
-                    "for p in /proc/[0-9]*; do cat $p/comm 2>/dev/null; done "
-                    "| grep -x claude || true"
-                ).strip()
-                != ""
-            ),
-            "claude to run in the sandbox",
+            lambda: "firstStartTime" in project.sh("cat ~/.claude.json || true"),
+            "claude to start in the sandbox",
             timeout=60.0,
         )
         assert "Claude Code" in project.sh("claude --version")
