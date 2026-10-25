@@ -367,7 +367,13 @@ impl OpenShell {
             git_credential_helper: self.needs_git_credential_helper(),
         };
         let tag = image::prepare(&recipe, &self.sandbox, &sandbox_path(&origin.path), context)?;
-        image::build(&self.docker, context, &tag)?;
+        // The bake fetches the flake's inputs, private ones with the
+        // workstation's gh login when it has one.
+        let github_token = recipe
+            .devshell
+            .as_ref()
+            .and_then(|_| github::login_token(&self.gh).ok());
+        image::build(&self.docker, context, &tag, github_token.as_deref())?;
         Ok(tag)
     }
 
@@ -719,9 +725,17 @@ pub(super) mod tests {
                  cat {dir}/gh-token\n",
                 dir = dir.path().display()
             );
+            // A stand-in `docker` that logs its arguments and the build
+            // secret it was handed.
+            let docker = format!(
+                "#!/bin/sh\n\
+                 printf '%s\\n' \"$*\" >> {dir}/docker-log\n\
+                 printf 'secret %s\\n' \"$WORKMUX_GITHUB_TOKEN\" >> {dir}/docker-log\n",
+                dir = dir.path().display()
+            );
             for (name, body) in [
                 ("openshell", script.as_str()),
-                ("docker", "#!/bin/sh\nexit 0\n"),
+                ("docker", docker.as_str()),
                 ("gh", gh.as_str()),
             ] {
                 let path = dir.path().join(name);
@@ -862,6 +876,53 @@ pub(super) mod tests {
         for flag in ["--upload", "--mount", "--driver-config-json", "-v"] {
             assert!(!words.contains(&flag), "{create}");
         }
+    }
+
+    /// `origin()` with a git URL to a local repository holding a flake.
+    fn flake_origin(repo: &std::path::Path) -> OpenshellRemote {
+        std::fs::write(repo.join("flake.nix"), "{ outputs = _: { }; }\n").unwrap();
+        crate::test_support::init_repo(repo);
+        crate::test_support::run_git(repo, &["add", "flake.nix"]);
+        crate::test_support::run_git(repo, &["commit", "-q", "-m", "flake"]);
+        OpenshellRemote {
+            git_url: Some(crate::remote::git_url::GitUrl::new(
+                repo.display().to_string(),
+            )),
+            ..origin()
+        }
+    }
+
+    #[test]
+    fn the_devshell_bake_gets_the_gh_login_as_a_build_secret_never_on_argv() {
+        let fake = FakeOpenShell::new();
+        std::fs::write(fake.dir.path().join("gh-token"), "gho_secret\n").unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let transport = fake.transport(Some(flake_origin(repo.path())));
+
+        transport.create().unwrap();
+
+        let docker = std::fs::read_to_string(fake.dir.path().join("docker-log")).unwrap();
+        let (build, secret) = docker.split_once('\n').unwrap();
+        assert!(
+            build.starts_with("build --secret id=github-token,env=WORKMUX_GITHUB_TOKEN -t "),
+            "{build}"
+        );
+        assert_eq!(secret, "secret gho_secret\n");
+        assert!(!fake.log().join("\n").contains("gho_secret"));
+    }
+
+    #[test]
+    fn without_a_gh_login_the_devshell_bake_goes_without_the_secret() {
+        let fake = FakeOpenShell::new();
+        let repo = tempfile::tempdir().unwrap();
+        let transport = fake.transport(Some(flake_origin(repo.path())));
+
+        transport.create().unwrap();
+
+        let docker = std::fs::read_to_string(fake.dir.path().join("docker-log")).unwrap();
+        let (build, secret) = docker.split_once('\n').unwrap();
+        assert!(build.starts_with("build -t "), "{build}");
+        assert_eq!(secret, "secret \n");
     }
 
     #[test]
