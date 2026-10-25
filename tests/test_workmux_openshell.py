@@ -20,7 +20,13 @@ from pathlib import Path
 import pytest
 
 from .conftest import MuxEnvironment, TmuxEnvironment, run_workmux_command
-from .support.openshell import LEARNING_IMAGE, build_learning_image, openshell
+from .support.openshell import (
+    GH_IMAGE,
+    LEARNING_IMAGE,
+    build_gh_image,
+    build_learning_image,
+    openshell,
+)
 from .test_workmux_remote import (
     SidebarFeed,
     agent_in,
@@ -426,17 +432,21 @@ def test_a_private_ssh_github_repo_clones_over_https_with_the_providers_credenti
 def gh_login(project: Project):
     """The workstation's real `gh` login, which the isolated HOME can't
     reach: a `gh` on PATH runs the real one with the real HOME (it holds no
-    token). The provider and profile workmux creates on the gateway are
-    deleted afterwards, after the project's sandbox, unless they were
-    there before."""
+    token). Writing a token to the yielded file stands in for a new login:
+    `gh auth token` prints it instead. The provider and profile workmux
+    creates on the gateway are deleted afterwards, after the project's
+    sandbox, unless they were there before."""
     if not PRIVATE_REPO:
         pytest.skip("set WORKMUX_TEST_OPENSHELL_PRIVATE_REPO=<owner>/<repo>")
     gh = shutil.which("gh")
     if not gh or subprocess.run([gh, "auth", "token"], capture_output=True).returncode:
         pytest.skip("needs a `gh` login on the workstation")
     shims = Path(tempfile.mkdtemp(prefix="wm-"))
+    login = shims / "login"
     (shims / "gh").write_text(
-        f'#!/bin/sh\nHOME={shlex.quote(str(Path.home()))} exec {shlex.quote(gh)} "$@"\n'
+        "#!/bin/sh\n"
+        f'[ "$1 $2" = "auth token" ] && [ -f {login} ] && exec cat {login}\n'
+        f'HOME={shlex.quote(str(Path.home()))} exec {shlex.quote(gh)} "$@"\n'
     )
     (shims / "gh").chmod(0o755)
     project.tmp["PATH"] = f"{shims}:{os.environ['PATH']}"
@@ -446,7 +456,7 @@ def gh_login(project: Project):
         in openshell(["provider", "profile", "list", "-o", "json"]).stdout
     )
     try:
-        yield
+        yield login
     finally:
         project.clean_up()
         if not provider_there:
@@ -457,7 +467,7 @@ def gh_login(project: Project):
 
 
 def test_a_projects_sandbox_gets_the_workstations_gh_login(
-    project: Project, gh_login: None
+    project: Project, gh_login: Path
 ):
     """`--provider gh-login` needs only a `gh` login: workmux keeps its token
     in that gateway provider, of its own full-access profile, so the
@@ -483,3 +493,67 @@ def test_a_projects_sandbox_gets_the_workstations_gh_login(
     )
     pushed = project.sh(f"git -c alias.probe={shlex.quote('!' + probe)} probe")
     assert pushed == "200", pushed
+
+
+def add_gh_login_project(project: Project):
+    """A `--provider gh-login` project of the private repository, from an
+    image with `gh`, cloned and ready."""
+    build_gh_image()
+    project.wm(
+        f"project add openshell {project.name} --provider gh-login "
+        f"--repo https://github.com/{PRIVATE_REPO}.git --image {GH_IMAGE}"
+    )
+    project.wm(f"remote start {project.name}", timeout=900.0)
+    project.wm(f"list --project {project.name}", timeout=300.0)
+
+
+def gh_api(project: Project, args: str) -> tuple[str, str]:
+    """`gh api` in the sandbox: the HTTP status line and the body."""
+    out = project.sh(f"gh api -i {args} 2>/dev/null; true")
+    head, _, body = out.replace("\r\n", "\n").partition("\n\n")
+    return head.splitlines()[0], body
+
+
+def test_a_gh_login_sandbox_is_authorised_to_open_pull_requests(
+    project: Project, gh_login: Path
+):
+    """`gh pr create`'s GraphQL mutation and the REST call for a pull
+    request both reach GitHub with the login's token: GitHub, not the
+    proxy, rejects them, for an id that names no repository and an empty
+    body. No pull request is created."""
+    add_gh_login_project(project)
+
+    status, body = gh_api(
+        project,
+        "graphql -f query="
+        + shlex.quote(
+            "mutation { createPullRequest(input: {repositoryId: "
+            '"R_wm_no_such_repository", baseRefName: "main", '
+            'headRefName: "wm-none", title: "never"}) { pullRequest { url } } }'
+        ),
+    )
+    assert " 200" in status, (status, body)
+    assert [e["type"] for e in json.loads(body)["errors"]] == ["NOT_FOUND"], body
+
+    status, body = gh_api(
+        project, f"-X POST repos/{PRIVATE_REPO}/pulls --input /dev/null"
+    )
+    assert " 422" in status, (status, body)
+
+
+def test_a_new_gh_login_reaches_a_running_sandbox(project: Project, gh_login: Path):
+    """A command that needs the sandbox gives `gh-login` the workstation's
+    current `gh` token, and the running sandbox authenticates with it at
+    once: a token GitHub rejects gets 401, the real login 200 again."""
+    add_gh_login_project(project)
+    assert gh_api(project, "user")[0].endswith(" 200 OK")
+
+    gh_login.write_text("gho_wm_not_a_real_token\n")
+    project.wm(f"list --project {project.name}", timeout=300.0)
+    status, body = gh_api(project, "user")
+    assert " 401" in status, (status, body)
+
+    gh_login.unlink()
+    project.wm(f"list --project {project.name}", timeout=300.0)
+    status, body = gh_api(project, "user")
+    assert " 200" in status, (status, body)
