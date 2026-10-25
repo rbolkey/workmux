@@ -467,7 +467,14 @@ def gh_login(project: Project):
                 [gh, "auth", "token"], capture_output=True, text=True
             ).stdout.strip()
             openshell(
-                ["provider", "update", "gh-login", "--credential", "GH_TOKEN", "--wait"],
+                [
+                    "provider",
+                    "update",
+                    "gh-login",
+                    "--credential",
+                    "GH_TOKEN",
+                    "--wait",
+                ],
                 env={"GH_TOKEN": token},
             )
         else:
