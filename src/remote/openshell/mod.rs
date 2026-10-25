@@ -28,6 +28,10 @@ use crate::config::OpenshellRemote;
 /// Where OpenShell runs every sandbox's workload, and its `HOME`.
 pub const SANDBOX_HOME: &str = "/sandbox";
 
+/// Set on every command OpenShell runs in a sandbox, to the sandbox's name:
+/// remote workmux there never starts workmux's own sandbox.
+pub const SANDBOX_ENV: &str = "WORKMUX_OPENSHELL_SANDBOX";
+
 /// How long a sandbox may take to reach a phase.
 const PHASE_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -93,6 +97,9 @@ impl OpenShell {
         if let Some(workdir) = workdir {
             command.arg("--workdir").arg(sandbox_path(workdir));
         }
+        command
+            .arg("--env")
+            .arg(format!("{SANDBOX_ENV}={}", self.sandbox));
         for (name, value) in env {
             command.arg("--env").arg(format!("{name}={value}"));
         }
@@ -823,6 +830,8 @@ pub(super) mod tests {
                 "api",
                 "--no-login-shell",
                 "--no-tty",
+                "--env",
+                "WORKMUX_OPENSHELL_SANDBOX=api",
                 "--",
                 "workmux",
                 "remote",
@@ -858,6 +867,8 @@ pub(super) mod tests {
                 "--tty",
                 "--workdir",
                 "/sandbox/api__worktrees/feature",
+                "--env",
+                "WORKMUX_OPENSHELL_SANDBOX=api",
                 "--env",
                 "TERM=xterm-256color",
                 "--",
