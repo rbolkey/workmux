@@ -20,7 +20,7 @@ Register the remote, then a project on it. Several projects can share one SSH re
 
 ```bash
 workmux remote add devbox --transport ssh --target devbox
-workmux project add api --remote devbox --repo git@github.com:me/api.git
+workmux project add remote api --remote devbox --repo git@github.com:me/api.git
 ```
 
 `--target` is a host as you would pass it to `ssh`, so your SSH config, keys, agent and jump hosts apply. The project's clone defaults to `~/api` on the remote (`--path` changes it). Its worktrees go in the usual `api__worktrees` directory beside it.
@@ -82,7 +82,7 @@ Published workmux releases don't include remote support yet. Until they do, the 
 ## Set up an OpenShell project
 
 ```bash
-workmux project add api --openshell --repo https://github.com/me/api.git
+workmux project add openshell api --repo https://github.com/me/api.git
 ```
 
 An OpenShell project gets a sandbox of its own, which is its remote, named after the project. workmux creates the sandbox on the first command that needs it. See [OpenShell projects](/guide/remote-projects/openshell/).
@@ -111,7 +111,7 @@ In window mode, a remote project's windows go in a workstation session named aft
 | `placement: current-session` | Put windows in the session you ran the command from, as for local projects |
 | `--mode session` on `add`    | A session per worktree, as in [session mode](/guide/session-mode/)         |
 
-Set them with `workmux project add --session` and `--placement`, or in global config. Everything else, including `mode`, comes from the remote's `.workmux.yaml`.
+Set them with `--session` and `--placement` on `workmux project add remote` (or `project add openshell`), or in global config. Everything else, including `mode`, comes from the remote's `.workmux.yaml`.
 
 ## Configuration
 

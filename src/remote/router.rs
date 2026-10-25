@@ -70,7 +70,6 @@ pub fn remote_project(config: &Config, name: &str) -> Result<RemoteProject> {
             name: name.to_string(),
             path: entry.path.clone().unwrap_or_else(|| format!("~/{name}")),
             git_url: entry.git_url.clone(),
-            ssh_git_url: entry.ssh_git_url.clone(),
             session: match entry.placement.unwrap_or_default() {
                 ProjectPlacement::ProjectSession => {
                     Some(entry.session.clone().unwrap_or_else(|| name.to_string()))
@@ -592,12 +591,7 @@ fn rewrite_option(
                 None => (long_arg, None),
             };
             if long == Some(name) {
-                let mut typed = vec![arg.clone()];
-                let value = inline.unwrap_or_else(|| {
-                    let value = args.next().unwrap_or_default();
-                    typed.push(value.clone());
-                    value
-                });
+                let (typed, value) = typed_value(&arg, inline, &mut args);
                 kept.extend(respelled(None, typed, &value)?);
                 continue;
             }
@@ -628,15 +622,9 @@ fn rewrite_option(
             let inline = &cluster[at + flag.len_utf8()..];
             wants_next = inline.is_empty();
             if Some(flag) == short {
-                let mut typed = vec![arg.clone()];
-                let value = if wants_next {
-                    wants_next = false;
-                    let value = args.next().unwrap_or_default();
-                    typed.push(value.clone());
-                    value
-                } else {
-                    inline.to_string()
-                };
+                let (typed, value) =
+                    typed_value(&arg, (!wants_next).then(|| inline.to_string()), &mut args);
+                wants_next = false;
                 let before = (at > 0).then(|| format!("-{}", &cluster[..at]));
                 kept_cluster = respelled(before, typed, &value)?;
             }
@@ -650,10 +638,30 @@ fn rewrite_option(
     Ok(kept)
 }
 
+/// An option as typed, `arg`, with its value: `inline`, else the next of
+/// `args`, which is then typed too.
+fn typed_value(
+    arg: &str,
+    inline: Option<String>,
+    args: &mut impl Iterator<Item = String>,
+) -> (Vec<String>, String) {
+    let mut typed = vec![arg.to_string()];
+    let value = inline.unwrap_or_else(|| {
+        let value = args.next().unwrap_or_default();
+        typed.push(value.clone());
+        value
+    });
+    (typed, value)
+}
+
 /// Relay this command, as it was typed, to `project`'s remote and exit
 /// with the remote command's exit code.
 pub fn relay(project: &RemoteProject) -> Result<()> {
-    let argv = relayed_argv();
+    relay_argv(project, &relayed_argv())
+}
+
+/// Run `argv` on `project`'s remote and exit with its exit code.
+fn relay_argv(project: &RemoteProject, argv: &[String]) -> Result<()> {
     let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
     exit_with(run(project, &argv)?)
 }
@@ -663,10 +671,11 @@ pub fn relay(project: &RemoteProject) -> Result<()> {
 const MAX_PROMPT_FILE_BYTES: u64 = 1024 * 1024;
 
 /// Relay this command, `command` as it was typed, to `project`'s remote like
-/// [`relay`], with its prompt file, `prompt_file`, read here on the
-/// workstation, where the user means it, rather than on the remote, and
-/// any workstation agent alias it names translated to its agent type.
-pub fn relay_with_prompt_file(
+/// [`relay`], with the arguments that mean something only on the workstation
+/// resolved here: its prompt file, `prompt_file`, read where the user means
+/// it rather than on the remote, and any workstation agent alias it names
+/// translated to its agent type.
+pub fn relay_with_workstation_args(
     project: &RemoteProject,
     prompt_file: Option<&Path>,
     command: &clap::Command,
@@ -676,8 +685,7 @@ pub fn relay_with_prompt_file(
         argv = with_agent_types(argv, command, &*global_config()?)?;
     }
     let Some(path) = prompt_file else {
-        let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
-        return exit_with(run(project, &argv)?);
+        return relay_argv(project, &argv);
     };
     let contents = read_prompt_file(path)?;
     let argv = without_prompt_file(argv, command);
@@ -790,8 +798,10 @@ projects:
         assert_eq!(api.project(), Project::remote("devbox", "api"));
         assert_eq!(api.site.path, "~/code/api");
         assert_eq!(
-            api.site.git_url.as_deref(),
-            Some("git@github.com:me/api.git")
+            api.site.git_url,
+            Some(crate::remote::git_url::GitUrl::new(
+                "git@github.com:me/api.git"
+            ))
         );
         assert_eq!(api.remote.target, "me@devbox");
     }

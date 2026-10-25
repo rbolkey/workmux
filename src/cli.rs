@@ -1194,7 +1194,7 @@ pub fn run() -> Result<()> {
                         "Pass the prompt with -p TEXT.",
                     ));
                 }
-                return crate::remote::router::relay_with_prompt_file(
+                return crate::remote::router::relay_with_workstation_args(
                     &project,
                     prompt.prompt_file.as_deref(),
                     &subcommand("add").expect("add is a subcommand"),
@@ -1249,7 +1249,7 @@ pub fn run() -> Result<()> {
                         "Pass the prompt with -p TEXT instead.",
                     ));
                 }
-                return crate::remote::router::relay_with_prompt_file(
+                return crate::remote::router::relay_with_workstation_args(
                     &project,
                     prompt.prompt_file.as_deref(),
                     &subcommand("open").expect("open is a subcommand"),

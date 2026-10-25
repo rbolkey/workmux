@@ -337,7 +337,12 @@ impl ProjectScope {
             Self::Remote { remote, project } => {
                 let entry = config.projects.get(project)?;
                 (entry.remote.as_deref() == Some(remote.as_str()))
-                    .then(|| entry.git_url.clone().map(crate::github::RepoSource::GitUrl))
+                    .then(|| {
+                        entry
+                            .git_url
+                            .clone()
+                            .map(|git_url| crate::github::RepoSource::GitUrl(git_url.url))
+                    })
                     .flatten()
             }
         }

@@ -152,7 +152,7 @@ def project(mux_server, workmux_exe_path, repo_path, short_tmp):
 
 def add_project(project: Project):
     added = project.wm(
-        f"project add {project.name} --openshell --repo /sandbox/origin "
+        f"project add openshell {project.name} --repo /sandbox/origin "
         f"--image {LEARNING_IMAGE}"
     )
     assert "the sandbox is created on first use" in added.stdout
@@ -297,7 +297,7 @@ def test_an_openshell_projects_sandbox_runs_claude_code(project: Project):
     sandbox with no credentials attached."""
     env = project.env
     added = project.wm(
-        f"project add {project.name} --openshell --repo /sandbox/origin "
+        f"project add openshell {project.name} --repo /sandbox/origin "
         f"--image {LEARNING_IMAGE}"
     )
     assert "Agent claude: installed at /usr/local/bin/claude" in added.stdout, (
@@ -400,7 +400,7 @@ def test_a_private_ssh_github_repo_clones_over_https_with_the_providers_credenti
     ssh = f"git@github.com:{PRIVATE_REPO}.git"
     https = f"https://github.com/{PRIVATE_REPO}.git"
     added = project.wm(
-        f"project add {project.name} --openshell --repo {ssh} "
+        f"project add openshell {project.name} --repo {ssh} "
         f"--image {LEARNING_IMAGE} --provider {github_provider}"
     )
     assert (
@@ -440,7 +440,7 @@ def gh_login(project: Project):
     )
     (shims / "gh").chmod(0o755)
     project.tmp["PATH"] = f"{shims}:{os.environ['PATH']}"
-    provider_there = openshell(["provider", "get", "workmux-gh-host"]).returncode == 0
+    provider_there = openshell(["provider", "get", "gh-login"]).returncode == 0
     profile_there = (
         "workmux-github"
         in openshell(["provider", "profile", "list", "-o", "json"]).stdout
@@ -450,7 +450,7 @@ def gh_login(project: Project):
     finally:
         project.clean_up()
         if not provider_there:
-            openshell(["provider", "delete", "workmux-gh-host"])
+            openshell(["provider", "delete", "gh-login"])
         if not profile_there:
             openshell(["provider", "profile", "delete", "--global", "workmux-github"])
         shutil.rmtree(shims, ignore_errors=True)
@@ -459,17 +459,18 @@ def gh_login(project: Project):
 def test_a_projects_sandbox_gets_the_workstations_gh_login(
     project: Project, gh_login: None
 ):
-    """`--github host` needs only a `gh` login: workmux keeps its token in a
-    gateway provider of its own full-access profile, so the first-use clone
-    of a private repository succeeds and push is authorised."""
+    """`--provider gh-login` needs only a `gh` login: workmux keeps its token
+    in that gateway provider, of its own full-access profile, so the
+    first-use clone of a private repository succeeds and push is
+    authorised."""
     https = f"https://github.com/{PRIVATE_REPO}.git"
     added = project.wm(
-        f"project add {project.name} --openshell --github host --repo {https} "
+        f"project add openshell {project.name} --provider gh-login --repo {https} "
         f"--image {LEARNING_IMAGE}"
     )
-    assert "the sandbox gets your gh login's GitHub access" in added.stdout, (
+    assert "provider gh-login gives the sandbox your gh login's GitHub access" in (
         added.stdout
-    )
+    ), added.stdout
     project.wm(f"remote start {project.name}", timeout=900.0)
     project.wm(f"list --project {project.name}", timeout=300.0)
 

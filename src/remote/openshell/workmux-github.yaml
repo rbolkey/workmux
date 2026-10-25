@@ -1,4 +1,4 @@
-# The profile of the provider `--github host` attaches: the workstation's
+# The profile of `gh-login`, the provider workmux keeps from the workstation's
 # `gh` login, with what that login can do on GitHub. Unlike OpenShell's
 # stock `github` profile, it allows push (git-receive-pack) and read-write
 # REST and GraphQL, so agents can push branches and open pull requests.

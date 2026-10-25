@@ -7,6 +7,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use tracing::debug;
 
+use crate::remote::git_url::GitUrl;
 use crate::util::{PROJECT_PLACEHOLDER, expand_project_placeholder};
 use crate::{cmd, git, nerdfont};
 use which::{which, which_in};
@@ -1074,9 +1075,7 @@ pub struct RemoteConfig {
 pub struct OpenshellRemote {
     /// The project the sandbox belongs to.
     pub project: String,
-    pub git_url: Option<String>,
-    /// The SSH URL `git_url` was rewritten from.
-    pub ssh_git_url: Option<String>,
+    pub git_url: Option<GitUrl>,
     /// Path of the project's clone in the sandbox.
     pub path: String,
     pub settings: OpenshellProject,
@@ -1100,27 +1099,17 @@ pub struct OpenshellProject {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy: Option<String>,
 
-    /// OpenShell providers attached to the sandbox, for credentials.
+    /// OpenShell providers attached to the sandbox, for credentials;
+    /// `gh-login` is the one workmux keeps from the workstation's `gh`
+    /// login.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub providers: Vec<String>,
-
-    /// GitHub credentials workmux attaches itself, besides `providers`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub github: Option<GithubCredentials>,
 
     /// Agents the sandbox's image installs, by type such as `claude` or
     /// `codex`; the first is remote workmux's default agent (default: the
     /// default agent's type).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub agents: Vec<String>,
-}
-
-/// GitHub credentials workmux attaches to an OpenShell project's sandbox.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
-#[serde(rename_all = "kebab-case")]
-pub enum GithubCredentials {
-    /// The workstation's `gh` login, kept in a gateway provider.
-    Host,
 }
 
 /// OpenShell's limit on sandbox name length.
@@ -1173,13 +1162,10 @@ pub struct ProjectEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote: Option<String>,
 
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub git_url: Option<String>,
-
-    /// The SSH URL `project add` was given for an OpenShell project, whose
-    /// HTTPS form `git_url` is: the sandbox has no SSH.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ssh_git_url: Option<String>,
+    /// The URL the remote clones the project from: for an OpenShell
+    /// project given an SSH URL, its HTTPS form, with the original.
+    #[serde(flatten)]
+    pub git_url: Option<GitUrl>,
 
     /// Path of the project's clone on the remote.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3285,7 +3271,6 @@ impl Config {
                     openshell: Some(OpenshellRemote {
                         project: name.clone(),
                         git_url: entry.git_url.clone(),
-                        ssh_git_url: entry.ssh_git_url.clone(),
                         path: entry.path.clone().unwrap_or_else(|| format!("~/{name}")),
                         settings: settings.clone(),
                         agents: if settings.agents.is_empty() {
@@ -4355,7 +4340,12 @@ projects:
         assert_eq!(devbox.host_commands, vec!["just".to_string()]);
         let api = &merged.projects["api"];
         assert_eq!(api.remote.as_deref(), Some("devbox"));
-        assert_eq!(api.git_url.as_deref(), Some("git@github.com:me/api.git"));
+        assert_eq!(
+            api.git_url,
+            Some(crate::remote::git_url::GitUrl::new(
+                "git@github.com:me/api.git"
+            ))
+        );
         assert_eq!(api.path.as_deref(), Some("~/src/api"));
         assert_eq!(api.session.as_deref(), Some("api-work"));
     }
@@ -4383,8 +4373,10 @@ projects:
         let openshell = remote.openshell.as_ref().expect("openshell settings");
         assert_eq!(openshell.project, "api");
         assert_eq!(
-            openshell.git_url.as_deref(),
-            Some("https://github.com/me/api.git")
+            openshell.git_url,
+            Some(crate::remote::git_url::GitUrl::new(
+                "https://github.com/me/api.git"
+            ))
         );
         assert_eq!(
             openshell.settings.image.as_deref(),

@@ -71,36 +71,32 @@ pub struct Report {
     pub warnings: Vec<String>,
 }
 
-/// A provider on the gateway, as the agent check sees it.
+/// A provider on the gateway, as the agent and GitHub checks see it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Provider {
     /// Its type: the id of the profile it was created from.
     pub provider_type: String,
-    /// The binaries its profile lets reach the profile's endpoints, or
-    /// `None` when the profile could not be found.
-    pub binaries: Option<Vec<String>>,
-    /// The hosts of its profile's endpoints, or `None` when the profile
-    /// could not be found.
-    pub hosts: Option<Vec<String>>,
+    /// What its profile lets reach where, or `None` when the profile could
+    /// not be found.
+    pub profile: Option<ProfileReach>,
+}
+
+/// What a provider's profile allows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileReach {
+    /// The binaries it lets reach its endpoints.
+    pub binaries: Vec<String>,
+    /// The hosts of its endpoints.
+    pub hosts: Vec<String>,
 }
 
 impl Provider {
-    /// Whether the provider gives git credentials for github.com: its
-    /// profile reaches github.com, or, with no profile to go by, it is of
-    /// OpenShell's stock `github` type.
-    pub fn gives_github(&self) -> bool {
-        match &self.hosts {
-            Some(hosts) => hosts.iter().any(|host| host == "github.com"),
-            None => self.provider_type == "github",
-        }
-    }
-
     /// Whether the provider gives `agent` its credentials: its profile
     /// allows the agent's binary, or, with no profile to go by, it is of
     /// the agent's stock type.
     fn gives(&self, agent: &SandboxAgent) -> bool {
-        match &self.binaries {
-            Some(binaries) => binaries.iter().any(|binary| binary == agent.path),
+        match &self.profile {
+            Some(profile) => profile.binaries.iter().any(|binary| binary == agent.path),
             None => self.provider_type == agent.provider_type,
         }
     }
@@ -180,8 +176,10 @@ mod tests {
     fn provider(provider_type: &str, binaries: Option<&[&str]>) -> Provider {
         Provider {
             provider_type: provider_type.to_string(),
-            binaries: binaries.map(names),
-            hosts: None,
+            profile: binaries.map(|binaries| ProfileReach {
+                binaries: names(binaries),
+                hosts: Vec::new(),
+            }),
         }
     }
 
