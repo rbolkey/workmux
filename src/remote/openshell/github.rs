@@ -144,7 +144,7 @@ fn is_managed(provider: &Value) -> bool {
 
 impl OpenShell {
     /// Whether the project attaches `gh-login`.
-    fn attaches_gh_login(&self) -> bool {
+    pub(super) fn attaches_gh_login(&self) -> bool {
         self.attached_providers()
             .iter()
             .any(|name| name == GH_LOGIN)

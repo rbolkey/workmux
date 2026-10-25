@@ -435,7 +435,8 @@ def gh_login(project: Project):
     token). Writing a token to the yielded file stands in for a new login:
     `gh auth token` prints it instead. The provider and profile workmux
     creates on the gateway are deleted afterwards, after the project's
-    sandbox, unless they were there before."""
+    sandbox, unless they were there before; a `gh-login` that was there
+    gets the real login's token back."""
     if not PRIVATE_REPO:
         pytest.skip("set WORKMUX_TEST_OPENSHELL_PRIVATE_REPO=<owner>/<repo>")
     gh = shutil.which("gh")
@@ -445,7 +446,8 @@ def gh_login(project: Project):
     login = shims / "login"
     (shims / "gh").write_text(
         "#!/bin/sh\n"
-        f'[ "$1 $2" = "auth token" ] && [ -f {login} ] && exec cat {login}\n'
+        f'[ "$1 $2" = "auth token" ] && [ -f {shlex.quote(str(login))} ] '
+        f"&& exec cat {shlex.quote(str(login))}\n"
         f'HOME={shlex.quote(str(Path.home()))} exec {shlex.quote(gh)} "$@"\n'
     )
     (shims / "gh").chmod(0o755)
@@ -459,7 +461,23 @@ def gh_login(project: Project):
         yield login
     finally:
         project.clean_up()
-        if not provider_there:
+        if provider_there:
+            # A test may have left it a stand-in token.
+            token = subprocess.run(
+                [gh, "auth", "token"], capture_output=True, text=True
+            ).stdout.strip()
+            openshell(
+                [
+                    "provider",
+                    "update",
+                    "gh-login",
+                    "--credential",
+                    "GH_TOKEN",
+                    "--wait",
+                ],
+                env={"GH_TOKEN": token},
+            )
+        else:
             openshell(["provider", "delete", "gh-login"])
         if not profile_there:
             openshell(["provider", "profile", "delete", "--global", "workmux-github"])
@@ -549,11 +567,13 @@ def test_a_new_gh_login_reaches_a_running_sandbox(project: Project, gh_login: Pa
     assert gh_api(project, "user")[0].endswith(" 200 OK")
 
     gh_login.write_text("gho_wm_not_a_real_token\n")
-    project.wm(f"list --project {project.name}", timeout=300.0)
-    status, body = gh_api(project, "user")
-    assert " 401" in status, (status, body)
-
-    gh_login.unlink()
-    project.wm(f"list --project {project.name}", timeout=300.0)
+    try:
+        project.wm(f"list --project {project.name}", timeout=300.0)
+        status, body = gh_api(project, "user")
+        assert " 401" in status, (status, body)
+    finally:
+        # Never leave `gh-login` the stand-in token.
+        gh_login.unlink(missing_ok=True)
+        project.wm(f"list --project {project.name}", timeout=300.0)
     status, body = gh_api(project, "user")
     assert " 200" in status, (status, body)

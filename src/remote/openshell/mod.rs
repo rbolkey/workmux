@@ -367,13 +367,25 @@ impl OpenShell {
             git_credential_helper: self.needs_git_credential_helper(),
         };
         let tag = image::prepare(&recipe, &self.sandbox, &sandbox_path(&origin.path), context)?;
-        // The bake fetches the flake's inputs, private ones with the
-        // workstation's gh login when it has one.
-        let github_token = recipe
-            .devshell
-            .as_ref()
-            .and_then(|_| github::login_token(&self.gh).ok());
-        image::build(&self.docker, context, &tag, github_token.as_deref())?;
+        // The bake fetches the flake's inputs, private GitHub ones with the
+        // workstation's gh login, but only for a project that already gives
+        // its sandbox that login: the bake runs the project's own flake.
+        let gh_login = recipe.devshell.is_some() && self.attaches_gh_login();
+        let github_token = gh_login
+            .then(|| github::login_token(&self.gh).ok())
+            .flatten();
+        let built = image::build(&self.docker, context, &tag, github_token.as_deref());
+        if recipe.devshell.is_some() && !gh_login {
+            built.map_err(|error| {
+                anyhow!(
+                    "{error:#}; the devshell bake had no GitHub credentials, and private GitHub \
+                     flake inputs can only be fetched with `--provider {}`",
+                    github::GH_LOGIN
+                )
+            })?;
+        } else {
+            built?;
+        }
         Ok(tag)
     }
 
@@ -748,7 +760,8 @@ pub(super) mod tests {
             let docker = format!(
                 "#!/bin/sh\n\
                  printf '%s\\n' \"$*\" >> {dir}/docker-log\n\
-                 printf 'secret %s\\n' \"$WORKMUX_GITHUB_TOKEN\" >> {dir}/docker-log\n",
+                 printf 'secret %s\\n' \"$WORKMUX_GITHUB_TOKEN\" >> {dir}/docker-log\n\
+                 [ ! -f {dir}/docker-fail ]\n",
                 dir = dir.path().display()
             );
             for (name, body) in [
@@ -910,12 +923,23 @@ pub(super) mod tests {
         }
     }
 
+    /// `flake_origin` attaching `providers`.
+    fn flake_origin_with(repo: &std::path::Path, providers: &[&str]) -> OpenshellRemote {
+        let mut origin = flake_origin(repo);
+        origin.settings.providers = providers.iter().map(|p| p.to_string()).collect();
+        origin
+    }
+
     #[test]
-    fn the_devshell_bake_gets_the_gh_login_as_a_build_secret_never_on_argv() {
+    fn with_gh_login_attached_the_devshell_bake_gets_the_gh_login_as_a_build_secret_never_on_argv()
+    {
         let fake = FakeOpenShell::new();
         std::fs::write(fake.dir.path().join("gh-token"), "gho_secret\n").unwrap();
         let repo = tempfile::tempdir().unwrap();
-        let transport = fake.transport(Some(flake_origin(repo.path())));
+        let transport = fake.transport(Some(flake_origin_with(
+            repo.path(),
+            &["gh-login", "anthropic"],
+        )));
 
         transport.create().unwrap();
 
@@ -930,8 +954,10 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn without_a_gh_login_the_devshell_bake_goes_without_the_secret() {
+    fn without_gh_login_attached_the_devshell_bake_goes_without_the_secret() {
         let fake = FakeOpenShell::new();
+        // Logged in, but the project didn't give the sandbox the login.
+        std::fs::write(fake.dir.path().join("gh-token"), "gho_secret\n").unwrap();
         let repo = tempfile::tempdir().unwrap();
         let transport = fake.transport(Some(flake_origin(repo.path())));
 
@@ -941,6 +967,30 @@ pub(super) mod tests {
         let (build, secret) = docker.split_once('\n').unwrap();
         assert!(build.starts_with("build -t "), "{build}");
         assert_eq!(secret, "secret \n");
+    }
+
+    #[test]
+    fn a_failed_devshell_bake_without_gh_login_says_private_inputs_need_it() {
+        let fake = FakeOpenShell::new();
+        std::fs::write(fake.dir.path().join("docker-fail"), "").unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let origin = flake_origin(repo.path());
+        let without = fake.transport(Some(origin.clone()));
+        std::fs::write(fake.dir.path().join("gh-token"), "gho_secret\n").unwrap();
+        let mut origin = origin;
+        origin.settings.providers = vec!["gh-login".to_string()];
+        let with = fake.transport(Some(origin));
+
+        let without = format!("{:#}", without.create().unwrap_err());
+        let with = format!("{:#}", with.create().unwrap_err());
+
+        assert!(
+            without.contains(
+                "private GitHub flake inputs can only be fetched with `--provider gh-login`"
+            ),
+            "{without}"
+        );
+        assert!(!with.contains("--provider gh-login"), "{with}");
     }
 
     #[test]
@@ -1056,7 +1106,7 @@ pub(super) mod tests {
     }
 
     /// What the gateway prints when its supervisor image is gone from
-    /// Docker (ticket 45).
+    /// Docker, as seen after an image prune removed that untagged image.
     const NO_SUPERVISOR_IMAGE: &str = "ControlSupervisorStartFailed create Docker supervisor staging container: Docker responded with status code 404: No such image: sha256:4efdb659add55a99e1bb6e5773d7b35a51770106a3d819c000fd078edfc098b3";
 
     #[test]

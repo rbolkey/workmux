@@ -221,13 +221,13 @@ Nix cannot install or build inside an OpenShell sandbox. Instead, for a project 
 2. A `nixos/nix` build stage builds the devshell and copies its closure into the image's `/nix/store`.
 3. A wrapper at `/usr/local/bin/workmux-devshell` enters it. Agents start as `workmux-devshell bash -c '…'`.
 
-**Private flake inputs.** The bake fetches the flake's inputs, and private GitHub ones with your workstation's `gh` login, whichever providers the project attaches. workmux hands the build the token `gh auth token` prints as a Docker build secret, never on a command line and never in the image:
+**Private flake inputs.** The bake fetches private GitHub inputs only for a project that attaches `--provider gh-login`, because that project already gives its sandbox your `gh` login. workmux hands the build the token `gh auth token` prints as a Docker build secret, never on a command line and never in the image. Only the step that fetches the inputs gets it, before anything of the project's is built:
 
 - `github:` inputs get it as nix's `access-tokens` for github.com.
 - `git+https://github.com/…` inputs get it from a git credential helper.
 - `git+ssh://git@github.com/…` inputs go over HTTPS with it, because the build has no SSH.
 
-Without a `gh` login, a private input fails the bake with nix's `HTTP error 404` or `Cannot find Git revision`. Private inputs on other hosts, such as GitLab, aren't covered. Nothing fetches flake inputs inside the sandbox, because nix can't write its read-only `/nix`.
+The step that builds the devshell has no secret, so the flake's builders and `shellHook` can't read the token. Any other project's bake gets no token: a private input fails it with nix's `HTTP error 404` or `Cannot find Git revision`, and workmux says private GitHub flake inputs need `--provider gh-login`. Private inputs on other git servers aren't covered. Nothing fetches flake inputs inside the sandbox, because nix can't write its read-only `/nix`.
 
 The image is fixed when the sandbox is created. When the clone's `flake.lock` no longer matches the baked one, `remote status` warns, and `workmux remote recreate` rebuilds the image.
 
