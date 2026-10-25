@@ -37,7 +37,9 @@ macro_rules! fish_ssh_harness {
         match $crate::ssh_learning::harness::SshHarness::fish_from_env() {
             Some(harness) => harness,
             None => {
-                eprintln!("skipped: needs WORKMUX_TEST_SSH=1, the local sshd harness and fish on PATH");
+                eprintln!(
+                    "skipped: needs WORKMUX_TEST_SSH=1, the local sshd harness and fish on PATH"
+                );
                 return;
             }
         }
@@ -101,7 +103,9 @@ impl SshHarness {
             return None;
         }
         let fish = which::which("fish").ok()?;
-        Some(Self::with_target(Target::Local(LocalSshd::start(Some(&fish)))))
+        Some(Self::with_target(Target::Local(LocalSshd::start(Some(
+            &fish,
+        )))))
     }
 
     fn with_target(target: Target) -> Self {

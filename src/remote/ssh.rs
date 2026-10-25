@@ -378,7 +378,12 @@ pub(crate) mod tests {
         let output = transport(&harness).exec_captured(&command).unwrap();
 
         let expected: String = AWKWARD_ARGS.iter().map(|arg| format!("{arg}|")).collect();
-        assert_eq!(stdout(&output), expected, "{}", String::from_utf8_lossy(&output.stderr));
+        assert_eq!(
+            stdout(&output),
+            expected,
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         assert_eq!(output.status.code(), Some(3));
     }
 
@@ -430,7 +435,9 @@ pub(crate) mod tests {
         let ssh = transport(&harness).with_uploaded_workmux(true);
 
         ssh.upload_workmux(&script).unwrap();
-        let output = ssh.exec_captured(&argv(&["workmux", "a\\b", "it's"])).unwrap();
+        let output = ssh
+            .exec_captured(&argv(&["workmux", "a\\b", "it's"]))
+            .unwrap();
 
         assert_eq!(stdout(&output), "uploaded a\\b|uploaded it's|");
     }
