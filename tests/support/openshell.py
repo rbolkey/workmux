@@ -36,8 +36,10 @@ def openshell(
     *,
     input: Optional[str] = None,
     timeout: float = 120,
+    env: Optional[dict[str, str]] = None,
 ) -> subprocess.CompletedProcess[str]:
-    """Run an openshell CLI command and capture its output, never raising on failure."""
+    """Run an openshell CLI command and capture its output, never raising on
+    failure. `env` adds to its environment, for credentials kept off argv."""
     return subprocess.run(
         ["openshell", *args],
         input=input,
@@ -45,7 +47,7 @@ def openshell(
         capture_output=True,
         text=True,
         timeout=timeout,
-        env={**os.environ, "NO_COLOR": "1"},
+        env={**os.environ, "NO_COLOR": "1", **(env or {})},
     )
 
 
