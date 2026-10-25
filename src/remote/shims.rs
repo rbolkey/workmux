@@ -275,7 +275,7 @@ mod tests {
             refused.contains("Refused: host command ls is not allowed for remote devbox"),
             "{refused}"
         );
-        assert!(clipboard_write.contains("refused"), "{clipboard_write}");
+        assert!(clipboard_write.contains("Refused"), "{clipboard_write}");
     }
 
     fn installed(transport: &ServeTransport, expected: usize) -> BTreeSet<String> {

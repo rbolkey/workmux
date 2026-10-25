@@ -1017,7 +1017,7 @@ agents:
         );
         assert_eq!(
             remote_project(&config, "stray").unwrap_err().to_string(),
-            "project stray is on remote gone, which is not registered"
+            "Project stray is on remote gone, which is not registered"
         );
     }
 }

@@ -343,7 +343,7 @@ mod tests {
             .to_string();
         assert_eq!(
             error,
-            "provider gh-login gives the sandbox your gh login, but gh is not installed on the workstation; \
+            "Provider gh-login gives the sandbox your gh login, but gh is not installed on the workstation; \
              install it and run `gh auth login`"
         );
     }
@@ -622,7 +622,7 @@ mod tests {
         );
         let error = transport.create().unwrap_err();
         assert!(
-            error.to_string().starts_with("providers work, gh-login"),
+            error.to_string().starts_with("Providers work, gh-login"),
             "{error}"
         );
 
