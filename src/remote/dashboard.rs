@@ -178,7 +178,7 @@ pub fn serve(params: Value) -> Result<Value> {
         }
         DashboardRequest::KillPane { pane } => {
             if pane.project != project.name {
-                bail!("remote pane {pane} is not one of project {}", project.name);
+                bail!("Remote pane {pane} is not one of project {}", project.name);
             }
             SessionHolder::for_this_remote()?.kill(&pane)?;
             Value::Null
@@ -455,7 +455,7 @@ mod tests {
             )
             .unwrap_err();
 
-        assert_eq!(error.to_string(), "remote devbox is not connected");
+        assert_eq!(error.to_string(), "Remote devbox is not connected");
         assert_eq!(transport.exec_count(), 0);
     }
 

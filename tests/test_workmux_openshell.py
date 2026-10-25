@@ -316,7 +316,7 @@ def test_a_projects_lima_sandbox_is_ignored_inside_its_openshell_sandbox(
     output = added.stdout + added.stderr
     assert "limactl" not in output, output
     assert (
-        "ignoring the project's sandbox: setting inside OpenShell sandbox "
+        "the sandbox: setting is ignored inside OpenShell sandbox "
         f"{project.name}" in output
     ), output
     wait_until(

@@ -27,7 +27,7 @@ pub fn run(dry_run: bool) -> Result<()> {
 /// whose remote panes survive unshown: each reopens showing them.
 fn run_served(dry_run: bool) -> Result<()> {
     let surviving = crate::remote::forwarding::ForwardingMux::from_env()
-        .ok_or_else(|| anyhow!("workstation not connected"))?
+        .ok_or_else(|| anyhow!("Workstation not connected"))?
         .surviving_panes()?;
     let mut handles: Vec<String> = surviving.into_iter().map(|pane| pane.worktree).collect();
     handles.sort();

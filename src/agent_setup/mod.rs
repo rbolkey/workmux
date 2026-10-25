@@ -279,7 +279,7 @@ pub fn check_all_for_setup_with(agents: &[Agent]) -> Vec<AgentCheck> {
                 check_for_setup(agent).unwrap_or_else(|e| StatusCheck::Error(e.to_string()));
             checks.push(AgentCheck {
                 agent,
-                reason: "asked for",
+                reason: "named with --agent",
                 status,
             });
         }

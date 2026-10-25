@@ -63,7 +63,7 @@ impl Connection {
                     // Remote workmux ran but did not serve; 255 is the
                     // transport's own failure.
                     Some(code) if code != 0 && code != 255 => anyhow!(
-                        "workmux on {remote} exited before its hello: {failure}; if it is \
+                        "workmux on {remote} exited before the handshake: {failure}; if it is \
                          older than {ours}, install workmux {ours} there",
                         ours = env!("CARGO_PKG_VERSION")
                     ),
@@ -76,7 +76,7 @@ impl Connection {
             Err(_) => {
                 process.kill();
                 return Err(anyhow!(
-                    "no hello from {remote} within {}s",
+                    "{remote} did not answer the handshake within {}s",
                     hello_timeout.as_secs_f32()
                 ));
             }
@@ -249,6 +249,9 @@ mod tests {
             .unwrap()
             .to_string();
 
-        assert!(error.contains("no hello from devbox"), "{error}");
+        assert!(
+            error.contains("devbox did not answer the handshake"),
+            "{error}"
+        );
     }
 }

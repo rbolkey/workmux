@@ -53,7 +53,7 @@ impl FromStr for RemotePaneId {
     type Err = anyhow::Error;
 
     fn from_str(s: &str) -> Result<Self> {
-        let invalid = || anyhow!("invalid remote pane {s:?}: expected <project>/<worktree>/<slot>");
+        let invalid = || anyhow!("Invalid remote pane {s:?}: expected <project>/<worktree>/<slot>");
         let mut parts = s.split('/');
         let (Some(project), Some(worktree), Some(slot), None) =
             (parts.next(), parts.next(), parts.next(), parts.next())
@@ -113,7 +113,7 @@ impl FromStr for PaneState {
         match s.trim() {
             "running" => Ok(PaneState::Running),
             "ended" => Ok(PaneState::Ended),
-            other => Err(anyhow!("unexpected remote pane state {other:?}")),
+            other => Err(anyhow!("Unexpected remote pane state {other:?}")),
         }
     }
 }
@@ -185,14 +185,14 @@ impl SessionHolder {
         env: &[(&str, &str)],
     ) -> Result<RemotePaneId> {
         if argv.is_empty() {
-            bail!("no command for the remote pane");
+            bail!("No command for the remote pane");
         }
         let id = self.allocate(project, &worktree_name(workdir))?;
         let socket = self.socket(&id);
         if socket.as_os_str().len() > MAX_SOCKET_PATH {
             let _ = std::fs::remove_file(self.pid_file(&id));
             bail!(
-                "remote pane socket path {} is too long for a Unix socket",
+                "Remote pane socket path {} is too long for a Unix socket",
                 socket.display()
             );
         }
@@ -222,7 +222,7 @@ impl SessionHolder {
             let path = std::env::join_paths(
                 std::iter::once(shims.clone()).chain(std::env::split_paths(&path)),
             )
-            .context("the shims directory cannot go on PATH")?;
+            .context("The shims directory cannot go on PATH")?;
             command
                 .env(super::shell::SOCKET_ENV, socket)
                 .env("PATH", path);
@@ -230,11 +230,11 @@ impl SessionHolder {
         let status = command.status();
         let failure = match status {
             Ok(status) if status.success() => return Ok(id),
-            Ok(status) => anyhow!("the session holder (dtach) exited with {status}"),
+            Ok(status) => anyhow!("The session holder (dtach) exited with {status}"),
             Err(error) if error.kind() == ErrorKind::NotFound => {
-                anyhow!("the session holder dtach is not installed on this remote")
+                anyhow!("The session holder dtach is not installed on this remote")
             }
-            Err(error) => anyhow::Error::from(error).context("failed to run dtach"),
+            Err(error) => anyhow::Error::from(error).context("Failed to run dtach"),
         };
         let _ = std::fs::remove_file(self.pid_file(&id));
         Err(failure)
@@ -247,7 +247,7 @@ impl SessionHolder {
             .recursive(true)
             .mode(0o700)
             .create(&dir)
-            .with_context(|| format!("failed to create {}", dir.display()))?;
+            .with_context(|| format!("Failed to create {}", dir.display()))?;
         for slot in 0.. {
             let id = RemotePaneId {
                 project: project.to_string(),
@@ -270,7 +270,7 @@ impl SessionHolder {
                 Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
                 Err(error) => {
                     return Err(anyhow::Error::from(error)
-                        .context(format!("failed to reserve a slot in {}", dir.display())));
+                        .context(format!("Failed to reserve a slot in {}", dir.display())));
                 }
             }
         }
@@ -294,7 +294,7 @@ impl SessionHolder {
                 Ok(PaneState::Ended)
             }
             Err(error) => {
-                Err(anyhow::Error::from(error).context(format!("failed to check remote pane {id}")))
+                Err(anyhow::Error::from(error).context(format!("Failed to check remote pane {id}")))
             }
         }
     }
@@ -306,7 +306,7 @@ impl SessionHolder {
         for worktree in subdirectories(&self.dir.join(project))? {
             let dir = self.worktree_dir(project, &worktree);
             for entry in std::fs::read_dir(&dir)
-                .with_context(|| format!("failed to read {}", dir.display()))?
+                .with_context(|| format!("Failed to read {}", dir.display()))?
             {
                 let name = entry?.file_name();
                 let Some(slot) = name
@@ -391,7 +391,7 @@ impl SessionHolder {
         };
         if !self.holds(id, pid) {
             bail!(
-                "the pid file of remote pane {id} names process {pid}, which the pane does not run; not signalling it"
+                "The pid file of remote pane {id} names process {pid}, which the pane does not run; not signalling it"
             );
         }
         unsafe { libc::kill(pid, libc::SIGHUP) };
@@ -490,7 +490,7 @@ fn subdirectories(dir: &Path) -> Result<Vec<String>> {
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => {
             return Err(
-                anyhow::Error::from(error).context(format!("failed to read {}", dir.display()))
+                anyhow::Error::from(error).context(format!("Failed to read {}", dir.display()))
             );
         }
     };
@@ -813,7 +813,7 @@ pub mod tests {
 
         let error = holder.create("api", Path::new("/"), &[]).unwrap_err();
 
-        assert_eq!(error.to_string(), "no command for the remote pane");
+        assert_eq!(error.to_string(), "No command for the remote pane");
     }
 
     #[test]

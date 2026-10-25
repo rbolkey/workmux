@@ -79,17 +79,17 @@ pub struct OpenshellAddArgs {
 #[derive(Debug, Args)]
 #[command(next_help_heading = "OpenShell options")]
 pub struct OpenshellOptions {
-    /// Image the sandbox runs; it must contain git
+    /// Image the sandbox is built from; it must contain git and dtach
     #[arg(long)]
     pub image: Option<String>,
     /// Policy file merged on top of workmux's base policy
     #[arg(long, value_name = "FILE")]
     pub policy: Option<std::path::PathBuf>,
     /// OpenShell provider to attach to the sandbox, for credentials (repeatable).
-    /// `gh-login` is special: workmux creates it from your workstation's `gh` login
-    /// and keeps it current, and it gives the sandbox everything that login can do on
-    /// GitHub, every repo it reaches, push and pull requests included. At most one
-    /// attached provider may give GitHub credentials
+    /// At most one attached provider may give GitHub credentials. `gh-login` is
+    /// special: workmux creates it from your workstation's `gh` login and keeps it
+    /// current. It gives the sandbox everything that login can do on GitHub: every
+    /// repo it reaches, push and pull requests included
     #[arg(long = "provider", value_name = "PROVIDER")]
     pub providers: Vec<String>,
     /// Agent the sandbox's image installs, such as claude or codex; the first is its
@@ -167,9 +167,9 @@ fn project_entry(command: AddCommand) -> Result<(String, ProjectEntry)> {
 /// A policy file's absolute path, so the project resolves it from anywhere.
 fn absolute_policy(policy: std::path::PathBuf) -> Result<String> {
     let absolute = std::path::absolute(&policy)
-        .with_context(|| format!("failed to resolve {}", policy.display()))?;
+        .with_context(|| format!("Failed to resolve {}", policy.display()))?;
     if !absolute.is_file() {
-        bail!("policy file {} does not exist", absolute.display());
+        bail!("Policy file {} does not exist", absolute.display());
     }
     Ok(absolute.display().to_string())
 }
@@ -247,12 +247,12 @@ fn add_project_to(content: &str, name: &str, project: &ProjectEntry) -> Result<S
         && !config.remotes.contains_key(remote)
     {
         bail!(
-            "no remote named {remote}; add it with: workmux remote add {remote} --transport ssh --target <host>"
+            "No remote named {remote}; add it with: workmux remote add {remote} --transport ssh --target <host>"
         );
     }
     if project.openshell.is_some() && config.remotes.contains_key(name) {
         bail!(
-            "remote {name} already exists; an OpenShell project's sandbox is its remote, named after it"
+            "Remote {name} already exists; an OpenShell project's sandbox is its remote, named after it"
         );
     }
     global_config::add_entry(content, &PROJECTS, name, project)
@@ -296,7 +296,7 @@ fn remove_project_from(content: &str, name: &str) -> Result<String> {
         .is_some_and(|project| project.openshell.is_some())
     {
         bail!(
-            "project {name} is an OpenShell project, whose sandbox is its remote; remove both with: workmux remote rm {name}"
+            "Project {name} is an OpenShell project, whose sandbox is its remote; remove both with: workmux remote rm {name}"
         );
     }
     global_config::remove_entry(content, &PROJECTS, name)
@@ -379,7 +379,7 @@ remotes:
 
         assert_eq!(
             error.to_string(),
-            "remote api already exists; an OpenShell project's sandbox is its remote, named after it"
+            "Remote api already exists; an OpenShell project's sandbox is its remote, named after it"
         );
     }
 
@@ -403,7 +403,7 @@ remotes:
     fn removing_an_unknown_project_is_an_error() {
         let error = remove_project_from(WITH_REMOTE, "api").unwrap_err();
 
-        assert_eq!(error.to_string(), "no project named api");
+        assert_eq!(error.to_string(), "No project named api");
     }
 
     #[test]
@@ -414,7 +414,7 @@ remotes:
 
         assert_eq!(
             error.to_string(),
-            "project api is an OpenShell project, whose sandbox is its remote; remove both with: workmux remote rm api"
+            "Project api is an OpenShell project, whose sandbox is its remote; remove both with: workmux remote rm api"
         );
     }
 
@@ -575,7 +575,7 @@ remotes:
         let error = add_project_to("", "api", &api()).unwrap_err();
 
         assert!(
-            error.to_string().starts_with("no remote named devbox"),
+            error.to_string().starts_with("No remote named devbox"),
             "{error}"
         );
     }

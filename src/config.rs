@@ -4299,7 +4299,7 @@ fn ignore_sandbox_in_openshell(
     if config.sandbox.is_enabled() {
         let _ = writeln!(
             note,
-            "workmux: ignoring the project's sandbox: setting inside OpenShell sandbox {sandbox}"
+            "Note: the sandbox: setting is ignored inside OpenShell sandbox {sandbox}, which is already the project's sandbox"
         );
     }
     config.sandbox.enabled = Some(false);

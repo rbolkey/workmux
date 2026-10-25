@@ -121,7 +121,7 @@ fn remote_dashboard(params: &Value) -> Result<Value> {
     )?;
     if project.site.remote != params.remote {
         bail!(
-            "project {} is not on remote {}",
+            "Project {} is not on remote {}",
             params.project,
             params.remote
         );
@@ -157,7 +157,7 @@ pub(crate) fn read_line(reader: &mut impl BufRead) -> Result<Option<Vec<u8>>> {
     }
     if line.len() > MAX_LINE_BYTES {
         return Err(anyhow!(
-            "workstation daemon line exceeds {MAX_LINE_BYTES} bytes"
+            "Workstation daemon line exceeds {MAX_LINE_BYTES} bytes"
         ));
     }
     if line.last() == Some(&b'\n') {
@@ -229,15 +229,19 @@ fn pane_hold(request: &Request) -> Result<crate::remote::channels::PaneHold> {
     let remotes = crate::remote::registry::remotes()?;
     let config = remotes
         .get(name)
-        .ok_or_else(|| anyhow!("no remote named {name}"))?;
+        .ok_or_else(|| anyhow!("No remote named {name}"))?;
     crate::remote::channels().hold_for_pane(crate::remote::Remote::new(name, config))
 }
 
 /// Keep `remote`'s control channel open for an attached pane until the
 /// returned connection is dropped.
 pub fn hold_for_pane(socket: &Path, remote: &str) -> Result<UnixStream> {
-    let stream = UnixStream::connect(socket)
-        .with_context(|| format!("connect to workstation daemon at {}", socket.display()))?;
+    let stream = UnixStream::connect(socket).with_context(|| {
+        format!(
+            "Failed to connect to the workstation daemon at {}",
+            socket.display()
+        )
+    })?;
     stream.set_read_timeout(Some(Duration::from_secs(120)))?;
     stream.set_write_timeout(Some(CALL_TIMEOUT))?;
     let mut writer = stream.try_clone()?;
@@ -250,11 +254,11 @@ pub fn hold_for_pane(socket: &Path, remote: &str) -> Result<UnixStream> {
         },
     )?;
     let line = read_line(&mut BufReader::new(&stream))?
-        .ok_or_else(|| anyhow!("workstation daemon closed the connection without answering"))?;
+        .ok_or_else(|| anyhow!("Workstation daemon closed the connection without answering"))?;
     let response: Response =
-        serde_json::from_slice(&line).context("workstation daemon sent an unreadable response")?;
+        serde_json::from_slice(&line).context("Workstation daemon sent an unreadable response")?;
     if let Some(error) = response.error {
-        bail!("workstation daemon: {}", error.message);
+        bail!("Workstation daemon: {}", error.message);
     }
     Ok(stream)
 }
@@ -370,7 +374,7 @@ fn command_session(
         )?;
         if project.site.remote != params.remote || params.request.project.remote != params.remote {
             bail!(
-                "project {} is not on remote {}",
+                "Project {} is not on remote {}",
                 params.request.project.name,
                 params.remote
             );
@@ -428,8 +432,12 @@ pub fn call_streaming(
     timeout: Option<Duration>,
     on_notification: &mut dyn FnMut(&str, Value) -> Option<Value>,
 ) -> Result<Value> {
-    let stream = UnixStream::connect(socket)
-        .with_context(|| format!("connect to workstation daemon at {}", socket.display()))?;
+    let stream = UnixStream::connect(socket).with_context(|| {
+        format!(
+            "Failed to connect to the workstation daemon at {}",
+            socket.display()
+        )
+    })?;
     stream.set_read_timeout(timeout)?;
     stream.set_write_timeout(Some(CALL_TIMEOUT))?;
     let mut writer = stream.try_clone()?;
@@ -446,7 +454,7 @@ pub fn call_streaming(
     )?;
     let response = loop {
         let line = read_line(&mut reader)?
-            .ok_or_else(|| anyhow!("workstation daemon closed the connection without answering"))?;
+            .ok_or_else(|| anyhow!("Workstation daemon closed the connection without answering"))?;
         if let Ok(notification) = serde_json::from_slice::<Notification>(&line) {
             if let Some(answer) = on_notification(&notification.method, notification.params) {
                 write_message(
@@ -460,16 +468,16 @@ pub fn call_streaming(
             continue;
         }
         break serde_json::from_slice::<Response>(&line)
-            .context("workstation daemon sent an unreadable response")?;
+            .context("Workstation daemon sent an unreadable response")?;
     };
     if response.id != Some(id) {
         return Err(anyhow!(
-            "workstation daemon answered request {:?}, expected {id}",
+            "Workstation daemon answered request {:?}, expected {id}",
             response.id
         ));
     }
     match (response.result, response.error) {
-        (_, Some(error)) => Err(anyhow!("workstation daemon: {}", error.message)),
+        (_, Some(error)) => Err(anyhow!("Workstation daemon: {}", error.message)),
         (Some(result), None) => Ok(result),
         (None, None) => Ok(Value::Null),
     }
@@ -500,11 +508,11 @@ pub(crate) fn classify(stream: &UnixStream) -> Result<Connection> {
     // Byte at a time so nothing past the first line is consumed.
     loop {
         match (&*stream).read(&mut byte) {
-            Ok(0) => return Err(anyhow!("client closed before sending a request")),
+            Ok(0) => return Err(anyhow!("Client closed before sending a request")),
             Ok(_) if byte[0] == b'\n' => break,
             Ok(_) if line.len() >= MAX_LINE_BYTES => {
                 return Err(anyhow!(
-                    "workstation daemon line exceeds {MAX_LINE_BYTES} bytes"
+                    "Workstation daemon line exceeds {MAX_LINE_BYTES} bytes"
                 ));
             }
             Ok(_) => line.push(byte[0]),
@@ -601,7 +609,7 @@ fn ensure_current_at(
         while UnixStream::connect(socket).is_ok() {
             if started.elapsed() >= timeout {
                 return Err(anyhow!(
-                    "workstation daemon from another release did not stop"
+                    "Workstation daemon from another release did not stop"
                 ));
             }
             std::thread::sleep(Duration::from_millis(50));
@@ -623,7 +631,7 @@ fn stop_daemon(pid: Option<u32>) -> Result<()> {
                 .flatten()
                 .and_then(|pid| pid.trim().parse().ok())
                 .ok_or_else(|| {
-                    anyhow!("a workstation daemon from another release is running and its pid is unknown")
+                    anyhow!("A workstation daemon from another release is running and its pid is unknown")
                 })?
         }
     };
@@ -660,7 +668,7 @@ fn ensure_running_at(
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    Err(anyhow!("workstation daemon failed to start"))
+    Err(anyhow!("Workstation daemon failed to start"))
 }
 
 /// Spawn the workstation daemon as a detached background process.
@@ -691,7 +699,7 @@ pub fn run_ping() -> Result<()> {
 /// Ask the workstation daemon at `socket` for its version and protocol.
 pub fn ping(socket: &Path) -> Result<Ping> {
     let result = call(socket, "ping", Value::Null)?;
-    serde_json::from_value(result).context("workstation daemon sent an unreadable ping")
+    serde_json::from_value(result).context("Workstation daemon sent an unreadable ping")
 }
 
 #[cfg(test)]
@@ -847,7 +855,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("workstation daemon failed to start")
+                .contains("Workstation daemon failed to start")
         );
     }
 

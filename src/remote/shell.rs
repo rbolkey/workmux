@@ -206,11 +206,11 @@ fn allowed_argv(argv: &[String]) -> Result<Vec<String>> {
     let command = argv.first().map(String::as_str).unwrap_or_default();
     let shape = relayed_shape(command).filter(|_| RELAYED_COMMANDS.contains(&command));
     let Some(shape) = shape else {
-        bail!("refused: workmux {command} does not run on the workstation for a remote");
+        bail!("Refused: workmux {command} does not run on the workstation for a remote");
     };
     let refuse = |arg: &str| -> anyhow::Error {
         anyhow::anyhow!(
-            "refused: workmux {command} {arg} does not run on the workstation for a remote"
+            "Refused: workmux {command} {arg} does not run on the workstation for a remote"
         )
     };
     let mut options = Vec::new();
@@ -262,7 +262,7 @@ fn allowed_argv(argv: &[String]) -> Result<Vec<String>> {
     }
     if !shape.positionals.contains(&positionals.len()) {
         bail!(
-            "refused: workmux {command} with these arguments does not run on the workstation for a remote"
+            "Refused: workmux {command} with these arguments does not run on the workstation for a remote"
         );
     }
     Ok(std::iter::once(command.to_string())
@@ -305,7 +305,7 @@ pub fn answer_relay(
     };
     let mut child = child
         .spawn()
-        .with_context(|| format!("failed to run {}", workmux.display()))?;
+        .with_context(|| format!("Failed to run {}", workmux.display()))?;
     if let Some(stdin) = stdin {
         let mut pipe = child.stdin.take().expect("piped stdin");
         std::thread::spawn(move || {
@@ -488,7 +488,7 @@ mod tests {
             let error = relay(&transport.shell_socket(), &argv(args), None)
                 .unwrap_err()
                 .to_string();
-            assert!(error.contains("refused"), "{args:?}: {error}");
+            assert!(error.contains("Refused"), "{args:?}: {error}");
         }
     }
 
@@ -535,7 +535,7 @@ mod tests {
             let error = relay(&transport.shell_socket(), &argv(refused), None)
                 .unwrap_err()
                 .to_string();
-            assert!(error.contains("refused"), "{refused:?}: {error}");
+            assert!(error.contains("Refused"), "{refused:?}: {error}");
         }
     }
 
@@ -553,7 +553,7 @@ mod tests {
         .to_string();
 
         assert!(
-            error.contains("refused: workmux remove does not run on the workstation for a remote"),
+            error.contains("Refused: workmux remove does not run on the workstation for a remote"),
             "{error}"
         );
     }

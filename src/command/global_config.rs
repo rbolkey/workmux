@@ -34,12 +34,12 @@ pub const PROJECTS: Section<ProjectEntry> = Section {
 /// The global config file's path and text (empty when it doesn't exist).
 pub fn read() -> Result<(PathBuf, String)> {
     let path = crate::config::global_config_path()
-        .ok_or_else(|| anyhow!("could not determine your home directory"))?;
+        .ok_or_else(|| anyhow!("Could not determine your home directory"))?;
     let content = match std::fs::read_to_string(&path) {
         Ok(content) => content,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(error) => {
-            return Err(error).with_context(|| format!("failed to read {}", path.display()));
+            return Err(error).with_context(|| format!("Failed to read {}", path.display()));
         }
     };
     Ok((path, content))
@@ -48,16 +48,16 @@ pub fn read() -> Result<(PathBuf, String)> {
 pub fn write(path: &PathBuf, content: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
+            .with_context(|| format!("Failed to create {}", parent.display()))?;
     }
-    std::fs::write(path, content).with_context(|| format!("failed to write {}", path.display()))
+    std::fs::write(path, content).with_context(|| format!("Failed to write {}", path.display()))
 }
 
 pub fn parse(content: &str) -> Result<Config> {
     if content.trim().is_empty() {
         return Ok(Config::default());
     }
-    serde_yaml::from_str(content).context("global config does not parse")
+    serde_yaml::from_str(content).context("Failed to parse your global config")
 }
 
 fn indent_of(line: &str) -> usize {
@@ -77,7 +77,7 @@ fn find_section(lines: &[&str], key: &str) -> Result<Option<(usize, usize, Optio
     };
     let rest = lines[header][header_text.len()..].trim();
     if !(rest.is_empty() || rest.starts_with('#')) {
-        bail!("the {key} section of your global config is not a block mapping; edit it by hand");
+        bail!("The {key} section of your global config is not a block mapping; edit it by hand");
     }
     let end = lines[header + 1..]
         .iter()
@@ -137,7 +137,7 @@ pub fn add_entry<T: Serialize + PartialEq>(
     });
     if !added {
         bail!(
-            "could not add {} {name} to your global config automatically; add it by hand",
+            "Could not add {} {name} to your global config automatically; add it by hand",
             section.noun
         );
     }
@@ -160,11 +160,11 @@ pub fn remove_entry<T>(content: &str, section: &Section<T>, name: &str) -> Resul
     let noun = section.noun;
     let before = parse(content)?;
     if !(section.entries)(&before).contains_key(name) {
-        bail!("no {noun} named {name}");
+        bail!("No {noun} named {name}");
     }
     let lines: Vec<&str> = content.lines().collect();
     let (header, end, indent) = find_section(&lines, section.key)?
-        .ok_or_else(|| anyhow!("no {} section in your global config", section.key))?;
+        .ok_or_else(|| anyhow!("No {} section in your global config", section.key))?;
     let indent = indent.unwrap_or(2);
     let is_entry_line = |line: &str| {
         indent_of(line) == indent && {
@@ -184,7 +184,7 @@ pub fn remove_entry<T>(content: &str, section: &Section<T>, name: &str) -> Resul
     let start = (header + 1..end)
         .find(|&i| is_entry_line(lines[i]))
         .ok_or_else(|| {
-            anyhow!("could not find {noun} {name} in your global config; remove it by hand")
+            anyhow!("Could not find {noun} {name} in your global config; remove it by hand")
         })?;
     let stop = (start + 1..end)
         .find(|&i| !is_blank(lines[i]) && indent_of(lines[i]) <= indent)
@@ -210,7 +210,7 @@ pub fn remove_entry<T>(content: &str, section: &Section<T>, name: &str) -> Resul
     });
     if !removed {
         bail!(
-            "could not remove {noun} {name} from your global config automatically; remove it by hand"
+            "Could not remove {noun} {name} from your global config automatically; remove it by hand"
         );
     }
     Ok(updated)

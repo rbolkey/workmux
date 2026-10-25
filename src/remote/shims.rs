@@ -90,7 +90,7 @@ pub fn serve_install(params: Value) -> Result<Value> {
     let dir = super::shell::shims_dir()?;
     if dir.exists() {
         std::fs::remove_dir_all(&dir)
-            .with_context(|| format!("failed to clear {}", dir.display()))?;
+            .with_context(|| format!("Failed to clear {}", dir.display()))?;
     }
     create_shim_directory(&state, &commands)?;
     Ok(Value::Null)
@@ -135,10 +135,10 @@ pub fn answer_clipboard(
 ) -> Result<Value> {
     let ClipboardRead { mime } = serde_json::from_value(params)?;
     if !remote.builtin_shims() {
-        bail!("refused: the built-in shims are off for remote {name}");
+        bail!("Refused: the built-in shims are off for remote {name}");
     }
     if mime != "image/png" {
-        bail!("unsupported clipboard MIME type: {mime}");
+        bail!("Unsupported clipboard MIME type: {mime}");
     }
     let png = read()?.map(|png| base64::engine::general_purpose::STANDARD.encode(png));
     Ok(serde_json::to_value(Clipboard { png })?)
@@ -150,7 +150,7 @@ pub fn answer_clipboard(
 pub fn answer_exec(name: &str, remote: &RemoteConfig, params: Value) -> Result<Value> {
     let HostExec { command, args } = serde_json::from_value(params)?;
     if is_clipboard_shim(&command) || !allowed(remote).contains(&command) {
-        bail!("refused: host command {command} is not allowed for remote {name}");
+        bail!("Refused: host command {command} is not allowed for remote {name}");
     }
     tracing::info!(
         remote = name,
@@ -160,7 +160,7 @@ pub fn answer_exec(name: &str, remote: &RemoteConfig, params: Value) -> Result<V
     );
     let workdir = std::env::temp_dir().join("workmux-host-exec").join(name);
     std::fs::create_dir_all(&workdir)
-        .with_context(|| format!("failed to create {}", workdir.display()))?;
+        .with_context(|| format!("Failed to create {}", workdir.display()))?;
     let child = crate::sandbox::host_exec_sandbox::spawn_sandboxed(
         &command,
         &args,
@@ -245,11 +245,11 @@ mod tests {
         .to_string();
 
         assert!(
-            clipboard.contains("refused: the built-in shims are off for remote devbox"),
+            clipboard.contains("Refused: the built-in shims are off for remote devbox"),
             "{clipboard}"
         );
         assert!(
-            sound.contains("refused: host command afplay is not allowed for remote devbox"),
+            sound.contains("Refused: host command afplay is not allowed for remote devbox"),
             "{sound}"
         );
     }
@@ -272,10 +272,10 @@ mod tests {
             (0, b"hello\n".to_vec())
         );
         assert!(
-            refused.contains("refused: host command ls is not allowed for remote devbox"),
+            refused.contains("Refused: host command ls is not allowed for remote devbox"),
             "{refused}"
         );
-        assert!(clipboard_write.contains("refused"), "{clipboard_write}");
+        assert!(clipboard_write.contains("Refused"), "{clipboard_write}");
     }
 
     fn installed(transport: &ServeTransport, expected: usize) -> BTreeSet<String> {

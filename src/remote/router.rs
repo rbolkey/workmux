@@ -56,13 +56,13 @@ pub fn remote_project(config: &Config, name: &str) -> Result<RemoteProject> {
     let entry = config
         .projects
         .get(name)
-        .ok_or_else(|| anyhow!("no project named {name} in your global config"))?;
+        .ok_or_else(|| anyhow!("No project named {name} in your global config"))?;
     let remote_name = entry
         .remote
         .as_deref()
-        .ok_or_else(|| anyhow!("project {name} is not on a remote"))?;
+        .ok_or_else(|| anyhow!("Project {name} is not on a remote"))?;
     let remote = config.remotes.get(remote_name).ok_or_else(|| {
-        anyhow!("project {name} is on remote {remote_name}, which is not registered")
+        anyhow!("Project {name} is on remote {remote_name}, which is not registered")
     })?;
     Ok(RemoteProject {
         site: ProjectSite {
@@ -349,10 +349,10 @@ fn session_once(
         },
     )?;
     if let Some(error) = undelivered {
-        return Err(error.context("workstation daemon sent unreadable command output"));
+        return Err(error.context("Workstation daemon sent unreadable command output"));
     }
     let exit: super::session::Exit =
-        serde_json::from_value(result).context("workstation daemon sent no exit code")?;
+        serde_json::from_value(result).context("Workstation daemon sent no exit code")?;
     Ok(exit.exit_code)
 }
 
@@ -1013,11 +1013,11 @@ agents:
 
         assert_eq!(
             remote_project(&config, "nope").unwrap_err().to_string(),
-            "no project named nope in your global config"
+            "No project named nope in your global config"
         );
         assert_eq!(
             remote_project(&config, "stray").unwrap_err().to_string(),
-            "project stray is on remote gone, which is not registered"
+            "Project stray is on remote gone, which is not registered"
         );
     }
 }

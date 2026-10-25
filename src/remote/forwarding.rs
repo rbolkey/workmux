@@ -206,7 +206,7 @@ enum Reply {
 /// removed when the returned guard drops.
 pub fn listen(peer: Peer) -> Result<SocketGuard> {
     let dir = std::env::temp_dir().join(format!("workmux-{}", unsafe { libc::getuid() }));
-    std::fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    std::fs::create_dir_all(&dir).with_context(|| format!("Failed to create {}", dir.display()))?;
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
     let path = dir.join(format!("serve-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&path);
@@ -226,7 +226,7 @@ pub fn listen_at(peer: Peer, path: PathBuf) -> Result<SocketGuard> {
 pub fn bind(path: PathBuf) -> Result<(UnixListener, SocketGuard)> {
     use std::os::unix::fs::MetadataExt;
     let listener = UnixListener::bind(&path)
-        .with_context(|| format!("failed to listen on {}", path.display()))?;
+        .with_context(|| format!("Failed to listen on {}", path.display()))?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
     let inode = std::fs::metadata(&path)?.ino();
     Ok((listener, SocketGuard { path, inode }))
@@ -283,7 +283,7 @@ fn relay(stream: UnixStream, peer: &Peer) {
             .map_err(anyhow::Error::from)
             .and_then(|SocketRequest { method, params }| {
                 let Some(timeout) = method_timeout(&method) else {
-                    bail!("unknown method: {method}");
+                    bail!("Unknown method: {method}");
                 };
                 let value = peer.request(&method, params, timeout)?;
                 if method == shell::OPEN_METHOD
@@ -322,7 +322,7 @@ struct Connection {
 impl Connection {
     fn open(socket: &Path) -> Result<Self> {
         let stream = UnixStream::connect(socket)
-            .context("workstation not connected: remote workmux's control channel is gone")?;
+            .context("Workstation not connected: remote workmux's control channel is gone")?;
         Ok(Self {
             reader: BufReader::new(stream.try_clone()?),
             writer: stream,
@@ -344,7 +344,7 @@ impl Connection {
             .write_all(line.as_bytes())
             .and_then(|()| self.reader.read_line(&mut reply));
         if !matches!(sent, Ok(read) if read > 0) {
-            bail!("workstation not connected: the control channel closed");
+            bail!("Workstation not connected: the control channel closed");
         }
         Ok(serde_json::from_str(&reply)?)
     }
@@ -354,7 +354,7 @@ impl Reply {
     fn into_result(self) -> Result<Value> {
         match self {
             Reply::Result(value) => Ok(value),
-            Reply::Error(error) => Err(anyhow!("workstation: {error}")),
+            Reply::Error(error) => Err(anyhow!("Workstation: {error}")),
         }
     }
 }
@@ -695,7 +695,7 @@ impl ForwardingMux {
     /// A shell command, for a deferred script, that forwards `request`.
     fn forward_cmd(&self, request: MuxRequest) -> Result<String> {
         self.in_shell("a shell command for the workstation's tmux")?;
-        let workmux = std::env::current_exe().context("failed to locate the workmux binary")?;
+        let workmux = std::env::current_exe().context("Failed to locate the workmux binary")?;
         let quote = |value: &str| format!("'{}'", value.replace('\'', r#"'\''"#));
         Ok(format!(
             "{} remote forward {}",
@@ -706,7 +706,7 @@ impl ForwardingMux {
 }
 
 fn unsupported(what: &str) -> anyhow::Error {
-    anyhow!("{what} is unsupported on remote")
+    anyhow!("{what} is not supported on a remote")
 }
 
 impl Multiplexer for ForwardingMux {
@@ -872,7 +872,7 @@ impl Multiplexer for ForwardingMux {
             // Outlives the remote pane it was started from.
             .process_group(0)
             .spawn()
-            .context("failed to start a deferred script")?;
+            .context("Failed to start a deferred script")?;
         Ok(())
     }
 
@@ -1464,7 +1464,7 @@ mod tests {
         // Like any forwarded request, it cannot reach the user's own panes.
         let mine = server.new_session("mine", temp.path());
         let error = mux.select_pane(&mine).unwrap_err().to_string();
-        assert!(error.contains("refused"), "{error}");
+        assert!(error.contains("Refused"), "{error}");
         mux.kill_window("wm-other").unwrap();
     }
 
@@ -1493,7 +1493,7 @@ mod tests {
         let error = mux.is_running().unwrap_err().to_string();
 
         assert!(
-            error.contains("refused: project web is not on remote devbox"),
+            error.contains("Refused: project web is not on remote devbox"),
             "{error}"
         );
     }
@@ -1534,7 +1534,7 @@ mod tests {
                 Ok(_) => panic!("the shell socket outlived its channel"),
             }
         };
-        assert!(error.starts_with("workstation not connected"), "{error}");
+        assert!(error.starts_with("Workstation not connected"), "{error}");
     }
 
     #[test]
@@ -1684,7 +1684,7 @@ mod tests {
 
         let error = forged.session_exists("api").unwrap_err().to_string();
 
-        assert!(error.contains("refused: no command session"), "{error}");
+        assert!(error.contains("Refused: no command session"), "{error}");
         std::fs::write(&release, "").unwrap();
         session.join().unwrap().unwrap();
     }
@@ -1701,7 +1701,7 @@ mod tests {
 
         let error = mux.is_running().unwrap_err().to_string();
 
-        assert!(error.starts_with("workstation not connected"), "{error}");
+        assert!(error.starts_with("Workstation not connected"), "{error}");
     }
 
     #[test]
@@ -1719,6 +1719,9 @@ mod tests {
             .unwrap_err()
             .to_string();
 
-        assert_eq!(error, "scheduling a window close is unsupported on remote");
+        assert_eq!(
+            error,
+            "scheduling a window close is not supported on a remote"
+        );
     }
 }

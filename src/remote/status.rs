@@ -146,13 +146,13 @@ impl StatusFiles {
         let path = self.path(pane);
         let dir = path.parent().expect("a status file has a directory");
         std::fs::create_dir_all(dir)
-            .with_context(|| format!("failed to create {}", dir.display()))?;
+            .with_context(|| format!("Failed to create {}", dir.display()))?;
         // Written whole and renamed into place, so a reader never sees half.
         let temp = dir.join(format!(".{}.{}.tmp", pane.slot, std::process::id()));
         std::fs::write(&temp, serde_json::to_vec(&record)?)
-            .with_context(|| format!("failed to write {}", temp.display()))?;
+            .with_context(|| format!("Failed to write {}", temp.display()))?;
         std::fs::rename(&temp, &path)
-            .with_context(|| format!("failed to write {}", path.display()))?;
+            .with_context(|| format!("Failed to write {}", path.display()))?;
         Ok(record)
     }
 

@@ -314,7 +314,7 @@ pub fn prepare(recipe: &Recipe, sandbox: &str, clone: &str, context: &Path) -> R
     match &recipe.workmux {
         Workmux::Binary(binary) => {
             let bytes = std::fs::read(binary)
-                .with_context(|| format!("failed to read {}", binary.display()))?;
+                .with_context(|| format!("Failed to read {}", binary.display()))?;
             digest.extend(sha256_hex(&bytes).into_bytes());
             std::fs::write(context.join("workmux"), bytes)?;
         }
@@ -338,7 +338,7 @@ pub fn prepare(recipe: &Recipe, sandbox: &str, clone: &str, context: &Path) -> R
     }
     if let Some(checkout) = &recipe.devshell {
         if checkout != &context.join("project") {
-            bail!("the devshell checkout must be the build context's project directory");
+            bail!("The devshell checkout must be the build context's project directory");
         }
         for file in ["flake.nix", "flake.lock"] {
             digest.extend(std::fs::read(checkout.join(file)).unwrap_or_default());
@@ -377,10 +377,10 @@ fn copy_working_tree(source: &Path, dest: &Path, digest: &mut Vec<u8>) -> Result
         ])
         .stderr(Stdio::inherit())
         .output()
-        .context("failed to run git")?;
+        .context("Failed to run git")?;
     if !output.status.success() {
         bail!(
-            "failed to list workmux's source files in {}",
+            "Failed to list workmux's source files in {}",
             source.display()
         );
     }
@@ -398,7 +398,7 @@ fn copy_working_tree(source: &Path, dest: &Path, digest: &mut Vec<u8>) -> Result
             continue;
         }
         let bytes =
-            std::fs::read(&from).with_context(|| format!("failed to read {}", from.display()))?;
+            std::fs::read(&from).with_context(|| format!("Failed to read {}", from.display()))?;
         digest.extend(file.as_bytes());
         digest.extend(sha256_hex(&bytes).into_bytes());
         let to = dest.join(file);
@@ -431,7 +431,7 @@ pub fn build(docker: &Path, context: &Path, tag: &str, github_token: Option<&str
         .stdin(Stdio::null())
         .stdout(std::io::stderr())
         .status()
-        .context("failed to run docker build")?;
+        .context("Failed to run docker build")?;
     if !status.success() {
         bail!("docker build of the sandbox image {tag} failed ({status})");
     }

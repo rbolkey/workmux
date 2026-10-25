@@ -89,7 +89,7 @@ impl OpenShell {
         argv: &[String],
     ) -> Result<Command> {
         if argv.is_empty() {
-            return Err(anyhow!("no command to run on the remote"));
+            return Err(anyhow!("No command to run on the remote"));
         }
         let mut command = self.openshell();
         command.args(["sandbox", "exec", "-n", &self.sandbox, "--no-login-shell"]);
@@ -114,7 +114,7 @@ impl OpenShell {
             .args(args)
             .stdin(Stdio::null())
             .output()
-            .context("failed to run openshell")?;
+            .context("Failed to run openshell")?;
         if !output.status.success() {
             bail!("{}", failure(&output));
         }
@@ -128,7 +128,7 @@ impl OpenShell {
             .args(["sandbox", "get", &self.sandbox, "-o", "json"])
             .stdin(Stdio::null())
             .output()
-            .context("failed to run openshell")?;
+            .context("Failed to run openshell")?;
         if !output.status.success() {
             let error = failure(&output);
             if error.contains("not found") {
@@ -167,11 +167,11 @@ impl OpenShell {
                 (Phase::Missing, None) => return Ok(()),
                 (Phase::Is(phase), Some(wanted)) if phase == wanted => return Ok(()),
                 (Phase::Is(phase), _) if phase == "Error" => {
-                    bail!("sandbox {} is in phase Error", self.sandbox)
+                    bail!("Sandbox {} is in phase Error", self.sandbox)
                 }
                 (Phase::Missing, Some(wanted)) => {
                     bail!(
-                        "sandbox {} disappeared while waiting for {wanted}",
+                        "Sandbox {} disappeared while waiting for {wanted}",
                         self.sandbox
                     )
                 }
@@ -179,7 +179,7 @@ impl OpenShell {
             }
             if Instant::now() > deadline {
                 bail!(
-                    "sandbox {} did not reach {} within {}s; it is {phase:?}",
+                    "Sandbox {} did not reach {} within {}s; it is {phase:?}",
                     self.sandbox,
                     wanted.unwrap_or("deletion"),
                     PHASE_TIMEOUT.as_secs()
@@ -192,7 +192,7 @@ impl OpenShell {
     fn origin(&self) -> Result<&OpenshellRemote> {
         self.origin.as_ref().ok_or_else(|| {
             anyhow!(
-                "sandbox {} does not exist; workmux creates sandboxes only for projects added with `workmux project add openshell`",
+                "Sandbox {} does not exist; workmux creates sandboxes only for projects added with `workmux project add openshell`",
                 self.sandbox
             )
         })
@@ -405,7 +405,7 @@ impl OpenShell {
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .status()
-                .context("failed to run git")
+                .context("Failed to run git")
         });
         if !cloned.is_ok_and(|status| status.success()) {
             eprintln!(
@@ -619,7 +619,7 @@ impl Transport for OpenShell {
         self.exec(false, None, &[], argv)?
             .stdin(Stdio::null())
             .output()
-            .context("failed to run openshell")
+            .context("Failed to run openshell")
     }
 
     fn exec_stdio(&self, argv: &[String]) -> Result<StdioProcess> {

@@ -98,7 +98,7 @@ fn merge_network(merged: &mut Mapping, user: Value) -> Result<()> {
     for (name, rule) in user {
         if network.contains_key(&name) {
             bail!(
-                "network rule {} in the project's policy file clashes with workmux's base policy; rename it",
+                "Network rule {} in the project's policy file clashes with workmux's base policy; rename it",
                 name.as_str().unwrap_or("?")
             );
         }
@@ -209,7 +209,7 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(error.to_string().contains("network rule github"), "{error}");
+        assert!(error.to_string().contains("Network rule github"), "{error}");
     }
 
     #[test]

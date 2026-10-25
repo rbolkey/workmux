@@ -49,7 +49,7 @@ impl RemoteAgent {
                 unsafe { libc::kill(self.pid, libc::SIGKILL) };
                 std::thread::sleep(Duration::from_millis(100));
                 if alive(self.pid) {
-                    return Err(anyhow!("agent {} did not exit", self.pid));
+                    return Err(anyhow!("Agent {} did not exit", self.pid));
                 }
                 break;
             }
@@ -181,7 +181,7 @@ fn process_table() -> Result<ProcessTable> {
     let output = Command::new("ps")
         .args(["-A", "-o", "pid=,ppid=,tty=,args="])
         .output()
-        .context("failed to list processes")?;
+        .context("Failed to list processes")?;
     Ok(parse_process_table(&String::from_utf8_lossy(
         &output.stdout,
     )))

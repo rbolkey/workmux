@@ -50,7 +50,7 @@ impl Hello {
         let ours = env!("CARGO_PKG_VERSION");
         if self.protocol != PROTOCOL_VERSION {
             return Err(anyhow!(
-                "remote {remote} runs workmux {} (control protocol {}), but this workstation \
+                "Remote {remote} runs workmux {} (control protocol {}), but this workstation \
                  speaks control protocol {PROTOCOL_VERSION}: install workmux {ours} on {remote}",
                 self.workmux,
                 self.protocol,
@@ -80,16 +80,16 @@ pub fn read_hello(reader: &mut impl BufRead) -> Result<Hello> {
     let mut discarded = 0;
     while discarded <= MAX_NOISE_BYTES {
         let Some(line) = super::channel::read_line(reader)? else {
-            return Err(anyhow!("remote workmux ended before its hello"));
+            return Err(anyhow!("Remote workmux exited before the handshake"));
         };
         if let Some(json) = line.strip_prefix(prefix.as_bytes()) {
             return serde_json::from_slice(json)
-                .map_err(|error| anyhow!("remote workmux sent an unreadable hello: {error}"));
+                .map_err(|error| anyhow!("Remote workmux sent an unreadable handshake: {error}"));
         }
         discarded += line.len() + 1;
     }
     Err(anyhow!(
-        "remote workmux printed {MAX_NOISE_BYTES} bytes without a hello"
+        "Remote workmux printed {MAX_NOISE_BYTES} bytes without starting the handshake"
     ))
 }
 
@@ -157,7 +157,7 @@ mod tests {
         .unwrap_err();
 
         assert!(
-            error.to_string().contains("ended before its hello"),
+            error.to_string().contains("exited before the handshake"),
             "{error}"
         );
     }

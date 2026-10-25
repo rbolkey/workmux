@@ -51,7 +51,7 @@ pub enum RemoteCommand {
     /// Install a workmux matching this one on an SSH remote, in its cache directory
     Upload {
         name: String,
-        /// A workmux built for the remote's platform (default: this build, or its release for the remote's platform)
+        /// A workmux built for the remote's platform (default: this build when the platforms match, else this version's release for the remote's platform)
         #[arg(long, value_name = "PATH")]
         binary: Option<std::path::PathBuf>,
     },
@@ -153,7 +153,7 @@ pub fn run(args: RemoteArgs) -> Result<()> {
             let error = SessionHolder::for_this_remote()?
                 .attach_command(&pane)
                 .exec();
-            Err(error).context("failed to run the session holder dtach")
+            Err(error).context("Failed to run the session holder dtach")
         }
         RemoteCommand::PaneState { pane } => {
             println!(
@@ -169,8 +169,8 @@ pub fn run(args: RemoteArgs) -> Result<()> {
         } => crate::remote::carry::serve(&action, &path, manifest.as_deref()),
         RemoteCommand::Forward { request } => {
             let mux = crate::remote::forwarding::ForwardingMux::from_env()
-                .context("remote forward runs only in a remote shell")?;
-            mux.forward(serde_json::from_str(&request).context("unreadable request")?)
+                .context("Remote forward runs only in a remote shell")?;
+            mux.forward(serde_json::from_str(&request).context("Unreadable request")?)
         }
     }
 }
@@ -183,7 +183,7 @@ fn add(name: &str, remote: RemoteConfig) -> Result<()> {
         .get(name)
         .is_some_and(|project| project.openshell.is_some())
     {
-        bail!("project {name} is in an OpenShell sandbox, which is already its remote {name}");
+        bail!("Project {name} is in an OpenShell sandbox, which is already its remote {name}");
     }
     let updated = global_config::add_entry(&content, &REMOTES, name, &remote)?;
     global_config::write(&path, &updated)?;
@@ -201,10 +201,10 @@ fn add(name: &str, remote: RemoteConfig) -> Result<()> {
 fn upload(name: &str, binary: Option<&std::path::Path>) -> Result<()> {
     let remote = registry::remotes()?
         .remove(name)
-        .ok_or_else(|| anyhow!("no remote named {name}"))?;
+        .ok_or_else(|| anyhow!("No remote named {name}"))?;
     if remote.transport != TransportKind::Ssh {
         bail!(
-            "remote {name} is reached over {}; workmux installs itself only on SSH remotes",
+            "Remote {name} is reached over {}; workmux installs itself only on SSH remotes",
             remote.transport
         );
     }
@@ -229,11 +229,11 @@ fn upload(name: &str, binary: Option<&std::path::Path>) -> Result<()> {
 fn managed(name: &str) -> Result<(RemoteConfig, Arc<dyn Transport>)> {
     let remote = registry::remotes()?
         .remove(name)
-        .ok_or_else(|| anyhow!("no remote named {name}"))?;
+        .ok_or_else(|| anyhow!("No remote named {name}"))?;
     let transport = registry::transport(name, &remote)?;
     if transport.provisioning().is_none() {
         bail!(
-            "remote {name} is reached over {}; workmux does not start or stop it",
+            "Remote {name} is reached over {}; workmux does not start or stop it",
             remote.transport
         );
     }
@@ -263,7 +263,7 @@ fn stop(name: &str) -> Result<()> {
     let (_, transport) = managed(name)?;
     let provisioning = lifecycle(transport.as_ref());
     match provisioning.status()? {
-        RemoteState::Missing => bail!("remote {name} has no sandbox yet"),
+        RemoteState::Missing => bail!("Remote {name} has no sandbox yet"),
         RemoteState::Stopped => println!("Remote {name} is already stopped"),
         RemoteState::Running => {
             eprintln!("Stopping remote {name}…");
@@ -426,7 +426,7 @@ pub(super) fn close_workstation_windows(remote: &str, name: &str) {
 
 fn recreate(name: &str, yes: bool) -> Result<()> {
     let project = openshell_project(name)?.ok_or_else(|| {
-        anyhow!("remote {name} is not an OpenShell project's sandbox; only those are recreated")
+        anyhow!("Remote {name} is not an OpenShell project's sandbox; only those are recreated")
     })?;
     let transport = registry::transport(name, &project.remote)?;
     let provisioning = lifecycle(transport.as_ref());
@@ -471,7 +471,7 @@ fn recreate(name: &str, yes: bool) -> Result<()> {
         },
         &mut print_notice,
     )
-    .with_context(|| format!("recreating remote {name}"))?;
+    .with_context(|| format!("Failed to recreate remote {name}"))?;
     let hooks =
         transport.exec_captured(&["workmux", "setup", "--hooks", "--yes"].map(String::from))?;
     if !hooks.status.success() {
@@ -538,7 +538,7 @@ fn rm(name: &str, yes: bool) -> Result<()> {
         .map(|(project, _)| project)
         .collect();
     if !users.is_empty() {
-        bail!("remote {name} is used by project(s) {}", users.join(", "));
+        bail!("Remote {name} is used by project(s) {}", users.join(", "));
     }
     let updated = global_config::remove_entry(&content, &REMOTES, name)?;
     global_config::write(&path, &updated)?;
@@ -570,7 +570,7 @@ fn fetch_statuses_once(name: Option<&str>) -> Result<Vec<RemoteStatus>> {
     if let Some(name) = name
         && !remotes.contains_key(name)
     {
-        bail!("no remote named {name}");
+        bail!("No remote named {name}");
     }
     if remotes.is_empty() {
         return Ok(Vec::new());
@@ -583,7 +583,7 @@ fn fetch_statuses_once(name: Option<&str>) -> Result<Vec<RemoteStatus>> {
                 serde_json::json!({ "name": name }),
                 STATUS_TIMEOUT,
             )?;
-            serde_json::from_value(result).context("workstation daemon sent unreadable statuses")
+            serde_json::from_value(result).context("Workstation daemon sent unreadable statuses")
         }
         None => crate::remote::statuses(crate::remote::channels(), &remotes, name),
     }
@@ -994,6 +994,6 @@ nerdfont: true
         let error =
             global_config::remove_entry("nerdfont: true\n", &REMOTES, "devbox").unwrap_err();
 
-        assert_eq!(error.to_string(), "no remote named devbox");
+        assert_eq!(error.to_string(), "No remote named devbox");
     }
 }

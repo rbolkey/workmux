@@ -127,7 +127,7 @@ impl WorkstationHandler {
             .filter(|scope| scope.remote == self.remote)
             .ok_or_else(|| {
                 anyhow!(
-                    "refused: no command session {session} on remote {}",
+                    "Refused: no command session {session} on remote {}",
                     self.remote
                 )
             })
@@ -145,7 +145,7 @@ impl WorkstationHandler {
         let shell::OpenParams { pane } = serde_json::from_value(params)?;
         if !(self.registered)(&self.remote, &pane.project) {
             bail!(
-                "refused: project {} is not on remote {}",
+                "Refused: project {} is not on remote {}",
                 pane.project,
                 self.remote
             );
@@ -387,7 +387,7 @@ impl Channels {
             && let Some(provisioning) = transport.provisioning()
             && provisioning.status()? != RemoteState::Running
         {
-            return Err(anyhow!("remote {} is stopped", remote.name));
+            return Err(anyhow!("Remote {} is stopped", remote.name));
         }
         self.channel_with(remote, transport, use_now)
     }
@@ -576,7 +576,7 @@ impl Channels {
             self.channel(remote)?
         } else {
             self.open_channel(remote.name)
-                .ok_or_else(|| anyhow!("remote {} is not connected", remote.name))?
+                .ok_or_else(|| anyhow!("Remote {} is not connected", remote.name))?
         };
         connection.peer.request(
             dashboard::METHOD,
