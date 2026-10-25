@@ -936,8 +936,10 @@ pub(super) mod tests {
         let fake = FakeOpenShell::new();
         std::fs::write(fake.dir.path().join("gh-token"), "gho_secret\n").unwrap();
         let repo = tempfile::tempdir().unwrap();
-        let transport =
-            fake.transport(Some(flake_origin_with(repo.path(), &["gh-login", "anthropic"])));
+        let transport = fake.transport(Some(flake_origin_with(
+            repo.path(),
+            &["gh-login", "anthropic"],
+        )));
 
         transport.create().unwrap();
 
@@ -1104,7 +1106,7 @@ pub(super) mod tests {
     }
 
     /// What the gateway prints when its supervisor image is gone from
-    /// Docker (ticket 45).
+    /// Docker, as seen after an image prune removed that untagged image.
     const NO_SUPERVISOR_IMAGE: &str = "ControlSupervisorStartFailed create Docker supervisor staging container: Docker responded with status code 404: No such image: sha256:4efdb659add55a99e1bb6e5773d7b35a51770106a3d819c000fd078edfc098b3";
 
     #[test]

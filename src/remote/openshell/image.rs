@@ -853,29 +853,18 @@ mod contract {
             devshell: None,
             git_credential_helper: false,
         };
-        run_recipe(&recipe, label, None, &[], argv)
+        let context = tempfile::tempdir().unwrap();
+        run_recipe(context.path(), &recipe, label, None, argv)
     }
 
-    /// Run `argv` as the sandbox user, with `env`, in an image built from
+    /// Run `argv` as the sandbox user in an image built in `context` from
     /// `recipe` with `github_token`. A devshell recipe's project is the
     /// directory `project` in `context`.
     fn run_recipe(
-        recipe: &Recipe,
-        label: &str,
-        github_token: Option<&str>,
-        env: &[&str],
-        argv: &[&str],
-    ) -> String {
-        let context = tempfile::tempdir().unwrap();
-        run_recipe_in(context.path(), recipe, label, github_token, env, argv)
-    }
-
-    fn run_recipe_in(
         context: &Path,
         recipe: &Recipe,
         label: &str,
         github_token: Option<&str>,
-        env: &[&str],
         argv: &[&str],
     ) -> String {
         let sandbox = format!("wm-c29-{label}-{:04x}", std::process::id() % 0x10000);
@@ -883,7 +872,6 @@ mod contract {
         build(Path::new("docker"), context, &tag, github_token).unwrap();
         let output = Command::new("docker")
             .args(["run", "--rm", "--user", "1000", "-e", "HOME=/tmp"])
-            .args(env.iter().flat_map(|var| ["-e", var]))
             .arg(&tag)
             .args(argv)
             .output()
@@ -964,12 +952,15 @@ mod contract {
             devshell: None,
             git_credential_helper: true,
         };
+        let context = tempfile::tempdir().unwrap();
         let out = run_recipe(
+            context.path(),
             &recipe,
             "git",
             None,
-            &["GITHUB_TOKEN=ghp-placeholder"],
             &[
+                "env",
+                "GITHUB_TOKEN=ghp-placeholder",
                 "sh",
                 "-c",
                 "printf 'protocol=https\\nhost=github.com\\n\\n' | git credential fill \
@@ -1063,12 +1054,11 @@ mod contract {
             git_credential_helper: false,
         };
 
-        let out = run_recipe_in(
+        let out = run_recipe(
             context.path(),
             &recipe,
             "flk",
             Some(&token),
-            &[],
             &[
                 crate::remote::provision::BAKED_DEVSHELL,
                 "sh",

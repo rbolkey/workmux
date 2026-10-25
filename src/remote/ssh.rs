@@ -413,7 +413,7 @@ pub(crate) mod tests {
     }
 
     /// Fish startup that prints to stdout, as a chatty `config.fish` does.
-    const NOISY_FISH_STARTUP: &str = "echo 'Welcome to devbox'; printf partial\n";
+    const NOISY_FISH_STARTUP: &str = "echo 'Welcome to the remote'; printf partial\n";
 
     #[test]
     fn a_control_channel_opens_through_a_chatty_fish_login_shell() {

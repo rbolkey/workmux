@@ -79,16 +79,26 @@ enum Target {
 }
 
 impl SshHarness {
-    pub fn from_env() -> Option<Self> {
+    /// What the environment asks for: `None` when SSH tests are off, else
+    /// the external target's host, or `None` inside for the local harness.
+    fn requested_target() -> Option<Option<String>> {
         if std::env::var("WORKMUX_TEST_SSH").as_deref() != Ok("1") {
             return None;
         }
-        let target = match std::env::var("WORKMUX_TEST_SSH_TARGET") {
-            Ok(host) if !host.is_empty() => Target::External {
+        Some(
+            std::env::var("WORKMUX_TEST_SSH_TARGET")
+                .ok()
+                .filter(|host| !host.is_empty()),
+        )
+    }
+
+    pub fn from_env() -> Option<Self> {
+        let target = match Self::requested_target()? {
+            Some(host) => Target::External {
                 host,
                 config: std::env::var_os("WORKMUX_TEST_SSH_CONFIG").map(PathBuf::from),
             },
-            _ => Target::Local(LocalSshd::start(None)),
+            None => Target::Local(LocalSshd::start(None)),
         };
         Some(Self::with_target(target))
     }
@@ -97,9 +107,7 @@ impl SshHarness {
     /// login shell hands every remote command to fish unchanged, as sshd
     /// would hand it to a fish login shell.
     pub fn fish_from_env() -> Option<Self> {
-        if std::env::var("WORKMUX_TEST_SSH").as_deref() != Ok("1")
-            || std::env::var("WORKMUX_TEST_SSH_TARGET").is_ok_and(|host| !host.is_empty())
-        {
+        if Self::requested_target()?.is_some() {
             return None;
         }
         let fish = which::which("fish").ok()?;

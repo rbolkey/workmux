@@ -950,8 +950,10 @@ def test_add_and_a_relayed_command_on_a_fish_login_shell_remote(
             worktree.resolve()
         )
 
+        # The Rust fish tests' AWKWARD_ARGS, through the relay.
         awkward = ["back\\slash", "two\\\\backslashes", "trailing\\", "it's"]
-        awkward += ["\\'", 'say "hi"', "two words", "$HOME *"]
+        awkward += ["\\'", 'say "hi"', "two words", "$HOME (x) *", "~", ""]
+        awkward += ["line\nbreak"]
         ran = wm(
             "run feature --project api -- "
             + shlex.join(["printf", "%s|", *awkward, "end"])
