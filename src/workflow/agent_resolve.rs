@@ -419,22 +419,7 @@ mod tests {
             remote_agent("api", "feature", "%1"),
             remote_agent("web", "feature", "%2"),
         ];
-        let api = crate::remote::router::RemoteProject {
-            site: crate::remote::session::ProjectSite {
-                remote: "devbox".to_string(),
-                name: "api".to_string(),
-                path: "~/api".to_string(),
-                git_url: None,
-                session: None,
-            },
-            remote: crate::config::RemoteConfig {
-                transport: crate::config::TransportKind::Loopback,
-                target: "/tmp/devbox".to_string(),
-                builtin_shims: None,
-                host_commands: Vec::new(),
-                openshell: None,
-            },
-        };
+        let api = crate::remote::testing::devbox_api();
 
         let targeted = targeted_name("feature", Some(&api));
         let (_, matched) = resolve_worktree_agents_from_snapshot(&targeted, &panes).unwrap();

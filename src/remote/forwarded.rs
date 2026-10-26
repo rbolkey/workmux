@@ -18,7 +18,7 @@ use crate::multiplexer::types::{
     CreateSessionParams, CreateWindowInSessionParams, CreateWindowParams,
 };
 use crate::multiplexer::{InvocationContext, Multiplexer, TmuxBackend};
-use crate::project::RemoteProjectId;
+use crate::project::{ProjectTag, RemoteProjectId};
 
 /// Session option naming the project a workstation session holds.
 pub const SESSION_TAG: &str = "@workmux_project";
@@ -36,13 +36,15 @@ const REMOTE_PANE_FORMAT: &str = "#{@workmux_remote_pane}";
 pub struct SessionScope {
     pub remote: String,
     pub project: String,
+    /// The workstation clone whose config puts the project on the remote.
+    pub root: PathBuf,
     pub invocation: InvocationContext,
 }
 
 impl SessionScope {
     /// The tag workmux puts on the project's sessions and windows.
     pub fn tag(&self) -> String {
-        self.id().tag()
+        ProjectTag::new(self.id(), &self.root).to_string()
     }
 
     /// The project the session runs for.
@@ -62,7 +64,7 @@ impl SessionScope {
 /// how many. A session left holding other windows loses the project's tag,
 /// so it is no longer taken for the project's.
 pub fn close_project_windows(tmux: &TmuxBackend, remote: &str, name: &str) -> Result<usize> {
-    let tag = RemoteProjectId::new(remote, name).tag();
+    let id = Some(RemoteProjectId::new(remote, name));
     let windows = tmux.query(&[
         "list-windows",
         "-a",
@@ -73,7 +75,7 @@ pub fn close_project_windows(tmux: &TmuxBackend, remote: &str, name: &str) -> Re
     for (window, _) in windows
         .lines()
         .filter_map(|line| line.split_once('\t'))
-        .filter(|(_, window_tag)| window_tag.trim() == tag)
+        .filter(|(_, window_tag)| RemoteProjectId::from_tag(window_tag) == id)
     {
         tmux.query(&["kill-window", "-t", window])?;
         closed += 1;
@@ -88,7 +90,7 @@ pub fn close_project_windows(tmux: &TmuxBackend, remote: &str, name: &str) -> Re
     for (session, _) in sessions
         .lines()
         .filter_map(|line| line.split_once('\t'))
-        .filter(|(_, session_tag)| session_tag.trim() == tag)
+        .filter(|(_, session_tag)| RemoteProjectId::from_tag(session_tag) == id)
     {
         tmux.query(&["set-option", "-qu", "-t", session, SESSION_TAG])?;
     }
@@ -343,7 +345,6 @@ impl Workstation<'_> {
                 json!(ended)
             }
             MuxRequest::ShownRemotePanes => {
-                let tag = self.scope.tag();
                 let panes = tmux.query(&[
                     "list-panes",
                     "-a",
@@ -354,7 +355,7 @@ impl Workstation<'_> {
                     panes
                         .lines()
                         .filter_map(|line| line.split_once('\t'))
-                        .filter(|(window, _)| *window == tag)
+                        .filter(|(window, _)| self.belongs(window))
                         .filter_map(|(_, pane)| pane.parse::<RemotePaneId>().ok())
                         .collect::<Vec<_>>()
                 )
@@ -580,6 +581,7 @@ mod tests {
             SessionScope {
                 remote: remote.to_string(),
                 project: name.to_string(),
+                root: PathBuf::from(format!("/src/{name}")),
                 invocation: InvocationContext {
                     pane_id: Some(pane.to_string()),
                     tmux: Some(format!("{},1,0", self.server.socket)),
@@ -658,11 +660,11 @@ mod tests {
         );
         assert_eq!(
             ws.tmux(&["show-options", "-qv", "-t", "api", SESSION_TAG]),
-            "devbox:api"
+            "devbox:api:/src/api"
         );
         assert_eq!(
             ws.tmux(&["show-options", "-wqv", "-t", &pane_id, WINDOW_TAG]),
-            "devbox:api"
+            "devbox:api:/src/api"
         );
         let attached = wait_for_file(&ws.remote_root.path().join("attached"));
         assert_eq!(attached.trim(), "remote attach devbox api/feature/0");
@@ -695,7 +697,7 @@ mod tests {
         );
         assert_eq!(
             ws.tmux(&["show-options", "-qv", "-t", "api", SESSION_TAG]),
-            "devbox:api"
+            "devbox:api:/src/api"
         );
     }
 

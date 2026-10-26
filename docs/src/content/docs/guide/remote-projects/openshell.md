@@ -8,7 +8,7 @@ An OpenShell project lives in an [OpenShell](https://github.com/NVIDIA/OpenShell
 - The repository is cloned inside the sandbox, and its worktrees live beside the clone.
 - workmux never requests a bind mount, so no workstation file is visible in the sandbox.
 - The control channel runs over `openshell sandbox exec`, so the sandbox's network policy needs no rule for workmux.
-- The OpenShell sandbox is the project's sandbox. In it, workmux runs no container or Lima sandbox: a `sandbox:` setting that asks for one, from the project's `.workmux.yaml` or global config, is ignored there with a note. The rest of the config, hooks included, still applies.
+- The OpenShell sandbox is the project's sandbox. In it, workmux runs no container or Lima sandbox: a `sandbox:` setting that asks for one, from the project's `.workmux.yaml` or global config, or `add --sandbox`, is ignored there with a note. The rest of the config, hooks included, still applies.
 
 ## Set up a project
 
@@ -38,14 +38,13 @@ sandbox:
 | `policy`                | Policy file merged on top of workmux's [base policy](#policy), relative to the repository                                                                                                                  |
 | `providers`             | OpenShell providers to attach, for credentials. No other provider is attached. Global config only. `gh-login` is special: see [Your gh login](#your-gh-login-provider-gh-login)                          |
 | `agents`                | Agents the image installs; the first is the sandbox's default agent                                                                                                                                       |
-| `sandbox`               | Sandbox name. Default: the project name                                                                                                                                                                    |
 | `path`                  | The clone's path in the sandbox. Default: `~/<project>`                                                                                                                                                    |
 
 Settings merge as any other setting does: the repository's value overrides your global config's, key by key. `providers` is the exception. It is read only from global config, and a repository's `.workmux.yaml` setting it is ignored with a warning, so a repository can't commit `providers: [gh-login]` and receive your GitHub login. Every OpenShell sandbox gets the same providers; tokens scoped to what your projects need bound what each one can reach.
 
-The project is named after the repository: the directory name of your clone. The sandbox clones the repository from your clone's `origin`. OpenShell sandbox names allow only lowercase letters, digits and hyphens, up to 19 characters. When the project name doesn't fit, the sandbox is named with a prefix of it plus a short hash.
+The project is named after the repository: the directory name of your clone. The sandbox clones the repository from your clone's `origin`. The sandbox is named after your clone, as Lima VMs are: up to 10 characters of the directory name and a hash of the clone's full path, such as `api-1a2b3c4d`, within OpenShell's rules (lowercase letters, digits and hyphens, up to 19 characters). Config can't name a sandbox, so no repository can reach another's. Two clones get two sandboxes, even of the same repository, and a clone moved to another path gets a new one.
 
-The sandbox is the project's remote and has the project's name, so there is nothing to register. Run in the repository, `workmux remote status` shows the sandbox before any other command has created it.
+The sandbox is the project's remote, so there is nothing to register. Run in the repository, `workmux remote status` shows the sandbox before any other command has created it.
 
 Git credentials and agent API keys should come from OpenShell providers, so that secrets never sit in the sandbox environment. See [Git and GitHub](#git-and-github) for git.
 

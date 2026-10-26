@@ -454,28 +454,23 @@ mod tests {
         // The remote worktree's path is also a checkout on the workstation.
         let temp = tempfile::tempdir().unwrap();
         crate::test_support::init_repo(temp.path());
-        let records = tempfile::tempdir().unwrap();
         let agent = |remote| crate::command::dashboard::site::tests::agent(temp.path(), remote);
 
-        crate::remote::registry::with_recorded(
-            records.path(),
-            &[crate::command::dashboard::site::tests::devbox_api()],
-            || {
-                assert_eq!(
-                    repo_source(&agent(Some(("devbox", "api")))),
-                    Some(crate::github::RepoSource::GitUrl(
-                        "git@github.com:me/api.git".to_string()
-                    ))
-                );
-                // A project on another remote is not this agent's.
-                assert_eq!(repo_source(&agent(Some(("other", "api")))), None);
-                assert_eq!(
-                    repo_source(&agent(None)),
-                    Some(crate::github::RepoSource::Checkout(
-                        temp.path().to_path_buf()
-                    ))
-                );
-            },
-        );
+        crate::remote::resolve::with_open(&[crate::remote::testing::devbox_api()], || {
+            assert_eq!(
+                repo_source(&agent(Some(("devbox", "api")))),
+                Some(crate::github::RepoSource::GitUrl(
+                    "git@github.com:me/api.git".to_string()
+                ))
+            );
+            // A project on another remote is not this agent's.
+            assert_eq!(repo_source(&agent(Some(("other", "api")))), None);
+            assert_eq!(
+                repo_source(&agent(None)),
+                Some(crate::github::RepoSource::Checkout(
+                    temp.path().to_path_buf()
+                ))
+            );
+        });
     }
 }

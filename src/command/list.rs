@@ -362,7 +362,7 @@ pub fn run(show_pr: bool, json: bool, all: bool, filter: &[String]) -> Result<()
         for root in discover_project_roots(mux.as_ref())? {
             worktrees.extend(list_project(&root, mux.as_ref(), show_pr && !json, filter)?);
         }
-        for remote in router::remote_projects()? {
+        for remote in router::remote_projects() {
             // A stopped sandbox is never started just to list it.
             if !router::ready(&remote, false).unwrap_or(true) {
                 eprintln!(

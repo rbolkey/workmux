@@ -757,9 +757,9 @@ impl App {
                 .entry(name)
                 .or_insert_with(|| ProjectScope::Workstation(root.clone()));
         }
-        // Remote projects commands have resolved, whether or not an agent
-        // runs there.
-        for project in crate::remote::router::remote_projects().unwrap_or_default() {
+        // Remote projects with open workstation windows, whether or not an
+        // agent runs there.
+        for project in crate::remote::router::remote_projects() {
             let scope = ProjectScope::Remote {
                 remote: project.site.remote,
                 project: project.site.name,

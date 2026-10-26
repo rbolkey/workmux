@@ -1028,7 +1028,7 @@ pub struct Config {
 
 /// A config key workmux no longer reads. Deserializing one fails with the
 /// key's [`WithdrawnKey::MESSAGE`].
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Withdrawn<K>(std::marker::PhantomData<K>);
 
 pub(crate) trait WithdrawnKey {
@@ -1053,6 +1053,15 @@ impl WithdrawnKey for RemotesWithdrawn {
 OpenShell sandbox comes from its repository's config (sandbox.backend: openshell in .workmux.yaml)";
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct SandboxNameWithdrawn;
+
+impl WithdrawnKey for SandboxNameWithdrawn {
+    const MESSAGE: &'static str = "sandbox.openshell.sandbox is no longer read: a sandbox's name \
+derives from the path of the repository's clone, so no repository can name another's sandbox. \
+Remove it";
+}
+
 impl<'de, K: WithdrawnKey> Deserialize<'de> for Withdrawn<K> {
     fn deserialize<D: serde::Deserializer<'de>>(_: D) -> Result<Self, D::Error> {
         Err(serde::de::Error::custom(K::MESSAGE))
@@ -1060,14 +1069,13 @@ impl<'de, K: WithdrawnKey> Deserialize<'de> for Withdrawn<K> {
 }
 
 /// How the workstation reaches a remote.
-#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum TransportKind {
     Ssh,
     Openshell,
     /// Runs remote workmux as a local child process rooted in the target
     /// directory. Stands in for a real remote in tests.
-    #[value(hide = true)]
     Loopback,
 }
 
@@ -1129,9 +1137,10 @@ pub struct OpenshellRemote {
 /// OpenShell sandbox settings, under `sandbox.openshell`.
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, Default)]
 pub struct OpenshellProject {
-    /// Sandbox name (default: derived from the project name).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sandbox: Option<String>,
+    /// A sandbox name, withdrawn: the name derives from the clone's path.
+    #[serde(default, skip_serializing)]
+    #[allow(dead_code)]
+    pub(crate) sandbox: Withdrawn<SandboxNameWithdrawn>,
 
     /// Image the sandbox runs (default: workmux's OpenShell image).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1173,7 +1182,7 @@ impl OpenshellProject {
             );
         }
         Self {
-            sandbox: project.sandbox.or(global.sandbox),
+            sandbox: Withdrawn::default(),
             image: project.image.or(global.image),
             policy: project.policy.or(global.policy),
             path: project.path.or(global.path),
@@ -1220,30 +1229,31 @@ impl LoopbackConfig {
 /// OpenShell's limit on sandbox name length.
 const SANDBOX_NAME_MAX: usize = 19;
 
-/// The sandbox name for OpenShell project `project`: the name itself when
-/// OpenShell accepts it (lowercase letters, digits and hyphens, at most 19
-/// characters), else a readable prefix and a hash of the name.
-pub fn openshell_sandbox_name(project: &str) -> String {
-    let fits = project.len() <= SANDBOX_NAME_MAX
-        && !project.starts_with('-')
-        && project
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
-    if fits {
-        return project.to_string();
-    }
+/// The sandbox name for the OpenShell project whose clone is `root`, as
+/// Lima's VM names are derived: its directory's name and a hash of its
+/// canonical path, within OpenShell's rules (lowercase letters, digits and
+/// hyphens, at most 19 characters). Config cannot name a sandbox, so no
+/// repository can reach another's.
+pub fn openshell_sandbox_name(root: &Path) -> String {
     use sha2::Digest;
-    let hash = sha2::Sha256::digest(project.as_bytes());
-    let suffix: String = hash[..3].iter().map(|b| format!("{b:02x}")).collect();
-    let prefix: String = project
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let hash = sha2::Sha256::digest(root.to_string_lossy().as_bytes());
+    let suffix: String = hash[..4].iter().map(|b| format!("{b:02x}")).collect();
+    let mut prefix = String::new();
+    for c in root
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default()
         .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() {
-                c.to_ascii_lowercase()
-            } else {
-                '-'
-            }
-        })
+    {
+        if c.is_ascii_alphanumeric() {
+            prefix.push(c.to_ascii_lowercase());
+        } else if !prefix.is_empty() && !prefix.ends_with('-') {
+            prefix.push('-');
+        }
+    }
+    let prefix: String = prefix
+        .chars()
         .take(SANDBOX_NAME_MAX - suffix.len() - 1)
         .collect();
     let prefix = prefix.trim_matches('-');
@@ -1745,6 +1755,14 @@ pub enum SandboxBackend {
     Openshell,
     /// Test-only: a loopback remote, standing in for an OpenShell sandbox.
     Loopback,
+}
+
+impl SandboxBackend {
+    /// Whether the backend puts the project on a remote, a sandbox of its
+    /// own, rather than wrapping its panes in a container or Lima VM.
+    pub fn is_remote(&self) -> bool {
+        matches!(self, SandboxBackend::Openshell | SandboxBackend::Loopback)
+    }
 }
 
 /// Container runtime for sandbox
@@ -2615,12 +2633,7 @@ impl SandboxConfig {
     /// enabled with one: OpenShell, or the hidden loopback backend.
     pub fn remote_backend(&self) -> Option<SandboxBackend> {
         let backend = self.backend();
-        (self.enabled.unwrap_or(false)
-            && matches!(
-                backend,
-                SandboxBackend::Openshell | SandboxBackend::Loopback
-            ))
-        .then_some(backend)
+        (self.enabled.unwrap_or(false) && backend.is_remote()).then_some(backend)
     }
 
     pub fn backend(&self) -> SandboxBackend {
@@ -3124,15 +3137,9 @@ impl Config {
         )?;
         let openshell = std::env::var(crate::remote::openshell::SANDBOX_ENV).ok();
         if openshell.is_some() {
-            // Say so once per command, however often it loads config.
-            static NOTE: std::sync::Once = std::sync::Once::new();
             let mut note = Vec::new();
             ignore_sandbox_in_openshell(&mut config, openshell.as_deref(), &mut note);
-            if !note.is_empty() {
-                NOTE.call_once(|| {
-                    let _ = std::io::Write::write_all(&mut std::io::stderr(), &note);
-                });
-            }
+            note_once(&note);
         }
         Ok((config, location))
     }
@@ -4342,12 +4349,49 @@ fn ignore_sandbox_in_openshell(
         return;
     };
     if config.sandbox.is_enabled() {
-        let _ = writeln!(
-            note,
-            "Note: the sandbox: setting is ignored inside OpenShell sandbox {sandbox}, which is already the project's sandbox"
-        );
+        write_ignored_note(sandbox, note);
     }
     config.sandbox.enabled = Some(false);
+}
+
+/// Whether `add --sandbox`, `flag`, starts workmux's own sandbox: never in
+/// OpenShell sandbox `sandbox`, where it is ignored with the note the
+/// `sandbox:` setting gets.
+fn sandbox_flag_in(flag: bool, sandbox: Option<&str>, note: &mut impl std::io::Write) -> bool {
+    match sandbox {
+        Some(sandbox) if flag => {
+            write_ignored_note(sandbox, note);
+            false
+        }
+        _ => flag,
+    }
+}
+
+/// [`sandbox_flag_in`] the OpenShell sandbox this process runs in, if any,
+/// with its note on stderr.
+pub fn sandbox_flag(flag: bool) -> bool {
+    let openshell = std::env::var(crate::remote::openshell::SANDBOX_ENV).ok();
+    let mut note = Vec::new();
+    let flag = sandbox_flag_in(flag, openshell.as_deref(), &mut note);
+    note_once(&note);
+    flag
+}
+
+fn write_ignored_note(sandbox: &str, note: &mut impl std::io::Write) {
+    let _ = writeln!(
+        note,
+        "Note: the sandbox: setting is ignored inside OpenShell sandbox {sandbox}, which is already the project's sandbox"
+    );
+}
+
+/// Print `note` on stderr once per command, however often config loads.
+fn note_once(note: &[u8]) {
+    static NOTE: std::sync::Once = std::sync::Once::new();
+    if !note.is_empty() {
+        NOTE.call_once(|| {
+            let _ = std::io::Write::write_all(&mut std::io::stderr(), note);
+        });
+    }
 }
 
 #[cfg(test)]
@@ -4393,6 +4437,26 @@ mod tests {
 
         assert!(config.sandbox.is_enabled());
         assert!(note.is_empty());
+    }
+
+    #[test]
+    fn an_openshell_sandbox_ignores_the_sandbox_flag_with_the_same_note() {
+        let mut note = Vec::new();
+
+        assert!(!super::sandbox_flag_in(true, Some("api"), &mut note));
+
+        let note = String::from_utf8(note).unwrap();
+        let mut config = Config::default();
+        config.sandbox.enabled = Some(true);
+        let mut setting_note = Vec::new();
+        super::ignore_sandbox_in_openshell(&mut config, Some("api"), &mut setting_note);
+        assert_eq!(note, String::from_utf8(setting_note).unwrap());
+
+        // Unasked, or outside a sandbox, the flag stands and says nothing.
+        let mut quiet = Vec::new();
+        assert!(!super::sandbox_flag_in(false, Some("api"), &mut quiet));
+        assert!(super::sandbox_flag_in(true, None, &mut quiet));
+        assert!(quiet.is_empty());
     }
 
     #[test]
@@ -4601,25 +4665,43 @@ sandbox:
     }
 
     #[test]
-    fn an_openshell_sandbox_name_fits_openshells_rules() {
-        let name = super::openshell_sandbox_name;
+    fn an_openshell_sandbox_is_named_after_its_clones_directory_and_path() {
+        let name = |path: &str| super::openshell_sandbox_name(std::path::Path::new(path));
+        let fits = |name: &str| {
+            name.len() <= 19
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        };
 
-        assert_eq!(name("api"), "api");
-        assert_eq!(name("web-app-2"), "web-app-2");
-        // Too long, upper case, or with characters OpenShell refuses: a
-        // readable prefix and a hash that keeps distinct projects apart.
-        let long = name("a-very-long-project-name");
-        assert!(long.len() <= 19, "{long}");
-        assert!(long.starts_with("a-very-long-"), "{long}");
-        assert_ne!(long, name("a-very-long-project-name2"));
-        let odd = name("My_App.v2");
-        assert!(odd.starts_with("my-app-v2-"), "{odd}");
-        assert!(
-            odd.chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
-            "{odd}"
-        );
-        assert_ne!(odd, name("my-app-v2"));
+        let api = name("/src/api");
+        assert!(api.starts_with("api-"), "{api}");
+        assert_eq!(api.len(), "api-".len() + 8, "{api}");
+        assert_eq!(name("/src/api"), api);
+        // Two repositories with the same directory name get two sandboxes.
+        assert_ne!(name("/work/api"), api);
+        for odd in [
+            "/src/a-very-long-project-name",
+            "/src/My_App.v2",
+            "/src/___",
+            "/",
+        ] {
+            assert!(fits(&name(odd)), "{}", name(odd));
+        }
+        assert!(name("/src/a-very-long-project-name").starts_with("a-very-lon-"));
+        assert!(name("/src/My_App.v2").starts_with("my-app-v2-"));
+        assert!(name("/src/___").starts_with("wm-"));
+    }
+
+    #[test]
+    fn a_project_config_cannot_name_its_openshell_sandbox() {
+        let error = serde_yaml::from_str::<Config>(
+            "sandbox:\n  backend: openshell\n  openshell:\n    sandbox: someone-elses\n",
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("sandbox.openshell.sandbox"), "{error}");
     }
 
     #[test]

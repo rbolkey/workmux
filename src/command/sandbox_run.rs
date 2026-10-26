@@ -75,14 +75,15 @@ pub fn run(worktree: PathBuf, worktree_root: Option<PathBuf>, command: Vec<Strin
 
     match config.sandbox.backend() {
         SandboxBackend::Lima => run_lima(&config, frozen_config.path(), &worktree, &command),
-        SandboxBackend::Openshell | SandboxBackend::Loopback => {
-            anyhow::bail!("This project lives in a sandbox of its own, not a container or Lima VM")
-        }
         SandboxBackend::Container => {
             let wt_root = worktree_root
                 .map(|p| p.canonicalize().unwrap_or(p))
                 .unwrap_or_else(|| worktree.clone());
             run_container(&config, frozen_config.path(), &worktree, &wt_root, &command)
+        }
+        // A remote backend: the project lives in a sandbox of its own.
+        _ => {
+            anyhow::bail!("This project lives in a sandbox of its own, not a container or Lima VM")
         }
     }
 }

@@ -15,7 +15,6 @@ use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use super::pane::{ATTACHED, PaneState, RemotePaneId};
-use super::registry;
 use super::transport::{Transport, TtyExec};
 
 const RETRY_INITIAL: Duration = Duration::from_secs(1);
@@ -35,12 +34,9 @@ enum Choice {
 /// Show remote pane `pane` on `remote` in this terminal until it ends or the
 /// user closes the view.
 pub fn run(remote: &str, pane: &RemotePaneId) -> Result<()> {
-    let remotes = registry::remotes()?;
-    let config = remotes
-        .get(remote)
-        .ok_or_else(|| anyhow!("No remote named {remote}"))?;
-    let transport = registry::transport(remote, config)?;
-    hold_channel(remote);
+    let project = super::router::remote_project_on(remote, &pane.project)?;
+    let transport = super::transport::build(&project.remote_config)?;
+    hold_channel(remote, &pane.project);
 
     let mut backoff = RETRY_INITIAL;
     loop {
@@ -147,14 +143,14 @@ fn pane_state(transport: &dyn Transport, pane: &RemotePaneId) -> Result<PaneStat
 /// Keep `remote`'s control channel open for as long as this process runs,
 /// through the workstation daemon, holding again whenever the daemon
 /// restarts. Without a daemon there is no channel to keep.
-fn hold_channel(remote: &str) {
-    let remote = remote.to_string();
+fn hold_channel(remote: &str, project: &str) {
+    let (remote, project) = (remote.to_string(), project.to_string());
     std::thread::spawn(move || {
         loop {
             let Some(socket) = super::router::daemon_socket() else {
                 return;
             };
-            match crate::workstation_daemon::hold_for_pane(&socket, &remote) {
+            match crate::workstation_daemon::hold_for_pane(&socket, &remote, &project) {
                 Ok(stream) => {
                     // Held until the daemon goes away.
                     let _ = stream.set_read_timeout(None);

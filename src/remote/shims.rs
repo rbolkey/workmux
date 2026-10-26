@@ -202,7 +202,7 @@ mod tests {
         Channels::new(
             Arc::new(move |_, _| Ok(transport.clone() as Arc<dyn Transport>)),
             ChannelPolicy {
-                registered: |_, project| project == "api",
+                still_tagged: |tag| tag.id.name == "api",
                 clipboard: || Ok(Some(b"\x89PNG image".to_vec())),
                 ..ChannelPolicy::default()
             },

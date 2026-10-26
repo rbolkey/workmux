@@ -86,10 +86,11 @@ fn dispatch(request: &Request) -> Response {
             .expect("ping serializes"),
         ),
         "remote.status" => {
-            let name = request.params.get("name").and_then(Value::as_str);
-            let statuses = crate::remote::registry::remotes().and_then(|remotes| {
-                crate::remote::statuses(crate::remote::channels(), &remotes, name)
-            });
+            let statuses = serde_json::from_value(request.params["remotes"].clone())
+                .map_err(anyhow::Error::from)
+                .and_then(|remotes| {
+                    crate::remote::statuses(crate::remote::channels(), &remotes, None)
+                });
             match statuses.and_then(|statuses| Ok(serde_json::to_value(statuses)?)) {
                 Ok(result) => Response::ok(request.id, result),
                 Err(error) => Response::err(Some(request.id), format!("{error:#}")),
@@ -207,25 +208,24 @@ pub(crate) fn serve_requests(stream: UnixStream, first_line: Option<Vec<u8>>) ->
 }
 
 /// Method a `remote attach` loop calls to keep its remote's control channel
-/// open while its connection stays open: `{remote}`.
+/// open while its connection stays open: `{remote, project}`.
 pub const PANE_HOLD_METHOD: &str = "remote.hold";
 
 fn pane_hold(request: &Request) -> Result<crate::remote::channels::PaneHold> {
-    let name = request
-        .params
-        .get("remote")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("remote.hold needs a remote"))?;
-    let remotes = crate::remote::registry::remotes()?;
-    let config = remotes
-        .get(name)
-        .ok_or_else(|| anyhow!("No remote named {name}"))?;
-    crate::remote::channels().hold_for_pane(crate::remote::Remote::new(name, config))
+    let param = |name: &str| {
+        request
+            .params
+            .get(name)
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("remote.hold needs a {name}"))
+    };
+    let project = crate::remote::router::remote_project_on(param("remote")?, param("project")?)?;
+    crate::remote::channels().hold_for_pane(project.host())
 }
 
 /// Keep `remote`'s control channel open for an attached pane until the
 /// returned connection is dropped.
-pub fn hold_for_pane(socket: &Path, remote: &str) -> Result<UnixStream> {
+pub fn hold_for_pane(socket: &Path, remote: &str, project: &str) -> Result<UnixStream> {
     let stream = UnixStream::connect(socket).with_context(|| {
         format!(
             "Failed to connect to the workstation daemon at {}",
@@ -240,7 +240,7 @@ pub fn hold_for_pane(socket: &Path, remote: &str) -> Result<UnixStream> {
         &Request {
             id: 1,
             method: PANE_HOLD_METHOD.to_string(),
-            params: serde_json::json!({ "remote": remote }),
+            params: serde_json::json!({ "remote": remote, "project": project }),
         },
     )?;
     let line = read_line(&mut BufReader::new(&stream))?
@@ -273,7 +273,8 @@ struct Notification {
 
 #[derive(Deserialize)]
 struct CommandSessionParams {
-    remote: String,
+    /// The workstation clone whose config puts the project on its remote.
+    root: PathBuf,
     request: crate::remote::session::CommandRequest,
     /// Where the command was run from on the workstation.
     #[serde(default)]
@@ -358,15 +359,17 @@ fn command_session(
 ) -> Response {
     let run = || -> Result<Value> {
         let params: CommandSessionParams = serde_json::from_value(request.params.clone())?;
-        let project =
-            crate::remote::router::remote_project_on(&params.remote, &params.request.project.name)?;
-        if params.request.project.remote != params.remote {
-            bail!(
-                "Project {} is not on remote {}",
-                params.request.project.name,
-                params.remote
-            );
-        }
+        let site = &params.request.project;
+        let project = crate::remote::resolve::at(&params.root)?
+            .filter(|project| project.id() == site.id())
+            .ok_or_else(|| {
+                anyhow!(
+                    "The config of {} no longer puts project {} on {}",
+                    params.root.display(),
+                    site.name,
+                    site.remote
+                )
+            })?;
         let gone = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (answered, answers) = std::sync::mpsc::channel();
         {
@@ -375,7 +378,7 @@ fn command_session(
         }
         // A client that has gone away cancels the command.
         let exit_code = crate::remote::channels().run_command(
-            project.host(),
+            &project,
             &params.request,
             &params.invocation,
             &mut ClientTerminal {

@@ -1158,6 +1158,13 @@ mod tests {
     use std::sync::Arc;
     use std::sync::mpsc;
 
+    /// Project `api` on remote `devbox`, as [`remote`] reaches it.
+    fn devbox() -> crate::remote::router::RemoteProject {
+        let mut project = crate::remote::testing::devbox_api();
+        project.remote_config = remote();
+        project
+    }
+
     fn remote() -> RemoteConfig {
         RemoteConfig {
             transport: TransportKind::Loopback,
@@ -1219,7 +1226,7 @@ mod tests {
         let (env, received) = mpsc::channel();
         let session = std::thread::spawn(move || {
             channels.run_command(
-                crate::remote::Remote::new("devbox", &remote()),
+                &devbox(),
                 &request,
                 &invocation,
                 &mut |stream, data: &[u8]| {
@@ -1351,7 +1358,7 @@ mod tests {
         );
         assert_eq!(
             server.query(&["show-options", "-wqv", "-t", &pane, WINDOW_TAG]),
-            "devbox:api"
+            "devbox:api:/src/api"
         );
         let shell: RemotePaneId = "api/feature/0".parse().unwrap();
         assert!(
@@ -1395,7 +1402,7 @@ mod tests {
                 workmux: fake_workmux(dir),
                 linger,
                 tmux_socket: Some(server.socket.clone()),
-                registered: |_, project| project == "api",
+                still_tagged: |tag| tag.id.name == "api",
                 ..ChannelPolicy::default()
             },
         )
@@ -1405,7 +1412,14 @@ mod tests {
     /// remote pane `pane`.
     fn viewing_pane(server: &PrivateTmuxServer, session: &str, dir: &Path, pane: &str) -> String {
         let viewing = server.new_session(session, dir);
-        server.query(&["set-option", "-w", "-t", &viewing, WINDOW_TAG, "devbox:api"]);
+        server.query(&[
+            "set-option",
+            "-w",
+            "-t",
+            &viewing,
+            WINDOW_TAG,
+            "devbox:api:/src/api",
+        ]);
         server.query(&["set-option", "-p", "-t", &viewing, REMOTE_PANE_TAG, pane]);
         viewing
     }
@@ -1458,7 +1472,7 @@ mod tests {
         );
         assert_eq!(
             server.query(&["show-options", "-wqv", "-t", &pane, WINDOW_TAG]),
-            "devbox:api"
+            "devbox:api:/src/api"
         );
         // Like any forwarded request, it cannot reach the user's own panes.
         let mine = server.new_session("mine", temp.path());
@@ -1508,6 +1522,7 @@ mod tests {
         channels
             .channel(crate::remote::Remote::new("devbox", &remote()))
             .unwrap();
+        viewing_pane(&server, "api", temp.path(), "api/feature/0");
         let mux = ForwardingMux::for_shell(
             transport.shell_socket(),
             "api/feature/0".parse().unwrap(),

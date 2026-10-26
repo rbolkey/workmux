@@ -4,6 +4,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Subcommand};
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::time::Duration;
 use tabled::{
     Table, Tabled,
@@ -13,8 +14,9 @@ use tabled::{
 use crate::config::{RemoteConfig, TransportKind};
 use crate::remote::carry::AtRisk;
 use crate::remote::channels::{Reach, RemoteStatus};
+use crate::remote::openshell::Listed;
 use crate::remote::pane::{RemotePaneId, SessionHolder};
-use crate::remote::registry;
+use crate::remote::router::RemoteProject;
 use crate::remote::transport::{Provisioning, RemoteState, Transport, ensure_running};
 use std::sync::Arc;
 
@@ -87,21 +89,24 @@ pub enum RemoteCommand {
 
 pub fn run(args: RemoteArgs) -> Result<()> {
     match args.command {
-        RemoteCommand::List => {
-            resolve_here();
-            list()
-        }
+        RemoteCommand::List => list(),
         RemoteCommand::Status => {
-            let here = crate::remote::router::resolve()?;
-            if !status(here.as_ref().map(|project| project.site.remote.as_str()))? {
+            let all_reachable = match crate::remote::router::resolve()? {
+                Some(project) => status(&project_remotes(std::slice::from_ref(&project)), &[])?,
+                None => {
+                    let remotes = known_remotes(None);
+                    status(&remotes, &gateway_only(&remotes))?
+                }
+            };
+            if !all_reachable {
                 std::process::exit(1);
             }
             Ok(())
         }
-        RemoteCommand::Start => start(&current_remote()?),
-        RemoteCommand::Stop => stop(&current_remote()?),
-        RemoteCommand::Recreate { yes } => recreate(&current_remote()?, yes),
-        RemoteCommand::Rm { yes } => rm(&current_remote()?, yes),
+        RemoteCommand::Start => start(&current_project()?),
+        RemoteCommand::Stop => stop(&current_project()?),
+        RemoteCommand::Recreate { yes } => recreate(&current_project()?, yes),
+        RemoteCommand::Rm { yes } => rm(&current_project()?, yes),
         RemoteCommand::Attach { remote, pane } => crate::remote::attach::run(&remote, &pane),
         RemoteCommand::Serve => crate::remote::serve::run(),
         RemoteCommand::PaneAttach { pane } => {
@@ -131,45 +136,63 @@ pub fn run(args: RemoteArgs) -> Result<()> {
     }
 }
 
-/// Resolve the working directory's project, so a repository whose config
-/// puts it in a sandbox is known here before any other command ran in it.
-fn resolve_here() {
-    if crate::remote::router::on_a_remote() {
-        return;
-    }
-    if let Ok(dir) = std::env::current_dir()
-        && let Err(error) = registry::resolve_at(&dir)
-    {
-        eprintln!("warning: {error:#}");
+/// The project this command targets: the working directory's repository,
+/// or the project window it was run from.
+fn current_project() -> Result<RemoteProject> {
+    crate::remote::router::resolve()?.ok_or_else(|| {
+        anyhow!(
+            "Not in a project with a sandbox; run this inside a clone of a repository \
+             whose .workmux.yaml sets sandbox.backend: openshell"
+        )
+    })
+}
+
+/// The remotes of `projects`, by name.
+fn project_remotes(projects: &[RemoteProject]) -> BTreeMap<String, RemoteConfig> {
+    projects
+        .iter()
+        .map(|project| (project.site.remote.clone(), project.remote_config.clone()))
+        .collect()
+}
+
+/// The remotes workmux knows of here: the working directory's project's,
+/// `here`, and those of projects with open workstation windows.
+fn known_remotes(here: Option<RemoteProject>) -> BTreeMap<String, RemoteConfig> {
+    let mut projects = crate::remote::router::remote_projects();
+    projects.extend(here);
+    project_remotes(&projects)
+}
+
+/// The sandboxes workmux made on the gateway that none of `known` is:
+/// listed, never reached.
+fn gateway_only(known: &BTreeMap<String, RemoteConfig>) -> Vec<Listed> {
+    match crate::remote::openshell::workmux_sandboxes() {
+        Ok(listed) => listed
+            .into_iter()
+            .filter(|sandbox| {
+                !known.values().any(|remote| {
+                    remote.transport == TransportKind::Openshell && remote.target == sandbox.name
+                })
+            })
+            .collect(),
+        Err(error) => {
+            eprintln!("warning: could not list the gateway's sandboxes: {error:#}");
+            Vec::new()
+        }
     }
 }
 
-/// The remote of the project this command targets: the working
-/// directory's repository, or the project window it was run from.
-fn current_remote() -> Result<String> {
-    crate::remote::router::resolve()?
-        .map(|project| project.site.remote)
-        .ok_or_else(|| {
-            anyhow!(
-                "Not in a project with a sandbox; run this inside a clone of a repository \
-                 whose .workmux.yaml sets sandbox.backend: openshell"
-            )
-        })
-}
-
-/// A remote whose transport manages its lifecycle.
-fn managed(name: &str) -> Result<(RemoteConfig, Arc<dyn Transport>)> {
-    let remote = registry::remotes()?
-        .remove(name)
-        .ok_or_else(|| anyhow!("No remote named {name}"))?;
-    let transport = registry::transport(name, &remote)?;
+/// `project`'s transport, which must manage its remote's lifecycle.
+fn managed(project: &RemoteProject) -> Result<Arc<dyn Transport>> {
+    let transport = crate::remote::transport::build(&project.remote_config)?;
     if transport.provisioning().is_none() {
         bail!(
-            "Remote {name} is reached over {}; workmux does not start or stop it",
-            remote.transport
+            "Remote {} is reached over {}; workmux does not start or stop it",
+            project.site.remote,
+            project.remote_config.transport
         );
     }
-    Ok((remote, transport))
+    Ok(transport)
 }
 
 fn lifecycle(transport: &dyn Transport) -> &dyn Provisioning {
@@ -180,18 +203,20 @@ fn print_notice(notice: &str) {
     eprintln!("{notice}");
 }
 
-fn start(name: &str) -> Result<()> {
-    let (_, transport) = managed(name)?;
+fn start(project: &RemoteProject) -> Result<()> {
+    let name = &project.site.remote;
+    let transport = managed(project)?;
     ensure_running(name, transport.as_ref(), true, &mut print_notice)?;
     // Reconnect now rather than at the next backoff retry.
-    for status in fetch_statuses(Some(name))? {
+    for status in fetch_statuses(&project_remotes(std::slice::from_ref(project)))? {
         println!("{name}: {}", summary(&status.reach));
     }
     Ok(())
 }
 
-fn stop(name: &str) -> Result<()> {
-    let (_, transport) = managed(name)?;
+fn stop(project: &RemoteProject) -> Result<()> {
+    let name = &project.site.remote;
+    let transport = managed(project)?;
     let provisioning = lifecycle(transport.as_ref());
     match provisioning.status()? {
         RemoteState::Missing => bail!("Remote {name} has no sandbox yet"),
@@ -207,15 +232,15 @@ fn stop(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// The OpenShell project whose sandbox is remote `name`.
-fn openshell_project(name: &str) -> Result<Option<crate::remote::router::RemoteProject>> {
-    let Some(origin) = registry::remotes()?
-        .remove(name)
-        .and_then(|remote| remote.openshell)
-    else {
-        return Ok(None);
-    };
-    crate::remote::router::remote_project_on(name, &origin.project).map(Some)
+/// Refuse `what` for `project` unless it lives in an OpenShell sandbox.
+fn openshell_only(project: &RemoteProject, what: &str) -> Result<()> {
+    if project.remote_config.openshell.is_none() {
+        bail!(
+            "Remote {} is not an OpenShell project's sandbox; only those are {what}",
+            project.site.remote
+        );
+    }
+    Ok(())
 }
 
 /// Ask `prompt`, unless `yes`.
@@ -275,12 +300,13 @@ fn with_risks(mut prompt: String, risks: Option<&[AtRisk]>) -> String {
     prompt
 }
 
-/// Delete an OpenShell project's sandbox, close the project's workstation
-/// windows, then forget the project until a command resolves it again. A sandbox started only to check
-/// its worktrees is stopped again when the delete does not go ahead.
-fn rm_openshell(project: &crate::remote::router::RemoteProject, yes: bool) -> Result<()> {
+/// Delete an OpenShell project's sandbox and close the project's
+/// workstation windows. A sandbox started only to check its worktrees is
+/// stopped again when the delete does not go ahead.
+fn rm(project: &RemoteProject, yes: bool) -> Result<()> {
+    openshell_only(project, "deleted")?;
     let name = &project.site.remote;
-    let transport = registry::transport(name, &project.remote)?;
+    let transport = crate::remote::transport::build(&project.remote_config)?;
     let provisioning = lifecycle(transport.as_ref());
     let state = provisioning.status()?;
     if state != RemoteState::Missing {
@@ -310,7 +336,11 @@ fn rm_openshell(project: &crate::remote::router::RemoteProject, yes: bool) -> Re
             }
         };
         match confirmed(
-            &delete_prompt(&project.site.name, &project.remote.target, risks.as_deref()),
+            &delete_prompt(
+                &project.site.name,
+                &project.remote_config.target,
+                risks.as_deref(),
+            ),
             yes,
         ) {
             Ok(true) => {}
@@ -324,14 +354,13 @@ fn rm_openshell(project: &crate::remote::router::RemoteProject, yes: bool) -> Re
                 return Err(error);
             }
         }
-        eprintln!("Deleting sandbox {}…", project.remote.target);
+        eprintln!("Deleting sandbox {}…", project.remote_config.target);
         provisioning.delete()?;
     }
     close_workstation_windows(&project.site.remote, &project.site.name);
-    registry::forget_remote(name)?;
     println!(
         "Deleted sandbox {} of project {}; the next workmux command in its repository creates it again",
-        project.remote.target, project.site.name,
+        project.remote_config.target, project.site.name,
     );
     Ok(())
 }
@@ -353,15 +382,14 @@ fn close_workstation_windows(remote: &str, name: &str) {
     }
 }
 
-fn recreate(name: &str, yes: bool) -> Result<()> {
-    let project = openshell_project(name)?.ok_or_else(|| {
-        anyhow!("Remote {name} is not an OpenShell project's sandbox; only those are recreated")
-    })?;
-    let transport = registry::transport(name, &project.remote)?;
+fn recreate(project: &RemoteProject, yes: bool) -> Result<()> {
+    openshell_only(project, "recreated")?;
+    let name = &project.site.remote;
+    let transport = crate::remote::transport::build(&project.remote_config)?;
     let provisioning = lifecycle(transport.as_ref());
     let keep = crate::xdg::state_dir()?
         .join("recreate")
-        .join(&project.remote.target);
+        .join(&project.remote_config.target);
     // An earlier recreate that failed after deleting the sandbox kept the
     // work; this one creates the sandbox if need be and restores it.
     let resuming = crate::remote::carry::has_kept_work(&keep);
@@ -381,7 +409,11 @@ fn recreate(name: &str, yes: bool) -> Result<()> {
             }
         };
         if !confirmed(
-            &recreate_prompt(&project.site.name, &project.remote.target, risks.as_deref()),
+            &recreate_prompt(
+                &project.site.name,
+                &project.remote_config.target,
+                risks.as_deref(),
+            ),
             yes,
         )? {
             println!("Kept remote {name} as it is");
@@ -393,9 +425,9 @@ fn recreate(name: &str, yes: bool) -> Result<()> {
         &project.site.path,
         &keep,
         &mut || {
-            eprintln!("Deleting sandbox {}…", project.remote.target);
+            eprintln!("Deleting sandbox {}…", project.remote_config.target);
             provisioning.delete()?;
-            eprintln!("Creating sandbox {}…", project.remote.target);
+            eprintln!("Creating sandbox {}…", project.remote_config.target);
             provisioning.create()
         },
         &mut print_notice,
@@ -455,25 +487,9 @@ fn print_policy(name: &str, remote: &RemoteConfig) {
     }
 }
 
-fn rm(name: &str, yes: bool) -> Result<()> {
-    match openshell_project(name)? {
-        Some(project) => rm_openshell(&project, yes),
-        None if registry::remotes()?.contains_key(name) => {
-            bail!("Remote {name} is no OpenShell sandbox; workmux deletes only those")
-        }
-        None => bail!("No remote named {name}"),
-    }
-}
-
-/// Fetch statuses through the workstation daemon, which holds the control
-/// channels, or directly when no daemon can run.
-fn fetch_statuses(name: Option<&str>) -> Result<Vec<RemoteStatus>> {
-    let remotes = registry::remotes()?;
-    if let Some(name) = name
-        && !remotes.contains_key(name)
-    {
-        bail!("No remote named {name}");
-    }
+/// Fetch the statuses of `remotes` through the workstation daemon, which
+/// holds the control channels, or directly when no daemon can run.
+fn fetch_statuses(remotes: &BTreeMap<String, RemoteConfig>) -> Result<Vec<RemoteStatus>> {
     if remotes.is_empty() {
         return Ok(Vec::new());
     }
@@ -482,19 +498,29 @@ fn fetch_statuses(name: Option<&str>) -> Result<Vec<RemoteStatus>> {
             let result = crate::workstation_daemon::call_with_timeout(
                 &socket,
                 "remote.status",
-                serde_json::json!({ "name": name }),
+                serde_json::json!({ "remotes": remotes }),
                 STATUS_TIMEOUT,
             )?;
             serde_json::from_value(result).context("Workstation daemon sent unreadable statuses")
         }
-        None => crate::remote::statuses(crate::remote::channels(), &remotes, name),
+        None => crate::remote::statuses(crate::remote::channels(), remotes, None),
     }
 }
 
-/// What `list` and `status` say when no command has put a project on a
-/// remote yet.
+/// What `list` and `status` say when no project here or in an open window
+/// is on a remote, and the gateway has no sandbox workmux made.
 const NO_REMOTES: &str = "No remotes. A repository whose .workmux.yaml sets sandbox.backend: \
 openshell gets its sandbox the first time workmux runs in it";
+
+/// The status of a sandbox the gateway lists that no clone here or open
+/// window resolves to: it is not reached.
+fn gateway_summary(sandbox: &Listed) -> String {
+    format!(
+        "{}, project {} has no open window",
+        sandbox.phase.to_lowercase(),
+        sandbox.project
+    )
+}
 
 /// One-line summary of a remote's reachability.
 fn summary(reach: &Reach) -> String {
@@ -537,8 +563,18 @@ impl Tabled for Row {
 }
 
 fn list() -> Result<()> {
-    let statuses = fetch_statuses(None)?;
-    if statuses.is_empty() {
+    let here = if crate::remote::router::on_a_remote() {
+        None
+    } else {
+        crate::remote::router::resolve().unwrap_or_else(|error| {
+            eprintln!("warning: {error:#}");
+            None
+        })
+    };
+    let remotes = known_remotes(here);
+    let statuses = fetch_statuses(&remotes)?;
+    let listed = gateway_only(&remotes);
+    if statuses.is_empty() && listed.is_empty() {
         println!("{NO_REMOTES}");
         return Ok(());
     }
@@ -550,6 +586,12 @@ fn list() -> Result<()> {
             target: status.target.clone(),
             status: summary(&status.reach),
         })
+        .chain(listed.iter().map(|sandbox| Row {
+            name: sandbox.name.clone(),
+            transport: TransportKind::Openshell.to_string(),
+            target: sandbox.name.clone(),
+            status: gateway_summary(sandbox),
+        }))
         .collect();
     let mut table = Table::new(rows);
     table
@@ -568,14 +610,14 @@ fn list() -> Result<()> {
     Ok(())
 }
 
-/// Print each remote's status. Returns whether none was unreachable.
-fn status(name: Option<&str>) -> Result<bool> {
-    let statuses = fetch_statuses(name)?;
-    if statuses.is_empty() {
+/// Print the status of each of `remotes`, then each of the gateway's
+/// sandboxes in `listed`. Returns whether none was unreachable.
+fn status(remotes: &BTreeMap<String, RemoteConfig>, listed: &[Listed]) -> Result<bool> {
+    let statuses = fetch_statuses(remotes)?;
+    if statuses.is_empty() && listed.is_empty() {
         println!("{NO_REMOTES}");
         return Ok(true);
     }
-    let remotes = registry::remotes()?;
     let mut all_reachable = true;
     for (i, status) in statuses.iter().enumerate() {
         if i > 0 {
@@ -612,6 +654,13 @@ fn status(name: Option<&str>) -> Result<bool> {
         {
             print_policy(&status.name, remote);
         }
+    }
+    for (i, sandbox) in listed.iter().enumerate() {
+        if i > 0 || !statuses.is_empty() {
+            println!();
+        }
+        println!("{} (openshell {})", sandbox.name, sandbox.name);
+        println!("  status:   {}", gateway_summary(sandbox));
     }
     Ok(all_reachable)
 }
@@ -668,6 +717,9 @@ mod tests {
                     ("XDG_STATE_HOME", temp.path()),
                     ("HOME", temp.path()),
                     ("PATH", std::path::Path::new(&path)),
+                    // No tmux server: closing windows never reaches a real one.
+                    ("TMUX", &temp.path().join("no-tmux")),
+                    ("TMUX_PANE", std::path::Path::new("%0")),
                 ],
             );
             let log = std::fs::read_to_string(temp.path().join("log")).unwrap_or_default();
@@ -684,42 +736,8 @@ mod tests {
         }
         println!("{}", crate::test_support::ISOLATED_TEST_CANARY);
 
-        let records = tempfile::tempdir().unwrap();
-        crate::remote::registry::with_recorded(records.path(), &[openshell_api()], || {
-            // stdin is closed: the confirmation reads no, the default.
-            rm("api", false).unwrap();
-
-            assert!(openshell_project("api").unwrap().is_some());
-        });
-    }
-
-    /// Project `api` in its OpenShell sandbox `api`.
-    fn openshell_api() -> crate::remote::router::RemoteProject {
-        let git_url = Some(crate::remote::git_url::GitUrl::new(
-            "https://example.com/api.git",
-        ));
-        crate::remote::router::RemoteProject {
-            site: crate::remote::session::ProjectSite {
-                remote: "api".to_string(),
-                name: "api".to_string(),
-                path: "~/api".to_string(),
-                git_url: git_url.clone(),
-                session: Some("api".to_string()),
-            },
-            remote: RemoteConfig {
-                transport: TransportKind::Openshell,
-                target: "api".to_string(),
-                builtin_shims: None,
-                host_commands: Vec::new(),
-                openshell: Some(crate::config::OpenshellRemote {
-                    project: "api".to_string(),
-                    git_url,
-                    path: "~/api".to_string(),
-                    settings: crate::config::OpenshellProject::default(),
-                    agents: vec!["claude".to_string()],
-                }),
-            },
-        }
+        // stdin is closed: the confirmation reads no, the default.
+        rm(&crate::remote::testing::openshell_api(), false).unwrap();
     }
 
     #[test]

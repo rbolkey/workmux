@@ -4296,14 +4296,12 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         crate::test_support::init_repo(temp.path());
         let agent = remote_agent(temp.path());
-        let records = tempfile::tempdir().unwrap();
 
-        let github = crate::remote::registry::with_recorded(
-            records.path(),
-            &[crate::command::dashboard::site::tests::devbox_api()],
-            || GithubWorkerPath::for_agent(&agent, "feature"),
-        )
-        .unwrap();
+        let github =
+            crate::remote::resolve::with_open(&[crate::remote::testing::devbox_api()], || {
+                GithubWorkerPath::for_agent(&agent, "feature")
+            })
+            .unwrap();
 
         assert_ne!(github.path, temp.path());
         assert_eq!(github.path, agent.git_key());

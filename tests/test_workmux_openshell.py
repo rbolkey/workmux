@@ -30,6 +30,7 @@ from .support.openshell import (
 from .test_workmux_remote import (
     SidebarFeed,
     agent_in,
+    openshell_sandbox_name,
     remote_daemon_ping,
     tmux_value,
     wait_until,
@@ -62,11 +63,13 @@ done
 
 
 class Project:
-    """An OpenShell project named `wm-e20-…`, whose sandbox has its name."""
+    """An OpenShell project named `wm-e20-…`, in the sandbox workmux names
+    after its workstation clone (`wm-e20-…-<hash>`)."""
 
     def __init__(self, env: MuxEnvironment, exe: Path, repo: Path, tmp: dict):
         self.name = f"wm-e20-{uuid.uuid4().hex[:4]}"
         self.env, self.exe, self.repo = env, exe, repo
+        self.configured = False
         self.tmp = {
             **tmp,
             **({"WORKMUX_OPENSHELL_WORKMUX": LINUX_WORKMUX} if LINUX_WORKMUX else {}),
@@ -97,6 +100,13 @@ class Project:
                 f"sandbox:\n  openshell:\n    providers: [{', '.join(providers)}]\n"
             )
         self.repo = repo
+        self.configured = True
+
+    @property
+    def sandbox(self) -> str:
+        """The sandbox workmux names after the project's clone."""
+        assert self.configured, "configure() names the clone the sandbox is named after"
+        return openshell_sandbox_name(self.repo)
 
     def wm(self, command: str, expect_fail=False, timeout=60.0, stdin=None):
         return run_workmux_command(
@@ -112,14 +122,14 @@ class Project:
 
     def sh(self, script: str) -> str:
         result = openshell(
-            ["sandbox", "exec", "-n", self.name, "--no-tty", "--no-login-shell"]
+            ["sandbox", "exec", "-n", self.sandbox, "--no-tty", "--no-login-shell"]
             + ["--", "sh", "-c", script]
         )
         assert result.returncode == 0, result.stderr
         return result.stdout
 
     def phase(self):
-        result = openshell(["sandbox", "get", self.name, "-o", "json"])
+        result = openshell(["sandbox", "get", self.sandbox, "-o", "json"])
         if result.returncode != 0:
             return None
         return json.loads(result.stdout)["phase"]
@@ -148,12 +158,14 @@ class Project:
         )
 
     def clean_up(self):
-        openshell(["sandbox", "delete", self.name], timeout=300)
+        if not self.configured:
+            return
+        openshell(["sandbox", "delete", self.sandbox], timeout=300)
         deadline = time.monotonic() + 120
         while self.phase() is not None and time.monotonic() < deadline:
             time.sleep(2)
         images = subprocess.run(
-            ["docker", "image", "ls", "-q", f"workmux-openshell-{self.name}"],
+            ["docker", "image", "ls", "-q", f"workmux-openshell-{self.sandbox}"],
             capture_output=True,
             text=True,
         ).stdout.split()
@@ -180,7 +192,7 @@ def project(mux_server, workmux_exe_path, repo_path, short_tmp):
 def add_project(project: Project):
     project.configure("/sandbox/origin", LEARNING_IMAGE)
     started = project.wm("remote start", timeout=600.0)
-    assert f"Creating remote {project.name} on first use" in started.stderr
+    assert f"Creating remote {project.sandbox} on first use" in started.stderr
     assert project.phase() == "Ready"
     project.make_origin()
 
@@ -220,7 +232,7 @@ def test_an_openshell_project_lives_stops_resumes_and_is_removed_with_its_sandbo
             "the sandbox agent working",
             timeout=60.0,
         )
-        assert agent_in(snapshot, pane)["remote"]["remote"] == project.name
+        assert agent_in(snapshot, pane)["remote"]["remote"] == project.sandbox
 
         # Stopped only on request; the agent turns stale, and status never
         # starts the sandbox.
@@ -247,7 +259,7 @@ def test_an_openshell_project_lives_stops_resumes_and_is_removed_with_its_sandbo
         listing = project.wm("list").stdout
         assert "feature" in listing, listing
         assert listing.splitlines()[0] == (
-            f"Worktrees in OpenShell sandbox {project.name} (project {project.name})"
+            f"Worktrees in OpenShell sandbox {project.sandbox} (project {project.name})"
         ), listing
 
         # A command that needs a stopped sandbox starts it itself.
@@ -290,7 +302,7 @@ def test_a_recreate_carries_a_worktree_and_its_commit_across(project: Project):
     head = project.sh(f"git -C {worktree} rev-parse HEAD").strip()
     project.sh(f"echo draft > {worktree}/draft.txt")
     before = json.loads(
-        openshell(["sandbox", "get", project.name, "-o", "json"]).stdout
+        openshell(["sandbox", "get", project.sandbox, "-o", "json"]).stdout
     )["id"]
 
     refused = project.wm("remote recreate --yes", expect_fail=True, timeout=120.0)
@@ -301,7 +313,7 @@ def test_a_recreate_carries_a_worktree_and_its_commit_across(project: Project):
     project.wm("remote recreate --yes", timeout=900.0)
 
     after = json.loads(
-        openshell(["sandbox", "get", project.name, "-o", "json"]).stdout
+        openshell(["sandbox", "get", project.sandbox, "-o", "json"]).stdout
     )["id"]
     assert after != before
     assert project.sh(f"git -C {worktree} rev-parse HEAD").strip() == head
@@ -333,7 +345,7 @@ def test_a_projects_lima_sandbox_is_ignored_inside_its_openshell_sandbox(
     assert "limactl" not in output, output
     assert (
         "the sandbox: setting is ignored inside OpenShell sandbox "
-        f"{project.name}" in output
+        f"{project.sandbox}" in output
     ), output
     wait_until(
         lambda: (

@@ -278,10 +278,12 @@ impl Sessions {
     /// Run `request` on the remote at the other end of `peer`, passing its
     /// output to `terminal` as it arrives and reading its prompts' answers
     /// there. Requests the command forwards are answered from
-    /// `invocation`. Returns the command's exit code.
+    /// `invocation`, and the windows they open tagged with the workstation
+    /// clone `root`. Returns the command's exit code.
     pub fn run(
         &self,
         peer: &Peer,
+        root: &Path,
         request: &CommandRequest,
         invocation: &InvocationContext,
         terminal: &mut dyn Terminal,
@@ -289,6 +291,7 @@ impl Sessions {
         let (session, sender, events) = self.open(SessionScope {
             remote: request.project.remote.clone(),
             project: request.project.name.clone(),
+            root: root.to_path_buf(),
             invocation: invocation.clone(),
         });
         let params = serde_json::to_value(RunParams {
@@ -717,6 +720,13 @@ mod tests {
         )
     }
 
+    /// Project `api` on remote `devbox`, as [`remote`] reaches it.
+    fn devbox() -> crate::remote::router::RemoteProject {
+        let mut project = crate::remote::testing::devbox_api();
+        project.remote_config = remote();
+        project
+    }
+
     fn remote() -> RemoteConfig {
         RemoteConfig {
             transport: TransportKind::Loopback,
@@ -751,7 +761,7 @@ mod tests {
     fn run(request: &CommandRequest, mut on_stdout: impl FnMut(&str)) -> (Result<i32>, Captured) {
         let mut captured = Captured::default();
         let exit = channels().run_command(
-            crate::remote::Remote::new("devbox", &remote()),
+            &devbox(),
             request,
             &InvocationContext::default(),
             &mut |stream, data: &[u8]| {
@@ -851,7 +861,7 @@ mod tests {
         let started = std::time::Instant::now();
 
         let exit = channels().run_command(
-            crate::remote::Remote::new("devbox", &remote()),
+            &devbox(),
             &request(project.path(), None, script),
             &InvocationContext::default(),
             &mut Interrupting::default(),
@@ -919,7 +929,7 @@ mod tests {
         };
 
         let exit = channels().run_command(
-            crate::remote::Remote::new("devbox", &remote()),
+            &devbox(),
             &request,
             &InvocationContext::default(),
             &mut terminal,

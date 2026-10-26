@@ -18,13 +18,17 @@ use super::session::ServedProject;
 use super::session::{Answer, CommandRequest, OutputParams, ProjectSite, Stream, Terminal};
 use crate::config::{Config, RemoteConfig};
 use crate::multiplexer::{InvocationContext, TmuxBackend, create_backend, detect_backend};
-use crate::project::{Project, RemoteProjectId};
+use crate::project::{Project, ProjectTag, RemoteProjectId};
 
 /// A project on a remote, resolved from its repository's config.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteProject {
+    /// The workstation clone whose config puts the project on its remote.
+    pub root: PathBuf,
+    /// The project as remote workmux needs it, naming its remote.
     pub site: ProjectSite,
-    pub remote: RemoteConfig,
+    /// How the workstation reaches that remote.
+    pub remote_config: RemoteConfig,
 }
 
 impl RemoteProject {
@@ -36,17 +40,23 @@ impl RemoteProject {
         self.site.id()
     }
 
+    /// The tag on the project's workstation sessions and windows.
+    #[cfg(test)]
+    pub fn tag(&self) -> ProjectTag {
+        ProjectTag::new(self.id(), &self.root)
+    }
+
     /// The remote the project is on.
     pub fn host(&self) -> super::Remote<'_> {
-        super::Remote::new(&self.site.remote, &self.remote)
+        super::Remote::new(&self.site.remote, &self.remote_config)
     }
 
     /// Where the project runs, as a command targeting it says once.
     pub fn target(&self) -> String {
-        match self.remote.transport {
+        match self.remote_config.transport {
             crate::config::TransportKind::Openshell => format!(
                 "OpenShell sandbox {} (project {})",
-                self.remote.target, self.site.name
+                self.remote_config.target, self.site.name
             ),
             _ => format!("remote {} (project {})", self.site.remote, self.site.name),
         }
@@ -64,20 +74,15 @@ pub fn refuse_editor(project: &RemoteProject, what: &str, instead: &str) -> anyh
     )
 }
 
-/// The remote project `name`, as a command last resolved it.
-pub fn remote_project(name: &str) -> Result<RemoteProject> {
-    super::registry::project(name)
-}
-
-/// The remote project `name` on `remote`, as a command last resolved it.
+/// The remote project `name` on `remote`, resolved from the clone its
+/// open workstation windows are tagged with.
 pub fn remote_project_on(remote: &str, name: &str) -> Result<RemoteProject> {
-    super::registry::project_on(remote, name)?
-        .ok_or_else(|| anyhow!("No project {name} on remote {remote}"))
+    super::resolve::open_project(remote, name)
 }
 
-/// Every remote project commands have resolved.
-pub fn remote_projects() -> Result<Vec<RemoteProject>> {
-    super::registry::projects()
+/// Every remote project with open workstation windows.
+pub fn remote_projects() -> Vec<RemoteProject> {
+    super::resolve::open_projects()
 }
 
 /// The remote project a command targets, or `None` for a local project:
@@ -89,13 +94,13 @@ pub fn resolve() -> Result<Option<RemoteProject>> {
         return Ok(None);
     }
     if let Some(tag) = invoking_project_tag()
-        && let Some(project) = project_tagged(&tag)
+        && let Some(project) = super::resolve::tagged(&tag)?
     {
         return Ok(Some(project));
     }
     std::env::current_dir()
         .ok()
-        .map(|dir| super::registry::resolve_at(&dir))
+        .map(|dir| super::resolve::at(&dir))
         .transpose()
         .map(Option::flatten)
 }
@@ -112,7 +117,7 @@ pub fn on_a_remote() -> bool {
 /// The project tag of the tmux window this command was run from, else of
 /// its session: a window or session workmux opened for a project. Commands
 /// remote workmux runs are never routed again.
-fn invoking_project_tag() -> Option<String> {
+fn invoking_project_tag() -> Option<ProjectTag> {
     if ServedProject::current().is_some() {
         return None;
     }
@@ -137,13 +142,13 @@ fn invoking_project_tag() -> Option<String> {
 
 /// The project tag in a `<window tag>\t<session tag>` line: the window's,
 /// else the session's.
-fn project_tag_of(tags: &str) -> Option<String> {
+fn project_tag_of(tags: &str) -> Option<ProjectTag> {
     // The query may come back trimmed, losing the tab before a session
     // tag when the window has none.
     tags.split('\t')
         .map(str::trim)
         .find(|tag| !tag.is_empty())
-        .map(str::to_string)
+        .and_then(ProjectTag::parse)
 }
 
 /// The ownership token of the window this command was typed in, when that
@@ -171,23 +176,8 @@ fn invoking_window_token(project: &RemoteProject) -> Option<String> {
 /// The token in a `<window tag>\t<token>` line, when the tag is `project`'s.
 fn window_token_for(project: &RemoteProject, window: &str) -> Option<String> {
     let (tag, token) = window.trim_end_matches('\n').split_once('\t')?;
-    let own = project.id().tag();
-    (tag.trim() == own && !token.trim().is_empty()).then(|| token.trim().to_string())
-}
-
-/// The remote project `tag` names, if a command has resolved it.
-fn project_tagged(tag: &str) -> Option<RemoteProject> {
-    let id = RemoteProjectId::from_tag(tag)?;
-    match remote_project_on(&id.remote, &id.name) {
-        Ok(project) => Some(project),
-        Err(_) => {
-            tracing::warn!(
-                tag,
-                "session is tagged with a project workmux does not know"
-            );
-            None
-        }
-    }
+    (RemoteProjectId::from_tag(tag) == Some(project.id()) && !token.trim().is_empty())
+        .then(|| token.trim().to_string())
 }
 
 /// The workstation daemon's socket, when a tmux server can host it.
@@ -275,7 +265,7 @@ fn session_once(
     };
     let Some(socket) = daemon_socket() else {
         return super::channels().run_command(
-            project.host(),
+            project,
             &request,
             InvocationContext::current(),
             terminal,
@@ -287,7 +277,7 @@ fn session_once(
         &socket,
         crate::workstation_daemon::COMMAND_SESSION_METHOD,
         serde_json::json!({
-            "remote": project.site.remote,
+            "root": project.root,
             "request": request,
             "invocation": InvocationContext::current(),
             "running": running,
@@ -371,7 +361,7 @@ pub fn run(project: &RemoteProject, argv: &[&str]) -> Result<i32> {
 /// it reports to this terminal: with `start`, a missing remote is created
 /// and a stopped one started. Returns whether it is running.
 pub fn ready(project: &RemoteProject, start: bool) -> Result<bool> {
-    let transport = super::registry::transport(&project.site.remote, &project.remote)?;
+    let transport = super::transport::build(&project.remote_config)?;
     super::transport::ensure_running(
         &project.site.remote,
         transport.as_ref(),
@@ -669,14 +659,21 @@ fn read_prompt_file(path: &Path) -> Result<String> {
     std::fs::read_to_string(path).with_context(failed)
 }
 
-/// Relay this command, as it was typed, to every remote project, printing
+/// Relay this command, as it was typed, to every remote project with an
+/// open workstation window and to the one this command runs in, printing
 /// each one's output under its name; a project with nothing to say prints
 /// nothing. Returns how many projects failed or could not be reached.
 pub fn relay_to_every_project() -> Result<usize> {
     let argv = relayed_argv();
     let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let mut projects = remote_projects();
+    if let Some(here) = resolve()?
+        && !projects.iter().any(|project| project.id() == here.id())
+    {
+        projects.insert(0, here);
+    }
     let mut failures = 0;
-    for project in remote_projects()? {
+    for project in projects {
         let (name, remote) = (&project.site.name, &project.site.remote);
         // A stopped sandbox is never started just to visit it.
         match ready(&project, false) {
@@ -729,22 +726,7 @@ mod tests {
     }
 
     fn api() -> RemoteProject {
-        RemoteProject {
-            site: ProjectSite {
-                remote: "devbox".to_string(),
-                name: "api".to_string(),
-                path: "~/api".to_string(),
-                git_url: None,
-                session: Some("api".to_string()),
-            },
-            remote: RemoteConfig {
-                transport: crate::config::TransportKind::Loopback,
-                target: "/tmp/devbox".to_string(),
-                builtin_shims: None,
-                host_commands: Vec::new(),
-                openshell: None,
-            },
-        }
+        crate::remote::testing::devbox_api()
     }
 
     #[test]
@@ -865,23 +847,27 @@ agents:
     fn a_command_names_the_sandbox_it_targets() {
         let mut api = api();
         assert_eq!(api.target(), "remote devbox (project api)");
-        api.remote.transport = crate::config::TransportKind::Openshell;
-        api.remote.target = "wm-api".to_string();
+        api.remote_config.transport = crate::config::TransportKind::Openshell;
+        api.remote_config.target = "wm-api".to_string();
         assert_eq!(api.target(), "OpenShell sandbox wm-api (project api)");
     }
 
     #[test]
     fn a_project_window_targets_its_project_before_its_session() {
+        let tag = |line: &str| project_tag_of(line).map(|tag| tag.to_string());
         assert_eq!(
-            project_tag_of("devbox:api\tdevbox:web\n").as_deref(),
-            Some("devbox:api")
+            tag("devbox:api:/src/api\tdevbox:web:/src/web\n").as_deref(),
+            Some("devbox:api:/src/api")
         );
         assert_eq!(
-            project_tag_of("\tdevbox:web\n").as_deref(),
-            Some("devbox:web")
+            tag("\tdevbox:web:/src/web\n").as_deref(),
+            Some("devbox:web:/src/web")
         );
-        assert_eq!(project_tag_of("devbox:web").as_deref(), Some("devbox:web"));
-        assert_eq!(project_tag_of("\t\n"), None);
+        assert_eq!(
+            tag("devbox:web:/src/web").as_deref(),
+            Some("devbox:web:/src/web")
+        );
+        assert_eq!(tag("\t\n"), None);
     }
 
     #[test]
@@ -889,11 +875,11 @@ agents:
         let api = api();
 
         assert_eq!(
-            window_token_for(&api, "devbox:api\tf00d\n").as_deref(),
+            window_token_for(&api, "devbox:api:/src/api\tf00d\n").as_deref(),
             Some("f00d")
         );
-        assert_eq!(window_token_for(&api, "devbox:web\tf00d\n"), None);
+        assert_eq!(window_token_for(&api, "devbox:web:/src/web\tf00d\n"), None);
         assert_eq!(window_token_for(&api, "\tf00d\n"), None);
-        assert_eq!(window_token_for(&api, "devbox:api\t\n"), None);
+        assert_eq!(window_token_for(&api, "devbox:api:/src/api\t\n"), None);
     }
 }

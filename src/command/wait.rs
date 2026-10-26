@@ -94,7 +94,7 @@ fn unstarted_remote_target(name: &str) -> Result<Option<WaitTarget>> {
         _ => (None, name),
     };
     let project = match qualifier {
-        Some(qualifier) => crate::remote::router::remote_projects()?
+        Some(qualifier) => crate::remote::router::remote_projects()
             .into_iter()
             .find(|project| {
                 project.site.name == qualifier || project.project().group_label() == qualifier
@@ -171,9 +171,21 @@ fn worktree_removed(target: &WaitTarget) -> Option<bool> {
     match target {
         WaitTarget::Path(path) => Some(!path.exists()),
         WaitTarget::Remote {
-            project, worktree, ..
+            remote,
+            project,
+            worktree,
         } => {
-            let project = crate::remote::router::remote_project(project).ok()?;
+            // The project of an open window, else of the working directory.
+            let project = crate::remote::router::remote_project_on(remote, project)
+                .ok()
+                .or_else(|| {
+                    crate::remote::router::resolve()
+                        .ok()
+                        .flatten()
+                        .filter(|here| {
+                            here.id() == crate::project::RemoteProjectId::new(remote, project)
+                        })
+                })?;
             match crate::remote::router::quietly(&project, &["workmux", "path", worktree]) {
                 Ok(exit) => Some(exit != 0),
                 Err(error) => {
@@ -327,12 +339,19 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             let temp = tempfile::tempdir().unwrap();
             let bin = temp.path().join("bin");
-            let config = temp.path().join("config/workmux");
             std::fs::create_dir_all(&bin).unwrap();
-            std::fs::create_dir_all(&config).unwrap();
+            std::fs::create_dir_all(temp.path().join("config")).unwrap();
+            // A clone whose config puts it in an OpenShell sandbox.
+            let repo = temp.path().join("api");
+            std::fs::create_dir(&repo).unwrap();
+            crate::test_support::init_repo(&repo);
+            crate::test_support::run_git(
+                &repo,
+                &["remote", "add", "origin", "https://example.com/api.git"],
+            );
             std::fs::write(
-                config.join("config.yaml"),
-                "projects:\n  api:\n    git_url: https://example.com/api.git\n    openshell: {}\n",
+                repo.join(".workmux.yaml"),
+                "sandbox:\n  enabled: true\n  backend: openshell\n",
             )
             .unwrap();
             // The sandbox is missing; every call is logged.
@@ -348,33 +367,47 @@ mod tests {
             std::fs::set_permissions(&openshell, std::fs::Permissions::from_mode(0o755)).unwrap();
             // Nothing may build an image either.
             let docker = bin.join("docker");
-            std::fs::write(&docker, "#!/bin/sh\nexit 1\n").unwrap();
+            std::fs::write(
+                &docker,
+                format!(
+                    "#!/bin/sh\nprintf 'docker %s\\n' \"$*\" >> '{}'\nexit 1\n",
+                    temp.path().join("log").display()
+                ),
+            )
+            .unwrap();
             std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).unwrap();
             let path = std::env::join_paths(
                 std::iter::once(bin.clone())
                     .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
             )
             .unwrap();
+            let no_tmux = temp.path().join("no-tmux");
             crate::test_support::run_isolated_test(
                 TEST_NAME,
-                temp.path(),
+                &repo,
                 &[
                     ("XDG_CONFIG_HOME", &temp.path().join("config")),
                     ("XDG_STATE_HOME", temp.path()),
                     ("HOME", temp.path()),
                     ("PATH", std::path::Path::new(&path)),
+                    // No tmux server: no window tags route the command.
+                    ("TMUX", &no_tmux),
+                    ("TMUX_PANE", std::path::Path::new("%0")),
                 ],
             );
             let log = std::fs::read_to_string(temp.path().join("log")).unwrap_or_default();
+            // The clone's sandbox was looked at, and nothing else: it was
+            // neither built, created nor started.
+            assert!(log.contains("sandbox get"), "{log}");
             assert!(
-                !log.contains("sandbox create") && !log.contains("sandbox start"),
+                log.lines().all(|line| line.starts_with("sandbox get")),
                 "{log}"
             );
             return;
         }
         println!("{}", crate::test_support::ISOLATED_TEST_CANARY);
 
-        assert!(unstarted_remote_target("api:feature").unwrap().is_none());
+        assert!(unstarted_remote_target("feature").unwrap().is_none());
     }
 
     fn remote_agent(worktree: &str, status: AgentStatus, stale: bool) -> AgentPane {

@@ -38,6 +38,67 @@ const PHASE_TIMEOUT: Duration = Duration::from_secs(300);
 /// The annotation recording the image a sandbox was created from.
 pub const IMAGE_ANNOTATION: &str = "workmux.image";
 
+/// The annotation recording the project a sandbox was created for: the
+/// mark of a sandbox workmux made.
+pub const PROJECT_ANNOTATION: &str = "workmux.project";
+
+/// A sandbox workmux made, as the gateway lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Listed {
+    pub name: String,
+    pub project: String,
+    pub phase: String,
+}
+
+/// The sandboxes on the gateway that workmux made, by its annotation.
+/// None when OpenShell is not installed.
+pub fn workmux_sandboxes() -> Result<Vec<Listed>> {
+    let mut listed = Vec::new();
+    let mut token = String::new();
+    loop {
+        let output = match Command::new("openshell")
+            .env("NO_COLOR", "1")
+            .args(["sandbox", "list", "-o", "json", "--page-token", &token])
+            .stdin(Stdio::null())
+            .output()
+        {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(listed),
+            output => output.context("Failed to run openshell")?,
+        };
+        if !output.status.success() {
+            bail!("{}", failure(&output));
+        }
+        let page: Value = serde_json::from_slice(&output.stdout)
+            .context("openshell sandbox list printed unreadable JSON")?;
+        listed.extend(workmux_sandboxes_in(&page));
+        token = page["next_page_token"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        if token.is_empty() {
+            return Ok(listed);
+        }
+    }
+}
+
+/// The sandboxes workmux made in one page of `sandbox list -o json`.
+fn workmux_sandboxes_in(page: &Value) -> Vec<Listed> {
+    page["sandboxes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|sandbox| {
+            Some(Listed {
+                name: sandbox["name"].as_str()?.to_string(),
+                project: sandbox["annotations"][PROJECT_ANNOTATION]
+                    .as_str()?
+                    .to_string(),
+                phase: sandbox["phase"].as_str().unwrap_or_default().to_string(),
+            })
+        })
+        .collect()
+}
+
 pub struct OpenShell {
     sandbox: String,
     /// What the sandbox is created from, for a project's implicit remote.
@@ -441,7 +502,7 @@ impl OpenShell {
         }
         args.extend([
             "--annotation".to_string(),
-            format!("workmux.project={}", origin.project),
+            format!("{PROJECT_ANNOTATION}={}", origin.project),
             "--annotation".to_string(),
             format!("{IMAGE_ANNOTATION}={image}"),
         ]);
@@ -714,6 +775,36 @@ impl Provisioning for OpenShell {
 pub(super) mod tests {
     use super::*;
     use crate::config::OpenshellProject;
+
+    #[test]
+    fn the_gateway_lists_the_sandboxes_workmux_made_by_their_annotation() {
+        let page = serde_json::json!({
+            "next_page_token": "",
+            "sandboxes": [
+                {"name": "api-1a2b3c4d", "phase": "Ready",
+                 "annotations": {"workmux.project": "api", "workmux.image": "i:1"}},
+                {"name": "theirs", "phase": "Ready", "annotations": {}},
+                {"name": "web-5e6f7a8b", "phase": "Stopped",
+                 "annotations": {"workmux.project": "web"}},
+            ],
+        });
+
+        assert_eq!(
+            workmux_sandboxes_in(&page),
+            [
+                Listed {
+                    name: "api-1a2b3c4d".to_string(),
+                    project: "api".to_string(),
+                    phase: "Ready".to_string(),
+                },
+                Listed {
+                    name: "web-5e6f7a8b".to_string(),
+                    project: "web".to_string(),
+                    phase: "Stopped".to_string(),
+                },
+            ]
+        );
+    }
     use std::os::unix::fs::PermissionsExt;
 
     fn argv(args: &[&str]) -> Vec<String> {

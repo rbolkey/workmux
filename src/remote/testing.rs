@@ -200,3 +200,46 @@ impl Provisioning for StoppedTransport {
         unimplemented!()
     }
 }
+
+/// Project `api` on loopback remote `devbox`, cloned from GitHub over SSH;
+/// its workstation clone is `/src/api`.
+pub fn devbox_api() -> super::router::RemoteProject {
+    super::router::RemoteProject {
+        root: std::path::PathBuf::from("/src/api"),
+        site: super::session::ProjectSite {
+            remote: "devbox".to_string(),
+            name: "api".to_string(),
+            path: "~/api".to_string(),
+            git_url: Some(super::git_url::GitUrl::new("git@github.com:me/api.git")),
+            session: Some("api".to_string()),
+        },
+        remote_config: crate::config::RemoteConfig {
+            transport: crate::config::TransportKind::Loopback,
+            target: "/tmp/devbox".to_string(),
+            builtin_shims: None,
+            host_commands: Vec::new(),
+            openshell: None,
+        },
+    }
+}
+
+/// Project `api` in its OpenShell sandbox `api`.
+pub fn openshell_api() -> super::router::RemoteProject {
+    let mut project = devbox_api();
+    project.site.remote = "api".to_string();
+    project.site.git_url = Some(super::git_url::GitUrl::new("https://example.com/api.git"));
+    project.remote_config = crate::config::RemoteConfig {
+        transport: crate::config::TransportKind::Openshell,
+        target: "api".to_string(),
+        builtin_shims: None,
+        host_commands: Vec::new(),
+        openshell: Some(crate::config::OpenshellRemote {
+            project: "api".to_string(),
+            git_url: project.site.git_url.clone(),
+            path: "~/api".to_string(),
+            settings: crate::config::OpenshellProject::default(),
+            agents: vec!["claude".to_string()],
+        }),
+    };
+    project
+}

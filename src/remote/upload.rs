@@ -17,20 +17,24 @@ use super::ssh::{Ssh, uploaded_workmux_dir};
 use super::transport::Transport;
 use crate::command::update;
 
-/// Where released builds are downloaded from:
-/// `<base>/v<version>/workmux-<platform>.tar.gz` with its `.sha256`.
-const RELEASES_URL: &str = "https://github.com/raine/workmux/releases/download";
-
 /// Set when building a release, so a build can tell whether a released
 /// artifact of its version is the same program.
 const RELEASE_BUILD: bool = option_env!("WORKMUX_RELEASE_BUILD").is_some();
+
+/// Where a build downloads released builds from: its release source, when
+/// it is a release build. There is no default source (ticket 54).
+fn releases_for(release_build: bool, source: Option<String>) -> Option<String> {
+    source.filter(|_| release_build)
+}
 
 /// Where a workmux matching this workstation comes from.
 pub struct Builds {
     /// This workstation's own binary and the platform it runs on.
     pub own: Option<(String, PathBuf)>,
-    /// Base URL of released builds of this version; `None` for a
-    /// development build, which no release matches.
+    /// Base URL of released builds, `<base>/v<version>/workmux-<platform>.tar.gz`
+    /// with its `.sha256`: the build's release source (ticket 54). `None`
+    /// for a development build, which no release matches, or a build with
+    /// no release source.
     pub releases: Option<String>,
 }
 
@@ -41,9 +45,10 @@ impl Builds {
             .ok()
             .zip(std::env::current_exe().ok())
             .map(|(platform, exe)| (platform.to_string(), exe));
-        let releases = RELEASE_BUILD
-            .then(|| update::release_source().unwrap_or_else(|| RELEASES_URL.to_string()));
-        Self { own, releases }
+        Self {
+            own,
+            releases: releases_for(RELEASE_BUILD, update::release_source()),
+        }
     }
 
     /// A workmux binary for `platform`, downloading into `dir` if need be.
@@ -56,9 +61,9 @@ impl Builds {
         let version = env!("CARGO_PKG_VERSION");
         let Some(base) = &self.releases else {
             bail!(
-                "This workmux {version} is a development build, so no release of it exists \
-                 for {remote}'s platform ({platform}): build workmux for {platform} and run \
-                 `workmux remote upload {remote} --binary <path>`"
+                "No release of workmux {version} can be downloaded for {remote}'s platform \
+                 ({platform}): this is a development build or has no release source. Build \
+                 workmux for {platform} and run `workmux remote upload {remote} --binary <path>`"
             );
         };
         let artifact = format!("workmux-{platform}");
@@ -214,6 +219,19 @@ fn remote_platform(remote: &str, ssh: &Ssh) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_release_build_downloads_only_from_its_own_release_source() {
+        assert_eq!(releases_for(true, None), None);
+        assert_eq!(
+            releases_for(true, Some("file:///releases".to_string())).as_deref(),
+            Some("file:///releases")
+        );
+        assert_eq!(
+            releases_for(false, Some("file:///releases".to_string())),
+            None
+        );
+    }
     use crate::remote::handshake::{Hello, PROTOCOL_VERSION, SENTINEL};
     use crate::remote::ssh::tests::{install_remote_workmux, serve_script, transport};
     use crate::ssh_learning::harness::{SshHarness, local_sshd, ssh_harness};

@@ -459,7 +459,19 @@ fn create_impl(
         .context("Failed to acquire git config lock")?;
 
     // Store the review base before checkout so observers that see the worktree
-    // appear on disk also see complete branch metadata.
+    // appear on disk also see complete branch metadata. A failed `add` puts
+    // back the base an existing branch had.
+    let new_worktree = NewWorktree {
+        context,
+        branch_name,
+        handle: &current_handle,
+        path: &worktree_path,
+        created_branch: create_new,
+        headless,
+        stored_base: comparison_base
+            .as_ref()
+            .map(|_| git::get_branch_base_in(branch_name, Some(&context.execution_dir)).ok()),
+    };
     if let Some(ref base) = comparison_base {
         git::set_branch_base_in(branch_name, base, Some(&context.execution_dir)).with_context(
             || {
@@ -476,95 +488,32 @@ fn create_impl(
         );
     }
 
-    git::create_worktree_in(
+    if let Err(error) = git::create_worktree_in(
         &worktree_path,
         branch_name,
         create_new,
         base_branch_for_creation.as_deref(),
         track_upstream,
         Some(&context.execution_dir),
-    )
-    .context("Failed to create git worktree")?;
+    ) {
+        new_worktree.restore_base();
+        return Err(error.context("Failed to create git worktree"));
+    }
 
     // From here on a failure removes what this `add` created, so a retry
     // does not find the worktree (or a new branch) already there.
-    let roll_back = |error: anyhow::Error| {
-        roll_back_new_worktree(
-            context,
-            branch_name,
-            &current_handle,
-            &worktree_path,
-            create_new,
-            headless,
-            error,
-        )
-    };
+    let roll_back = |error: anyhow::Error| new_worktree.roll_back(error);
 
-    if headless {
-        if let Err(error) = git::set_worktree_attachment_in(
+    let metadata = if headless {
+        git::set_worktree_attachment_in(
             &current_handle,
             git::WorktreeAttachment::Headless,
             Some(&context.execution_dir),
-        ) {
-            drop(_config_lock);
-            return Err(roll_back(error));
-        }
-    } else if let Err(error) = (|| -> Result<()> {
-        let mode_str = match options.mode {
-            MuxMode::Session => "session",
-            MuxMode::Window => "window",
-        };
-        git::set_worktree_meta_in(
-            &current_handle,
-            "mode",
-            mode_str,
-            Some(&context.execution_dir),
         )
-        .with_context(|| {
-            format!(
-                "Failed to store tmux mode for worktree '{}'",
-                current_handle
-            )
-        })?;
-        git::set_worktree_attachment_in(
-            &current_handle,
-            git::WorktreeAttachment::Multiplexer,
-            Some(&context.execution_dir),
-        )?;
-        if let Some(target_window_name) = &options.target_window_name {
-            git::set_worktree_meta_in(
-                &current_handle,
-                "target-window",
-                target_window_name,
-                Some(&context.execution_dir),
-            )?;
-        }
-        if let Some(target_session_name) = &options.target_session_name {
-            git::set_worktree_meta_in(
-                &current_handle,
-                "target-session",
-                target_session_name,
-                Some(&context.execution_dir),
-            )?;
-        }
-        if let Some(window_session_name) = &options.window_session_name {
-            git::set_worktree_meta_in(
-                &current_handle,
-                "window-session",
-                window_session_name,
-                Some(&context.execution_dir),
-            )?;
-        }
-        if options.mode == MuxMode::Window && context.mux.supports_window_ownership() {
-            options.window_token = Some(git::ensure_worktree_window_token_in(
-                &current_handle,
-                Some(&context.execution_dir),
-            )?);
-            options.primary_window = true;
-        }
-        debug!(handle = %current_handle, mode = mode_str, "create:stored mux metadata");
-        Ok(())
-    })() {
+    } else {
+        store_mux_metadata(context, &current_handle, &mut options)
+    };
+    if let Err(error) = metadata {
         drop(_config_lock);
         return Err(roll_back(error));
     }
@@ -684,46 +633,128 @@ fn create_impl(
     Ok(CreateOutcome::Attached(result))
 }
 
-/// Remove the worktree (and the branch, when `add` created it) after a failure
-/// past worktree creation, and say so on the error.
-fn roll_back_new_worktree(
+/// Record how the new worktree `handle` is shown: its multiplexer mode,
+/// target window and session, and the token of the window that owns it.
+fn store_mux_metadata(
     context: &WorkflowContext,
-    branch_name: &str,
     handle: &str,
-    worktree_path: &Path,
+    options: &mut SetupOptions,
+) -> Result<()> {
+    let mode_str = match options.mode {
+        MuxMode::Session => "session",
+        MuxMode::Window => "window",
+    };
+    git::set_worktree_meta_in(handle, "mode", mode_str, Some(&context.execution_dir))
+        .with_context(|| format!("Failed to store tmux mode for worktree '{}'", handle))?;
+    git::set_worktree_attachment_in(
+        handle,
+        git::WorktreeAttachment::Multiplexer,
+        Some(&context.execution_dir),
+    )?;
+    if let Some(target_window_name) = &options.target_window_name {
+        git::set_worktree_meta_in(
+            handle,
+            "target-window",
+            target_window_name,
+            Some(&context.execution_dir),
+        )?;
+    }
+    if let Some(target_session_name) = &options.target_session_name {
+        git::set_worktree_meta_in(
+            handle,
+            "target-session",
+            target_session_name,
+            Some(&context.execution_dir),
+        )?;
+    }
+    if let Some(window_session_name) = &options.window_session_name {
+        git::set_worktree_meta_in(
+            handle,
+            "window-session",
+            window_session_name,
+            Some(&context.execution_dir),
+        )?;
+    }
+    if options.mode == MuxMode::Window && context.mux.supports_window_ownership() {
+        options.window_token = Some(git::ensure_worktree_window_token_in(
+            handle,
+            Some(&context.execution_dir),
+        )?);
+        options.primary_window = true;
+    }
+    debug!(handle = %handle, mode = mode_str, "create:stored mux metadata");
+    Ok(())
+}
+
+/// What `add` created, for undoing when it fails before finishing: the
+/// worktree, the branch if `add` created it, and the base it stored.
+struct NewWorktree<'a> {
+    context: &'a WorkflowContext,
+    branch_name: &'a str,
+    handle: &'a str,
+    path: &'a Path,
     created_branch: bool,
     headless: bool,
-    error: anyhow::Error,
-) -> anyhow::Error {
-    let options = cleanup::CleanupOptions {
-        force: true,
-        keep_branch: !created_branch,
-        no_hooks: true,
-        show_hook_output: false,
-    };
-    let rollback = if headless {
-        cleanup::cleanup_headless(context, branch_name, handle, worktree_path, options)
-    } else {
-        cleanup::cleanup(context, branch_name, handle, worktree_path, options)
-    };
-    match rollback {
-        Ok(_) => {
-            info!(branch = branch_name, path = %worktree_path.display(), "create:rolled back");
-            let removed = if created_branch {
-                format!("removed the new worktree and branch '{branch_name}'")
-            } else {
-                "removed the new worktree".to_string()
-            };
-            error.context(format!(
-                "Could not finish adding '{branch_name}'; {removed}, so it can be added again"
-            ))
+    /// The base an existing branch had stored before `add` stored its own:
+    /// `None` when `add` stores none, `Some(None)` when there was none.
+    stored_base: Option<Option<String>>,
+}
+
+impl NewWorktree<'_> {
+    /// Put back the base an existing branch had stored. A branch `add`
+    /// created goes with its config.
+    fn restore_base(&self) {
+        let Some(stored) = &self.stored_base else {
+            return;
+        };
+        if self.created_branch {
+            return;
         }
-        Err(rollback_error) => {
-            warn!(branch = branch_name, error = %rollback_error, "create:rollback failed");
-            error.context(format!(
-                "Could not finish adding '{branch_name}', and removing the new worktree '{}' also failed: {rollback_error:#}",
-                worktree_path.display()
-            ))
+        let workdir = Some(self.context.execution_dir.as_path());
+        let restored = match stored {
+            Some(base) => git::set_branch_base_in(self.branch_name, base, workdir),
+            None => git::unset_branch_base_in(self.branch_name, workdir),
+        };
+        if let Err(error) = restored {
+            warn!(branch = self.branch_name, error = %error, "create:could not restore the stored base");
+        }
+    }
+
+    /// Remove the worktree `add` created, with its window and, if `add`
+    /// created it, its branch, then return `error` saying so.
+    fn roll_back(&self, error: anyhow::Error) -> anyhow::Error {
+        let options = cleanup::CleanupOptions {
+            force: true,
+            keep_branch: !self.created_branch,
+            no_hooks: true,
+            show_hook_output: false,
+        };
+        let (context, branch_name) = (self.context, self.branch_name);
+        let rollback = if self.headless {
+            cleanup::cleanup_headless(context, branch_name, self.handle, self.path, options)
+        } else {
+            cleanup::cleanup(context, branch_name, self.handle, self.path, options)
+        };
+        self.restore_base();
+        match rollback {
+            Ok(_) => {
+                info!(branch = branch_name, path = %self.path.display(), "create:rolled back");
+                let removed = if self.created_branch {
+                    format!("removed the new worktree and branch '{branch_name}'")
+                } else {
+                    "removed the new worktree".to_string()
+                };
+                error.context(format!(
+                    "Failed to add '{branch_name}'; {removed}, so it can be added again"
+                ))
+            }
+            Err(rollback_error) => {
+                warn!(branch = branch_name, error = %rollback_error, "create:rollback failed");
+                error.context(format!(
+                    "Failed to add '{branch_name}', and removing the new worktree '{}' also failed: {rollback_error:#}",
+                    self.path.display()
+                ))
+            }
         }
     }
 }
@@ -1475,5 +1506,69 @@ mod tests {
 
         let retried = add(Config::default()).unwrap();
         assert!(retried.worktree_path.exists());
+    }
+
+    #[test]
+    fn a_failed_add_of_an_existing_branch_keeps_its_stored_base() {
+        const TEST_NAME: &str =
+            "workflow::create::tests::a_failed_add_of_an_existing_branch_keeps_its_stored_base";
+        // Rollback changes the process directory, so run in a child process.
+        if !test_support::is_isolated_child(TEST_NAME) {
+            let temp = tempfile::tempdir().unwrap();
+            let repo = temp.path().join("repo");
+            std::fs::create_dir_all(&repo).unwrap();
+            test_support::init_repo(&repo);
+            test_support::run_git(&repo, &["branch", "feature"]);
+            test_support::run_git(&repo, &["remote", "add", "origin", repo.to_str().unwrap()]);
+            git::set_branch_base_in("feature", "develop", Some(&repo)).unwrap();
+            test_support::run_isolated_test(TEST_NAME, &repo, &[("WM_TEST_TEMP", temp.path())]);
+            return;
+        }
+
+        println!("{}", test_support::ISOLATED_TEST_CANARY);
+        let repo = std::env::var_os("WM_TEST_TEMP")
+            .map(PathBuf::from)
+            .unwrap()
+            .join("repo");
+        let failing = Config {
+            post_create: Some(vec!["exit 7".to_string()]),
+            ..Config::default()
+        };
+        let ctx = WorkflowContext::new_in(&repo, failing, Arc::new(TestMux), None).unwrap();
+        let mut options = SetupOptions::new(true, false, false);
+        options.focus_window = false;
+
+        let Err(error) = create(
+            &ctx,
+            CreateArgs {
+                branch_name: "feature",
+                handle: "feature",
+                // Checking out a review of an existing branch stores the
+                // review's base over the branch's own.
+                base_branch: Some("origin/main"),
+                remote_branch: Some("origin/feature"),
+                checkout_ref: Some(crate::workflow::pr::CheckoutRef {
+                    number: 1,
+                    forge: crate::workflow::pr::Forge::Github,
+                }),
+                prompt: None,
+                options,
+                mode_override: None,
+                agent: None,
+                is_explicit_name: false,
+                prompt_file_only: false,
+                fork_source: None,
+            },
+        ) else {
+            panic!("add should fail when a post-create command fails");
+        };
+
+        let message = format!("{error:#}");
+        assert!(message.contains("removed the new worktree"), "{message}");
+        assert!(git::branch_exists_in("feature", Some(&repo)).unwrap());
+        assert_eq!(
+            git::get_branch_base_in("feature", Some(&repo)).unwrap(),
+            "develop"
+        );
     }
 }

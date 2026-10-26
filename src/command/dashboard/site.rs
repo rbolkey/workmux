@@ -346,6 +346,12 @@ impl ProjectScope {
         }
     }
 
+    /// [`Self::remote_project`], for an operation only a remote project has.
+    fn required_remote_project(&self) -> anyhow::Result<RemoteProject> {
+        self.remote_project()?
+            .ok_or_else(|| anyhow::anyhow!("Not a remote project"))
+    }
+
     fn ask<T: serde::de::DeserializeOwned>(
         project: &RemoteProject,
         request: DashboardRequest,
@@ -442,9 +448,7 @@ impl ProjectScope {
     /// Remove a remote project's worktree `handle` as `workmux remove`
     /// does. The dashboard has already confirmed it.
     pub fn remove_remote(&self, handle: &str, keep_branch: bool) -> anyhow::Result<()> {
-        let project = self
-            .remote_project()?
-            .ok_or_else(|| anyhow::anyhow!("Not a remote project"))?;
+        let project = self.required_remote_project()?;
         let mut args = vec!["remove", handle, "--force"];
         if keep_branch {
             args.push("--keep-branch");
@@ -460,9 +464,7 @@ impl ProjectScope {
         base: Option<&str>,
         pr: Option<u32>,
     ) -> anyhow::Result<()> {
-        let project = self
-            .remote_project()?
-            .ok_or_else(|| anyhow::anyhow!("Not a remote project"))?;
+        let project = self.required_remote_project()?;
         let pr = pr.map(|pr| pr.to_string());
         let mut args = vec!["add", "--background"];
         args.extend(branch);
@@ -477,17 +479,13 @@ impl ProjectScope {
 
     /// Close a remote project's worktree window, keeping the worktree.
     pub fn close_remote(&self, handle: &str) -> anyhow::Result<()> {
-        let project = self
-            .remote_project()?
-            .ok_or_else(|| anyhow::anyhow!("Not a remote project"))?;
+        let project = self.required_remote_project()?;
         Self::relay(&project, &["close", handle])
     }
 
     /// Open (or switch to) a remote project's worktree window.
     pub fn open_remote(&self, handle: &str) -> anyhow::Result<()> {
-        let project = self
-            .remote_project()?
-            .ok_or_else(|| anyhow::anyhow!("Not a remote project"))?;
+        let project = self.required_remote_project()?;
         Self::relay(&project, &["open", handle])
     }
 }
@@ -544,7 +542,6 @@ pub(crate) mod tests {
     fn a_remote_projects_worktree_rows_are_keyed_and_asked_about_by_remote_and_project() {
         let temp = tempfile::tempdir().unwrap();
         crate::test_support::init_repo(temp.path());
-        let records = tempfile::tempdir().unwrap();
         let remote = ProjectScope::Remote {
             remote: "devbox".to_string(),
             project: "api".to_string(),
@@ -563,7 +560,7 @@ pub(crate) mod tests {
             remote: "other".to_string(),
             project: "api".to_string(),
         };
-        crate::remote::registry::with_recorded(records.path(), &[devbox_api()], || {
+        crate::remote::resolve::with_open(&[crate::remote::testing::devbox_api()], || {
             assert_eq!(
                 remote.repo_source(temp.path()),
                 Some(crate::github::RepoSource::GitUrl(
@@ -578,27 +575,5 @@ pub(crate) mod tests {
             );
             assert_eq!(elsewhere.repo_source(temp.path()), None);
         });
-    }
-
-    /// Project `api` on remote `devbox`, cloned from GitHub over SSH.
-    pub(crate) fn devbox_api() -> crate::remote::router::RemoteProject {
-        crate::remote::router::RemoteProject {
-            site: crate::remote::session::ProjectSite {
-                remote: "devbox".to_string(),
-                name: "api".to_string(),
-                path: "~/api".to_string(),
-                git_url: Some(crate::remote::git_url::GitUrl::new(
-                    "git@github.com:me/api.git",
-                )),
-                session: Some("api".to_string()),
-            },
-            remote: crate::config::RemoteConfig {
-                transport: crate::config::TransportKind::Loopback,
-                target: "/tmp/devbox".to_string(),
-                builtin_shims: None,
-                host_commands: Vec::new(),
-                openshell: None,
-            },
-        }
     }
 }

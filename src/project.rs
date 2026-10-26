@@ -113,15 +113,7 @@ impl RemoteProjectId {
 
     /// The project named by `tag`, the tag on its sessions and windows.
     pub fn from_tag(tag: &str) -> Option<Self> {
-        tag.trim()
-            .split_once(':')
-            .filter(|(remote, name)| !remote.is_empty() && !name.is_empty())
-            .map(|(remote, name)| Self::new(remote, name))
-    }
-
-    /// The tag workmux puts on the project's sessions and windows.
-    pub fn tag(&self) -> String {
-        format!("{}:{}", self.remote, self.name)
+        ProjectTag::parse(tag).map(|tag| tag.id)
     }
 
     /// How the project is shown: its name and its remote, so it never reads
@@ -143,6 +135,44 @@ impl RemoteProjectId {
     pub fn worktree_key(&self, worktree: &Path) -> PathBuf {
         self.cache_key()
             .join(worktree.strip_prefix("/").unwrap_or(worktree))
+    }
+}
+
+/// The tag on a remote project's workstation sessions and windows: the
+/// project, and the root of the workstation clone whose config puts it on
+/// its remote. Commands run in the window resolve that config again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectTag {
+    pub id: RemoteProjectId,
+    pub root: PathBuf,
+}
+
+impl ProjectTag {
+    pub fn new(id: RemoteProjectId, root: impl Into<PathBuf>) -> Self {
+        Self {
+            id,
+            root: root.into(),
+        }
+    }
+
+    /// The tag spelled `<remote>:<project>:<root>`, as tmux holds it.
+    pub fn parse(tag: &str) -> Option<Self> {
+        let mut parts = tag.trim().splitn(3, ':');
+        let (remote, name, root) = (parts.next()?, parts.next()?, parts.next()?);
+        (!remote.is_empty() && !name.is_empty() && root.starts_with('/'))
+            .then(|| Self::new(RemoteProjectId::new(remote, name), root))
+    }
+}
+
+impl std::fmt::Display for ProjectTag {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}:{}:{}",
+            self.id.remote,
+            self.id.name,
+            self.root.display()
+        )
     }
 }
 
@@ -211,9 +241,8 @@ mod tests {
     }
 
     #[test]
-    fn a_remote_project_is_spelled_as_tag_label_and_cache_key() {
+    fn a_remote_project_is_spelled_as_label_and_cache_key() {
         let id = RemoteProjectId::new("devbox", "api");
-        assert_eq!(id.tag(), "devbox:api");
         assert_eq!(id.label(), "api@devbox");
         assert_eq!(id.cache_key(), Path::new("remote/devbox/api"));
         assert_eq!(
@@ -223,14 +252,23 @@ mod tests {
     }
 
     #[test]
-    fn a_tag_names_its_remote_project() {
+    fn a_tag_names_its_remote_project_and_its_workstation_clone() {
+        let tag = ProjectTag::new(RemoteProjectId::new("devbox", "api"), "/src/my:api");
+        assert_eq!(tag.to_string(), "devbox:api:/src/my:api");
+        assert_eq!(ProjectTag::parse(" devbox:api:/src/my:api\n"), Some(tag));
         assert_eq!(
-            RemoteProjectId::from_tag(" devbox:api\n"),
+            RemoteProjectId::from_tag("devbox:api:/src/api"),
             Some(RemoteProjectId::new("devbox", "api"))
         );
-        assert_eq!(RemoteProjectId::from_tag("garbage"), None);
-        assert_eq!(RemoteProjectId::from_tag(":api"), None);
-        assert_eq!(RemoteProjectId::from_tag("devbox:"), None);
+        for garbage in [
+            "garbage",
+            "devbox:api",
+            ":api:/src",
+            "devbox::/src",
+            "devbox:api:src",
+        ] {
+            assert_eq!(ProjectTag::parse(garbage), None, "{garbage}");
+        }
     }
 
     #[test]

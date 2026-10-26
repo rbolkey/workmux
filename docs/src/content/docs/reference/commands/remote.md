@@ -7,7 +7,7 @@ Commands for the remotes that [remote projects](/guide/remote-projects/) live on
 
 ## remote list
 
-List remotes and whether each is reachable. Alias: `ls`.
+List remotes and whether each is reachable: the current repository's sandbox and those of projects with open workstation windows. Sandboxes workmux made that none of those are (found on the OpenShell gateway by workmux's `workmux.project` annotation) are listed with their phase, without being reached. Alias: `ls`.
 
 ```bash
 workmux remote list
@@ -21,7 +21,7 @@ Show whether the current project's remote is reachable, with its workmux and pro
 workmux remote status
 ```
 
-Outside any project with a sandbox, it checks every remote. Exits 1 if any remote it checked is unreachable. A stopped sandbox is reported as `stopped` and is not started.
+Outside any project with a sandbox, it checks the remotes `list` shows. Exits 1 if any remote it checked is unreachable. A stopped sandbox is reported as `stopped` and is not started.
 
 ## remote start
 

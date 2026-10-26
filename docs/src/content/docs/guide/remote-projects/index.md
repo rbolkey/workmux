@@ -7,7 +7,7 @@ A remote project lives on a **remote**: an [OpenShell sandbox](/guide/remote-pro
 
 Where a project runs comes from its config, resolved the way workmux always resolves config: your global config merged with the repository's `.workmux.yaml`. A repository whose config says `sandbox.backend: openshell` is a remote project. There is nothing to register: run workmux in a clone of the repository and it targets the sandbox.
 
-You use workmux commands on a remote project the same way you use them on a local one. `add` creates the worktree in the sandbox and the window on your workstation. `merge` merges in the sandbox's clone. The sidebar and dashboard show local and remote agents together. Projects with no `openshell` backend work exactly as before.
+You use workmux commands on a remote project the same way you use them on one on the workstation. `add` creates the worktree in the sandbox and the window on your workstation. `merge` merges in the sandbox's clone. The sidebar and dashboard show the workstation's agents and remote agents together. Projects with no `openshell` backend work exactly as before.
 
 ## How it works
 
@@ -46,26 +46,26 @@ The first command that needs the sandbox creates it, clones the repository from 
 
 A command acts on the project it runs in; there is no flag naming another project. Commands that act on a project (`add`, `open`, `close`, `remove`, `merge`, `list`, `path`, `run`, `rename`, `rebase`, `set-base`, `sync-files` and `init`, and plain worktree names given to `send`, `capture` and `wait`) find it in this order:
 
-1. the project of the tmux window, or else the session, you typed the command in. workmux tags each remote project's windows and session, so commands typed there act on it.
-2. the repository of the current directory: its config decides whether the project is local or in a sandbox
+1. the project of the tmux window, or else the session, you typed the command in. workmux tags each remote project's windows and session with the path of your clone, and reads the clone's config again for every command typed there, so a config change applies at once. If the config no longer puts the project in a sandbox, the window is no longer the project's; if the clone is gone, commands typed there fail and say so.
+2. the repository of the current directory: its config decides whether the project is on the workstation or in a sandbox
 
 Outside any repository and any project window, they fail and tell you to run them inside a clone of the repository. A command relayed to a sandbox says so once (`Running in OpenShell sandbox wm-api (project api)`), and `list` names the sandbox in its first line.
 
-Run from a remote worktree's window, commands with no worktree name act on that worktree, as they do locally.
+Run from a remote worktree's window, commands with no worktree name act on that worktree, as they do on the workstation.
 
-A remote project is named after its repository: the directory name of your clone. A clone named like another remote project from a different origin gets a short hash of its origin added to the name, so the two stay apart. In the sidebar, dashboard and `workmux status` a remote project shows as `name@remote`, for example `api@api`, so it never merges with a local project of the same name. Agent selectors accept `feature`, `api:feature` and `api@api:feature`.
+A remote project is named after its repository: the directory name of your clone. Its sandbox is named after the clone's path (see [OpenShell projects](/guide/remote-projects/openshell/)), so two clones get two sandboxes, even of the same repository. workmux stores nothing about a project. In the sidebar, dashboard and `workmux status` a remote project shows as `name@remote`, for example `api@api-1a2b3c4d`, so it never merges with a project of the same name on the workstation. Agent selectors accept `feature`, `api:feature` and `api@api-1a2b3c4d:feature`.
 
-`resurrect` and `reap-agents` run locally and then on every remote project workmux knows. Each project's output appears under a `<project> (on <remote>):` heading.
+`resurrect` and `reap-agents` run on the workstation and then on every remote project with an open window on the workstation, and on the project of the clone you run them in (after the tmux server restarts no window is left, so run `resurrect` in the clone). Each project's output appears under a `<project> (on <remote>):` heading.
 
 ## Where the windows go
 
 In window mode, a remote project's windows go in a workstation session named after the project, whichever session you typed the command in. workmux creates the session if it is missing and adopts it if you already made one with that name.
 
-| Setting                              | Effect                                                                     |
-| ------------------------------------ | -------------------------------------------------------------------------- |
-| `project_session: NAME`              | Use session `NAME` instead of the project name                             |
-| `project_placement: current-session` | Put windows in the session you ran the command from, as for local projects |
-| `--mode session` on `add`            | A session per worktree, as in [session mode](/guide/session-mode/)         |
+| Setting                              | Effect                                                                                  |
+| ------------------------------------ | --------------------------------------------------------------------------------------- |
+| `project_session: NAME`              | Use session `NAME` instead of the project name                                          |
+| `project_placement: current-session` | Put windows in the session you ran the command from, as for projects on the workstation |
+| `--mode session` on `add`            | A session per worktree, as in [session mode](/guide/session-mode/)                      |
 
 Set them in the repository's `.workmux.yaml` or in global config; the project's value wins, as for any other setting. Everything else, including `mode`, comes from the `.workmux.yaml` in the sandbox's clone.
 
@@ -117,5 +117,5 @@ Run in a repository whose config puts it in a sandbox, they include that sandbox
 
 - Commands that would open your editor refuse for a remote project: `add --prompt-editor`, `add --auto-name` without `-p` or `-P`, `open --prompt-editor`, and a `merge` that needs a commit message (staged changes or a squash). Pass the prompt with `-p TEXT`. A prompt file given with `-P FILE` is read on your workstation (up to 1 MiB).
 - Command output from a relayed `send`, `capture` or `wait` typed in a remote pane arrives when the command exits, not streamed.
-- Files are never synced between your workstation and a sandbox; code moves through git. An existing local project's worktrees can't be moved into a sandbox.
+- Files are never synced between your workstation and a sandbox; code moves through git. An existing project's worktrees on the workstation can't be moved into a sandbox.
 - Only tmux is supported on the workstation for remote projects.

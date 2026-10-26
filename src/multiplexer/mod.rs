@@ -911,10 +911,6 @@ pub fn setup_configured_panes<M: Multiplexer + ?Sized>(
                                 working_dir,
                             )
                         }
-                        crate::config::SandboxBackend::Openshell
-                        | crate::config::SandboxBackend::Loopback => Err(anyhow!(
-                            "A project in a sandbox of its own has no pane sandbox"
-                        )),
                         crate::config::SandboxBackend::Lima => {
                             let vm_name = options.lima_vm_name.ok_or_else(|| {
                                 anyhow!(
@@ -929,6 +925,11 @@ pub fn setup_configured_panes<M: Multiplexer + ?Sized>(
                                 working_dir,
                             )
                         }
+                        // A remote backend: the project lives in a sandbox
+                        // of its own.
+                        _ => Err(anyhow!(
+                            "A project in a sandbox of its own has no pane sandbox"
+                        )),
                     };
 
                     // Fail closed: if sandbox is enabled but wrapping fails, don't fall back to unsandboxed

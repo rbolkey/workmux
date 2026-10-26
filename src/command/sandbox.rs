@@ -930,7 +930,8 @@ fn run_shell(exec: bool, command: Vec<String>) -> Result<()> {
     match config.sandbox.backend() {
         SandboxBackend::Container => run_shell_container(exec, command, &config),
         SandboxBackend::Lima => run_shell_lima(exec, command, &config),
-        SandboxBackend::Openshell | SandboxBackend::Loopback => {
+        // A remote backend: the project lives in a sandbox of its own.
+        _ => {
             anyhow::bail!("This project lives in a sandbox of its own, not a container or Lima VM")
         }
     }
