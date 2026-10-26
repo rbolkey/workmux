@@ -42,11 +42,16 @@ pub const IMAGE_ANNOTATION: &str = "workmux.image";
 /// mark of a sandbox workmux made.
 pub const PROJECT_ANNOTATION: &str = "workmux.project";
 
+/// The annotation recording where the project's clone is in the sandbox.
+pub const PATH_ANNOTATION: &str = "workmux.path";
+
 /// A sandbox workmux made, as the gateway lists it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Listed {
     pub name: String,
     pub project: String,
+    /// The project's clone in the sandbox.
+    pub path: String,
     pub phase: String,
 }
 
@@ -88,11 +93,17 @@ fn workmux_sandboxes_in(page: &Value) -> Vec<Listed> {
         .into_iter()
         .flatten()
         .filter_map(|sandbox| {
+            let annotations = &sandbox["annotations"];
+            let project = annotations[PROJECT_ANNOTATION].as_str()?.to_string();
             Some(Listed {
                 name: sandbox["name"].as_str()?.to_string(),
-                project: sandbox["annotations"][PROJECT_ANNOTATION]
-                    .as_str()?
-                    .to_string(),
+                // A sandbox made before workmux recorded the path has its
+                // clone at the default path.
+                path: annotations[PATH_ANNOTATION]
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("~/{project}")),
+                project,
                 phase: sandbox["phase"].as_str().unwrap_or_default().to_string(),
             })
         })
@@ -508,6 +519,8 @@ impl OpenShell {
             "--annotation".to_string(),
             format!("{PROJECT_ANNOTATION}={}", origin.project),
             "--annotation".to_string(),
+            format!("{PATH_ANNOTATION}={}", origin.path),
+            "--annotation".to_string(),
             format!("{IMAGE_ANNOTATION}={image}"),
         ]);
         args.extend(["--no-tty", "--no-auto-providers", "--detach"].map(str::to_string));
@@ -743,8 +756,12 @@ impl Provisioning for OpenShell {
         if let Phase::Is(phase) = self.phase()?
             && phase == "Stopped"
         {
-            for notice in self.sync_policy(false)? {
-                eprintln!("{notice}");
+            // Without its project's settings the policy it should have is
+            // unknown: started as it is.
+            if self.origin.is_some() {
+                for notice in self.sync_policy(false)? {
+                    eprintln!("{notice}");
+                }
             }
             self.run(&["sandbox", "start", &self.sandbox])
                 .map_err(with_supervisor_image_hint)?;
@@ -800,7 +817,8 @@ pub(super) mod tests {
             "next_page_token": "",
             "sandboxes": [
                 {"name": "api-1a2b3c4d", "phase": "Ready",
-                 "annotations": {"workmux.project": "api", "workmux.image": "i:1"}},
+                 "annotations": {"workmux.project": "api", "workmux.path": "src/api",
+                                 "workmux.image": "i:1"}},
                 {"name": "theirs", "phase": "Ready", "annotations": {}},
                 {"name": "web-5e6f7a8b", "phase": "Stopped",
                  "annotations": {"workmux.project": "web"}},
@@ -813,11 +831,14 @@ pub(super) mod tests {
                 Listed {
                     name: "api-1a2b3c4d".to_string(),
                     project: "api".to_string(),
+                    path: "src/api".to_string(),
                     phase: "Ready".to_string(),
                 },
                 Listed {
                     name: "web-5e6f7a8b".to_string(),
                     project: "web".to_string(),
+                    // Made before workmux recorded the path: the default.
+                    path: "~/web".to_string(),
                     phase: "Stopped".to_string(),
                 },
             ]
@@ -1059,8 +1080,8 @@ pub(super) mod tests {
             format!(
                 "sandbox create --name api --from {image} --policy {policy} \
                  --provider github --provider anthropic \
-                 --annotation workmux.project=api --annotation workmux.image={image} \
-                 --no-tty --no-auto-providers --detach"
+                 --annotation workmux.project=api --annotation workmux.path=~/api \
+                 --annotation workmux.image={image} --no-tty --no-auto-providers --detach"
             )
         );
         for flag in ["--upload", "--mount", "--driver-config-json", "-v"] {
@@ -1311,6 +1332,29 @@ pub(super) mod tests {
         assert_eq!(transport.status().unwrap(), RemoteState::Running);
         transport.delete().unwrap();
         assert_eq!(transport.status().unwrap(), RemoteState::Missing);
+    }
+
+    #[test]
+    fn a_sandbox_started_by_name_alone_keeps_its_policy() {
+        let fake = FakeOpenShell::new();
+        let project = fake.transport(Some(origin()));
+        project.create().unwrap();
+        project.stop().unwrap();
+        let before = fake.log().len();
+
+        // As `sandbox prune` starts another repository's sandbox to check
+        // its work: the policy its project gives it is unknown here.
+        fake.transport(None).start().unwrap();
+
+        assert_eq!(project.status().unwrap(), RemoteState::Running);
+        let calls: Vec<String> = fake.log()[before..]
+            .iter()
+            .map(|line| line.split(' ').take(2).collect::<Vec<_>>().join(" "))
+            .collect();
+        assert!(
+            calls.iter().all(|call| call == "sandbox get" || call == "sandbox start"),
+            "{calls:?}"
+        );
     }
 
     /// What the gateway prints when its supervisor image is gone from

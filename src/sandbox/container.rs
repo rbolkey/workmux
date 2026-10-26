@@ -169,20 +169,23 @@ pub fn pull_image(config: &SandboxConfig, image: &str) -> Result<()> {
 ///   If the update pull fails, warn and continue with the local image.
 /// - For custom (non-official) images, only check existence.
 /// - Kicks off a background freshness cache update for the next run.
-pub fn ensure_image_ready(config: &SandboxConfig, image: &str) -> Result<()> {
-    let runtime = config.runtime();
-    let runtime_bin = runtime.binary_name();
-    let runtime_display = runtime.display_name();
-    let is_official = crate::sandbox::freshness::is_official_image(image);
-
-    // Check if image exists locally
-    let exists = Command::new(runtime_bin)
+/// Whether `image` exists in `runtime`'s local image store.
+pub fn image_exists(runtime: SandboxRuntime, image: &str) -> bool {
+    Command::new(runtime.binary_name())
         .args(["image", "inspect", image])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
         .map(|s| s.success())
-        .unwrap_or(false);
+        .unwrap_or(false)
+}
+
+pub fn ensure_image_ready(config: &SandboxConfig, image: &str) -> Result<()> {
+    let runtime = config.runtime();
+    let runtime_display = runtime.display_name();
+    let is_official = crate::sandbox::freshness::is_official_image(image);
+
+    let exists = image_exists(runtime, image);
 
     if !exists {
         if is_official {

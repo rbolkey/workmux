@@ -230,28 +230,3 @@ pub fn devbox_api() -> super::router::RemoteProject {
         },
     }
 }
-
-/// Project `api` in its OpenShell sandbox `api`.
-pub fn openshell_api() -> super::router::RemoteProject {
-    let mut project = devbox_api();
-    project.site.remote = "api".to_string();
-    project.site.git_url = Some(super::git_url::GitUrl::new("https://example.com/api.git"));
-    project.remote_config = crate::config::RemoteConfig {
-        transport: crate::config::TransportKind::Openshell,
-        target: "api".to_string(),
-        builtin_shims: None,
-        host_commands: Vec::new(),
-        env_passthrough: Vec::new(),
-        env: Default::default(),
-        openshell: Some(crate::config::OpenshellRemote {
-            project: "api".to_string(),
-            git_url: project.site.git_url.clone(),
-            path: "~/api".to_string(),
-            settings: crate::config::OpenshellProject::default(),
-            agents: vec!["claude".to_string()],
-            nix: false,
-            extra_mounts: false,
-        }),
-    };
-    project
-}

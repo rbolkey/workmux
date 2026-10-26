@@ -24,6 +24,7 @@ pub mod rename;
 pub mod resurrect;
 pub mod run;
 pub mod sandbox;
+pub mod sandbox_openshell;
 pub mod sandbox_run;
 pub mod send;
 pub mod set_base;
