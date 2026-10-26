@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import re
@@ -128,50 +129,12 @@ def project_tag(env, remote: str, name: str) -> str:
     return f"{remote}:{name}:{os.path.realpath(clone_of(env, name))}"
 
 
-def _siphash13(data: bytes) -> int:
-    """SipHash-1-3 with zero keys: Rust's `DefaultHasher`."""
-    mask = (1 << 64) - 1
-
-    def rotl(x: int, b: int) -> int:
-        return ((x << b) | (x >> (64 - b))) & mask
-
-    v = [0x736F6D6570736575, 0x646F72616E646F6D, 0x6C7967656E657261, 0x7465646279746573]
-
-    def sip_round() -> None:
-        v[0] = (v[0] + v[1]) & mask
-        v[1] = rotl(v[1], 13) ^ v[0]
-        v[0] = rotl(v[0], 32)
-        v[2] = (v[2] + v[3]) & mask
-        v[3] = rotl(v[3], 16) ^ v[2]
-        v[0] = (v[0] + v[3]) & mask
-        v[3] = rotl(v[3], 21) ^ v[0]
-        v[2] = (v[2] + v[1]) & mask
-        v[1] = rotl(v[1], 17) ^ v[2]
-        v[2] = rotl(v[2], 32)
-
-    tail = len(data) % 8
-    for i in range(0, len(data) - tail, 8):
-        m = int.from_bytes(data[i : i + 8], "little")
-        v[3] ^= m
-        sip_round()
-        v[0] ^= m
-    m = int.from_bytes(data[len(data) - tail :], "little") | ((len(data) & 0xFF) << 56)
-    v[3] ^= m
-    sip_round()
-    v[0] ^= m
-    v[2] ^= 0xFF
-    for _ in range(3):
-        sip_round()
-    return v[0] ^ v[1] ^ v[2] ^ v[3]
-
-
 def openshell_sandbox_name(clone: Path) -> str:
-    """The OpenShell sandbox name workmux derives from a clone's path, as
-    it names a project's Lima VM: `wm-<project>-<hash8>`, the project cut
-    to fit OpenShell's 19 characters."""
+    """The OpenShell sandbox name workmux derives from a clone's path, in
+    the format of a project's Lima VM name: `wm-<project>-<hash8>`, the
+    project cut to fit OpenShell's 19 characters, the hash from sha256."""
     root = os.path.realpath(clone)
-    # A Rust `str` hashes as its bytes and a 0xff terminator.
-    digest = f"{_siphash13(root.encode() + b'\xff'):016x}"[:8]
+    digest = hashlib.sha256(root.encode()).hexdigest()[:8]
     project = re.sub(r"[^a-z0-9]+", "-", os.path.basename(root).lower()).strip("-")
     project = project[:7].rstrip("-")
     return f"wm-{project}-{digest}" if project else f"wm-{digest}"

@@ -1268,13 +1268,21 @@ impl LoopbackConfig {
 /// OpenShell's limit on sandbox name length.
 const SANDBOX_NAME_MAX: usize = 19;
 
-/// The sandbox name for the OpenShell project whose clone is `root`, by the
-/// rule that names a project's Lima VM (`wm-<project>-<hash8>`), with the
-/// project cut to fit OpenShell's limit. Config cannot name a sandbox, so no
-/// repository can reach another's.
+/// The sandbox name for the OpenShell project whose clone is `root`, in the
+/// format of a project's Lima VM name (`wm-<project>-<hash8>`), with the
+/// project cut to fit OpenShell's limit. The hash is the first 8 hex digits
+/// of the canonical path's sha256, not Lima's `DefaultHasher`, which Rust
+/// may change between releases: a renamed sandbox would strand its work.
+/// Config cannot name a sandbox, so no repository can reach another's.
 pub fn openshell_sandbox_name(root: &Path) -> String {
+    use sha2::Digest;
     // "wm-" + project + "-" + hash8 within the limit.
-    crate::sandbox::lima::project_name(root, SANDBOX_NAME_MAX - "wm-".len() - 1 - 8)
+    crate::sandbox::lima::project_name(root, SANDBOX_NAME_MAX - "wm-".len() - 1 - 8, |key| {
+        sha2::Sha256::digest(key.as_bytes())[..4]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    })
 }
 
 impl RemoteConfig {
@@ -4726,44 +4734,28 @@ sandbox:
     }
 
     #[test]
-    fn an_openshell_sandbox_is_named_as_lima_names_a_projects_vm() {
-        let name = |path: &std::path::Path| super::openshell_sandbox_name(path);
+    fn an_openshell_sandbox_is_named_in_limas_format_with_a_stable_hash() {
+        // Paths that don't exist are taken as they are.
+        let name = |path: &str| super::openshell_sandbox_name(std::path::Path::new(path));
         let fits = |name: &str| {
             name.len() <= 19
                 && name
                     .chars()
                     .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
         };
-        let temp = tempfile::tempdir().unwrap();
-        let repo = |dir: &str| {
-            let root = temp.path().join(dir);
-            std::fs::create_dir_all(&root).unwrap();
-            crate::test_support::run_git(&root, &["init", "-q"]);
-            root.canonicalize().unwrap()
-        };
 
-        // A short directory name: the name Lima gives the project's VM.
-        let api = repo("api");
-        let lima_vm = crate::sandbox::lima::instance_name(
-            &api,
-            super::IsolationLevel::Project,
-            &Config::default(),
-        )
-        .unwrap();
-        assert_eq!(name(&api), lima_vm);
-        assert!(lima_vm.starts_with("wm-api-"), "{lima_vm}");
-        assert_eq!(lima_vm.len(), "wm-api-".len() + 8, "{lima_vm}");
+        // `wm-<project>-<hash8>`, as Lima names a project's VM, with the
+        // first 8 hex digits of the path's sha256 (stable across Rust
+        // releases, unlike Lima's hash).
+        assert_eq!(name("/src/api"), "wm-api-79949073");
         // Two repositories with the same directory name get two sandboxes.
-        assert_ne!(name(&repo("work/api")), name(&api));
-        for odd in ["a-very-long-project-name", "My_App.v2", "___"] {
-            let odd = name(&repo(odd));
-            assert!(fits(&odd), "{odd}");
+        assert_eq!(name("/work/api"), "wm-api-c24c3b62");
+        assert_eq!(name("/src/My_App.v2"), "wm-my-app-faac9882");
+        for odd in ["/src/a-very-long-project-name", "/src/___", "/"] {
+            assert!(fits(&name(odd)), "{}", name(odd));
         }
-        assert!(name(&repo("a-very-long-project-name")).starts_with("wm-a-very-"));
-        assert!(name(&repo("My_App.v2")).starts_with("wm-my-app-"));
-        let unnamed = name(&repo("___"));
-        assert_eq!(unnamed.len(), "wm-".len() + 8, "{unnamed}");
-        assert!(fits(&name(std::path::Path::new("/"))));
+        assert!(name("/src/a-very-long-project-name").starts_with("wm-a-very-"));
+        assert_eq!(name("/src/___").len(), "wm-".len() + 8);
     }
 
     #[test]
