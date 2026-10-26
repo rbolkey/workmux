@@ -1268,39 +1268,13 @@ impl LoopbackConfig {
 /// OpenShell's limit on sandbox name length.
 const SANDBOX_NAME_MAX: usize = 19;
 
-/// The sandbox name for the OpenShell project whose clone is `root`, as
-/// Lima's VM names are derived: its directory's name and a hash of its
-/// canonical path, within OpenShell's rules (lowercase letters, digits and
-/// hyphens, at most 19 characters). Config cannot name a sandbox, so no
+/// The sandbox name for the OpenShell project whose clone is `root`, by the
+/// rule that names a project's Lima VM (`wm-<project>-<hash8>`), with the
+/// project cut to fit OpenShell's limit. Config cannot name a sandbox, so no
 /// repository can reach another's.
 pub fn openshell_sandbox_name(root: &Path) -> String {
-    use sha2::Digest;
-    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    let hash = sha2::Sha256::digest(root.to_string_lossy().as_bytes());
-    let suffix: String = hash[..4].iter().map(|b| format!("{b:02x}")).collect();
-    let mut prefix = String::new();
-    for c in root
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default()
-        .chars()
-    {
-        if c.is_ascii_alphanumeric() {
-            prefix.push(c.to_ascii_lowercase());
-        } else if !prefix.is_empty() && !prefix.ends_with('-') {
-            prefix.push('-');
-        }
-    }
-    let prefix: String = prefix
-        .chars()
-        .take(SANDBOX_NAME_MAX - suffix.len() - 1)
-        .collect();
-    let prefix = prefix.trim_matches('-');
-    if prefix.is_empty() {
-        format!("wm-{suffix}")
-    } else {
-        format!("{prefix}-{suffix}")
-    }
+    // "wm-" + project + "-" + hash8 within the limit.
+    crate::sandbox::lima::project_name(root, SANDBOX_NAME_MAX - "wm-".len() - 1 - 8)
 }
 
 impl RemoteConfig {
@@ -4752,32 +4726,44 @@ sandbox:
     }
 
     #[test]
-    fn an_openshell_sandbox_is_named_after_its_clones_directory_and_path() {
-        let name = |path: &str| super::openshell_sandbox_name(std::path::Path::new(path));
+    fn an_openshell_sandbox_is_named_as_lima_names_a_projects_vm() {
+        let name = |path: &std::path::Path| super::openshell_sandbox_name(path);
         let fits = |name: &str| {
             name.len() <= 19
                 && name
                     .chars()
                     .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
         };
+        let temp = tempfile::tempdir().unwrap();
+        let repo = |dir: &str| {
+            let root = temp.path().join(dir);
+            std::fs::create_dir_all(&root).unwrap();
+            crate::test_support::run_git(&root, &["init", "-q"]);
+            root.canonicalize().unwrap()
+        };
 
-        let api = name("/src/api");
-        assert!(api.starts_with("api-"), "{api}");
-        assert_eq!(api.len(), "api-".len() + 8, "{api}");
-        assert_eq!(name("/src/api"), api);
+        // A short directory name: the name Lima gives the project's VM.
+        let api = repo("api");
+        let lima_vm = crate::sandbox::lima::instance_name(
+            &api,
+            super::IsolationLevel::Project,
+            &Config::default(),
+        )
+        .unwrap();
+        assert_eq!(name(&api), lima_vm);
+        assert!(lima_vm.starts_with("wm-api-"), "{lima_vm}");
+        assert_eq!(lima_vm.len(), "wm-api-".len() + 8, "{lima_vm}");
         // Two repositories with the same directory name get two sandboxes.
-        assert_ne!(name("/work/api"), api);
-        for odd in [
-            "/src/a-very-long-project-name",
-            "/src/My_App.v2",
-            "/src/___",
-            "/",
-        ] {
-            assert!(fits(&name(odd)), "{}", name(odd));
+        assert_ne!(name(&repo("work/api")), name(&api));
+        for odd in ["a-very-long-project-name", "My_App.v2", "___"] {
+            let odd = name(&repo(odd));
+            assert!(fits(&odd), "{odd}");
         }
-        assert!(name("/src/a-very-long-project-name").starts_with("a-very-lon-"));
-        assert!(name("/src/My_App.v2").starts_with("my-app-v2-"));
-        assert!(name("/src/___").starts_with("wm-"));
+        assert!(name(&repo("a-very-long-project-name")).starts_with("wm-a-very-"));
+        assert!(name(&repo("My_App.v2")).starts_with("wm-my-app-"));
+        let unnamed = name(&repo("___"));
+        assert_eq!(unnamed.len(), "wm-".len() + 8, "{unnamed}");
+        assert!(fits(&name(std::path::Path::new("/"))));
     }
 
     #[test]

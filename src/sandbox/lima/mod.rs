@@ -59,6 +59,29 @@ fn hash_key(key: &str, len: usize) -> String {
     hex[..len].to_string()
 }
 
+/// The name of the sandbox for the project whose root is `project_root`:
+/// `wm-<project>-<hash8>`, the project directory's name (sanitized and cut to
+/// `max_project` characters) for readability and a hash of its canonical path,
+/// or `wm-<hash8>` when the directory's name has nothing usable. OpenShell
+/// sandboxes are named by the same rule, with a shorter project budget.
+pub fn project_name(project_root: &Path, max_project: usize) -> String {
+    let canonical = project_root
+        .canonicalize()
+        .unwrap_or_else(|_| project_root.to_path_buf());
+    let hash = hash_key(&canonical.to_string_lossy(), 8);
+    let project_dir_name = canonical
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let sanitized = sanitize_name(&project_dir_name, max_project);
+
+    if sanitized.is_empty() {
+        format!("{}{}", VM_PREFIX, hash)
+    } else {
+        format!("{}{}-{}", VM_PREFIX, sanitized, hash)
+    }
+}
+
 /// Generate a unique instance name for a worktree based on isolation level.
 ///
 /// For project isolation, the name includes the project directory name for
@@ -77,26 +100,8 @@ pub fn instance_name(
         }
         IsolationLevel::Project => {
             let project_root = determine_project_root(worktree)?;
-            let canonical = project_root
-                .canonicalize()
-                .unwrap_or_else(|_| project_root.clone());
-            let key = canonical.to_string_lossy();
-
-            let hash = hash_key(&key, 8);
-
-            // Extract project directory name for human-readable prefix
             // Budget: "wm-" (3) + project (up to 18) + "-" (1) + hash (8) = 30 max
-            let project_dir_name = canonical
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default();
-            let sanitized = sanitize_name(&project_dir_name, 18);
-
-            if sanitized.is_empty() {
-                format!("{}{}", VM_PREFIX, hash)
-            } else {
-                format!("{}{}-{}", VM_PREFIX, sanitized, hash)
-            }
+            project_name(&project_root, 18)
         }
     };
 

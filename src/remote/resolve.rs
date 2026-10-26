@@ -341,7 +341,7 @@ mod tests {
         .unwrap();
 
         let sandbox = openshell_sandbox_name(Path::new("/src/api"));
-        assert!(sandbox.starts_with("api-"), "{sandbox}");
+        assert!(sandbox.starts_with("wm-api-"), "{sandbox}");
         assert_eq!(project.root, Path::new("/src/api"));
         assert_eq!(project.site.name, "api");
         assert_eq!(project.site.remote, sandbox);
