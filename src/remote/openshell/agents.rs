@@ -147,7 +147,7 @@ pub fn report(
                 report.notes.push(note);
                 report.warnings.push(format!(
                     "no provider attached to the sandbox has a profile that allows {path}, so {name} has no credentials there; \
-                     create one with `openshell provider create --type {wanted}` and list it in sandbox.openshell.providers in your global config"
+                     create one with `openshell provider create --type {wanted}` and list it in sandbox.openshell.providers in your global config and the repository's .workmux.yaml"
                 ));
             }
             Ok(giving) => report
@@ -243,7 +243,7 @@ mod tests {
             report.warnings,
             [
                 "no provider attached to the sandbox has a profile that allows /usr/local/bin/codex, so codex has no credentials there; \
-                 create one with `openshell provider create --type codex` and list it in sandbox.openshell.providers in your global config"
+                 create one with `openshell provider create --type codex` and list it in sandbox.openshell.providers in your global config and the repository's .workmux.yaml"
             ]
         );
     }

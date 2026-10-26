@@ -12,7 +12,7 @@ An OpenShell project lives in an [OpenShell](https://github.com/NVIDIA/OpenShell
 
 ## Set up a project
 
-Commit the sandbox settings in the repository's `.workmux.yaml`, and list providers in your global config (`~/.config/workmux/config.yaml`):
+Commit the sandbox settings in the repository's `.workmux.yaml`, and list the providers repositories may use in your global config (`~/.config/workmux/config.yaml`):
 
 ```yaml
 # .workmux.yaml, in the repository
@@ -23,24 +23,31 @@ sandbox:
     image: ghcr.io/me/api-dev:1
     policy: api-policy.yaml
     agents: [claude]
+    providers: [api-github, claude]
 ```
 
 ```yaml
 # ~/.config/workmux/config.yaml
 sandbox:
   openshell:
-    providers: [github]
+    providers: [api-github, web-github, claude]
 ```
 
 | `sandbox.openshell` key | Meaning                                                                                                                                                                                                    |
 | ----------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `image`                 | Image the sandbox is built from. It must contain git and dtach. Default: workmux's own image                                                                                                               |
 | `policy`                | Policy file merged on top of workmux's [base policy](#policy), relative to the repository                                                                                                                  |
-| `providers`             | OpenShell providers to attach, for credentials. No other provider is attached. Global config only. `gh-login` is special: see [Your gh login](#your-gh-login-provider-gh-login)                          |
+| `providers`             | OpenShell providers to attach, for credentials. Global config lists the ones repositories may use; the repository's list picks from them. No other provider is attached. `gh-login` is special: see [Your gh login](#your-gh-login-provider-gh-login) |
 | `agents`                | Agents the image installs; the first is the sandbox's default agent                                                                                                                                       |
 | `path`                  | The clone's path in the sandbox. Default: `~/<project>`                                                                                                                                                    |
 
-Settings merge as any other setting does: the repository's value overrides your global config's, key by key. `providers` is the exception. It is read only from global config, and a repository's `.workmux.yaml` setting it is ignored with a warning, so a repository can't commit `providers: [gh-login]` and receive your GitHub login. Every OpenShell sandbox gets the same providers; tokens scoped to what your projects need bound what each one can reach.
+Settings merge as any other setting does: the repository's value overrides your global config's, key by key. `providers` is the exception, as named agents are:
+
+- Your global config lists the providers repositories may use. A repository's `.workmux.yaml` picks the ones its sandbox gets from that list, in its own order, and can never add one. A name your global config doesn't list is not attached, and creating the sandbox warns, naming it. So a repository can't commit `providers: [gh-login]` and receive your GitHub login unless you list `gh-login` globally, and then only a repository that asks for it gets it.
+- A repository that lists no providers gets none, and creating its sandbox says so, naming the setting. `providers: []` asks for none without the note.
+- Providers are attached when the sandbox is created. After changing either list, run `workmux sandbox rebuild` in the repository.
+
+So each sandbox gets only the credentials its repository needs, such as a fine-grained token for that repository alone.
 
 The project is named after the repository: the directory name of your clone. The sandbox clones the repository from your clone's `origin`. The sandbox is named after your clone in the format of a project's Lima VM name: `wm-`, up to 7 characters of the directory name and the first 8 hex digits of the sha256 of the clone's full path, such as `wm-api-79949073`, within OpenShell's rules (lowercase letters, digits and hyphens, up to 19 characters). Config can't name a sandbox, so no repository can reach another's. Two clones get two sandboxes, even of the same repository, and a clone moved to another path gets a new one.
 
@@ -83,7 +90,14 @@ sandbox:
     providers: [gh-login]
 ```
 
-`gh-login` is a provider name workmux reserves. Attaching it gives the sandbox your workstation's `gh` login, with nothing else to create: no token, profile or provider.
+```yaml
+# .workmux.yaml, in a repository that should get your gh login
+sandbox:
+  openshell:
+    providers: [gh-login]
+```
+
+`gh-login` is a provider name workmux reserves. Only a repository whose `.workmux.yaml` names it gets it, and only while your global config lists it. Attaching it gives the sandbox your workstation's `gh` login, with nothing else to create: no token, profile or provider.
 
 - workmux ships a GitHub profile, `workmux-github`, that allows clone, fetch and push, and read-write REST and GraphQL, for git and `gh` (including nix's, from a baked devshell). It imports the profile into the gateway when it's missing or differs from the shipped one.
 - On first use, workmux creates the provider `gh-login` from that profile, labelled `workmux.managed=gh-login`, holding the token `gh auth token` prints. It passes the token to `openshell` in the environment, never on its command line, and never logs it.
@@ -106,7 +120,7 @@ A fine-grained personal access token limits the agent to the repositories and pe
 
 1. Import a GitHub profile into the gateway. OpenShell's stock profiles aren't preinstalled, so even the stock `github` profile must be imported first (`openshell provider profile import --global -f github.yaml`). The stock profile is read-only.
 2. Create a provider from the token, passing it through the environment: `GITHUB_TOKEN=… openshell provider create --name api-github --type github --global-profile --credential GITHUB_TOKEN`.
-3. Attach it by listing `api-github` in `sandbox.openshell.providers`.
+3. Attach it by listing `api-github` in `sandbox.openshell.providers`, in your global config and in the project's `.workmux.yaml`.
 4. To allow push for just the project's repository on top of the read-only profile, add a `policy` file:
 
    ```yaml
@@ -220,7 +234,7 @@ The sandbox runs the agent's plain CLI, not your workstation's agent command. Th
 
 ```text
 agent:    claude: installed at /usr/local/bin/claude; its credentials come from a provider whose profile allows it, such as one of type claude-code
-warning: no provider attached to the sandbox has a profile that allows /usr/local/bin/claude, so claude has no credentials there; create one with `openshell provider create --type claude-code` and list it in sandbox.openshell.providers in your global config
+warning: no provider attached to the sandbox has a profile that allows /usr/local/bin/claude, so claude has no credentials there; create one with `openshell provider create --type claude-code` and list it in sandbox.openshell.providers in your global config and the repository's .workmux.yaml
 ```
 
 The agent still starts without one, but it can't authenticate. The sandbox's network policy reaches the agent's endpoints only through its provider.

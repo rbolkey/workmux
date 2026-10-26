@@ -23,7 +23,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use super::transport::{Provisioning, RemoteState, StdioProcess, Transport, TtyExec};
-use crate::config::OpenshellRemote;
+use crate::config::{OpenshellProject, OpenshellRemote};
 
 /// Where OpenShell runs every sandbox's workload, and its `HOME`.
 pub const SANDBOX_HOME: &str = "/sandbox";
@@ -351,7 +351,7 @@ impl OpenShell {
     fn attached_providers(&self) -> Vec<String> {
         self.origin
             .as_ref()
-            .map(|origin| origin.settings.providers.clone())
+            .map(|origin| origin.settings.attached_providers().to_vec())
             .unwrap_or_default()
     }
 
@@ -727,6 +727,31 @@ impl Transport for OpenShell {
     }
 }
 
+/// What sandbox creation says about the project's provider list: that the
+/// repository lists none, or names ones global config doesn't list.
+fn provider_notes(settings: &OpenshellProject) -> Vec<String> {
+    let mut notes = Vec::new();
+    if settings.providers.is_none() {
+        notes.push(
+            "Note: the repository's .workmux.yaml lists no sandbox.openshell.providers, so its \
+             sandbox gets no providers; list the ones it needs there, from those your global config \
+             lists"
+                .to_string(),
+        );
+    }
+    let (verb, pronoun) = match settings.unlisted_providers.len() {
+        0 => return notes,
+        1 => ("is", "it"),
+        _ => ("are", "them"),
+    };
+    notes.push(format!(
+        "warning: {} in sandbox.openshell.providers in project config (.workmux.yaml) {verb} not \
+         attached -- your global config (~/.config/workmux/config.yaml) does not list {pronoun}",
+        settings.unlisted_providers.join(", ")
+    ));
+    notes
+}
+
 impl Provisioning for OpenShell {
     fn status(&self) -> Result<RemoteState> {
         Ok(match self.phase()? {
@@ -738,6 +763,9 @@ impl Provisioning for OpenShell {
     fn create(&self) -> Result<()> {
         let origin = self.origin()?;
         let workmux = image::linux_workmux(self.linux_workmux.as_deref())?;
+        for note in provider_notes(&origin.settings) {
+            eprintln!("{note}");
+        }
         self.check_github_credentials()?;
         if self.attaches_gh_login() {
             eprintln!(
@@ -826,7 +854,6 @@ impl Provisioning for OpenShell {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
-    use crate::config::OpenshellProject;
 
     #[test]
     fn the_gateway_lists_the_sandboxes_workmux_made_by_their_annotation() {
@@ -887,7 +914,7 @@ pub(super) mod tests {
             git_url: None,
             path: "~/api".to_string(),
             settings: OpenshellProject {
-                providers: vec!["github".to_string(), "anthropic".to_string()],
+                providers: Some(vec!["github".to_string(), "anthropic".to_string()]),
                 ..OpenshellProject::default()
             },
             agents: Vec::new(),
@@ -1123,6 +1150,49 @@ pub(super) mod tests {
         }
     }
 
+    #[test]
+    fn creation_says_when_a_repository_lists_no_providers_or_ones_global_config_does_not() {
+        let listed = origin();
+        assert!(provider_notes(&listed.settings).is_empty());
+
+        let mut none_listed = origin();
+        none_listed.settings.providers = None;
+        assert_eq!(
+            provider_notes(&none_listed.settings),
+            [
+                "Note: the repository's .workmux.yaml lists no sandbox.openshell.providers, so its \
+                 sandbox gets no providers; list the ones it needs there, from those your global config \
+                 lists"
+            ]
+        );
+
+        let mut asks_for_none = origin();
+        asks_for_none.settings.providers = Some(Vec::new());
+        assert!(provider_notes(&asks_for_none.settings).is_empty());
+
+        let mut unlisted = origin();
+        unlisted.settings.unlisted_providers = vec!["gh-login".to_string()];
+        assert_eq!(
+            provider_notes(&unlisted.settings),
+            [
+                "warning: gh-login in sandbox.openshell.providers in project config (.workmux.yaml) \
+                 is not attached -- your global config (~/.config/workmux/config.yaml) does not list it"
+            ]
+        );
+        unlisted
+            .settings
+            .unlisted_providers
+            .push("github-api".to_string());
+        assert_eq!(
+            provider_notes(&unlisted.settings),
+            [
+                "warning: gh-login, github-api in sandbox.openshell.providers in project config \
+                 (.workmux.yaml) are not attached -- your global config (~/.config/workmux/config.yaml) \
+                 does not list them"
+            ]
+        );
+    }
+
     /// `origin()` with a git URL to a local repository holding a flake, its
     /// toolchain.
     fn flake_origin(repo: &std::path::Path) -> OpenshellRemote {
@@ -1142,7 +1212,7 @@ pub(super) mod tests {
     /// `flake_origin` attaching `providers`.
     fn flake_origin_with(repo: &std::path::Path, providers: &[&str]) -> OpenshellRemote {
         let mut origin = flake_origin(repo);
-        origin.settings.providers = providers.iter().map(|p| p.to_string()).collect();
+        origin.settings.providers = Some(providers.iter().map(|p| p.to_string()).collect());
         origin
     }
 
@@ -1241,7 +1311,7 @@ pub(super) mod tests {
         let without = fake.transport(Some(origin.clone()));
         std::fs::write(fake.dir.path().join("gh-token"), "gho_secret\n").unwrap();
         let mut origin = origin;
-        origin.settings.providers = vec!["gh-login".to_string()];
+        origin.settings.providers = Some(vec!["gh-login".to_string()]);
         let with = fake.transport(Some(origin));
 
         let without = format!("{:#}", without.create().unwrap_err());
@@ -1285,7 +1355,8 @@ pub(super) mod tests {
         )
         .unwrap();
         let mut origin = origin();
-        origin.settings.providers = ["github", "anthropic", "openai"].map(String::from).to_vec();
+        origin.settings.providers =
+            Some(["github", "anthropic", "openai"].map(String::from).to_vec());
         origin.agents = vec!["claude".to_string(), "codex".to_string()];
 
         let report = fake.transport(Some(origin)).agent_report().unwrap();

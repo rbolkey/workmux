@@ -82,8 +82,9 @@ class Project:
     def configure(self, origin: str, image: str, providers=()):
         """A workstation repository named after the project, with `origin`,
         whose `.workmux.yaml` puts it in an OpenShell sandbox of `image`
-        (ADR 0004); `providers` go in global config, the only place they
-        may be set. Commands run in it from now on."""
+        (ADR 0004) and attaches `providers`: global config lists them as
+        ones repositories may use, and `.workmux.yaml` picks them. Commands
+        run in it from now on."""
         repo = self.env.tmp_path / "workstation" / self.name
         repo.mkdir(parents=True)
         self.env.run_command(["git", "init", "-q", "-b", "main"], cwd=repo)
@@ -91,6 +92,7 @@ class Project:
         (repo / ".workmux.yaml").write_text(
             "nerdfont: false\nsandbox:\n  enabled: true\n  backend: openshell\n"
             f"  openshell:\n    image: {image}\n"
+            f"    providers: [{', '.join(providers)}]\n"
         )
         if providers:
             config = self.env.home_path / ".config" / "workmux" / "config.yaml"
