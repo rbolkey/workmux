@@ -1171,6 +1171,7 @@ mod tests {
             target: "/remote".to_string(),
             builtin_shims: None,
             host_commands: vec![],
+            env_passthrough: vec![],
             openshell: None,
         }
     }
@@ -1222,6 +1223,7 @@ mod tests {
             .to_vec(),
             invoking_window_token: None,
             prompt_file: None,
+            env: Default::default(),
         };
         let (env, received) = mpsc::channel();
         let session = std::thread::spawn(move || {

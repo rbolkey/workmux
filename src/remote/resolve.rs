@@ -162,6 +162,12 @@ fn project_in(config: &Config, root: &Path, origin: Option<&str>) -> Result<Remo
         _ => config.sandbox.openshell.path.clone(),
     }
     .unwrap_or_else(|| format!("~/{name}"));
+    let passthrough: Vec<String> = config
+        .sandbox
+        .env_passthrough()
+        .into_iter()
+        .map(String::from)
+        .collect();
     let (remote_name, remote_config) = match backend {
         SandboxBackend::Loopback => (
             config
@@ -177,6 +183,7 @@ fn project_in(config: &Config, root: &Path, origin: Option<&str>) -> Result<Remo
                 })?,
                 builtin_shims: None,
                 host_commands: config.sandbox.host_commands().to_vec(),
+                env_passthrough: passthrough.clone(),
                 openshell: None,
             },
         ),
@@ -199,6 +206,7 @@ fn project_in(config: &Config, root: &Path, origin: Option<&str>) -> Result<Remo
                     target: sandbox,
                     builtin_shims: None,
                     host_commands: config.sandbox.host_commands().to_vec(),
+                    env_passthrough: passthrough.clone(),
                     openshell: Some(OpenshellRemote {
                         project: name.clone(),
                         git_url: Some(git_url.clone()),
@@ -210,6 +218,17 @@ fn project_in(config: &Config, root: &Path, origin: Option<&str>) -> Result<Remo
             )
         }
     };
+    // ADR 0003: an OpenShell sandbox clones the repository, never mounts.
+    let notes = (remote_config.transport == TransportKind::Openshell
+        && !config.sandbox.extra_mounts().is_empty())
+    .then(|| {
+        format!(
+            "Note: extra_mounts is ignored for OpenShell sandbox {}: OpenShell does not mount workstation directories",
+            remote_config.target
+        )
+    })
+    .into_iter()
+    .collect();
     let session = match config.project_placement.unwrap_or_default() {
         ProjectPlacement::ProjectSession => Some(
             config
@@ -229,6 +248,7 @@ fn project_in(config: &Config, root: &Path, origin: Option<&str>) -> Result<Remo
             git_url: Some(git_url),
             session,
         },
+        notes,
         remote_config,
     })
 }
@@ -489,6 +509,44 @@ mod tests {
         .unwrap();
 
         assert_eq!(project.remote_config.host_commands, ["just"]);
+    }
+
+    #[test]
+    fn a_remote_gets_the_environment_global_config_passes_through() {
+        let global = config("sandbox:\n  env_passthrough: [GITHUB_TOKEN]\n");
+        let project = config(&format!(
+            "{OPENSHELL}  env_passthrough: [AWS_SECRET_ACCESS_KEY]\n"
+        ));
+
+        let project = project_in(
+            &global.merge_for_test(project),
+            Path::new("/src/api"),
+            Some("https://github.com/me/api.git"),
+        )
+        .unwrap();
+
+        assert_eq!(project.remote_config.env_passthrough, ["GITHUB_TOKEN"]);
+    }
+
+    #[test]
+    fn extra_mounts_for_an_openshell_repository_get_a_note_that_openshell_does_not_mount() {
+        let global = config("sandbox:\n  extra_mounts: [/notes]\n");
+
+        let project = project_in(
+            &global.merge_for_test(config(OPENSHELL)),
+            Path::new("/src/api"),
+            Some("https://github.com/me/api.git"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            project.notes,
+            [format!(
+                "Note: extra_mounts is ignored for OpenShell sandbox {}: OpenShell does not mount workstation directories",
+                project.remote_config.target
+            )]
+        );
+        assert!(openshell_at("/src/api").notes.is_empty());
     }
 
     #[test]

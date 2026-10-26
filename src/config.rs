@@ -1115,6 +1115,12 @@ pub struct RemoteConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub host_commands: Vec<String>,
 
+    /// Workstation environment variables passed through to remote workmux
+    /// and the panes it starts, as `sandbox.env_passthrough` passes them to
+    /// a container or Lima sandbox.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env_passthrough: Vec<String>,
+
     /// For an OpenShell project's remote: what its sandbox is created from.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub openshell: Option<OpenshellRemote>,
