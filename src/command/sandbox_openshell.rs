@@ -219,31 +219,22 @@ fn select_interactive<'a>(
     Ok(vec![running[i - 1]])
 }
 
-/// What would be lost with a sandbox: work that exists only there.
-fn lost(risks: &[AtRisk]) -> Vec<&AtRisk> {
-    risks
-        .iter()
-        .filter(|risk| risk.uncommitted || risk.unpushed > 0)
-        .collect()
-}
-
 /// A sandbox `prune` would delete, with what checking it found.
 struct Candidate {
     sandbox: Listed,
     transport: Arc<dyn Transport>,
-    /// The work only it holds: `None` when it could not be checked, or was
-    /// not (`--force`).
+    /// Its work that is unmerged or exists only there: `None` when it could
+    /// not be checked, or was not (`--force`).
     risks: Option<Vec<AtRisk>>,
     /// Started only to be checked: stopped again unless deleted.
     started: bool,
 }
 
 impl Candidate {
-    /// Whether deleting it would lose work, or might.
-    fn holds_work(&self) -> bool {
+    fn has_uncommitted_changes(&self) -> bool {
         self.risks
             .as_deref()
-            .is_none_or(|risks| !lost(risks).is_empty())
+            .is_some_and(|risks| risks.iter().any(|risk| risk.uncommitted))
     }
 
     fn stop_again(&self) {
@@ -259,10 +250,34 @@ impl Candidate {
     }
 }
 
+/// The one confirmation `prune` asks for, naming first the work that is
+/// unmerged or exists only in a sandbox (its unpushed commits are lost).
+fn confirmation(candidates: &[Candidate]) -> String {
+    let mut prompt = String::new();
+    for candidate in candidates {
+        for risk in candidate.risks.iter().flatten() {
+            if prompt.is_empty() {
+                prompt.push_str("These have work that is unmerged or exists only in a sandbox:\n");
+            }
+            prompt.push_str(&format!(
+                "  {}: {}\n",
+                candidate.sandbox.name,
+                risk.describe()
+            ));
+        }
+    }
+    if !prompt.is_empty() {
+        prompt.push('\n');
+    }
+    prompt.push_str("Delete all these sandboxes? Their clones and worktrees are lost. [y/N] ");
+    prompt
+}
+
 /// Delete workmux's OpenShell sandboxes after one confirmation, closing the
-/// workstation windows of their projects. Refused while any holds work that
-/// exists only there, or could not be checked for it, unless `force`, which
-/// also skips the check and the confirmation.
+/// workstation windows of their projects, as `workmux remove` deletes
+/// worktrees: refused while any has uncommitted changes (or could not be
+/// checked for them), and naming unpushed commits and unmerged branches in
+/// the confirmation. `force` skips the check and the confirmation.
 pub fn prune(force: bool) -> Result<()> {
     let sandboxes = workmux_sandboxes()?;
     if sandboxes.is_empty() {
@@ -306,12 +321,8 @@ pub fn prune(force: bool) -> Result<()> {
                 println!("   Its worktrees could not be checked for work that exists only there")
             }
             Some(risks) => {
-                let lost = lost(risks);
-                if !lost.is_empty() {
-                    println!("   Work that exists only in the sandbox:");
-                    for risk in lost {
-                        println!("     {}", risk.describe());
-                    }
+                for risk in risks {
+                    println!("   {}", risk.describe());
                 }
             }
         }
@@ -319,21 +330,30 @@ pub fn prune(force: bool) -> Result<()> {
     }
 
     if !force {
-        let holding: Vec<&str> = candidates
-            .iter()
-            .filter(|candidate| candidate.holds_work())
-            .map(|candidate| candidate.sandbox.name.as_str())
-            .collect();
-        if !holding.is_empty() {
+        let names = |keep: &dyn Fn(&Candidate) -> bool| -> Vec<&str> {
+            candidates
+                .iter()
+                .filter(|candidate| keep(candidate))
+                .map(|candidate| candidate.sandbox.name.as_str())
+                .collect()
+        };
+        let uncommitted = names(&|candidate| candidate.has_uncommitted_changes());
+        if !uncommitted.is_empty() {
             stop_again(&candidates);
             bail!(
-                "Not deleting: {} may hold uncommitted or unpushed work. Commit and push it, \
-                 or delete anyway with --force",
-                holding.join(", ")
+                "Cannot delete sandboxes with uncommitted changes: {}. Use --force to override",
+                uncommitted.join(", ")
             );
         }
-        let answer =
-            read_answer("Delete all these sandboxes? Their clones and worktrees are lost. [y/N] ");
+        let unchecked = names(&|candidate| candidate.risks.is_none());
+        if !unchecked.is_empty() {
+            stop_again(&candidates);
+            bail!(
+                "Could not check {} for uncommitted changes. Use --force to delete anyway",
+                unchecked.join(", ")
+            );
+        }
+        let answer = read_answer(&confirmation(&candidates));
         match answer {
             Ok(answer) if answer.eq_ignore_ascii_case("y") => {}
             Ok(_) => {
@@ -381,8 +401,8 @@ pub fn prune(force: bool) -> Result<()> {
     Ok(())
 }
 
-/// Check `candidate`'s worktrees for work that exists only in it, starting
-/// a stopped sandbox to look.
+/// Check `candidate`'s worktrees and branches for work that is unmerged or
+/// exists only in it, starting a stopped sandbox to look.
 fn check(candidate: &mut Candidate) {
     let name = &candidate.sandbox.name;
     let provisioning = lifecycle(candidate.transport.as_ref());
@@ -691,21 +711,28 @@ mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
 
-    /// A gateway with workmux's sandboxes `wm-api-…` (running, with
-    /// uncommitted work when `api_has_work`) and `wm-web-…` (stopped, its
-    /// work pushed), the trial's unprefixed `trellis-…` and an unannotated
-    /// `wm-theirs`: a fake `openshell` and remote `workmux` on PATH, logging
-    /// every call.
+    /// A gateway with workmux's sandboxes `wm-api-…` (running, holding
+    /// `api` work) and `wm-web-…` (stopped, its work pushed and merged but
+    /// for a pushed unmerged branch), the trial's unprefixed `trellis-…` and
+    /// an unannotated `wm-theirs`: a fake `openshell` and remote `workmux` on
+    /// PATH, logging every call.
     struct Gateway {
         dir: tempfile::TempDir,
     }
 
     const API: &str = "wm-api-1a2b3c4d";
+
+    /// The work `wm-api-…` holds.
+    enum Work {
+        None,
+        Uncommitted,
+        Unpushed,
+    }
     const WEB: &str = "wm-web-5e6f7a8b";
     const TRELLIS: &str = "trellis-7fba5166";
 
     impl Gateway {
-        fn new(api_has_work: bool) -> Self {
+        fn new(api: Work) -> Self {
             use std::os::unix::fs::PermissionsExt;
             let dir = tempfile::tempdir().unwrap();
             let d = dir.path();
@@ -719,10 +746,14 @@ mod tests {
                 std::fs::write(d.join(format!("phase-{name}")), phase).unwrap();
             }
             let pushed = r#"[{"path":"/sandbox/web","branch":"main","uncommitted":false,"unpushed":0,"unmerged_into":null},{"path":null,"branch":"review","uncommitted":false,"unpushed":0,"unmerged_into":"main"}]"#;
-            let api = if api_has_work {
-                r#"[{"path":"/sandbox/api__worktrees/feature","branch":"feature","uncommitted":true,"unpushed":2,"unmerged_into":"main"}]"#
-            } else {
-                "[]"
+            let api = match api {
+                Work::None => "[]",
+                Work::Uncommitted => {
+                    r#"[{"path":"/sandbox/api__worktrees/feature","branch":"feature","uncommitted":true,"unpushed":2,"unmerged_into":"main"}]"#
+                }
+                Work::Unpushed => {
+                    r#"[{"path":null,"branch":"spike","uncommitted":false,"unpushed":2,"unmerged_into":"main"}]"#
+                }
             };
             std::fs::write(d.join(format!("risks-{API}")), api).unwrap();
             std::fs::write(d.join(format!("risks-{WEB}")), pushed).unwrap();
@@ -836,7 +867,7 @@ mod tests {
     fn stop_stops_only_workmux_sandboxes() {
         const NAME: &str = "command::sandbox_openshell::tests::stop_stops_only_workmux_sandboxes";
         if !crate::test_support::is_isolated_child(NAME) {
-            let gateway = Gateway::new(false);
+            let gateway = Gateway::new(Work::None);
             gateway.run(NAME);
             assert_eq!(gateway.phase(API).as_deref(), Some("Stopped"));
             assert_eq!(gateway.phase(TRELLIS).as_deref(), Some("Ready"));
@@ -858,11 +889,10 @@ mod tests {
     }
 
     #[test]
-    fn prune_refuses_while_a_sandbox_holds_work_naming_it() {
-        const NAME: &str =
-            "command::sandbox_openshell::tests::prune_refuses_while_a_sandbox_holds_work_naming_it";
+    fn prune_refuses_while_a_sandbox_has_uncommitted_changes_naming_it() {
+        const NAME: &str = "command::sandbox_openshell::tests::prune_refuses_while_a_sandbox_has_uncommitted_changes_naming_it";
         if !crate::test_support::is_isolated_child(NAME) {
-            let gateway = Gateway::new(true);
+            let gateway = Gateway::new(Work::Uncommitted);
             gateway.run(NAME);
             assert_eq!(gateway.phase(API).as_deref(), Some("Ready"));
             // Started to be checked, then stopped again.
@@ -887,7 +917,69 @@ mod tests {
 
         assert!(error.contains(API), "{error}");
         assert!(!error.contains(WEB), "{error}");
+        assert!(error.contains("uncommitted changes"), "{error}");
         assert!(error.contains("--force"), "{error}");
+    }
+
+    #[test]
+    fn prune_asks_rather_than_refuses_for_unpushed_or_unmerged_work() {
+        const NAME: &str = "command::sandbox_openshell::tests::prune_asks_rather_than_refuses_for_unpushed_or_unmerged_work";
+        if !crate::test_support::is_isolated_child(NAME) {
+            let gateway = Gateway::new(Work::Unpushed);
+            gateway.run(NAME);
+            assert!(!gateway.log("log").contains("sandbox delete"));
+            assert_eq!(gateway.phase(WEB).as_deref(), Some("Stopped"));
+            return;
+        }
+        println!("{}", crate::test_support::ISOLATED_TEST_CANARY);
+
+        // stdin is closed: the confirmation reads no, the default.
+        prune(false).unwrap();
+    }
+
+    #[test]
+    fn the_confirmation_names_unpushed_and_unmerged_work() {
+        let candidate = |name: &str, risks: Vec<AtRisk>| Candidate {
+            sandbox: Listed {
+                name: name.to_string(),
+                project: "api".to_string(),
+                path: "~/api".to_string(),
+                phase: "Ready".to_string(),
+            },
+            transport: Arc::new(OpenShell::new(name, None)),
+            risks: Some(risks),
+            started: false,
+        };
+        let spike = AtRisk {
+            path: None,
+            branch: Some("spike".to_string()),
+            uncommitted: false,
+            unpushed: 2,
+            unmerged_into: Some("main".to_string()),
+        };
+        let review = AtRisk {
+            path: Some("/sandbox/web__worktrees/review".into()),
+            branch: Some("review".to_string()),
+            uncommitted: false,
+            unpushed: 0,
+            unmerged_into: Some("main".to_string()),
+        };
+
+        assert_eq!(
+            confirmation(&[
+                candidate(API, vec![spike]),
+                candidate(WEB, vec![review]),
+                candidate("wm-idle-0a0b0c0d", Vec::new()),
+            ]),
+            "These have work that is unmerged or exists only in a sandbox:\n  \
+             wm-api-1a2b3c4d: branch spike: 2 commits not on any remote, not merged into main\n  \
+             wm-web-5e6f7a8b: /sandbox/web__worktrees/review (branch review): not merged into main\n\
+             \nDelete all these sandboxes? Their clones and worktrees are lost. [y/N] "
+        );
+        assert_eq!(
+            confirmation(&[candidate("wm-idle-0a0b0c0d", Vec::new())]),
+            "Delete all these sandboxes? Their clones and worktrees are lost. [y/N] "
+        );
     }
 
     #[test]
@@ -895,7 +987,7 @@ mod tests {
         const NAME: &str =
             "command::sandbox_openshell::tests::prune_deletes_nothing_unless_confirmed";
         if !crate::test_support::is_isolated_child(NAME) {
-            let gateway = Gateway::new(false);
+            let gateway = Gateway::new(Work::None);
             gateway.run(NAME);
             assert!(!gateway.log("log").contains("sandbox delete"));
             assert_eq!(gateway.phase(WEB).as_deref(), Some("Stopped"));
@@ -911,7 +1003,7 @@ mod tests {
     fn prune_force_deletes_workmux_sandboxes_even_with_work() {
         const NAME: &str = "command::sandbox_openshell::tests::prune_force_deletes_workmux_sandboxes_even_with_work";
         if !crate::test_support::is_isolated_child(NAME) {
-            let gateway = Gateway::new(true);
+            let gateway = Gateway::new(Work::Uncommitted);
             gateway.run(NAME);
             assert_eq!(gateway.phase(API), None);
             assert_eq!(gateway.phase(WEB), None);

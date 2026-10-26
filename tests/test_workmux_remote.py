@@ -2902,9 +2902,10 @@ def test_pruning_openshell_sandboxes_closes_their_workstation_windows(
     short_tmp: dict,
 ):
     """`sandbox prune` deletes workmux's (`wm-`) sandboxes after one
-    confirmation and closes every workstation window tagged with their
-    projects, leaving the user's other windows and other sandboxes alone.
-    `openshell` is a fake on PATH."""
+    confirmation, which names the commits that exist only in them, and
+    closes every workstation window tagged with their projects, leaving the
+    user's other windows and other sandboxes alone. `openshell` is a fake on
+    PATH."""
     env = mux_server
     assert isinstance(env, TmuxEnvironment)
     state = env.tmp_path / "openshell"
@@ -2935,7 +2936,7 @@ case "$1 $2" in
   [ -e {state}/phase-$3 ] || {{ echo "sandbox not found" >&2; exit 1; }}
   printf '{{"phase":"%s","policy":{{}}}}' "$(cat {state}/phase-$3)" ;;
 'sandbox delete') rm -f {state}/phase-$3 ;;
-'sandbox exec') echo '[]' ;;
+'sandbox exec') echo '[{{"path":null,"branch":"spike","uncommitted":false,"unpushed":1,"unmerged_into":null}}]' ;;
 esac
 """,
     )
@@ -2980,6 +2981,7 @@ esac
     pruned = wm("sandbox prune", cwd=clone_of(env, "api"), stdin_input="y\n")
 
     assert sandbox in pruned.stdout
+    assert f"{sandbox}: branch spike: 1 commit not on any remote" in pruned.stdout
     assert "trellis-7fba5166" not in pruned.stdout
     log = (state / "log").read_text()
     assert f"sandbox delete {sandbox}" in log
