@@ -486,6 +486,20 @@ fn create_impl(
     )
     .context("Failed to create git worktree")?;
 
+    // From here on a failure removes what this `add` created, so a retry
+    // does not find the worktree (or a new branch) already there.
+    let roll_back = |error: anyhow::Error| {
+        roll_back_new_worktree(
+            context,
+            branch_name,
+            &current_handle,
+            &worktree_path,
+            create_new,
+            headless,
+            error,
+        )
+    };
+
     if headless {
         if let Err(error) = git::set_worktree_attachment_in(
             &current_handle,
@@ -493,27 +507,9 @@ fn create_impl(
             Some(&context.execution_dir),
         ) {
             drop(_config_lock);
-            let rollback = cleanup::cleanup_headless(
-                context,
-                branch_name,
-                &current_handle,
-                &worktree_path,
-                cleanup::CleanupOptions {
-                    force: true,
-                    keep_branch: !create_new,
-                    no_hooks: true,
-                    show_hook_output: false,
-                },
-            );
-            return match rollback {
-                Ok(_) => Err(error),
-                Err(rollback_error) => Err(error.context(format!(
-                    "Metadata rollback also failed for '{}': {rollback_error:#}",
-                    worktree_path.display()
-                ))),
-            };
+            return Err(roll_back(error));
         }
-    } else {
+    } else if let Err(error) = (|| -> Result<()> {
         let mode_str = match options.mode {
             MuxMode::Session => "session",
             MuxMode::Window => "window",
@@ -567,6 +563,10 @@ fn create_impl(
             options.primary_window = true;
         }
         debug!(handle = %current_handle, mode = mode_str, "create:stored mux metadata");
+        Ok(())
+    })() {
+        drop(_config_lock);
+        return Err(roll_back(error));
     }
 
     // Release the config lock before proceeding to non-git operations
@@ -580,7 +580,8 @@ fn create_impl(
         let session_id = fork
             .forker
             .prepare_fork(&fork.session, &worktree_path)
-            .context("Failed to fork conversation into new worktree")?;
+            .context("Failed to fork conversation into new worktree")
+            .map_err(roll_back)?;
         options.resume_mode =
             crate::multiplexer::types::ResumeMode::ForkSession(session_id.clone());
         info!(
@@ -592,11 +593,7 @@ fn create_impl(
 
     // Write prompt file to worktree if provided
     let prompt_file_path = if let Some(p) = prompt {
-        Some(setup::write_prompt_file(
-            Some(&worktree_path),
-            branch_name,
-            p,
-        )?)
+        Some(setup::write_prompt_file(Some(&worktree_path), branch_name, p).map_err(roll_back)?)
     } else {
         None
     };
@@ -652,27 +649,7 @@ fn create_impl(
             hook_output,
         ) {
             Ok(result) => result,
-            Err(error) => {
-                let rollback = cleanup::cleanup_headless(
-                    context,
-                    branch_name,
-                    &current_handle,
-                    &worktree_path,
-                    cleanup::CleanupOptions {
-                        force: true,
-                        keep_branch: !create_new,
-                        no_hooks: true,
-                        show_hook_output: false,
-                    },
-                );
-                return match rollback {
-                    Ok(_) => Err(error),
-                    Err(rollback_error) => Err(error.context(format!(
-                        "Provisioning rollback also failed for '{}': {rollback_error:#}",
-                        worktree_path.display()
-                    ))),
-                };
-            }
+            Err(error) => return Err(roll_back(error)),
         };
         let result = ProvisionResult {
             worktree_path,
@@ -695,7 +672,8 @@ fn create_impl(
         &options_with_prompt,
         agent,
         placement_window_id,
-    )?;
+    )
+    .map_err(roll_back)?;
     result.base_branch = comparison_base;
     info!(
         branch = branch_name,
@@ -704,6 +682,50 @@ fn create_impl(
         "create:completed"
     );
     Ok(CreateOutcome::Attached(result))
+}
+
+/// Remove the worktree (and the branch, when `add` created it) after a failure
+/// past worktree creation, and say so on the error.
+fn roll_back_new_worktree(
+    context: &WorkflowContext,
+    branch_name: &str,
+    handle: &str,
+    worktree_path: &Path,
+    created_branch: bool,
+    headless: bool,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    let options = cleanup::CleanupOptions {
+        force: true,
+        keep_branch: !created_branch,
+        no_hooks: true,
+        show_hook_output: false,
+    };
+    let rollback = if headless {
+        cleanup::cleanup_headless(context, branch_name, handle, worktree_path, options)
+    } else {
+        cleanup::cleanup(context, branch_name, handle, worktree_path, options)
+    };
+    match rollback {
+        Ok(_) => {
+            info!(branch = branch_name, path = %worktree_path.display(), "create:rolled back");
+            let removed = if created_branch {
+                format!("removed the new worktree and branch '{branch_name}'")
+            } else {
+                "removed the new worktree".to_string()
+            };
+            error.context(format!(
+                "Could not finish adding '{branch_name}'; {removed}, so it can be added again"
+            ))
+        }
+        Err(rollback_error) => {
+            warn!(branch = branch_name, error = %rollback_error, "create:rollback failed");
+            error.context(format!(
+                "Could not finish adding '{branch_name}', and removing the new worktree '{}' also failed: {rollback_error:#}",
+                worktree_path.display()
+            ))
+        }
+    }
 }
 
 /// Create a new worktree and move uncommitted changes from the current worktree into it.
@@ -1390,5 +1412,68 @@ mod tests {
             Some("window")
         );
         assert!(!git::branch_exists_in("feature", Some(&repo_a)).unwrap());
+    }
+
+    #[test]
+    fn failed_setup_removes_the_new_worktree_and_branch() {
+        const TEST_NAME: &str =
+            "workflow::create::tests::failed_setup_removes_the_new_worktree_and_branch";
+        // Rollback changes the process directory, so run in a child process.
+        if !test_support::is_isolated_child(TEST_NAME) {
+            let temp = tempfile::tempdir().unwrap();
+            let repo = temp.path().join("repo");
+            std::fs::create_dir_all(&repo).unwrap();
+            test_support::init_repo(&repo);
+            test_support::run_isolated_test(TEST_NAME, &repo, &[("WM_TEST_TEMP", temp.path())]);
+            return;
+        }
+
+        println!("{}", test_support::ISOLATED_TEST_CANARY);
+        let repo = std::env::var_os("WM_TEST_TEMP")
+            .map(PathBuf::from)
+            .unwrap()
+            .join("repo");
+
+        let failing = Config {
+            post_create: Some(vec!["exit 7".to_string()]),
+            ..Config::default()
+        };
+        let add = |config: Config| {
+            let ctx = WorkflowContext::new_in(&repo, config, Arc::new(TestMux), None).unwrap();
+            let mut options = SetupOptions::new(true, false, false);
+            options.focus_window = false;
+            create(
+                &ctx,
+                CreateArgs {
+                    branch_name: "feature",
+                    handle: "feature",
+                    base_branch: Some("main"),
+                    remote_branch: None,
+                    checkout_ref: None,
+                    prompt: None,
+                    options,
+                    mode_override: None,
+                    agent: None,
+                    is_explicit_name: false,
+                    prompt_file_only: false,
+                    fork_source: None,
+                },
+            )
+        };
+
+        let Err(error) = add(failing) else {
+            panic!("add should fail when a post-create command fails");
+        };
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("Failed to run post-create command: 'exit 7'"),
+            "{message}"
+        );
+        assert!(message.contains("removed the new worktree"), "{message}");
+        assert!(!git::worktree_exists_in("feature", Some(&repo)).unwrap());
+        assert!(!git::branch_exists_in("feature", Some(&repo)).unwrap());
+
+        let retried = add(Config::default()).unwrap();
+        assert!(retried.worktree_path.exists());
     }
 }
