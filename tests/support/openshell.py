@@ -5,12 +5,10 @@ the fixture that created it; nothing here touches other sandboxes.
 """
 
 import functools
-import io
 import json
 import os
 import shutil
 import subprocess
-import tarfile
 import tempfile
 import time
 import uuid
@@ -126,25 +124,22 @@ def build_linux_workmux() -> Path:
         check=True,
         capture_output=True,
     ).stdout.split(b"\0")
-    context = io.BytesIO()
-    with tarfile.open(fileobj=context, mode="w") as tar:
-        for name in filter(None, files):
-            path = CHECKOUT / name.decode()
-            if path.is_file():
-                tar.add(path, arcname=name.decode())
-        dockerfile = LINUX_WORKMUX_DOCKERFILE.encode()
-        info = tarfile.TarInfo("Dockerfile.workmux-linux")
-        info.size = len(dockerfile)
-        tar.addfile(info, io.BytesIO(dockerfile))
+    context = Path(tempfile.mkdtemp(prefix="wm-linux-workmux-src-"))
+    for name in filter(None, files):
+        path = CHECKOUT / name.decode()
+        if path.is_file() and name != b"Dockerfile":
+            (context / name.decode()).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy(path, context / name.decode())
+    (context / "Dockerfile").write_text(LINUX_WORKMUX_DOCKERFILE)
     out = Path(tempfile.mkdtemp(prefix="wm-linux-workmux-"))
-    subprocess.run(
-        ["docker", "build", "-q", "-f", "Dockerfile.workmux-linux"]
-        + ["--output", f"type=local,dest={out}", "-"],
-        input=context.getvalue(),
-        check=True,
+    built = subprocess.run(
+        ["docker", "build", "-q", "--output", f"type=local,dest={out}", str(context)],
         capture_output=True,
+        text=True,
         env={**os.environ, "DOCKER_BUILDKIT": "1"},
     )
+    shutil.rmtree(context, ignore_errors=True)
+    assert built.returncode == 0, built.stderr
     return out / "workmux"
 
 
