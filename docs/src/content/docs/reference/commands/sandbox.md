@@ -3,7 +3,7 @@ title: "sandbox"
 description: Manage sandbox backends and tooling
 ---
 
-Commands for managing sandbox functionality across container (Docker/Podman/Apple Container) and Lima backends.
+Commands for managing sandbox functionality across container (Docker/Podman/Apple Container), Lima and OpenShell backends. `stop`, `prune`, `status` and `shell` act on the backend the current repository's config picks with `sandbox.backend`.
 
 ## Container commands
 
@@ -97,7 +97,79 @@ workmux sandbox prune --force
 
 Lists all workmux Lima VMs (those starting with `wm-` prefix) with their size, age, and last accessed time, then prompts for confirmation before deleting them. Requires `limactl` to be installed.
 
+## OpenShell commands
+
+An [OpenShell sandbox](/guide/remote-projects/openshell/) holds its project's clone rather than mounting your worktrees, so deleting one loses the work that exists only there. Run these in a repository whose config sets `sandbox.backend: openshell` (or in a window workmux opened for it). Sandboxes are named like Lima VMs, `wm-<project>-<hash8>`, from the clone's path; `stop` and `prune` list and touch only workmux's `wm-` sandboxes. There is no `start`: the next command that needs the sandbox, such as `workmux add` or `workmux open`, creates or starts it.
+
+### sandbox stop
+
+Stop OpenShell sandboxes to free resources.
+
+```bash
+# Interactive mode - pick from the running sandboxes; Enter picks this repository's
+workmux sandbox stop
+
+# Stop a specific sandbox
+workmux sandbox stop <sandbox-name>
+
+# Stop all running workmux sandboxes, without asking
+workmux sandbox stop --all --yes
+```
+
+The options are Lima's. Stopping keeps the sandbox's workspace, but every process in it ends, agents included: their entries turn stale, and after the next start their workstation panes find their remote panes ended and close. Reopen a worktree with `workmux open`.
+
+### sandbox prune
+
+Delete workmux's OpenShell sandboxes after one confirmation, and close the workstation windows of their projects.
+
+```bash
+# List the sandboxes, check them for work, and confirm deletion
+workmux sandbox prune
+
+# Delete them all without checking or asking
+workmux sandbox prune --force
+```
+
+**Options:**
+
+- `-f, --force` - Skip the check and the confirmation, and delete every workmux sandbox even when it holds work
+
+Before asking, `prune` checks each sandbox's worktrees and branches, starting a stopped one to look (and stopping it again if nothing is deleted). It refuses, naming each sandbox, while any has uncommitted changes or commits not on any remote, or could not be checked:
+
+```text
+1. wm-api-1a2b3c4d (ready, project api)
+   Work that exists only in the sandbox:
+     /sandbox/api__worktrees/feature (branch feature): uncommitted changes, 2 commits not on any remote, not merged into main
+
+Error: Not deleting: wm-api-1a2b3c4d may hold uncommitted or unpushed work. Commit and push it, or delete anyway with --force
+```
+
+### sandbox rebuild
+
+Delete and recreate the current repository's sandbox from the current image and config, carrying its committed work across. Refused while any worktree has uncommitted changes. On a sandbox that doesn't exist yet, it only creates it. See [Rebuilding a sandbox](/guide/remote-projects/openshell/#rebuilding-a-sandbox).
+
+```bash
+workmux sandbox rebuild [-y]
+```
+
+**Options:**
+
+- `-y, --yes`: Don't ask for confirmation.
+
 ## General commands
+
+### sandbox status
+
+Show the current repository's sandbox. It never starts or creates one.
+
+```bash
+workmux sandbox status
+```
+
+- **OpenShell:** whether the sandbox is reachable, stopped or not created yet, with remote workmux's and the protocol's versions, warnings (a missing session holder, agents without hooks, a devshell built from older flake files), the transport's error when unreachable, the repository URL, the sandbox's effective policy, and its agents with the providers that give them credentials. Exits 1 when the sandbox is unreachable.
+- **Lima:** the VM's name and state (running, stopped, or not created yet), its isolation, the toolchain it uses, and, once the VM exists, the mounts workmux gives it.
+- **Container:** the image the config resolves to and whether it is present locally. Containers are per worktree and short-lived, so there is no long-lived sandbox to report.
+- **No sandbox:** says the repository runs on the workstation.
 
 ### sandbox agent
 
@@ -128,7 +200,7 @@ The key difference from `sandbox shell` is that this starts an RPC server, enabl
 
 ### sandbox shell
 
-Start an interactive shell in a sandbox. Uses the same mounts and environment as a normal worktree sandbox. Works with both container and Lima backends.
+Start an interactive shell in a sandbox. Uses the same mounts and environment as a normal worktree sandbox. Works with the container, Lima and OpenShell backends.
 
 ```bash
 # Start a new shell (container backend starts a new container, Lima connects to existing VM)
@@ -150,6 +222,7 @@ workmux sandbox shell --exec
 
 - **Container:** Starts a fresh container with the same mounts and environment as a normal worktree sandbox. With `--exec`, attaches to an existing container instead.
 - **Lima:** Connects to the Lima VM for the current worktree (creating it if needed). The `--exec` flag is not supported since Lima VMs are persistent and `shell` always connects to the existing VM.
+- **OpenShell:** Opens the sandbox user's login shell in the sandbox, in the worktree of the project window you run it from, else in the sandbox's clone. It creates or starts the sandbox (and clones the project on first use) if need be. `workmux` typed in that shell is remote workmux, which can't reach your workstation; use a worktree's own panes for that. `--exec` is not supported.
 
 ### sandbox install-dev
 

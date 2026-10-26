@@ -11,7 +11,7 @@ workmux update
 
 ## Release source
 
-`WORKMUX_RELEASES_URL` names the release source: the base URL that releases are downloaded from, as `<base>/v<version>/workmux-<platform>.tar.gz` with its `.sha256`. The same variable sets where `workmux remote upload` downloads builds for another platform.
+`WORKMUX_RELEASES_URL` names the release source: the base URL that releases are downloaded from, as `<base>/v<version>/workmux-<platform>.tar.gz` with its `.sha256`.
 
 - For GitHub releases (`https://github.com/<owner>/<repo>/releases/download`), the latest version comes from the GitHub API.
 - For any other source, such as a `file://` directory, a `latest` file in the base directory holds the latest tag (for example `v0.1.125`).
