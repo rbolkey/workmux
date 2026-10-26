@@ -61,7 +61,20 @@ pub fn resolve_worktree_agents(
     mux: &dyn Multiplexer,
 ) -> Result<(PathBuf, Vec<AgentPane>)> {
     let agent_panes = StateStore::new().and_then(|store| store.load_reconciled_agents(mux))?;
-    resolve_worktree_agents_from_snapshot(name, &agent_panes)
+    let name = targeted_name(name, crate::remote::router::resolve()?.as_ref());
+    resolve_worktree_agents_from_snapshot(&name, &agent_panes)
+}
+
+/// `name` as a command run for `project` means it: a plain worktree name
+/// typed for a remote project (in a clone of its repository or one of its
+/// windows) names that project's worktree.
+pub fn targeted_name(name: &str, project: Option<&crate::remote::router::RemoteProject>) -> String {
+    match (AgentSelector::parse(name), project) {
+        (AgentSelector::Local(handle), Some(project)) => {
+            format!("{}:{handle}", project.project().group_label())
+        }
+        _ => name.to_string(),
+    }
 }
 
 /// Resolve a worktree name against one reconciled agent snapshot.
@@ -398,6 +411,38 @@ mod tests {
             stale: false,
         });
         agent
+    }
+
+    #[test]
+    fn a_plain_name_typed_for_a_remote_project_targets_that_project() {
+        let panes = [
+            remote_agent("api", "feature", "%1"),
+            remote_agent("web", "feature", "%2"),
+        ];
+        let api = crate::remote::router::RemoteProject {
+            site: crate::remote::session::ProjectSite {
+                remote: "devbox".to_string(),
+                name: "api".to_string(),
+                path: "~/api".to_string(),
+                git_url: None,
+                session: None,
+            },
+            remote: crate::config::RemoteConfig {
+                transport: crate::config::TransportKind::Loopback,
+                target: "/tmp/devbox".to_string(),
+                builtin_shims: None,
+                host_commands: Vec::new(),
+                openshell: None,
+            },
+        };
+
+        let targeted = targeted_name("feature", Some(&api));
+        let (_, matched) = resolve_worktree_agents_from_snapshot(&targeted, &panes).unwrap();
+        assert_eq!(matched, [panes[0].clone()]);
+        // A qualified name says which project it means; on the workstation
+        // a plain name stays plain.
+        assert_eq!(targeted_name("web:feature", Some(&api)), "web:feature");
+        assert_eq!(targeted_name("feature", None), "feature");
     }
 
     #[test]

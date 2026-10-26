@@ -44,11 +44,12 @@ The first command that needs the sandbox creates it, clones the repository from 
 
 ## Which project a command acts on
 
-Commands that act on a project (`add`, `open`, `close`, `remove`, `merge`, `list`, `path`, `run`, `rename`, `rebase`, `set-base`, `sync-files` and `init`) find a remote project in this order:
+A command acts on the project it runs in; there is no flag naming another project. Commands that act on a project (`add`, `open`, `close`, `remove`, `merge`, `list`, `path`, `run`, `rename`, `rebase`, `set-base`, `sync-files` and `init`, and plain worktree names given to `send`, `capture` and `wait`) find it in this order:
 
-1. `--project NAME`, a remote project a command has already run for
-2. the project of the tmux session you typed the command in. workmux tags each remote project's session, so commands typed there act on it.
-3. the repository of the current directory: its config decides whether the project is local or in a sandbox
+1. the project of the tmux window, or else the session, you typed the command in. workmux tags each remote project's windows and session, so commands typed there act on it.
+2. the repository of the current directory: its config decides whether the project is local or in a sandbox
+
+Outside any repository and any project window, they fail and tell you to run them inside a clone of the repository. A command relayed to a sandbox says so once (`Running in OpenShell sandbox wm-api (project api)`), and `list` names the sandbox in its first line.
 
 Run from a remote worktree's window, commands with no worktree name act on that worktree, as they do locally.
 

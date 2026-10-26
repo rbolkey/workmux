@@ -339,20 +339,16 @@ fn save_list(path: &Path, stdout: &[u8]) -> Result<()> {
     Ok(())
 }
 
-pub fn run(
-    show_pr: bool,
-    json: bool,
-    all: bool,
-    remote_project: Option<&str>,
-    filter: &[String],
-) -> Result<()> {
-    if let Some(remote) = router::resolve(remote_project)? {
+pub fn run(show_pr: bool, json: bool, all: bool, filter: &[String]) -> Result<()> {
+    if !all && let Some(remote) = router::resolve()? {
         let mut argv = vec!["workmux", "list"];
         if show_pr {
             argv.push("--pr");
         }
         if json {
             argv.push("--json");
+        } else {
+            println!("Worktrees in {}", remote.target());
         }
         argv.extend(filter.iter().map(String::as_str));
         return router::exit_with(router::run(&remote, &argv)?);
@@ -384,6 +380,9 @@ pub fn run(
             }
         }
     } else {
+        if !git::is_git_repo()? {
+            bail!(git::NOT_IN_A_REPOSITORY);
+        }
         let root = git::get_main_worktree_root()?;
         let project = project(&root);
         worktrees.extend(

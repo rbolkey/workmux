@@ -379,10 +379,6 @@ enum Commands {
         /// Use an alternate config file for this invocation (still merges with global config)
         #[arg(long, value_hint = clap::ValueHint::FilePath)]
         config: Option<PathBuf>,
-
-        /// Add the worktree to a remote project
-        #[arg(long)]
-        project: Option<String>,
     },
 
     /// Open a tmux window for an existing worktree
@@ -429,10 +425,6 @@ enum Commands {
         /// Use an alternate config file for this invocation (still merges with global config)
         #[arg(long, value_hint = clap::ValueHint::FilePath)]
         config: Option<PathBuf>,
-
-        /// Open a worktree of a remote project
-        #[arg(long)]
-        project: Option<String>,
     },
 
     /// Close a worktree's tmux window (keeps the worktree and branch)
@@ -440,10 +432,6 @@ enum Commands {
         /// Worktree name (defaults to current directory if omitted)
         #[arg(value_parser = WorktreeHandleParser::new())]
         name: Option<String>,
-
-        /// Close a worktree of a remote project
-        #[arg(long)]
-        project: Option<String>,
     },
 
     /// Restore worktree windows after a tmux or computer crash
@@ -497,10 +485,6 @@ enum Commands {
         /// Show a system notification on successful merge
         #[arg(long)]
         notification: bool,
-
-        /// Merge in a remote project
-        #[arg(long)]
-        project: Option<String>,
     },
 
     /// Rebase a worktree branch onto its base branch
@@ -508,10 +492,6 @@ enum Commands {
         /// Worktree name or branch (defaults to current directory)
         #[arg(value_parser = WorktreeHandleParser::new())]
         name: Option<String>,
-
-        /// Remote project that holds the worktree
-        #[arg(long, value_name = "NAME")]
-        project: Option<String>,
     },
 
     /// Rename a worktree, its tmux window/session, and (optionally) its branch
@@ -523,10 +503,6 @@ enum Commands {
         /// Also rename the underlying git branch to match the new handle
         #[arg(short = 'b', long)]
         branch: bool,
-
-        /// Remote project that holds the worktree
-        #[arg(long, value_name = "NAME")]
-        project: Option<String>,
     },
 
     /// Remove a worktree, tmux window, and branch without merging
@@ -551,10 +527,6 @@ enum Commands {
         /// Keep the local branch (only remove worktree and tmux window)
         #[arg(short = 'k', long)]
         keep_branch: bool,
-
-        /// Remove worktrees of a remote project
-        #[arg(long)]
-        project: Option<String>,
     },
 
     /// List all worktrees
@@ -572,10 +544,6 @@ enum Commands {
         #[arg(long)]
         all: bool,
 
-        /// List a remote project
-        #[arg(long, value_name = "NAME", conflicts_with = "all")]
-        project: Option<String>,
-
         /// Filter by worktree name or branch (supports multiple)
         #[arg(value_parser = WorktreeBranchParser::new())]
         filter: Vec<String>,
@@ -586,10 +554,6 @@ enum Commands {
         /// Worktree name (directory name)
         #[arg(value_parser = WorktreeHandleParser::new())]
         name: String,
-
-        /// Remote project that holds the worktree
-        #[arg(long, value_name = "NAME")]
-        project: Option<String>,
 
         /// Output as JSON: {"remote": ..., "path": ...}
         #[arg(long)]
@@ -681,10 +645,6 @@ enum Commands {
         /// Maximum wait time in seconds
         #[arg(long)]
         timeout: Option<u64>,
-
-        /// Run in a worktree of a remote project
-        #[arg(long)]
-        project: Option<String>,
     },
 
     /// Exit tracked agent processes older than a configured age
@@ -705,18 +665,10 @@ enum Commands {
         /// Sync all worktrees instead of just the current one
         #[arg(long)]
         all: bool,
-
-        /// Remote project that holds the worktree
-        #[arg(long, value_name = "NAME")]
-        project: Option<String>,
     },
 
     /// Generate example .workmux.yaml configuration file
-    Init {
-        /// Remote project to write the file into
-        #[arg(long, value_name = "NAME")]
-        project: Option<String>,
-    },
+    Init,
 
     /// Set up agent status tracking hooks and install skills
     Setup {
@@ -851,10 +803,6 @@ enum Commands {
         /// The new base branch
         #[arg(value_parser = GitBranchParser::new())]
         base: String,
-
-        /// Remote project that holds the worktree
-        #[arg(long, value_name = "NAME")]
-        project: Option<String>,
     },
 
     /// Execute a run spec (internal use)
@@ -987,7 +935,7 @@ fn should_prompt_nerdfont(cmd: &Commands) -> bool {
         && matches!(
             cmd,
             Commands::Add { .. }
-                | Commands::Init { .. }
+                | Commands::Init
                 | Commands::Dashboard { .. }
                 | Commands::List { .. }
         )
@@ -1000,7 +948,7 @@ fn should_prompt_status_setup(cmd: &Commands) -> bool {
     !is_headless_add(cmd)
         && matches!(
             cmd,
-            Commands::Add { .. } | Commands::Init { .. } | Commands::List { .. }
+            Commands::Add { .. } | Commands::Init | Commands::List { .. }
         )
 }
 
@@ -1177,9 +1125,8 @@ pub fn run() -> Result<()> {
             headless,
             json,
             config,
-            project,
         } => {
-            if let Some(project) = crate::remote::router::resolve(project.as_deref())? {
+            if let Some(project) = crate::remote::router::resolve()? {
                 if prompt.prompt_editor {
                     return Err(crate::remote::router::refuse_editor(
                         &project,
@@ -1239,9 +1186,8 @@ pub fn run() -> Result<()> {
             continue_session,
             prompt,
             config,
-            project,
         } => {
-            if let Some(project) = crate::remote::router::resolve(project.as_deref())? {
+            if let Some(project) = crate::remote::router::resolve()? {
                 if prompt.prompt_editor {
                     return Err(crate::remote::router::refuse_editor(
                         &project,
@@ -1271,8 +1217,8 @@ pub fn run() -> Result<()> {
                 config.as_deref(),
             )
         }
-        Commands::Close { name, project } => {
-            if let Some(project) = crate::remote::router::resolve(project.as_deref())? {
+        Commands::Close { name } => {
+            if let Some(project) = crate::remote::router::resolve()? {
                 return crate::remote::router::relay(&project);
             }
             command::close::run(name.as_deref())
@@ -1289,9 +1235,8 @@ pub fn run() -> Result<()> {
             no_verify,
             no_hooks,
             notification,
-            project,
         } => {
-            if let Some(project) = crate::remote::router::resolve(project.as_deref())? {
+            if let Some(project) = crate::remote::router::resolve()? {
                 return crate::remote::router::relay(&project);
             }
             command::merge::run(
@@ -1307,8 +1252,8 @@ pub fn run() -> Result<()> {
                 notification,
             )
         }
-        Commands::Rebase { name, project } => {
-            if let Some(project) = crate::remote::router::resolve(project.as_deref())? {
+        Commands::Rebase { name } => {
+            if let Some(project) = crate::remote::router::resolve()? {
                 return crate::remote::router::relay(&project);
             }
             command::rebase::run(name.as_deref())
@@ -1319,19 +1264,14 @@ pub fn run() -> Result<()> {
             all,
             force,
             keep_branch,
-            project,
         } => {
-            if let Some(project) = crate::remote::router::resolve(project.as_deref())? {
+            if let Some(project) = crate::remote::router::resolve()? {
                 return crate::remote::router::relay(&project);
             }
             command::remove::run(names, gone, all, force, keep_branch)
         }
-        Commands::Rename {
-            names,
-            branch,
-            project,
-        } => {
-            if let Some(project) = crate::remote::router::resolve(project.as_deref())? {
+        Commands::Rename { names, branch } => {
+            if let Some(project) = crate::remote::router::resolve()? {
                 return crate::remote::router::relay(&project);
             }
             command::rename::run(names, branch)
@@ -1340,14 +1280,9 @@ pub fn run() -> Result<()> {
             pr,
             json,
             all,
-            project,
             filter,
-        } => command::list::run(pr, json, all, project.as_deref(), &filter),
-        Commands::Path {
-            name,
-            project,
-            json,
-        } => command::path::run(&name, project.as_deref(), json),
+        } => command::list::run(pr, json, all, &filter),
+        Commands::Path { name, json } => command::path::run(&name, json),
         Commands::Send { name, text, file } => {
             command::send::run(&name, text.as_deref(), file.as_deref())
         }
@@ -1370,9 +1305,8 @@ pub fn run() -> Result<()> {
             background,
             keep,
             timeout,
-            project,
         } => {
-            if let Some(project) = crate::remote::router::resolve(project.as_deref())? {
+            if let Some(project) = crate::remote::router::resolve()? {
                 return crate::remote::router::relay(&project);
             }
             command::run::run(&name, command, background, keep, timeout)
@@ -1381,14 +1315,14 @@ pub fn run() -> Result<()> {
             command::reap_agents::run(hours.saturating_mul(3600), force)
         }
         Commands::Exec { run_dir } => command::exec::run(&run_dir),
-        Commands::SyncFiles { all, project } => {
-            if let Some(project) = crate::remote::router::resolve(project.as_deref())? {
+        Commands::SyncFiles { all } => {
+            if let Some(project) = crate::remote::router::resolve()? {
                 return crate::remote::router::relay(&project);
             }
             command::sync_files::run(all)
         }
-        Commands::Init { project } => {
-            if let Some(project) = crate::remote::router::resolve(project.as_deref())? {
+        Commands::Init => {
+            if let Some(project) = crate::remote::router::resolve()? {
                 return crate::remote::router::relay(&project);
             }
             crate::config::Config::init()
@@ -1485,8 +1419,8 @@ pub fn run() -> Result<()> {
         Commands::Remote(args) => command::remote::run(args),
         Commands::SetWindowStatus { command } => command::set_window_status::run(command),
         Commands::RegisterAgent => command::set_window_status::register_agent(),
-        Commands::SetBase { base, project } => {
-            if let Some(project) = crate::remote::router::resolve(project.as_deref())? {
+        Commands::SetBase { base } => {
+            if let Some(project) = crate::remote::router::resolve()? {
                 return crate::remote::router::relay(&project);
             }
             command::set_base::run(&base)
@@ -1621,6 +1555,40 @@ fn print_fish_dynamic_completion() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_command_takes_a_project_option() {
+        // A command targets the project it runs in (ADR 0004).
+        fn walk(command: &clap::Command, path: &str, found: &mut Vec<String>) {
+            if command
+                .get_arguments()
+                .any(|a| a.get_long() == Some("project"))
+            {
+                found.push(path.to_string());
+            }
+            for sub in command.get_subcommands() {
+                walk(sub, &format!("{path} {}", sub.get_name()), found);
+            }
+        }
+        let mut found = Vec::new();
+        walk(&Cli::command(), "workmux", &mut found);
+        assert_eq!(found, Vec::<String>::new());
+    }
+
+    #[test]
+    fn remote_lifecycle_commands_take_no_name() {
+        // They act on the current repository's sandbox.
+        for sub in ["status", "start", "stop", "recreate", "rm"] {
+            assert!(
+                Cli::try_parse_from(["workmux", "remote", sub]).is_ok(),
+                "remote {sub}"
+            );
+            assert!(
+                Cli::try_parse_from(["workmux", "remote", sub, "api"]).is_err(),
+                "remote {sub} api"
+            );
+        }
+    }
 
     #[test]
     fn add_continue_accepts_prompt() {

@@ -2,8 +2,8 @@ use crate::git;
 use crate::remote::{router, session::ServedProject};
 use anyhow::{Result, anyhow};
 
-pub fn run(name: &str, project: Option<&str>, json: bool) -> Result<()> {
-    if let Some(project) = router::resolve(project)? {
+pub fn run(name: &str, json: bool) -> Result<()> {
+    if let Some(project) = router::resolve()? {
         let mut argv = vec!["workmux", "path", name];
         if json {
             argv.push("--json");
@@ -11,6 +11,9 @@ pub fn run(name: &str, project: Option<&str>, json: bool) -> Result<()> {
         return router::exit_with(router::run(&project, &argv)?);
     }
 
+    if !git::is_git_repo()? {
+        return Err(anyhow!(git::NOT_IN_A_REPOSITORY));
+    }
     // Smart resolution: try handle first, then branch name
     let (path, _branch) = git::find_worktree(name).map_err(|_| {
         anyhow!(

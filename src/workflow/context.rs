@@ -93,7 +93,7 @@ impl WorkflowContext {
         })?;
 
         if !git::is_git_repo_in(Some(&execution_dir))? {
-            return Err(anyhow!("Not in a git repository"));
+            return Err(anyhow!(git::NOT_IN_A_REPOSITORY));
         }
 
         let main_worktree_root = git::get_main_worktree_root_in(Some(&execution_dir))

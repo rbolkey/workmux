@@ -73,6 +73,12 @@ def remote(env, exe, repo, command, tmp_env, expect_fail=False):
     )
 
 
+def clone_of(env, name: str) -> Path:
+    """The workstation clone `project_in_sandbox` made for project `name`:
+    commands run there target the project."""
+    return env.tmp_path / "workstation" / name
+
+
 def project_in_sandbox(
     env,
     exe,
@@ -149,7 +155,9 @@ def test_remote_list_and_status_against_a_loopback_remote(
         assert rows["lb"].rstrip().endswith("reachable")
         assert f"unreachable: Loopback root {missing} does not exist" in rows["gone"]
 
-        status = remote(env, workmux_exe_path, repo_path, "status lb", short_tmp).stdout
+        status = remote(
+            env, workmux_exe_path, clone_of(env, "api"), "status", short_tmp
+        ).stdout
         assert "status:   reachable" in status
         assert f"workmux:  {version}" in status
         assert "protocol: 1" in status
@@ -165,15 +173,14 @@ def test_remote_list_and_status_against_a_loopback_remote(
         ).stdout.split()
         assert len(children) == 1
 
+        web = clone_of(env, "web")
         failed = remote(
-            env, workmux_exe_path, repo_path, "status gone", short_tmp, expect_fail=True
+            env, workmux_exe_path, web, "status", short_tmp, expect_fail=True
         )
         assert "status:   unreachable" in failed.stdout
         assert f"Loopback root {missing} does not exist" in failed.stdout
 
-        refused = remote(
-            env, workmux_exe_path, repo_path, "rm gone", short_tmp, expect_fail=True
-        )
+        refused = remote(env, workmux_exe_path, web, "rm", short_tmp, expect_fail=True)
         assert "workmux deletes only those" in refused.stderr
     finally:
         if daemon_pid is not None:
@@ -264,7 +271,8 @@ def test_remote_project_is_cloned_on_first_use_and_answers_list_and_path(
         listing = wm("list", cwd=workstation)
         assert clone.joinpath(".git").is_dir()
         assert "Cloning" in listing.stderr
-        header, main_row = listing.stdout.splitlines()[:2]
+        target, header, main_row = listing.stdout.splitlines()[:3]
+        assert target == "Worktrees in remote lb (project api)"
         assert header.split()[:2] == ["PROJECT", "BRANCH"]
         assert main_row.split()[:2] == ["api@lb", "main"]
 
@@ -283,26 +291,30 @@ def test_remote_project_is_cloned_on_first_use_and_answers_list_and_path(
         env.run_command(
             ["git", "worktree", "add", "-q", "-b", "feature", str(worktree)], cwd=clone
         )
-        assert wm("path --project api feature").stdout.strip() == str(worktree)
-        assert json.loads(wm("path --project api feature --json").stdout) == {
+        assert wm("path feature", cwd=clone_of(env, "api")).stdout.strip() == str(
+            worktree
+        )
+        assert json.loads(
+            wm("path feature --json", cwd=clone_of(env, "api")).stdout
+        ) == {
             "remote": "lb",
             "path": str(worktree),
         }
 
-        missing = wm("path --project api nope", expect_fail=True)
+        missing = wm("path nope", cwd=clone_of(env, "api"), expect_fail=True)
         assert missing.exit_code == 1
         assert "Worktree 'nope' not found" in missing.stderr
 
-        entries = json.loads(wm("list --project api --json").stdout)
+        entries = json.loads(wm("list --json", cwd=clone_of(env, "api")).stdout)
         assert {(e["remote"], e["project"], e["branch"]) for e in entries} == {
             ("lb", "api", "main"),
             ("lb", "api", "feature"),
         }
 
-        rows = {
-            line.split()[1]: line.split()
-            for line in wm("list --project api").stdout.splitlines()[1:]
-        }
+        # Run in the project's clone, list says once where the project runs.
+        listing = wm("list", cwd=clone_of(env, "api")).stdout.splitlines()
+        assert listing[0] == "Worktrees in remote lb (project api)"
+        rows = {line.split()[1]: line.split() for line in listing[2:]}
         assert rows["feature"][-1] == str(worktree)
 
         everything = wm("list --all").stdout
@@ -406,11 +418,11 @@ def test_remote_add_places_windows_in_the_project_session(
     )
     origin = make_origin(env, env.tmp_path / "origin", workmux_yaml)
 
-    def wm(command, expect_fail=False):
+    def wm(command, expect_fail=False, cwd=None):
         return run_workmux_command(
             env,
             workmux_exe_path,
-            repo_path,
+            cwd or repo_path,
             command,
             pre_run_env=short_tmp,
             expect_fail=expect_fail,
@@ -439,7 +451,7 @@ def test_remote_add_places_windows_in_the_project_session(
     daemon_pid = None
     try:
         # Typed in session "test"; the window goes to the project's session.
-        added = wm("add feature --project api")
+        added = wm("add feature", cwd=clone_of(env, "api"))
         daemon_pid = remote_daemon_ping(env, workmux_exe_path, repo_path, short_tmp)[
             "pid"
         ]
@@ -460,12 +472,12 @@ def test_remote_add_places_windows_in_the_project_session(
 
         # A session the user made is adopted and tagged.
         env.tmux(["new-session", "-d", "-s", "frontend"])
-        wm("add other --project web")
+        wm("add other", cwd=clone_of(env, "web"))
         assert tmux_value(env, "=frontend:wm-other", "#{session_name}") == "frontend"
         assert session_tag(env, "frontend") == "lb:web"
 
         # Current-session placement keeps the window where the command ran.
-        wm("add notes --project docs")
+        wm("add notes", cwd=clone_of(env, "docs"))
         assert tmux_value(env, "=test:wm-notes", "#{session_name}") == "test"
         assert session_tag(env, "test") == ""
 
@@ -473,10 +485,10 @@ def test_remote_add_places_windows_in_the_project_session(
         env.tmux(["select-window", "-t", env.runner_pane_id or "test:0"])
 
         # Session mode gives the worktree its own session.
-        wm("add solo --project api --mode session")
+        wm("add solo --mode session", cwd=clone_of(env, "api"))
         assert session_tag(env, "wm-solo") == "lb:api"
 
-        # Typed without --project in the project's session (in a pane of the
+        # Typed outside any repository in the project's session (in a pane of the
         # user's own), the command targets the tagged project.
         env.tmux(["new-window", "-d", "-t", "api:", "-n", "mine"])
         code, out, err = run_in_pane(
@@ -513,11 +525,11 @@ def test_a_failed_remote_add_leaves_no_worktree_and_can_be_retried(
     workmux_yaml = 'post_create:\n  - test -f "$HOME/setup-works"\n'
     origin = make_origin(env, env.tmp_path / "origin", workmux_yaml)
 
-    def wm(command, expect_fail=False):
+    def wm(command, expect_fail=False, cwd=None):
         return run_workmux_command(
             env,
             workmux_exe_path,
-            repo_path,
+            cwd or repo_path,
             command,
             pre_run_env=short_tmp,
             expect_fail=expect_fail,
@@ -527,7 +539,7 @@ def test_a_failed_remote_add_leaves_no_worktree_and_can_be_retried(
     project_in_sandbox(env, workmux_exe_path, "api", origin, short_tmp, root=root)
     daemon_pid = None
     try:
-        failed = wm("add feature --project api", expect_fail=True)
+        failed = wm("add feature", cwd=clone_of(env, "api"), expect_fail=True)
         daemon_pid = remote_daemon_ping(env, workmux_exe_path, repo_path, short_tmp)[
             "pid"
         ]
@@ -545,7 +557,7 @@ def test_a_failed_remote_add_leaves_no_worktree_and_can_be_retried(
         assert "wm-feature" not in windows.split()
 
         (root / "home" / "setup-works").write_text("")
-        wm("add feature --project api")
+        wm("add feature", cwd=clone_of(env, "api"))
         assert worktree.is_dir()
     finally:
         if daemon_pid is not None:
@@ -580,14 +592,14 @@ def test_remote_git_commands_act_on_the_remote_repository(
         env, env.tmp_path / "origin", "files:\n  copy:\n    - local.env\n"
     )
 
-    def wm(command, expect_fail=False, from_pane=None):
+    def wm(command, expect_fail=False, from_pane=None, cwd=None):
         tmp_env = dict(short_tmp)
         if from_pane is not None:
             tmp_env["TMUX_PANE"] = from_pane
         result = run_workmux_command(
             env,
             workmux_exe_path,
-            repo_path,
+            cwd or repo_path,
             command,
             pre_run_env=tmp_env,
             expect_fail=expect_fail,
@@ -601,7 +613,7 @@ def test_remote_git_commands_act_on_the_remote_repository(
     worktrees = root / "home" / "code" / "api__worktrees"
     daemon_pid = None
     try:
-        wm("add feature --project api")
+        wm("add feature", cwd=clone_of(env, "api"))
         daemon_pid = remote_daemon_ping(env, workmux_exe_path, repo_path, short_tmp)[
             "pid"
         ]
@@ -609,7 +621,7 @@ def test_remote_git_commands_act_on_the_remote_repository(
 
         # set-base typed in the worktree's window sets that branch's base.
         git_in(env, clone, "branch", "develop")
-        set_base = wm("set-base develop --project api", from_pane=window)
+        set_base = wm("set-base develop", cwd=clone_of(env, "api"), from_pane=window)
         assert set_base.stdout.strip() == "Set base branch for 'feature' to 'develop'"
         assert git_in(env, clone, "config", "branch.feature.workmux-base") == "develop"
 
@@ -617,7 +629,7 @@ def test_remote_git_commands_act_on_the_remote_repository(
         git_in(env, clone, "checkout", "-q", "develop")
         git_in(env, clone, "commit", "-q", "--allow-empty", "-m", "on develop")
         git_in(env, clone, "checkout", "-q", "main")
-        rebased = wm("rebase --project api", from_pane=window)
+        rebased = wm("rebase", cwd=clone_of(env, "api"), from_pane=window)
         assert "✓ Rebased 'feature' onto 'develop'" in rebased.stdout
         assert git_in(env, clone, "log", "-1", "--format=%s", "feature") == (
             "on develop"
@@ -629,13 +641,13 @@ def test_remote_git_commands_act_on_the_remote_repository(
         synced = wm("sync-files", from_pane=window)
         assert "✓ Synced files to 'feature'" in synced.stdout
         assert (worktrees / "feature" / "local.env").read_text() == "SECRET=1\n"
-        outside = wm("sync-files --project api", expect_fail=True)
+        outside = wm("sync-files", cwd=clone_of(env, "api"), expect_fail=True)
         assert outside.exit_code == 1
         assert "Current directory is the main worktree" in outside.stderr
 
         # rename moves the remote worktree, its branch and the window in the
         # project's session, though typed in another session.
-        renamed = wm("rename feature renamed --branch --project api")
+        renamed = wm("rename feature renamed --branch", cwd=clone_of(env, "api"))
         assert "✓ Renamed worktree 'feature' -> 'renamed'" in renamed.stdout
         assert "✓ Renamed 1 tmux target" in renamed.stdout
         assert (worktrees / "renamed").is_dir()
@@ -646,16 +658,16 @@ def test_remote_git_commands_act_on_the_remote_repository(
             "api:wm-renamed"
         )
         # The window still leads to its worktree after the rename.
-        again = wm("set-base main --project api", from_pane=window)
+        again = wm("set-base main", cwd=clone_of(env, "api"), from_pane=window)
         assert again.stdout.strip() == "Set base branch for 'renamed' to 'main'"
 
         # init writes .workmux.yaml into the remote repository, refusing to
         # overwrite one exactly as locally.
-        exists = wm("init --project api", expect_fail=True)
+        exists = wm("init", cwd=clone_of(env, "api"), expect_fail=True)
         assert exists.exit_code == 1
         assert ".workmux.yaml already exists" in exists.stderr
         (clone / ".workmux.yaml").unlink()
-        created = wm("init --project api")
+        created = wm("init", cwd=clone_of(env, "api"))
         assert "✓ Created .workmux.yaml" in created.stdout
         assert "workmux project configuration" in (clone / ".workmux.yaml").read_text()
         assert not (repo_path / ".workmux.yaml").exists()
@@ -685,11 +697,11 @@ def test_remote_remove_cleans_up_the_remote_worktree_branch_and_window(
     clone = root / "home" / "code" / "api"
     worktrees = root / "home" / "code" / "api__worktrees"
 
-    def wm(command, expect_fail=False, stdin_input=None):
+    def wm(command, expect_fail=False, stdin_input=None, cwd=None):
         return run_workmux_command(
             env,
             workmux_exe_path,
-            repo_path,
+            cwd or repo_path,
             command,
             pre_run_env=short_tmp,
             expect_fail=expect_fail,
@@ -708,7 +720,7 @@ def test_remote_remove_cleans_up_the_remote_worktree_branch_and_window(
     project_in_sandbox(env, workmux_exe_path, "api", origin, short_tmp, root=root)
     daemon_pid = None
     try:
-        wm("add feature --project api")
+        wm("add feature", cwd=clone_of(env, "api"))
         daemon_pid = remote_daemon_ping(env, workmux_exe_path, repo_path, short_tmp)[
             "pid"
         ]
@@ -719,7 +731,7 @@ def test_remote_remove_cleans_up_the_remote_worktree_branch_and_window(
         # worktree.
         holders = f"dtach -n {root}/home/.local/state/workmux/panes/api/feature/"
         assert subprocess.run(["pgrep", "-f", holders]).returncode == 0
-        wm("close feature --project api")
+        wm("close feature", cwd=clone_of(env, "api"))
         assert "wm-feature" not in windows()
         assert (worktrees / "feature").is_dir()
         wait_until(
@@ -727,27 +739,27 @@ def test_remote_remove_cleans_up_the_remote_worktree_branch_and_window(
             "the remote panes to end",
         )
 
-        wm("remove feature --project api")
+        wm("remove feature", cwd=clone_of(env, "api"))
         assert not (worktrees / "feature").exists()
         assert "feature" not in branches()
         assert "wm-feature" not in windows()
 
         # An unmerged branch asks first; the answer comes from this terminal.
-        wm("add risky --project api")
+        wm("add risky", cwd=clone_of(env, "api"))
         env.tmux(["select-window", "-t", env.runner_pane_id or "test:0"])
         env.run_command(
             ["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q"]
             + ["--allow-empty", "-m", "unmerged work"],
             cwd=worktrees / "risky",
         )
-        declined = wm("remove risky --project api", stdin_input="n\n")
+        declined = wm("remove risky", cwd=clone_of(env, "api"), stdin_input="n\n")
         assert "risky (base: main)" in declined.stdout
         assert "Are you sure you want to continue? [y/N]" in declined.stdout
         assert "Aborted." in declined.stdout
         assert (worktrees / "risky").is_dir()
         assert "risky" in branches()
 
-        wm("remove risky --project api", stdin_input="y\n")
+        wm("remove risky", cwd=clone_of(env, "api"), stdin_input="y\n")
         assert not (worktrees / "risky").exists()
         assert "risky" not in branches()
         assert "wm-risky" not in windows()
@@ -776,11 +788,11 @@ def test_remote_merge_merges_in_the_remotes_clone_without_pushing(
     clone = root / "home" / "code" / "api"
     worktree = root / "home" / "code" / "api__worktrees" / "feature"
 
-    def wm(command):
+    def wm(command, cwd=None):
         return run_workmux_command(
             env,
             workmux_exe_path,
-            repo_path,
+            cwd or repo_path,
             command,
             pre_run_env=short_tmp,
             timeout=60.0,
@@ -793,7 +805,7 @@ def test_remote_merge_merges_in_the_remotes_clone_without_pushing(
     workstation_head = head(repo_path)
     daemon_pid = None
     try:
-        wm("add feature --project api")
+        wm("add feature", cwd=clone_of(env, "api"))
         daemon_pid = remote_daemon_ping(env, workmux_exe_path, repo_path, short_tmp)[
             "pid"
         ]
@@ -807,7 +819,7 @@ def test_remote_merge_merges_in_the_remotes_clone_without_pushing(
             cwd=worktree,
         )
 
-        wm("merge feature --project api")
+        wm("merge feature", cwd=clone_of(env, "api"))
 
         log = env.run_command(
             ["git", "log", "--format=%s", "main"], cwd=clone
@@ -849,11 +861,11 @@ def test_commands_that_would_open_an_editor_refuse_for_a_remote_project(
     editor.chmod(0o755)
     tmp_env = {**short_tmp, "EDITOR": str(editor), "GIT_EDITOR": str(editor)}
 
-    def wm(command, expect_fail=False):
+    def wm(command, expect_fail=False, cwd=None):
         return run_workmux_command(
             env,
             workmux_exe_path,
-            repo_path,
+            cwd or repo_path,
             command,
             pre_run_env=tmp_env,
             expect_fail=expect_fail,
@@ -864,14 +876,16 @@ def test_commands_that_would_open_an_editor_refuse_for_a_remote_project(
     daemon_pid = None
     try:
         # Refused on the workstation: the remote is never even cloned.
-        refused = wm("add other --project api --prompt-editor", expect_fail=True)
+        refused = wm(
+            "add other --prompt-editor", cwd=clone_of(env, "api"), expect_fail=True
+        )
         assert "cannot open an editor for remote project 'api'" in refused.stderr
         assert "-p" in refused.stderr
-        refused = wm("add --auto-name --project api", expect_fail=True)
+        refused = wm("add --auto-name", cwd=clone_of(env, "api"), expect_fail=True)
         assert "cannot open an editor for remote project 'api'" in refused.stderr
         assert not clone.exists()
 
-        wm("add feature --project api")
+        wm("add feature", cwd=clone_of(env, "api"))
         daemon_pid = remote_daemon_ping(env, workmux_exe_path, repo_path, short_tmp)[
             "pid"
         ]
@@ -879,7 +893,7 @@ def test_commands_that_would_open_an_editor_refuse_for_a_remote_project(
         (worktree / "work.txt").write_text("done\n")
         env.run_command(["git", "add", "work.txt"], cwd=worktree)
 
-        refused = wm("merge feature --project api", expect_fail=True)
+        refused = wm("merge feature", cwd=clone_of(env, "api"), expect_fail=True)
         assert "has staged changes" in refused.stderr
         assert "cannot open an editor" in refused.stderr
         assert "git commit -m" in refused.stderr
@@ -889,7 +903,9 @@ def test_commands_that_would_open_an_editor_refuse_for_a_remote_project(
             + ["-m", "remote work"],
             cwd=worktree,
         )
-        refused = wm("merge feature --project api --squash", expect_fail=True)
+        refused = wm(
+            "merge feature --squash", cwd=clone_of(env, "api"), expect_fail=True
+        )
         assert "--squash" in refused.stderr
         assert "cannot open an editor" in refused.stderr
 
@@ -920,11 +936,11 @@ def test_a_prompt_file_is_read_on_the_workstation_for_a_remote_project(
     clone = remote_root / "home" / "code" / "api"
     worktrees = remote_root / "home" / "code" / "api__worktrees"
 
-    def wm(command, expect_fail=False):
+    def wm(command, expect_fail=False, cwd=None):
         return run_workmux_command(
             env,
             workmux_exe_path,
-            repo_path,
+            cwd or repo_path,
             command,
             pre_run_env=short_tmp,
             expect_fail=expect_fail,
@@ -939,22 +955,29 @@ def test_a_prompt_file_is_read_on_the_workstation_for_a_remote_project(
     )
     daemon_pid = None
     try:
-        missing = wm("add feature -P missing.md --project api", expect_fail=True)
+        missing = wm(
+            "add feature -P missing.md", cwd=clone_of(env, "api"), expect_fail=True
+        )
         assert "Failed to read prompt file: missing.md" in missing.stderr
         assert not clone.exists()
 
-        wm("add first --project api")
+        wm("add first", cwd=clone_of(env, "api"))
         daemon_pid = remote_daemon_ping(env, workmux_exe_path, repo_path, short_tmp)[
             "pid"
         ]
         env.tmux(["select-window", "-t", env.runner_pane_id or "test:0"])
-        (repo_path / "prompt.md").write_text("Use the workstation's prompt\n")
+        (clone_of(env, "api") / "prompt.md").write_text(
+            "Use the workstation's prompt\n"
+        )
         (clone / "prompt.md").write_text("Not the remote's prompt\n")
 
-        wm("add feature -P prompt.md --prompt-file-only --project api")
+        wm("add feature -P prompt.md --prompt-file-only", cwd=clone_of(env, "api"))
         assert "Use the workstation's prompt" in prompt_of("feature")
 
-        wm("open first -n --prompt-file=prompt.md --prompt-file-only --project api")
+        wm(
+            "open first -n --prompt-file=prompt.md --prompt-file-only",
+            cwd=clone_of(env, "api"),
+        )
         assert "Use the workstation's prompt" in prompt_of("first")
     finally:
         if daemon_pid is not None:
@@ -982,11 +1005,11 @@ def test_a_workstation_agent_alias_runs_its_agent_type_on_a_remote_project(
     clone = remote_root / "home" / "code" / "api"
     worktrees = remote_root / "home" / "code" / "api__worktrees"
 
-    def wm(command, expect_fail=False):
+    def wm(command, expect_fail=False, cwd=None):
         return run_workmux_command(
             env,
             workmux_exe_path,
-            repo_path,
+            cwd or repo_path,
             command,
             pre_run_env=short_tmp,
             expect_fail=expect_fail,
@@ -1006,11 +1029,11 @@ def test_a_workstation_agent_alias_runs_its_agent_type_on_a_remote_project(
         )
     daemon_pid = None
     try:
-        refused = wm("add feature -a mine --project api", expect_fail=True)
+        refused = wm("add feature -a mine", cwd=clone_of(env, "api"), expect_fail=True)
         assert "Agent 'mine' is a workstation alias" in refused.stderr
         assert not clone.exists()
 
-        wm("add feature -a cc --project api")
+        wm("add feature -a cc", cwd=clone_of(env, "api"))
         daemon_pid = remote_daemon_ping(env, workmux_exe_path, repo_path, short_tmp)[
             "pid"
         ]
@@ -1051,11 +1074,11 @@ def test_ctrl_c_cancels_a_remote_command_during_a_long_hook(
         f"post_create:\n  - echo $$ > {out}/hook.pid; exec sleep 60\n",
     )
 
-    def wm(command):
+    def wm(command, cwd=None):
         return run_workmux_command(
             env,
             workmux_exe_path,
-            repo_path,
+            cwd or repo_path,
             command,
             pre_run_env=short_tmp,
             timeout=60.0,
@@ -1075,8 +1098,8 @@ def test_ctrl_c_cancels_a_remote_command_during_a_long_hook(
             f"export PATH={shlex.quote(env.env['PATH'])}"
             f" HOME={shlex.quote(str(env.home_path))}"
             f" TMPDIR={short_tmp['TMPDIR']} WORKMUX_TEST=1\n"
-            f"cd {repo_path}\n"
-            f"{workmux_exe_path} add slow --project api > {out}/out 2> {out}/err\n"
+            f"cd {clone_of(env, 'api')}\n"
+            f"{workmux_exe_path} add slow > {out}/out 2> {out}/err\n"
             f"echo $? > {out}/code\n"
         )
         pane = env.runner_pane_id or "test:0"
@@ -1186,11 +1209,11 @@ def test_remote_panes_survive_drops_and_reattach(
         f"panes:\n  - command: {shlex.quote(sys.executable)} {agent}\n",
     )
 
-    def wm(command):
+    def wm(command, cwd=None):
         return run_workmux_command(
             env,
             workmux_exe_path,
-            repo_path,
+            cwd or repo_path,
             command,
             pre_run_env=short_tmp,
             timeout=60.0,
@@ -1201,7 +1224,7 @@ def test_remote_panes_survive_drops_and_reattach(
     )
     daemon_pid = None
     try:
-        wm("add feature --project api")
+        wm("add feature", cwd=clone_of(env, "api"))
         daemon_pid = remote_daemon_ping(env, workmux_exe_path, repo_path, short_tmp)[
             "pid"
         ]
@@ -1264,7 +1287,7 @@ def test_remote_panes_survive_drops_and_reattach(
 
         # When the remote pane's process exits, its pane closes as it would
         # locally. Like a local pane, the agent's pane falls back to a shell.
-        wm("add second --project api")
+        wm("add second", cwd=clone_of(env, "api"))
         second = tmux_value(env, "=api:wm-second", "#{pane_id}")
         wait_until(
             lambda: (
@@ -1339,11 +1362,11 @@ def test_remote_agents_start_in_the_devshell_and_resume_conversations(
         cwd=origin,
     )
 
-    def wm(command):
+    def wm(command, cwd=None):
         return run_workmux_command(
             env,
             workmux_exe_path,
-            repo_path,
+            cwd or repo_path,
             command,
             pre_run_env=short_tmp,
             timeout=60.0,
@@ -1353,7 +1376,7 @@ def test_remote_agents_start_in_the_devshell_and_resume_conversations(
     worktrees = home / "code" / "api__worktrees"
     daemon_pid = None
     try:
-        wm("add feature --project api")
+        wm("add feature", cwd=clone_of(env, "api"))
         daemon_pid = remote_daemon_ping(env, workmux_exe_path, repo_path, short_tmp)[
             "pid"
         ]
@@ -1370,7 +1393,7 @@ def test_remote_agents_start_in_the_devshell_and_resume_conversations(
         (stored / f"{session_id}.jsonl").write_text('{"type":"user"}\n')
 
         env.tmux(["select-window", "-t", env.runner_pane_id or "test:0"])
-        wm("add forked --project api --fork")
+        wm("add forked --fork", cwd=clone_of(env, "api"))
         forked = worktrees / "forked"
         assert wait_for(forked / "agent-args.txt").strip() == (
             f"args:--resume {session_id}"
@@ -1379,7 +1402,7 @@ def test_remote_agents_start_in_the_devshell_and_resume_conversations(
         assert copied.read_text() == '{"type":"user"}\n'
 
         env.tmux(["select-window", "-t", env.runner_pane_id or "test:0"])
-        wm("add again --project api --continue")
+        wm("add again --continue", cwd=clone_of(env, "api"))
         assert wait_for(worktrees / "again" / "agent-args.txt").strip() == (
             "args:--continue"
         )
@@ -1406,11 +1429,11 @@ def test_provisioning_installs_agent_hooks_and_status_warns_without_them(
         (root / "home" / ".claude").mkdir(parents=True)
     origin = make_origin(env, env.tmp_path / "origin", "panes: []\n")
 
-    def wm(command, expect_fail=False):
+    def wm(command, expect_fail=False, cwd=None):
         return run_workmux_command(
             env,
             workmux_exe_path,
-            repo_path,
+            cwd or repo_path,
             command,
             pre_run_env=short_tmp,
             expect_fail=expect_fail,
@@ -1426,7 +1449,7 @@ def test_provisioning_installs_agent_hooks_and_status_warns_without_them(
     )
     daemon_pid = None
     try:
-        listing = wm("list --project api")
+        listing = wm("list", cwd=clone_of(env, "api"))
         daemon_pid = remote_daemon_ping(env, workmux_exe_path, repo_path, short_tmp)[
             "pid"
         ]
@@ -1436,14 +1459,14 @@ def test_provisioning_installs_agent_hooks_and_status_warns_without_them(
         )
         assert "hooks" in settings
 
-        status = wm("remote status lb").stdout
+        status = wm("remote status", cwd=clone_of(env, "api")).stdout
         assert "status:   reachable" in status
         # Agents found on the workstation's PATH (the loopback shares it)
         # may warn too; Claude Code's hooks were installed.
         assert "Claude Code has no status hooks" not in status, status
         assert "dtach" not in status, status
 
-        status = wm("remote status bare").stdout
+        status = wm("remote status", cwd=clone_of(env, "other")).stdout
         assert "status:   reachable" in status
         assert (
             "warning:  Claude Code has no status hooks on this remote,"
@@ -1538,11 +1561,11 @@ def test_remote_agent_status_shows_live_turns_stale_and_catches_up_on_reconnect(
         env, env.tmp_path / "origin", f"panes:\n  - command: sh {agent}\n"
     )
 
-    def wm(command):
+    def wm(command, cwd=None):
         return run_workmux_command(
             env,
             workmux_exe_path,
-            repo_path,
+            cwd or repo_path,
             command,
             pre_run_env=short_tmp,
             timeout=60.0,
@@ -1562,7 +1585,7 @@ def test_remote_agent_status_shows_live_turns_stale_and_catches_up_on_reconnect(
     daemon_pid = None
     feed = None
     try:
-        wm("add feature --project api")
+        wm("add feature", cwd=clone_of(env, "api"))
         daemon_pid = remote_daemon_ping(env, workmux_exe_path, repo_path, short_tmp)[
             "pid"
         ]
@@ -1665,11 +1688,11 @@ def test_open_and_resurrect_reattach_to_surviving_remote_panes(
         f"panes:\n  - command: sh {agent}\n  - split: horizontal\n",
     )
 
-    def wm(command):
+    def wm(command, cwd=None):
         return run_workmux_command(
             env,
             workmux_exe_path,
-            repo_path,
+            cwd or repo_path,
             command,
             pre_run_env=short_tmp,
             timeout=60.0,
@@ -1688,7 +1711,7 @@ def test_open_and_resurrect_reattach_to_surviving_remote_panes(
     )
     daemons = []
     try:
-        wm("add feature --project api")
+        wm("add feature", cwd=clone_of(env, "api"))
         daemons.append(
             remote_daemon_ping(env, workmux_exe_path, repo_path, short_tmp)["pid"]
         )
@@ -1702,13 +1725,13 @@ def test_open_and_resurrect_reattach_to_surviving_remote_panes(
         assert window_gone(window)
         assert pid_alive(agent_pid)
 
-        reopened = wm("open feature --project api")
+        reopened = wm("open feature", cwd=clone_of(env, "api"))
         assert "Opened tmux window for 'feature'" in reopened.stdout
         assert remote_panes(window) == shown
         assert started.read_text().split() == [str(agent_pid)]
 
         # Opening an open window only switches to it.
-        again = wm("open feature --project api")
+        again = wm("open feature", cwd=clone_of(env, "api"))
         assert "Switched to existing tmux window" in again.stdout
         assert remote_panes(window) == shown
 
@@ -1756,11 +1779,11 @@ def test_remote_run_executes_in_the_remote_worktree(
     origin = make_origin(env, env.tmp_path / "origin", "panes:\n  - command: sh\n")
     worktree = remote_root / "home" / "code" / "api__worktrees" / "feature"
 
-    def wm(command, expect_fail=False):
+    def wm(command, expect_fail=False, cwd=None):
         return run_workmux_command(
             env,
             workmux_exe_path,
-            repo_path,
+            cwd or repo_path,
             command,
             pre_run_env=short_tmp,
             expect_fail=expect_fail,
@@ -1772,16 +1795,17 @@ def test_remote_run_executes_in_the_remote_worktree(
     )
     daemon_pid = None
     try:
-        wm("add feature --project api")
+        wm("add feature", cwd=clone_of(env, "api"))
         daemon_pid = remote_daemon_ping(env, workmux_exe_path, repo_path, short_tmp)[
             "pid"
         ]
         env.tmux(["select-window", "-t", env.runner_pane_id or "test:0"])
 
         ran = wm(
-            "run feature --project api -- "
+            "run feature -- "
             "sh -c 'pwd -P; echo $WORKMUX_REMOTE_PANE; echo oops >&2; exit 3'",
             expect_fail=True,
+            cwd=clone_of(env, "api"),
         )
 
         assert ran.exit_code == 3, ran
@@ -1822,11 +1846,11 @@ def test_reap_agents_reaps_aged_agents_on_the_remote(
     )
     status_dir = remote_root / "home" / ".local" / "state" / "workmux" / "status"
 
-    def wm(command):
+    def wm(command, cwd=None):
         return run_workmux_command(
             env,
             workmux_exe_path,
-            repo_path,
+            cwd or repo_path,
             command,
             pre_run_env=short_tmp,
             timeout=60.0,
@@ -1834,7 +1858,7 @@ def test_reap_agents_reaps_aged_agents_on_the_remote(
 
     def add_agent(name: str) -> int:
         count = len(started.read_text().split()) if started.exists() else 0
-        wm(f"add {name} --project api")
+        wm(f"add {name}", cwd=clone_of(env, "api"))
         wait_until(
             lambda: started.exists() and len(started.read_text().split()) > count,
             f"agent {name} to start",
@@ -1935,11 +1959,11 @@ def test_close_and_remove_end_the_worktrees_unshown_remote_panes_too(
     origin = make_origin(env, env.tmp_path / "origin", "panes:\n  - command: sh\n")
     holders = f"dtach -n {remote_root}/home/.local/state/workmux/panes/api/feature/"
 
-    def wm(command):
+    def wm(command, cwd=None):
         return run_workmux_command(
             env,
             workmux_exe_path,
-            repo_path,
+            cwd or repo_path,
             command,
             pre_run_env=short_tmp,
             timeout=60.0,
@@ -1953,7 +1977,7 @@ def test_close_and_remove_end_the_worktrees_unshown_remote_panes_too(
     )
     daemon_pid = None
     try:
-        wm("add feature --project api")
+        wm("add feature", cwd=clone_of(env, "api"))
         daemon_pid = remote_daemon_ping(env, workmux_exe_path, repo_path, short_tmp)[
             "pid"
         ]
@@ -1964,7 +1988,7 @@ def test_close_and_remove_end_the_worktrees_unshown_remote_panes_too(
         ).stdout.split()
 
         # A long `run` gets a remote pane; its view is closed in tmux.
-        wm("run feature --project api --background -- sleep 600")
+        wm("run feature --background -- sleep 600", cwd=clone_of(env, "api"))
         wait_until(lambda: running() == 2, "the run's remote pane")
         [run_view] = [
             pane
@@ -1977,17 +2001,17 @@ def test_close_and_remove_end_the_worktrees_unshown_remote_panes_too(
         time.sleep(0.5)
         assert running() == 2
 
-        wm("close feature --project api")
+        wm("close feature", cwd=clone_of(env, "api"))
         wait_until(lambda: running() == 0, "close to end every remote pane")
 
         # The window is killed outside workmux; `remove` ends its survivors.
-        wm("open feature --project api")
+        wm("open feature", cwd=clone_of(env, "api"))
         wait_until(lambda: running() == 1, "the reopened window's remote pane")
         env.tmux(["kill-window", "-t", window])
         time.sleep(0.5)
         assert running() == 1
 
-        wm("remove feature --project api")
+        wm("remove feature", cwd=clone_of(env, "api"))
         wait_until(lambda: running() == 0, "remove to end every remote pane")
     finally:
         if daemon_pid is not None:
@@ -2067,11 +2091,11 @@ def test_commands_typed_in_a_remote_pane_reach_the_workstation(
     shims = root / "home/.local/state/workmux/shims/bin"
     with_workmux = f'export PATH="{shims}:{bin_dir}:$PATH" WORKMUX_TEST=1; '
 
-    def wm(command):
+    def wm(command, cwd=None):
         return run_workmux_command(
             env,
             workmux_exe_path,
-            repo_path,
+            cwd or repo_path,
             command,
             pre_run_env=short_tmp,
             timeout=60.0,
@@ -2089,7 +2113,7 @@ def test_commands_typed_in_a_remote_pane_reach_the_workstation(
     project_in_sandbox(env, workmux_exe_path, "api", origin, short_tmp, root=root)
     daemon_pid = None
     try:
-        wm("add feature --project api")
+        wm("add feature", cwd=clone_of(env, "api"))
         daemon_pid = remote_daemon_ping(env, workmux_exe_path, repo_path, short_tmp)[
             "pid"
         ]
@@ -2233,11 +2257,11 @@ def test_agent_commands_reach_remote_agents_from_the_workstation(
         env, env.tmp_path / "origin", f"panes:\n  - command: sh {agent}\n"
     )
 
-    def wm(command, expect_fail=False, timeout=60.0):
+    def wm(command, expect_fail=False, timeout=60.0, cwd=None):
         return run_workmux_command(
             env,
             workmux_exe_path,
-            repo_path,
+            cwd or repo_path,
             command,
             pre_run_env=short_tmp,
             expect_fail=expect_fail,
@@ -2267,7 +2291,7 @@ def test_agent_commands_reach_remote_agents_from_the_workstation(
     daemon_pid = None
     feed = None
     try:
-        wm("add feature --project api")
+        wm("add feature", cwd=clone_of(env, "api"))
         daemon_pid = remote_daemon_ping(env, workmux_exe_path, repo_path, short_tmp)[
             "pid"
         ]
@@ -2433,11 +2457,11 @@ def test_dashboard_reviews_stages_and_closes_a_remote_worktree(
         cwd=origin,
     )
 
-    def wm(command):
+    def wm(command, cwd=None):
         return run_workmux_command(
             env,
             workmux_exe_path,
-            repo_path,
+            cwd or repo_path,
             command,
             pre_run_env=short_tmp,
             timeout=60.0,
@@ -2449,7 +2473,7 @@ def test_dashboard_reviews_stages_and_closes_a_remote_worktree(
     daemon_pid = None
     feed = None
     try:
-        wm("add feature --project api")
+        wm("add feature", cwd=clone_of(env, "api"))
         daemon_pid = remote_daemon_ping(env, workmux_exe_path, repo_path, short_tmp)[
             "pid"
         ]
@@ -2606,11 +2630,11 @@ def test_dashboard_worktrees_tab_lists_adds_closes_and_removes_remote_worktrees(
     control = Path(short_tmp["TMPDIR"])
     origin = make_origin(env, env.tmp_path / "origin", "panes:\n  - command: sh\n")
 
-    def wm(command):
+    def wm(command, cwd=None):
         return run_workmux_command(
             env,
             workmux_exe_path,
-            repo_path,
+            cwd or repo_path,
             command,
             pre_run_env=short_tmp,
             timeout=60.0,
@@ -2623,7 +2647,7 @@ def test_dashboard_worktrees_tab_lists_adds_closes_and_removes_remote_worktrees(
     worktrees = remote_root / "home" / "code" / "api__worktrees"
     daemon_pid = None
     try:
-        wm("add feature --project api")
+        wm("add feature", cwd=clone_of(env, "api"))
         daemon_pid = remote_daemon_ping(env, workmux_exe_path, repo_path, short_tmp)[
             "pid"
         ]
@@ -2739,11 +2763,11 @@ def test_dashboard_shows_pr_status_for_a_remote_projects_branches_while_unreacha
     control = Path(short_tmp["TMPDIR"])
     origin = make_origin(env, env.tmp_path / "origin", "panes:\n  - command: sh\n")
 
-    def wm(command):
+    def wm(command, cwd=None):
         return run_workmux_command(
             env,
             workmux_exe_path,
-            repo_path,
+            cwd or repo_path,
             command,
             pre_run_env=short_tmp,
             timeout=60.0,
@@ -2754,7 +2778,7 @@ def test_dashboard_shows_pr_status_for_a_remote_projects_branches_while_unreacha
     )
     daemon_pid = None
     try:
-        wm("add feature --project api")
+        wm("add feature", cwd=clone_of(env, "api"))
         daemon_pid = remote_daemon_ping(env, workmux_exe_path, repo_path, short_tmp)[
             "pid"
         ]
@@ -2865,11 +2889,11 @@ esac
 """,
     )
 
-    def wm(command):
+    def wm(command, cwd=None):
         return run_workmux_command(
             env,
             workmux_exe_path,
-            repo_path,
+            cwd or repo_path,
             command,
             pre_run_env=short_tmp,
             timeout=30.0,
@@ -2903,7 +2927,7 @@ esac
     )
     env.tmux(["new-window", "-d", "-t", "test:", "-n", "mine"])
 
-    removed = wm("remote rm api --yes")
+    removed = wm("remote rm --yes", cwd=clone_of(env, "api"))
 
     assert "sandbox delete" in (state / "log").read_text()
     assert "Closed 2 workstation window(s) of project api" in removed.stderr
@@ -2984,11 +3008,11 @@ def test_a_command_for_every_project_checks_each_remotes_state_once(
     (state / "web.phase").write_text("Stopped")
     log = state / "log"
 
-    def wm(command):
+    def wm(command, cwd=None):
         return run_workmux_command(
             env,
             workmux_exe_path,
-            repo_path,
+            cwd or repo_path,
             command,
             pre_run_env=short_tmp,
             timeout=60.0,

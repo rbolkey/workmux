@@ -33,25 +33,20 @@ pub enum RemoteCommand {
     /// List remotes and whether each is reachable
     #[command(visible_alias = "ls")]
     List,
-    /// Show whether a remote is reachable, with its workmux and protocol versions
-    Status {
-        /// Remote to check (default: all)
-        name: Option<String>,
-    },
-    /// Start a remote's stopped sandbox (creating it if it does not exist yet)
-    Start { name: String },
-    /// Stop a remote's sandbox, keeping its workspace
-    Stop { name: String },
-    /// Delete and recreate an OpenShell project's sandbox, carrying its committed work across
+    /// Show whether this project's remote is reachable, with its workmux and protocol versions (outside any project: every remote)
+    Status,
+    /// Start this project's stopped sandbox (creating it if it does not exist yet)
+    Start,
+    /// Stop this project's sandbox, keeping its workspace
+    Stop,
+    /// Delete and recreate this project's OpenShell sandbox, carrying its committed work across
     Recreate {
-        name: String,
         /// Don't ask for confirmation
         #[arg(short, long)]
         yes: bool,
     },
-    /// Delete an OpenShell project's sandbox and close its workstation windows
+    /// Delete this project's OpenShell sandbox and close its workstation windows
     Rm {
-        name: String,
         /// Don't ask for confirmation
         #[arg(short, long)]
         yes: bool,
@@ -91,29 +86,22 @@ pub enum RemoteCommand {
 }
 
 pub fn run(args: RemoteArgs) -> Result<()> {
-    if matches!(
-        args.command,
-        RemoteCommand::List
-            | RemoteCommand::Status { .. }
-            | RemoteCommand::Start { .. }
-            | RemoteCommand::Stop { .. }
-            | RemoteCommand::Recreate { .. }
-            | RemoteCommand::Rm { .. }
-    ) {
-        resolve_here();
-    }
     match args.command {
-        RemoteCommand::List => list(),
-        RemoteCommand::Status { name } => {
-            if !status(name.as_deref())? {
+        RemoteCommand::List => {
+            resolve_here();
+            list()
+        }
+        RemoteCommand::Status => {
+            let here = crate::remote::router::resolve()?;
+            if !status(here.as_ref().map(|project| project.site.remote.as_str()))? {
                 std::process::exit(1);
             }
             Ok(())
         }
-        RemoteCommand::Start { name } => start(&name),
-        RemoteCommand::Stop { name } => stop(&name),
-        RemoteCommand::Recreate { name, yes } => recreate(&name, yes),
-        RemoteCommand::Rm { name, yes } => rm(&name, yes),
+        RemoteCommand::Start => start(&current_remote()?),
+        RemoteCommand::Stop => stop(&current_remote()?),
+        RemoteCommand::Recreate { yes } => recreate(&current_remote()?, yes),
+        RemoteCommand::Rm { yes } => rm(&current_remote()?, yes),
         RemoteCommand::Attach { remote, pane } => crate::remote::attach::run(&remote, &pane),
         RemoteCommand::Serve => crate::remote::serve::run(),
         RemoteCommand::PaneAttach { pane } => {
@@ -154,6 +142,19 @@ fn resolve_here() {
     {
         eprintln!("warning: {error:#}");
     }
+}
+
+/// The remote of the project this command targets: the working
+/// directory's repository, or the project window it was run from.
+fn current_remote() -> Result<String> {
+    crate::remote::router::resolve()?
+        .map(|project| project.site.remote)
+        .ok_or_else(|| {
+            anyhow!(
+                "Not in a project with a sandbox; run this inside a clone of a repository \
+                 whose .workmux.yaml sets sandbox.backend: openshell"
+            )
+        })
 }
 
 /// A remote whose transport manages its lifecycle.
@@ -199,7 +200,7 @@ fn stop(name: &str) -> Result<()> {
             eprintln!("Stopping remote {name}…");
             provisioning.stop()?;
             println!(
-                "Stopped remote {name}; its agents show as stale until `workmux remote start {name}`"
+                "Stopped remote {name}; its agents show as stale until `workmux remote start`"
             );
         }
     }

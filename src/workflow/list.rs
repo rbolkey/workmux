@@ -70,7 +70,7 @@ pub fn list_in(
     repo: Option<&Path>,
 ) -> Result<Vec<WorktreeInfo>> {
     if repo.is_none() && !git::is_git_repo()? {
-        return Err(anyhow!("Not in a git repository"));
+        return Err(anyhow!(git::NOT_IN_A_REPOSITORY));
     }
 
     let listing = git::list_worktrees_with_main_in(repo)?;

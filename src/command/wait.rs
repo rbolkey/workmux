@@ -51,8 +51,12 @@ impl WaitTarget {
 /// (the worktree directory exists from `workmux add`). Global resolution requires
 /// a running agent.
 fn resolve_target(name: &str, mux: &dyn crate::multiplexer::Multiplexer) -> Result<WaitTarget> {
+    // A plain name typed for a remote project names its worktree there.
+    let project = crate::remote::router::resolve()?;
+    let targeted = workflow::targeted_name(name, project.as_ref());
+    let name = targeted.as_str();
     // Try local git resolution first (supports waiting for unstarted agents)
-    if git::is_git_repo().unwrap_or(false) {
+    if project.is_none() && git::is_git_repo().unwrap_or(false) {
         match git::find_worktree(name) {
             Ok((path, _branch)) => return Ok(WaitTarget::Path(path)),
             Err(e) if e.downcast_ref::<git::WorktreeNotFound>().is_some() => {}
@@ -95,7 +99,7 @@ fn unstarted_remote_target(name: &str) -> Result<Option<WaitTarget>> {
             .find(|project| {
                 project.site.name == qualifier || project.project().group_label() == qualifier
             }),
-        None => crate::remote::router::resolve(None)?,
+        None => crate::remote::router::resolve()?,
     };
     let Some(project) = project else {
         return Ok(None);
