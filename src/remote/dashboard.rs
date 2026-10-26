@@ -252,7 +252,6 @@ mod tests {
             name: "api".to_string(),
             path: clone.display().to_string(),
             git_url: None,
-            session: None,
         }
     }
 

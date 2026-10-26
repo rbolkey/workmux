@@ -1003,16 +1003,17 @@ pub struct Config {
     #[serde(default)]
     pub sandbox: SandboxConfig,
 
-    /// Workstation session for the windows of a project in a sandbox
-    /// such as OpenShell's (default: the project name).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub project_session: Option<String>,
+    /// Placement keys a remote project once had, withdrawn: a remote
+    /// project's windows follow `mode`, `window_placement` and
+    /// `default_session` as any project's do.
+    #[serde(default, skip_serializing)]
+    #[allow(dead_code)]
+    pub(crate) project_session: Withdrawn<ProjectSessionWithdrawn>,
 
-    /// Where the windows of a project in a sandbox such as OpenShell's go
-    /// in window mode: its own session (default) or the session the
-    /// command was run from.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub project_placement: Option<ProjectPlacement>,
+    /// Withdrawn with `project_session`.
+    #[serde(default, skip_serializing)]
+    #[allow(dead_code)]
+    pub(crate) project_placement: Withdrawn<ProjectPlacementWithdrawn>,
 
     /// The global `remotes:` registry, withdrawn (ADR 0004): reading a
     /// config that still has it fails, naming what replaced it.
@@ -1060,6 +1061,24 @@ impl WithdrawnKey for SandboxNameWithdrawn {
     const MESSAGE: &'static str = "sandbox.openshell.sandbox is no longer read: a sandbox's name \
 derives from the path of the repository's clone, so no repository can name another's sandbox. \
 Remove it";
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ProjectSessionWithdrawn;
+
+impl WithdrawnKey for ProjectSessionWithdrawn {
+    const MESSAGE: &'static str = "project_session is no longer read. A remote project's windows \
+go where a local project's do: set mode (window or session), window_placement or default_session \
+instead, or remove it";
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ProjectPlacementWithdrawn;
+
+impl WithdrawnKey for ProjectPlacementWithdrawn {
+    const MESSAGE: &'static str = "project_placement is no longer read. A remote project's \
+windows go where a local project's do: set mode (window or session), window_placement or \
+default_session instead, or remove it";
 }
 
 impl<'de, K: WithdrawnKey> Deserialize<'de> for Withdrawn<K> {
@@ -1268,17 +1287,6 @@ impl RemoteConfig {
     pub fn builtin_shims(&self) -> bool {
         self.builtin_shims.unwrap_or(true)
     }
-}
-
-/// Workstation placement of a remote project's windows in window mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, clap::ValueEnum)]
-#[serde(rename_all = "kebab-case")]
-pub enum ProjectPlacement {
-    /// A session named after the project, or its `session` override.
-    #[default]
-    ProjectSession,
-    /// The session the command was run from.
-    CurrentSession,
 }
 
 /// A named agent environment value.
@@ -3473,8 +3481,6 @@ impl Config {
             auto_update_check,
             prompt_file_only,
             stale_after_secs,
-            project_session,
-            project_placement,
         );
 
         // Layouts: merge maps by key so project layouts extend global ones
@@ -4591,19 +4597,15 @@ sandbox:
     }
 
     #[test]
-    fn project_session_and_placement_merge_like_any_other_setting() {
-        let global: Config =
-            serde_yaml::from_str("project_session: work\nproject_placement: current-session\n")
-                .unwrap();
-        let project: Config = serde_yaml::from_str("project_session: frontend\n").unwrap();
-
-        let merged = global.merge(project);
-
-        assert_eq!(merged.project_session.as_deref(), Some("frontend"));
-        assert_eq!(
-            merged.project_placement,
-            Some(super::ProjectPlacement::CurrentSession)
-        );
+    fn a_config_with_the_withdrawn_placement_keys_fails_naming_main_placement_settings() {
+        for key in ["project_session: frontend", "project_placement: current-session"] {
+            let error = serde_yaml::from_str::<Config>(&format!("{key}\n"))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("is no longer read"), "{error}");
+            assert!(error.contains("mode"), "{error}");
+            assert!(error.contains("window_placement"), "{error}");
+        }
     }
 
     #[test]

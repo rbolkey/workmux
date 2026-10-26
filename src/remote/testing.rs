@@ -211,7 +211,6 @@ pub fn devbox_api() -> super::router::RemoteProject {
             name: "api".to_string(),
             path: "~/api".to_string(),
             git_url: Some(super::git_url::GitUrl::new("git@github.com:me/api.git")),
-            session: Some("api".to_string()),
         },
         remote_config: crate::config::RemoteConfig {
             transport: crate::config::TransportKind::Loopback,
