@@ -3,15 +3,24 @@ title: "update"
 description: Update workmux to the latest version
 ---
 
-Updates workmux to the latest version by downloading the prebuilt binary from GitHub Releases.
+Updates workmux to the latest version by downloading the prebuilt binary from this build's release source.
 
 ```bash
 workmux update
 ```
 
+## Release source
+
+`WORKMUX_RELEASES_URL` names the release source: the base URL that releases are downloaded from, as `<base>/v<version>/workmux-<platform>.tar.gz` with its `.sha256`. The same variable sets where `workmux remote upload` downloads builds for another platform.
+
+- For GitHub releases (`https://github.com/<owner>/<repo>/releases/download`), the latest version comes from the GitHub API.
+- For any other source, such as a `file://` directory, a `latest` file in the base directory holds the latest tag (for example `v0.1.125`).
+
+When `WORKMUX_RELEASES_URL` is unset, this build has no release source: `workmux update` says updates are not available for this build, and no update check runs.
+
 ## What happens
 
-1. Checks the latest release version from the GitHub API
+1. Checks the latest release version from the release source
 2. Compares with the currently installed version
 3. Downloads the correct binary for your OS and architecture
 4. Verifies the SHA-256 checksum
@@ -36,7 +45,7 @@ The command downloads prebuilt binaries for:
 
 ## Automatic update check
 
-Workmux periodically checks for new versions in the background. When an update is available, a one-line notice is printed to stderr:
+When a release source is set, workmux periodically checks it for new versions in the background. When an update is available, a one-line notice is printed to stderr:
 
 ```
 Update available: workmux v0.1.124 -> v0.1.125 (run `workmux update`)
