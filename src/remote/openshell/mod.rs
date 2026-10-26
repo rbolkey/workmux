@@ -1546,10 +1546,7 @@ mod contract {
             .unwrap();
         let source: image::DevshellSource = serde_json::from_slice(&source.stdout).unwrap();
         assert_eq!(source.clone, "/sandbox/api");
-        assert_eq!(
-            source.flake_lock_sha256,
-            image::flake_lock_digest(repo.path())
-        );
+        assert_eq!(source.devshell_sha256, image::devshell_digest(repo.path()));
     }
 
     #[test]

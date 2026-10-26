@@ -5,6 +5,7 @@
 //! installed or built inside the sandbox.
 
 use anyhow::{Context, Result, bail};
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -30,7 +31,7 @@ const DEFAULT_BASE: &str = "docker.io/library/ubuntu:24.04";
 pub const DEFAULT_AGENT: &str = "/etc/workmux/default-agent";
 
 /// Where the baked devshell records what it was built from, so remote
-/// workmux can tell when the project's `flake.lock` has moved on.
+/// workmux can tell when the project's flake has moved on.
 pub const DEVSHELL_SOURCE: &str = "/nix/devshell-source.json";
 
 /// The build secret holding the workstation's GitHub token, for the
@@ -282,8 +283,8 @@ fn installed(recipe: &Recipe) -> impl Iterator<Item = &'static SandboxAgent> + '
 pub struct DevshellSource {
     /// The project's clone in the sandbox.
     pub clone: String,
-    /// SHA-256 of the project's `flake.lock` (empty when it has none).
-    pub flake_lock_sha256: String,
+    /// [`devshell_digest`] of the project checkout the bake read.
+    pub devshell_sha256: String,
 }
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
@@ -294,11 +295,123 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
-/// The `flake.lock` digest of the project checkout at `dir`.
-pub fn flake_lock_digest(dir: &Path) -> String {
-    std::fs::read(dir.join("flake.lock"))
-        .map(|lock| sha256_hex(&lock))
-        .unwrap_or_default()
+/// The digest of [`devshell_inputs`] of the project checkout at `dir`: it
+/// changes whenever the devshell bake would read something else.
+pub fn devshell_digest(dir: &Path) -> String {
+    let mut digest = Vec::new();
+    for (file, sha256) in devshell_inputs(dir) {
+        digest.extend(file.into_bytes());
+        digest.extend(sha256.into_bytes());
+    }
+    sha256_hex(&digest)
+}
+
+/// The files of the project checkout at `dir` that the devshell bake
+/// reads, by path relative to `dir`, with each one's SHA-256: `flake.nix`,
+/// `flake.lock`, and the files and directories the flake names by path
+/// (`./nix/shell.nix`, `../tools`, `"${self}/nix"`, `self + "/nix"`),
+/// followed through every `.nix` file among them. A name that does not
+/// resolve to a file or directory in `dir` is skipped. So is the flake's own
+/// directory (`./.`), which is the whole repository: the image follows the
+/// devshell, not the project's source. Nix can read files in ways this
+/// does not see (paths built from strings at evaluation time); those
+/// changes need `workmux remote recreate` after a change to the flake.
+pub fn devshell_inputs(dir: &Path) -> BTreeMap<String, String> {
+    let mut inputs = BTreeMap::new();
+    let mut pending = vec!["flake.nix".to_string(), "flake.lock".to_string()];
+    let mut walked = HashSet::new();
+    while let Some(name) = pending.pop() {
+        if inputs.contains_key(&name) {
+            continue;
+        }
+        let path = dir.join(&name);
+        if path.is_dir() {
+            // A symlink can lead back to a directory already walked.
+            if path.canonicalize().is_ok_and(|real| walked.insert(real)) {
+                let Ok(entries) = std::fs::read_dir(&path) else {
+                    continue;
+                };
+                pending.extend(
+                    entries
+                        .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+                        .filter(|entry| entry != ".git")
+                        .map(|entry| format!("{name}/{entry}")),
+                );
+            }
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        if name.ends_with(".nix") {
+            let here = name.rsplit_once('/').map_or("", |(parent, _)| parent);
+            let text = String::from_utf8_lossy(&bytes);
+            pending.extend(named_paths(&text).into_iter().filter_map(|(base, named)| {
+                resolve(if base == NamedFrom::Flake { "" } else { here }, named)
+            }));
+        }
+        inputs.insert(name, sha256_hex(&bytes));
+    }
+    inputs
+}
+
+/// What a path a nix file names is relative to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NamedFrom {
+    /// The nix file's directory: a path literal, `./x` or `../x`.
+    File,
+    /// The flake's directory: `"${self}/x"` or `self + "/x"`.
+    Flake,
+}
+
+/// The paths nix `text` names, as written (`./nix/shell.nix`, `nix`). It
+/// reads comments and strings as code, so a path mentioned there counts
+/// too: one rebuild too many is better than one too few.
+fn named_paths(text: &str) -> Vec<(NamedFrom, &str)> {
+    let is_path_char = |c: u8| c.is_ascii_alphanumeric() || b"._-+/".contains(&c);
+    let path_at = |start: usize| {
+        let len = text.as_bytes()[start..]
+            .iter()
+            .take_while(|&&c| is_path_char(c))
+            .count();
+        &text[start..start + len]
+    };
+    let mut named = Vec::new();
+    let bytes = text.as_bytes();
+    for start in 0..bytes.len() {
+        if !text.is_char_boundary(start) {
+            continue;
+        }
+        let rest = &text[start..];
+        if (rest.starts_with("./") || rest.starts_with("../"))
+            && (start == 0 || !is_path_char(bytes[start - 1]))
+        {
+            named.push((NamedFrom::File, path_at(start)));
+        }
+        for prefix in ["${self}/", "self + \"/"] {
+            if rest.starts_with(prefix) {
+                named.push((NamedFrom::Flake, path_at(start + prefix.len())));
+            }
+        }
+    }
+    named
+}
+
+/// `named` resolved against the directory `here` (both relative to the
+/// flake's directory), or `None` when it is the flake's directory itself
+/// or outside it.
+fn resolve(here: &str, named: &str) -> Option<String> {
+    let mut parts: Vec<&str> = here.split('/').filter(|part| !part.is_empty()).collect();
+    for part in named.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            part => parts.push(part),
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join("/"))
 }
 
 /// Lay out the build context for `recipe` in `context`, and return the
@@ -340,13 +453,11 @@ pub fn prepare(recipe: &Recipe, sandbox: &str, clone: &str, context: &Path) -> R
         if checkout != &context.join("project") {
             bail!("The devshell checkout must be the build context's project directory");
         }
-        for file in ["flake.nix", "flake.lock"] {
-            digest.extend(std::fs::read(checkout.join(file)).unwrap_or_default());
-        }
         let source = DevshellSource {
             clone: clone.to_string(),
-            flake_lock_sha256: flake_lock_digest(checkout),
+            devshell_sha256: devshell_digest(checkout),
         };
+        digest.extend(source.devshell_sha256.as_bytes());
         std::fs::write(
             context.join("devshell-source.json"),
             serde_json::to_vec(&source)?,
@@ -828,8 +939,132 @@ mod tests {
             &std::fs::read(context.path().join("devshell-source.json")).unwrap(),
         )
         .unwrap();
-        assert_eq!(source.flake_lock_sha256, sha256_hex(b"v2"));
+        assert_eq!(source.devshell_sha256, devshell_digest(&project));
         assert_eq!(source.clone, "/sandbox/api");
+    }
+
+    /// A project checkout with a flake in the build context, and its tag.
+    struct FlakeProject {
+        context: tempfile::TempDir,
+    }
+
+    impl FlakeProject {
+        fn new(flake: &str) -> FlakeProject {
+            let project = FlakeProject {
+                context: tempfile::tempdir().unwrap(),
+            };
+            project.write("flake.nix", flake);
+            project.write("flake.lock", "lock");
+            project
+        }
+
+        fn write(&self, file: &str, contents: &str) {
+            let path = self.context.path().join("project").join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, contents).unwrap();
+        }
+
+        fn tag(&self) -> String {
+            let recipe = Recipe {
+                base: None,
+                workmux: Workmux::Release,
+                agents: Vec::new(),
+                devshell: Some(self.context.path().join("project")),
+                git_credential_helper: false,
+            };
+            prepare(&recipe, "api", "/sandbox/api", self.context.path()).unwrap()
+        }
+    }
+
+    #[test]
+    fn the_tag_follows_flake_nix() {
+        let project = FlakeProject::new("{ outputs = _: { }; }");
+        let first = project.tag();
+        project.write("flake.nix", "{ outputs = _: { x = 1; }; }");
+        assert_ne!(first, project.tag());
+    }
+
+    #[test]
+    fn the_tag_follows_the_files_the_flake_imports() {
+        let project = FlakeProject::new(
+            "{ outputs = _: { shell = import ./nix/shell.nix; \
+               tools = builtins.readFile ./nix/tools; }; }",
+        );
+        project.write("nix/shell.nix", "import ../recipes/active.nix");
+        project.write("nix/tools", "jq");
+        project.write("recipes/active.nix", "[ ]");
+        let first = project.tag();
+        assert_eq!(first, project.tag());
+
+        let mut tags = vec![first];
+        for (file, contents) in [
+            ("nix/shell.nix", "import ../recipes/active.nix // { }"),
+            ("nix/tools", "jq rg"),
+            // Imported by an imported file.
+            ("recipes/active.nix", "[ \"rg\" ]"),
+        ] {
+            project.write(file, contents);
+            let tag = project.tag();
+            assert!(!tags.contains(&tag), "{file}: {tag}");
+            tags.push(tag);
+        }
+    }
+
+    #[test]
+    fn the_tag_follows_directories_and_paths_from_self() {
+        let project = FlakeProject::new(
+            "{ outputs = { self }: { a = import ./nix; \
+               b = import \"${self}/lib/b.nix\"; c = import (self + \"/lib/c.nix\"); }; }",
+        );
+        project.write("nix/default.nix", "{ }");
+        project.write("nix/deep/tools", "jq");
+        project.write("lib/b.nix", "1");
+        project.write("lib/c.nix", "2");
+        let mut tags = vec![project.tag()];
+        for (file, contents) in [
+            ("nix/default.nix", "{ x = 1; }"),
+            ("nix/deep/tools", "jq rg"),
+            ("nix/new", "added"),
+            ("lib/b.nix", "3"),
+            ("lib/c.nix", "4"),
+        ] {
+            project.write(file, contents);
+            let tag = project.tag();
+            assert!(!tags.contains(&tag), "{file}: {tag}");
+            tags.push(tag);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_tag_follows_a_symlinked_import_to_where_it_points() {
+        let project = FlakeProject::new("{ outputs = _: import ./recipes/active/toolchain.nix; }");
+        project.write("recipes/go/toolchain.nix", "[ \"go\" ]");
+        project.write("recipes/python/toolchain.nix", "[ \"python3\" ]");
+        let active = project.context.path().join("project/recipes/active");
+        std::os::unix::fs::symlink("go", &active).unwrap();
+        let go = project.tag();
+        std::fs::remove_file(&active).unwrap();
+        std::os::unix::fs::symlink("python", &active).unwrap();
+        assert_ne!(go, project.tag());
+    }
+
+    #[test]
+    fn the_tag_ignores_the_projects_other_files() {
+        // `./.` is the whole repository; `../outside` is not in it.
+        let project = FlakeProject::new(
+            "{ outputs = _: { src = ./.; up = ../outside; shell = import ./nix/shell.nix; }; }",
+        );
+        project.write("nix/shell.nix", "{ }");
+        project.write("README.md", "v1");
+        project.write("src/main.rs", "fn main() {}");
+        project.write(".git/HEAD", "ref: refs/heads/main");
+        let first = project.tag();
+        project.write("README.md", "v2");
+        project.write("src/main.rs", "fn main() { 1; }");
+        project.write("src/new.rs", "");
+        project.write(".git/HEAD", "ref: refs/heads/other");
+        assert_eq!(first, project.tag());
     }
 }
 
