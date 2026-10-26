@@ -205,6 +205,7 @@ pub fn request<T: DeserializeOwned>(
             &socket,
             DAEMON_METHOD,
             serde_json::json!({
+                "root": project.root,
                 "remote": project.site.remote,
                 "project": project.site.name,
                 "request": request,

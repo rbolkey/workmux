@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use super::forwarded;
 use super::session::ServedProject;
 use super::session::{Answer, CommandRequest, OutputParams, ProjectSite, Stream, Terminal};
-use crate::config::{Config, RemoteConfig};
+use crate::config::{Config, Placement, RemoteConfig};
 use crate::multiplexer::{InvocationContext, TmuxBackend, create_backend, detect_backend};
 use crate::project::{Project, ProjectTag, RemoteProjectId};
 
@@ -262,6 +262,7 @@ fn session_once(
         argv: argv.iter().map(|arg| arg.to_string()).collect(),
         invoking_window_token: invoking_window_token(project),
         prompt_file,
+        placement: Placement::of(&Config::load_global_only()?),
     };
     let Some(socket) = daemon_socket() else {
         return super::channels().run_command(

@@ -397,15 +397,24 @@ impl App {
     /// Kill a pane and remove it from the agent list. A remote agent's
     /// remote pane ends too, as closing its window would end it.
     fn do_kill(&mut self, pane_id: &str) {
+        // The project is resolved from its open windows, so before the
+        // view goes: its window may be the project's last.
         let remote_pane = self
             .all_agents
             .iter()
             .find(|a| a.pane_id == pane_id && a.remote.is_some())
-            .and_then(|agent| Some((WorktreeSite::of(agent), self.remote_pane_of(pane_id)?)));
+            .and_then(|agent| {
+                let remote_pane = self.remote_pane_of(pane_id)?;
+                let project = WorktreeSite::of(agent)
+                    .remote_project()
+                    .inspect_err(|error| tracing::warn!(error, "could not end the remote pane"))
+                    .ok()??;
+                Some((project, remote_pane))
+            });
         let _ = self.mux.kill_pane(pane_id);
-        if let Some((site, remote_pane)) = remote_pane {
+        if let Some((project, remote_pane)) = remote_pane {
             std::thread::spawn(move || {
-                if let Err(error) = site.kill_remote_pane(remote_pane) {
+                if let Err(error) = WorktreeSite::kill_remote_pane(&project, remote_pane) {
                     tracing::warn!(error, "could not end the remote pane");
                 }
             });

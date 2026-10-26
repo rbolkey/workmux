@@ -1728,7 +1728,7 @@ pub enum WindowPlacement {
 }
 
 /// Mode for multiplexer operations: create windows within the current session or create new sessions
-#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum MuxMode {
     /// Create windows within the current tmux session (default)
@@ -1736,6 +1736,43 @@ pub enum MuxMode {
     Window,
     /// Create new tmux sessions for each worktree
     Session,
+}
+
+/// The workstation's placement settings, which remote workmux places a
+/// remote project's windows by: windows and sessions are the
+/// workstation's, so its global config sets them as it does for a local
+/// project.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Placement {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<MuxMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_placement: Option<WindowPlacement>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_session: Option<String>,
+}
+
+impl Placement {
+    pub fn of(config: &Config) -> Self {
+        Self {
+            mode: config.mode,
+            window_placement: config.window_placement,
+            default_session: config.default_session.clone(),
+        }
+    }
+
+    pub fn is_unset(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// `global` with these settings in place of its own, so that project
+    /// config still overrides them.
+    pub fn over(self, mut global: Config) -> Config {
+        global.mode = self.mode.or(global.mode);
+        global.window_placement = self.window_placement.or(global.window_placement);
+        global.default_session = self.default_session.or(global.default_session);
+        global
+    }
 }
 
 /// Strategy for deriving worktree/window names from branch names
@@ -3401,12 +3438,16 @@ impl Config {
     /// Uses `global_config_path()` which resolves via XDG_CONFIG_HOME with
     /// legacy fallback.
     fn load_global() -> anyhow::Result<Option<Self>> {
-        if let Some(path) = global_config_path()
-            && path.exists()
-        {
-            return Self::load_from_path(&path);
-        }
-        Ok(None)
+        let global = match global_config_path() {
+            Some(path) if path.exists() => Self::load_from_path(&path)?,
+            _ => None,
+        };
+        // Remote workmux places a remote project's windows by the
+        // workstation's settings.
+        Ok(match crate::remote::session::workstation_placement() {
+            Some(placement) => Some(placement.over(global.unwrap_or_default())),
+            None => global,
+        })
     }
 
     /// Merge a project config into a global config.
@@ -4594,6 +4635,27 @@ sandbox:
         assert_eq!(loopback.root.as_deref(), Some("/tmp/lb"));
         assert_eq!(loopback.remote.as_deref(), Some("lb"));
         assert_eq!(loopback.path.as_deref(), Some("code/api"));
+    }
+
+    #[test]
+    fn the_workstations_placement_settings_sit_between_the_remotes_global_and_project_config() {
+        let workstation: Config = serde_yaml::from_str(
+            "mode: session\nwindow_placement: rightmost\ndefault_session: home\nnerdfont: true\n",
+        )
+        .unwrap();
+        let remote_global: Config =
+            serde_yaml::from_str("mode: window\ndefault_session: remote\nnerdfont: false\n")
+                .unwrap();
+        let project: Config = serde_yaml::from_str("default_session: project\n").unwrap();
+
+        let placement = super::Placement::of(&workstation);
+        let merged = placement.over(remote_global).merge(project);
+
+        assert_eq!(merged.mode(), super::MuxMode::Session);
+        assert_eq!(merged.window_placement(), super::WindowPlacement::Rightmost);
+        assert_eq!(merged.default_session(), Some("project"));
+        // Only placement comes from the workstation.
+        assert_eq!(merged.nerdfont, Some(false));
     }
 
     #[test]

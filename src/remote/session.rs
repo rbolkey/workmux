@@ -14,6 +14,7 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::config::Placement;
 use crate::remote::git_url::GitUrl;
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -57,6 +58,8 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(7 * 24 * 3600);
 /// project: the remote's name and the project's name.
 pub const REMOTE_ENV: &str = "WORKMUX_REMOTE_NAME";
 pub const PROJECT_ENV: &str = "WORKMUX_PROJECT_NAME";
+/// The workstation's placement settings, as JSON, when it has any.
+pub const PLACEMENT_ENV: &str = "WORKMUX_WORKSTATION_PLACEMENT";
 
 /// A remote project as remote workmux needs it to run a command.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -92,6 +95,9 @@ pub struct CommandRequest {
     /// them in a file of its own, as the command's prompt file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_file: Option<String>,
+    /// The workstation's placement settings, from its global config.
+    #[serde(default, skip_serializing_if = "Placement::is_unset")]
+    pub placement: Placement,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -636,6 +642,11 @@ pub fn run_on_remote(
         .current_dir(&workdir)
         .env(REMOTE_ENV, &request.project.remote)
         .env(PROJECT_ENV, &request.project.name);
+    if request.placement.is_unset() {
+        command.env_remove(PLACEMENT_ENV);
+    } else {
+        command.env(PLACEMENT_ENV, serde_json::to_string(&request.placement)?);
+    }
     if let Some(forwarding) = forwarding {
         command
             .env(forwarding::SOCKET_ENV, forwarding.socket)
@@ -678,6 +689,15 @@ fn worktree_with_window_token(clone: &Path, token: &str) -> Option<PathBuf> {
 pub struct ServedProject {
     pub remote: String,
     pub name: String,
+}
+
+/// The workstation's placement settings, when remote workmux runs this
+/// command for it in a command session.
+pub fn workstation_placement() -> Option<Placement> {
+    let json = std::env::var(PLACEMENT_ENV).ok()?;
+    serde_json::from_str(&json)
+        .inspect_err(|error| tracing::warn!(%error, "unreadable workstation placement"))
+        .ok()
 }
 
 impl ServedProject {
@@ -735,6 +755,7 @@ mod tests {
             argv: ["sh", "-c", script].map(String::from).to_vec(),
             invoking_window_token: None,
             prompt_file: None,
+            placement: Default::default(),
         }
     }
 

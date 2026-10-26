@@ -104,8 +104,22 @@ fn dispatch(request: &Request) -> Response {
     }
 }
 
+/// Remote project `name` on `remote`, resolved from the config of the
+/// workstation clone at `root`.
+fn project_at(root: &Path, remote: &str, name: &str) -> Result<crate::remote::router::RemoteProject> {
+    crate::remote::resolve::at(root)?
+        .filter(|project| project.site.remote == remote && project.site.name == name)
+        .ok_or_else(|| {
+            anyhow!(
+                "The config of {} no longer puts project {name} on {remote}",
+                root.display()
+            )
+        })
+}
+
 #[derive(Deserialize)]
 struct DashboardParams {
+    root: PathBuf,
     remote: String,
     project: String,
     request: crate::remote::dashboard::DashboardRequest,
@@ -116,7 +130,7 @@ struct DashboardParams {
 /// Run a dashboard's operation on a remote project over its control channel.
 fn remote_dashboard(params: &Value) -> Result<Value> {
     let params: DashboardParams = serde_json::from_value(params.clone())?;
-    let project = crate::remote::router::remote_project_on(&params.remote, &params.project)?;
+    let project = project_at(&params.root, &params.remote, &params.project)?;
     crate::remote::channels().dashboard(
         project.host(),
         &project.site,
@@ -360,16 +374,7 @@ fn command_session(
     let run = || -> Result<Value> {
         let params: CommandSessionParams = serde_json::from_value(request.params.clone())?;
         let site = &params.request.project;
-        let project = crate::remote::resolve::at(&params.root)?
-            .filter(|project| project.id() == site.id())
-            .ok_or_else(|| {
-                anyhow!(
-                    "The config of {} no longer puts project {} on {}",
-                    params.root.display(),
-                    site.name,
-                    site.remote
-                )
-            })?;
+        let project = project_at(&params.root, &site.remote, &site.name)?;
         let gone = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (answered, answers) = std::sync::mpsc::channel();
         {

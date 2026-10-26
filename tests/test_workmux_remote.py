@@ -15,7 +15,17 @@ from pathlib import Path
 
 import pytest
 
-from .conftest import MuxEnvironment, TmuxEnvironment, run_workmux_command
+from .conftest import MuxEnvironment, TmuxEnvironment
+from .conftest import run_workmux_command as run_in_test_session
+
+
+def run_workmux_command(env, *args, **kwargs):
+    """Run workmux in the test's own pane. A remote project's new window
+    takes focus in the session, as a local project's does, and the harness
+    types into the session's active window."""
+    if isinstance(env, TmuxEnvironment) and env.runner_pane_id:
+        env.tmux(["select-window", "-t", env.runner_pane_id])
+    return run_in_test_session(env, *args, **kwargs)
 
 
 @pytest.fixture
@@ -441,7 +451,7 @@ def wait_for(path: Path, timeout=15.0) -> str:
 
 @requires_dtach
 @pytest.mark.tmux_only
-def test_remote_add_places_windows_in_the_project_session(
+def test_remote_add_places_windows_as_a_local_project_does(
     mux_server: MuxEnvironment,
     workmux_exe_path: Path,
     repo_path: Path,
@@ -449,10 +459,9 @@ def test_remote_add_places_windows_in_the_project_session(
     remote_root: Path,
 ):
     """`add` on a remote project creates the worktree on the remote, runs its
-    post-create hooks there with output streamed back, and puts the window in
-    a workstation session named after the project, whatever session the
-    command was typed in. A session the user made is adopted; the `session:`
-    override, current-session placement and session mode still work."""
+    post-create hooks there with output streamed back, and places the window
+    as for a local project: in the session the command was typed in, focused.
+    `window_placement` and `mode` in the workstation's global config apply."""
     env = mux_server
     assert isinstance(env, TmuxEnvironment)
     root = remote_root
@@ -465,6 +474,8 @@ def test_remote_add_places_windows_in_the_project_session(
         "  - command: pwd -P > pane-ran.txt\n"
     )
     origin = make_origin(env, env.tmp_path / "origin", workmux_yaml)
+    global_config = env.home_path / ".config" / "workmux" / "config.yaml"
+    global_config.parent.mkdir(parents=True, exist_ok=True)
 
     def wm(command, expect_fail=False, cwd=None):
         return run_workmux_command(
@@ -478,36 +489,27 @@ def test_remote_add_places_windows_in_the_project_session(
         )
 
     project_in_sandbox(env, workmux_exe_path, "api", origin, short_tmp, root=root)
-    project_in_sandbox(
-        env,
-        workmux_exe_path,
-        "web",
-        origin,
-        short_tmp,
-        root=root,
-        config="project_session: frontend\n",
-    )
-    project_in_sandbox(
-        env,
-        workmux_exe_path,
-        "docs",
-        origin,
-        short_tmp,
-        root=root,
-        config="project_placement: current-session\n",
-    )
     daemon_pid = None
     try:
-        # Typed in session "test"; the window goes to the project's session.
+        # With no placement config, the window goes in the session the
+        # command was typed in, after the window it was typed in, and takes
+        # focus.
         added = wm("add feature", cwd=clone_of(env, "api"))
+        assert tmux_value(env, "=test:wm-feature", "#{window_active}") == "1"
+        assert tmux_value(env, "=test:wm-feature", "#{session_name}") == "test"
         daemon_pid = remote_daemon_ping(env, workmux_exe_path, repo_path, short_tmp)[
             "pid"
         ]
         assert "post-create ran in" in added.stdout + added.stderr
         worktree = root / "home" / "code" / "api__worktrees" / "feature"
         assert worktree.is_dir()
-        assert tmux_value(env, "=api:wm-feature", "#{session_name}") == "api"
-        assert session_tag(env, "api") == project_tag(env, "lb", "api")
+        assert session_tag(env, "test") == ""
+        assert not any(
+            line == "api"
+            for line in env.tmux(["list-sessions", "-F", "#{session_name}"])
+            .stdout.strip()
+            .splitlines()
+        )
         # The branch lives in the remote's clone, not on the workstation.
         for repo in [origin, repo_path]:
             branches = env.run_command(
@@ -518,37 +520,32 @@ def test_remote_add_places_windows_in_the_project_session(
         ran = wait_for(worktree / "pane-ran.txt")
         assert ran.strip() == str(worktree.resolve())
 
-        # A session the user made is adopted and tagged.
-        env.tmux(["new-session", "-d", "-s", "frontend"])
-        wm("add other", cwd=clone_of(env, "web"))
-        assert tmux_value(env, "=frontend:wm-other", "#{session_name}") == "frontend"
-        assert session_tag(env, "frontend") == project_tag(env, "lb", "web")
+        # window_placement in the workstation's global config applies.
+        global_config.write_text("window_placement: rightmost\n")
+        wm("add other", cwd=clone_of(env, "api"))
 
-        # Current-session placement keeps the window where the command ran.
-        wm("add notes", cwd=clone_of(env, "docs"))
-        assert tmux_value(env, "=test:wm-notes", "#{session_name}") == "test"
-        assert session_tag(env, "test") == ""
+        def index(window):
+            return int(tmux_value(env, f"=test:{window}", "#{window_index}"))
 
-        # The new window took focus; later commands run in the test pane.
-        env.tmux(["select-window", "-t", env.runner_pane_id or "test:0"])
+        assert index("wm-other") > index("wm-feature")
 
-        # Session mode gives the worktree its own session.
-        wm("add solo --mode session", cwd=clone_of(env, "api"))
+        # So does mode: session, giving the worktree its own session.
+        global_config.write_text("mode: session\n")
+        wm("add solo", cwd=clone_of(env, "api"))
         assert session_tag(env, "wm-solo") == project_tag(env, "lb", "api")
 
-        # Typed outside any repository in the project's session (in a pane of the
-        # user's own), the command targets the tagged project.
-        env.tmux(["new-window", "-d", "-t", "api:", "-n", "mine"])
+        # Typed outside any repository in that session (in a pane of the
+        # user's own), a command targets the tagged project.
+        env.tmux(["new-window", "-d", "-t", "wm-solo:", "-n", "mine"])
         code, out, err = run_in_pane(
             env,
-            "=api:mine",
+            "=wm-solo:mine",
             f"cd /tmp && TMPDIR={short_tmp['TMPDIR']} {workmux_exe_path} add tagged",
             env.tmp_path / "pane-run",
             timeout=60.0,
         )
         assert code == 0, err
         assert (root / "home" / "code" / "api__worktrees" / "tagged").is_dir()
-        assert tmux_value(env, "=api:wm-tagged", "#{session_name}") == "api"
     finally:
         if daemon_pid is not None:
             os.kill(daemon_pid, signal.SIGTERM)
@@ -665,7 +662,7 @@ def test_remote_git_commands_act_on_the_remote_repository(
         daemon_pid = remote_daemon_ping(env, workmux_exe_path, repo_path, short_tmp)[
             "pid"
         ]
-        window = tmux_value(env, "=api:wm-feature", "#{pane_id}")
+        window = tmux_value(env, "=test:wm-feature", "#{pane_id}")
 
         # set-base typed in the worktree's window sets that branch's base.
         git_in(env, clone, "branch", "develop")
@@ -683,8 +680,8 @@ def test_remote_git_commands_act_on_the_remote_repository(
             "on develop"
         )
 
-        # sync-files, routed by the project session's tag alone, copies the
-        # main worktree's files into the window's worktree.
+        # sync-files, routed by the window's tag alone, copies the main
+        # worktree's files into the window's worktree.
         (clone / "local.env").write_text("SECRET=1\n")
         synced = wm("sync-files", from_pane=window)
         assert "✓ Synced files to 'feature'" in synced.stdout
@@ -693,8 +690,8 @@ def test_remote_git_commands_act_on_the_remote_repository(
         assert outside.exit_code == 1
         assert "Current directory is the main worktree" in outside.stderr
 
-        # rename moves the remote worktree, its branch and the window in the
-        # project's session, though typed in another session.
+        # rename moves the remote worktree, its branch and its window, though
+        # typed in another window.
         renamed = wm("rename feature renamed --branch", cwd=clone_of(env, "api"))
         assert "✓ Renamed worktree 'feature' -> 'renamed'" in renamed.stdout
         assert "✓ Renamed 1 tmux target" in renamed.stdout
@@ -703,7 +700,7 @@ def test_remote_git_commands_act_on_the_remote_repository(
         assert git_in(env, clone, "branch", "--list", "renamed") != ""
         assert git_in(env, clone, "branch", "--list", "feature") == ""
         assert tmux_value(env, window, "#{session_name}:#{window_name}") == (
-            "api:wm-renamed"
+            "test:wm-renamed"
         )
         # The window still leads to its worktree after the rename.
         again = wm("set-base main", cwd=clone_of(env, "api"), from_pane=window)
@@ -1276,7 +1273,7 @@ def test_remote_panes_survive_drops_and_reattach(
         daemon_pid = remote_daemon_ping(env, workmux_exe_path, repo_path, short_tmp)[
             "pid"
         ]
-        pane = tmux_value(env, "=api:wm-feature", "#{pane_id}")
+        pane = tmux_value(env, "=test:wm-feature", "#{pane_id}")
         rows = tmux_value(env, pane, "#{pane_height}")
 
         def screen() -> str:
@@ -1336,7 +1333,7 @@ def test_remote_panes_survive_drops_and_reattach(
         # When the remote pane's process exits, its pane closes as it would
         # locally. Like a local pane, the agent's pane falls back to a shell.
         wm("add second", cwd=clone_of(env, "api"))
-        second = tmux_value(env, "=api:wm-second", "#{pane_id}")
+        second = tmux_value(env, "=test:wm-second", "#{pane_id}")
         wait_until(
             lambda: (
                 "FAKE-TUI"
@@ -1637,7 +1634,7 @@ def test_remote_agent_status_shows_live_turns_stale_and_catches_up_on_reconnect(
         daemon_pid = remote_daemon_ping(env, workmux_exe_path, repo_path, short_tmp)[
             "pid"
         ]
-        pane = tmux_value(env, "=api:wm-feature", "#{pane_id}")
+        pane = tmux_value(env, "=test:wm-feature", "#{pane_id}")
         feed = SidebarFeed(short_tmp["TMPDIR"])
         remote_pane = tmux_value(env, pane, "#{@workmux_remote_pane}")
         status_file = (
@@ -1656,7 +1653,7 @@ def test_remote_agent_status_shows_live_turns_stale_and_catches_up_on_reconnect(
             "worktree": "feature",
             "stale": False,
         }
-        assert entry["session"] == "api"
+        assert entry["session"] == "test"
         assert pane not in snapshot["stale_pane_ids"]
         assert tmux_value(env, pane, "#{@workmux_pane_status}") != ""
 
@@ -1763,7 +1760,7 @@ def test_open_and_resurrect_reattach_to_surviving_remote_panes(
         daemons.append(
             remote_daemon_ping(env, workmux_exe_path, repo_path, short_tmp)["pid"]
         )
-        window = "=api:wm-feature"
+        window = "=test:wm-feature"
         shown = remote_panes(window)
         assert len(shown) == 2, shown
         agent_pid = int(wait_for(started).strip())
@@ -1922,7 +1919,7 @@ def test_reap_agents_reaps_aged_agents_on_the_remote(
         os.utime(f"/dev/{tty}", (since, since))
 
     def status_file(worktree: str, status: str, event_ts: float):
-        pane = tmux_value(env, f"=api:wm-{worktree}", "#{@workmux_remote_pane}")
+        pane = tmux_value(env, f"=test:wm-{worktree}", "#{@workmux_remote_pane}")
         slot = pane.rsplit("/", 1)[1]
         path = status_dir / "api" / worktree / f"{slot}.json"
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -1981,7 +1978,7 @@ def test_reap_agents_reaps_aged_agents_on_the_remote(
             "the idle agents to exit",
         )
         assert pid_alive(busy) and pid_alive(long_task)
-        assert tmux_value(env, "=api:wm-finished", "#{window_name}") == "wm-finished"
+        assert tmux_value(env, "=test:wm-finished", "#{window_name}") == "wm-finished"
     finally:
         for pid in started.read_text().split() if started.exists() else []:
             try:
@@ -2032,7 +2029,7 @@ def test_close_and_remove_end_the_worktrees_unshown_remote_panes_too(
             "pid"
         ]
         env.tmux(["select-window", "-t", env.runner_pane_id or "test:0"])
-        window = "=api:wm-feature"
+        window = "=test:wm-feature"
         [shown] = env.tmux(
             ["list-panes", "-t", window, "-F", "#{pane_id}"]
         ).stdout.split()
@@ -2168,7 +2165,7 @@ def test_commands_typed_in_a_remote_pane_reach_the_workstation(
             "pid"
         ]
         env.tmux(["select-window", "-t", env.runner_pane_id or "test:0"])
-        pane = tmux_value(env, "=api:wm-feature", "#{pane_id}")
+        pane = tmux_value(env, "=test:wm-feature", "#{pane_id}")
         out = env.tmp_path / "pane-out"
         shows_prompt(env, pane)
 
@@ -2184,12 +2181,12 @@ def test_commands_typed_in_a_remote_pane_reach_the_workstation(
         ]
 
         # `add` typed in the remote pane: the worktree on the remote, the
-        # window in the project's session on the workstation.
+        # window in that pane's session on the workstation.
         code, stdout, stderr = in_pane("workmux add second")
         assert code == 0, stderr
         assert (worktrees / "second").is_dir()
-        assert "api:wm-second" in windows()
-        second = tmux_value(env, "=api:wm-second", "#{pane_id}")
+        assert "test:wm-second" in windows()
+        second = tmux_value(env, "=test:wm-second", "#{pane_id}")
         shows_prompt(env, second)
         assert env.tmux(
             ["show-options", "-wqv", "-t", second, "@workmux_project_window"]
@@ -2209,7 +2206,7 @@ def test_commands_typed_in_a_remote_pane_reach_the_workstation(
         # `close` typed in a window's own pane closes that window.
         code, _, stderr = in_pane("workmux close")
         assert code == 0, stderr
-        wait_until(lambda: "api:wm-feature" not in windows(), "the window to close")
+        wait_until(lambda: "test:wm-feature" not in windows(), "the window to close")
         assert (worktrees / "feature").is_dir()
         holders = f"dtach -n {root}/home/.local/state/workmux/panes/api/feature/"
         wait_until(
@@ -2222,9 +2219,9 @@ def test_commands_typed_in_a_remote_pane_reach_the_workstation(
             env, second, with_workmux + "workmux add third && workmux remove", out
         )
         assert code == 0, stderr
-        wait_until(lambda: "api:wm-second" not in windows(), "the window to close")
+        wait_until(lambda: "test:wm-second" not in windows(), "the window to close")
         wait_until(lambda: not (worktrees / "second").exists(), "the worktree to go")
-        third = tmux_value(env, "=api:wm-third", "#{pane_id}")
+        third = tmux_value(env, "=test:wm-third", "#{pane_id}")
         shows_prompt(env, third)
 
         # With the control channel gone, commands fail as not connected.
@@ -2346,7 +2343,7 @@ def test_agent_commands_reach_remote_agents_from_the_workstation(
         # the daemon never drops it as a slow client.
         feed = SidebarFeed(short_tmp["TMPDIR"])
         threading.Thread(target=drain, args=(feed.sock,), daemon=True).start()
-        view = tmux_value(env, "=api:wm-feature", "#{pane_id}")
+        view = tmux_value(env, "=test:wm-feature", "#{pane_id}")
         wait_until(lambda: "agent ready" in (env.capture_pane(view) or ""), "the agent")
 
         # status and wait read the state store; send and capture use the view.
@@ -2450,7 +2447,7 @@ def test_agent_commands_reach_remote_agents_from_the_workstation(
 
             # last-agent switches to the pane remembered last, and remembers
             # the pane it ran from.
-            invoking = tmux_value(env, "test:", "#{pane_id}")
+            invoking = env.runner_pane_id
             settings = state_dir(env) / "settings.json"
             current = json.loads(settings.read_text()) if settings.exists() else {}
             settings.write_text(json.dumps({**current, "last_pane_id": local}))
@@ -2478,7 +2475,7 @@ def test_dashboard_reviews_stages_and_closes_a_remote_worktree(
     remote_root: Path,
     outage: Path,
 ):
-    """The dashboard, filtered to the project's session, lists the remote
+    """The dashboard, filtered to its session, lists the remote
     agent with its remote worktree's changes and not an agent of another
     session. Its diff comes from the remote, staging a hunk changes the
     remote's index, and killing the entry ends the remote pane too."""
@@ -2524,7 +2521,7 @@ def test_dashboard_reviews_stages_and_closes_a_remote_worktree(
         daemon_pid = remote_daemon_ping(env, workmux_exe_path, repo_path, short_tmp)[
             "pid"
         ]
-        pane = tmux_value(env, "=api:wm-feature", "#{pane_id}")
+        pane = tmux_value(env, "=test:wm-feature", "#{pane_id}")
         remote_pane = tmux_value(env, pane, "#{@workmux_remote_pane}")
         next_status.write_text("waiting")
         wait_until(lambda: done.exists(), "the remote agent's status hook")
@@ -2546,14 +2543,14 @@ def test_dashboard_reviews_stages_and_closes_a_remote_worktree(
             f"mkfifo {control}/hold && read _ < {control}/hold\n"
         )
         env.tmux(
-            ["new-window", "-d", "-t", "test:", "-n", "wm-local", f"sh {local_agent}"]
+            ["new-session", "-d", "-s", "other", "-n", "wm-local", f"sh {local_agent}"]
         )
         wait_until(
             lambda: (control / "local-waiting").exists(), "the local agent's status"
         )
 
-        env.tmux(["new-window", "-t", "api:", "-n", "dash"])
-        env.tmux(["resize-window", "-t", "=api:dash", "-x", "220", "-y", "50"])
+        env.tmux(["new-window", "-t", "test:", "-n", "dash"])
+        env.tmux(["resize-window", "-t", "=test:dash", "-x", "220", "-y", "50"])
         launch = control / "dashboard.sh"
         launch.write_text(
             f"export PATH={shlex.quote(env.env['PATH'])} "
@@ -2561,10 +2558,10 @@ def test_dashboard_reviews_stages_and_closes_a_remote_worktree(
             f"TMPDIR={short_tmp['TMPDIR']} WORKMUX_TEST=1\n"
             f"exec {workmux_exe_path} dashboard --session\n"
         )
-        env.send_keys("=api:dash", f"sh {launch}", enter=True)
+        env.send_keys("=test:dash", f"sh {launch}", enter=True)
 
         def screen() -> str:
-            return env.capture_pane("=api:dash") or ""
+            return env.capture_pane("=test:dash") or ""
 
         def wait_for_screen(predicate, what: str, timeout=15.0):
             try:
@@ -2607,18 +2604,18 @@ def test_dashboard_reviews_stages_and_closes_a_remote_worktree(
         assert "local" not in screen(), screen()
 
         # The diff is the remote worktree's; stage its first hunk.
-        env.send_keys("=api:dash", "d", enter=False)
+        env.send_keys("=test:dash", "d", enter=False)
         wait_for_screen(lambda shown: "line nineteen" in shown, "the remote diff")
-        env.send_keys("=api:dash", "a", enter=False)
+        env.send_keys("=test:dash", "a", enter=False)
         wait_for_screen(lambda shown: "line two" in shown, "patch mode")
-        env.send_keys("=api:dash", "y", enter=False)
+        env.send_keys("=test:dash", "y", enter=False)
         wait_until(
             lambda: "+line two" in git_in(env, worktree, "diff", "--cached"),
             "the hunk staged in the remote's index",
         )
         assert "nineteen" not in git_in(env, worktree, "diff", "--cached")
-        env.send_keys("=api:dash", "q", enter=False)
-        env.send_keys("=api:dash", "q", enter=False)
+        env.send_keys("=test:dash", "q", enter=False)
+        env.send_keys("=test:dash", "q", enter=False)
 
         # A disconnected remote's entry stays, stale, with its last status.
         outage.write_text("")
@@ -2648,7 +2645,7 @@ def test_dashboard_reviews_stages_and_closes_a_remote_worktree(
             remote_root / f"home/.local/state/workmux/panes/{remote_pane}.sock"
         )
         assert socket_path.exists()
-        env.send_keys("=api:dash", "X", enter=False)
+        env.send_keys("=test:dash", "X", enter=False)
         wait_until(lambda: not socket_path.exists(), "the remote pane to end")
         panes = env.tmux(["list-panes", "-a", "-F", "#{pane_id}"]).stdout.split()
         assert pane not in panes
@@ -2751,14 +2748,14 @@ def test_dashboard_worktrees_tab_lists_adds_closes_and_removes_remote_worktrees(
         wait_until(
             lambda: (
                 env.tmux(
-                    ["list-windows", "-t", "=api", "-F", "#{window_name}"],
+                    ["list-windows", "-t", "=test", "-F", "#{window_name}"],
                     check=False,
                 )
                 .stdout.split()
                 .count("wm-fresh")
                 == 1
             ),
-            "the worktree's window in the project's session",
+            "the worktree's window",
         )
         wait_for_screen(
             lambda shown: "api@lb" in dashboard_row(shown, "fresh"),
@@ -2772,7 +2769,7 @@ def test_dashboard_worktrees_tab_lists_adds_closes_and_removes_remote_worktrees(
             lambda: (
                 "wm-fresh"
                 not in env.tmux(
-                    ["list-windows", "-t", "=api", "-F", "#{window_name}"], check=False
+                    ["list-windows", "-t", "=test", "-F", "#{window_name}"], check=False
                 ).stdout.split()
             ),
             "the window closed",
@@ -2783,7 +2780,11 @@ def test_dashboard_worktrees_tab_lists_adds_closes_and_removes_remote_worktrees(
         wait_for_screen(lambda shown: "Remove" in shown, "the remove confirmation")
         keys("y")
         wait_until(lambda: not (worktrees / "fresh").exists(), "the worktree removed")
-        assert git_in(env, clone, "branch", "--list", "fresh") == ""
+        # The branch goes after the worktree.
+        wait_until(
+            lambda: git_in(env, clone, "branch", "--list", "fresh") == "",
+            "the branch removed",
+        )
         assert (worktrees / "feature").is_dir()
         # Nothing was created on the workstation.
         assert git_in(env, repo_path, "branch", "--list", "fresh") == ""
