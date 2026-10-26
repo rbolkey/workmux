@@ -45,7 +45,7 @@ Settings merge as any other setting does: the repository's value overrides your 
 
 The project is named after the repository: the directory name of your clone. The sandbox clones the repository from your clone's `origin`. OpenShell sandbox names allow only lowercase letters, digits and hyphens, up to 19 characters. When the project name doesn't fit, the sandbox is named with a prefix of it plus a short hash.
 
-The sandbox is the project's remote and has the project's name, so commands such as `workmux remote status api` work with nothing registered. Run in the repository, `workmux remote status` shows the sandbox before any other command has created it.
+The sandbox is the project's remote and has the project's name, so there is nothing to register. Run in the repository, `workmux remote status` shows the sandbox before any other command has created it.
 
 Git credentials and agent API keys should come from OpenShell providers, so that secrets never sit in the sandbox environment. See [Git and GitHub](#git-and-github) for git.
 
@@ -142,17 +142,18 @@ workmux creates and starts the sandbox for you, and stops or deletes it only whe
 - **Never in the background.** The sidebar, the dashboard, `wait`, `list --all`, `resurrect` and `reap-agents` never create or start a sandbox. `resurrect` and `reap-agents` skip a stopped one with a notice and don't count it as a failure.
 
 ```bash
-workmux remote stop api      # stop the sandbox; the workspace survives
-workmux remote start api     # start it again (creating it if missing)
-workmux remote recreate api  # delete and recreate, carrying committed work across
-workmux remote rm api        # delete the sandbox
+# run in your clone of the repository
+workmux remote stop      # stop the sandbox; the workspace survives
+workmux remote start     # start it again (creating it if missing)
+workmux remote recreate  # delete and recreate, carrying committed work across
+workmux remote rm        # delete the sandbox
 ```
 
 **Stopping ends every process in the sandbox**, agents included. The worktrees and status files survive, but agents do not: after `remote start`, workstation panes find their remote panes ended and close. Reopen the worktree with `workmux open`.
 
 ### Deleting a sandbox
 
-`workmux remote rm api` deletes the sandbox and everything in it, because nothing is mounted from your workstation. Before it asks for confirmation, it lists the work at risk, worktree by worktree and branch by branch:
+`workmux remote rm` deletes the sandbox and everything in it, because nothing is mounted from your workstation. Before it asks for confirmation, it lists the work at risk, worktree by worktree and branch by branch:
 
 - uncommitted changes
 - commits that are on no remote-tracking branch, so exist only in the sandbox
@@ -258,7 +259,7 @@ Your `policy` file is merged on top:
 - `network_policies`: the rules of both. A rule name in both files is refused.
 - Any other section: yours.
 
-`workmux remote status api` shows the sandbox's effective policy (read-only and read-write paths, workdir, network rules) and warns when it differs from the project's.
+`workmux remote status` shows the sandbox's effective policy (read-only and read-write paths, workdir, network rules) and warns when it differs from the project's.
 
 When you edit the policy file, the next command brings a running sandbox in line. Network rules apply at once. Filesystem grants that are added take effect after `remote stop` and `remote start`. A grant that is removed needs `workmux remote recreate`, because OpenShell can't narrow a live sandbox's filesystem policy; workmux warns instead.
 

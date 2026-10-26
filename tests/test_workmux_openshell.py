@@ -179,7 +179,7 @@ def project(mux_server, workmux_exe_path, repo_path, short_tmp):
 
 def add_project(project: Project):
     project.configure("/sandbox/origin", LEARNING_IMAGE)
-    started = project.wm(f"remote start {project.name}", timeout=600.0)
+    started = project.wm("remote start", timeout=600.0)
     assert f"Creating remote {project.name} on first use" in started.stderr
     assert project.phase() == "Ready"
     project.make_origin()
@@ -193,14 +193,14 @@ def test_an_openshell_project_lives_stops_resumes_and_is_removed_with_its_sandbo
     env = project.env
     assert isinstance(env, TmuxEnvironment)
     add_project(project)
-    status = project.wm(f"remote status {project.name}").stdout
+    status = project.wm("remote status").stdout
     assert "status:   reachable" in status, status
     assert "read-write: /tmp, /dev/null, /dev/pts, /dev/ptmx" in status, status
 
     daemon_pid = None
     feed = None
     try:
-        project.wm(f"add feature --project {project.name}", timeout=120.0)
+        project.wm("add feature", timeout=120.0)
         daemon_pid = remote_daemon_ping(env, project.exe, project.repo, project.tmp)[
             "pid"
         ]
@@ -224,7 +224,7 @@ def test_an_openshell_project_lives_stops_resumes_and_is_removed_with_its_sandbo
 
         # Stopped only on request; the agent turns stale, and status never
         # starts the sandbox.
-        stopped = project.wm(f"remote stop {project.name}", timeout=300.0)
+        stopped = project.wm("remote stop", timeout=300.0)
         assert "Stopped remote" in stopped.stdout
         feed.wait(
             lambda s: (
@@ -234,26 +234,29 @@ def test_an_openshell_project_lives_stops_resumes_and_is_removed_with_its_sandbo
             "the entry to turn stale",
             timeout=60.0,
         )
-        status = project.wm(f"remote status {project.name}").stdout
+        status = project.wm("remote status").stdout
         assert "status:   stopped" in status, status
         project.wm("resurrect")
         assert project.phase() == "Stopped"
 
         # Started on request: the channel reconnects and the workspace is
         # intact.
-        project.wm(f"remote start {project.name}", timeout=300.0)
-        status = project.wm(f"remote status {project.name}").stdout
+        project.wm("remote start", timeout=300.0)
+        status = project.wm("remote status").stdout
         assert "status:   reachable" in status, status
-        listing = project.wm(f"list --project {project.name}").stdout
+        listing = project.wm("list").stdout
         assert "feature" in listing, listing
+        assert listing.splitlines()[0] == (
+            f"Worktrees in OpenShell sandbox {project.name} (project {project.name})"
+        ), listing
 
         # A command that needs a stopped sandbox starts it itself.
-        project.wm(f"remote stop {project.name}", timeout=300.0)
-        path = project.wm(f"path feature --project {project.name}", timeout=300.0)
+        project.wm("remote stop", timeout=300.0)
+        path = project.wm("path feature", timeout=300.0)
         assert path.stdout.strip() == f"/sandbox/{project.name}__worktrees/feature"
         assert "Starting remote" in path.stderr
 
-        project.wm(f"remove feature --project {project.name} --force", timeout=120.0)
+        project.wm("remove feature --force", timeout=120.0)
     finally:
         if feed is not None:
             feed.close()
@@ -266,10 +269,10 @@ def test_an_openshell_project_lives_stops_resumes_and_is_removed_with_its_sandbo
         "git -c user.name=t -c user.email=t@t commit -q --allow-empty -m wip && "
         "git checkout -q main"
     )
-    kept = project.wm(f"remote rm {project.name}", stdin="n\n")
+    kept = project.wm("remote rm", stdin="n\n")
     assert "branch spike: 1 commit not on any remote" in kept.stdout, kept.stdout
     assert project.phase() == "Ready"
-    removed = project.wm(f"remote rm {project.name} --yes", timeout=300.0)
+    removed = project.wm("remote rm --yes", timeout=300.0)
     assert "Deleted sandbox" in removed.stdout
     assert project.phase() is None
 
@@ -278,7 +281,7 @@ def test_a_recreate_carries_a_worktree_and_its_commit_across(project: Project):
     """Commit on a worktree branch, recreate: the branch and the worktree are
     back with the commit, in a new sandbox."""
     add_project(project)
-    project.wm(f"add feature --project {project.name}", timeout=120.0)
+    project.wm("add feature", timeout=120.0)
     worktree = f"/sandbox/{project.name}__worktrees/feature"
     project.sh(
         f"cd {worktree} && echo work > work.txt && git add work.txt && "
@@ -290,14 +293,12 @@ def test_a_recreate_carries_a_worktree_and_its_commit_across(project: Project):
         openshell(["sandbox", "get", project.name, "-o", "json"]).stdout
     )["id"]
 
-    refused = project.wm(
-        f"remote recreate {project.name} --yes", expect_fail=True, timeout=120.0
-    )
+    refused = project.wm("remote recreate --yes", expect_fail=True, timeout=120.0)
     assert "uncommitted changes" in refused.stderr, refused.stderr
     assert f"{worktree} (branch feature)" in refused.stderr, refused.stderr
 
     project.sh(f"rm {worktree}/draft.txt")
-    project.wm(f"remote recreate {project.name} --yes", timeout=900.0)
+    project.wm("remote recreate --yes", timeout=900.0)
 
     after = json.loads(
         openshell(["sandbox", "get", project.name, "-o", "json"]).stdout
@@ -326,7 +327,7 @@ def test_a_projects_lima_sandbox_is_ignored_inside_its_openshell_sandbox(
         "commit -q -am 'lima sandbox'"
     )
 
-    added = project.wm(f"add feature --project {project.name}", timeout=120.0)
+    added = project.wm("add feature", timeout=120.0)
 
     output = added.stdout + added.stderr
     assert "limactl" not in output, output
@@ -349,7 +350,7 @@ def test_an_openshell_projects_sandbox_runs_claude_code(project: Project):
     sandbox with no credentials attached."""
     env = project.env
     project.configure("/sandbox/origin", LEARNING_IMAGE)
-    started = project.wm(f"remote start {project.name}", timeout=900.0)
+    started = project.wm("remote start", timeout=900.0)
     assert (
         "no provider attached to the sandbox has a profile that allows /usr/local/bin/claude"
         in started.stderr
@@ -360,12 +361,12 @@ def test_an_openshell_projects_sandbox_runs_claude_code(project: Project):
         "echo api > /sandbox/origin/README; git -C /sandbox/origin add README; "
         "git -C /sandbox/origin -c user.name=t -c user.email=t@t commit -q -m initial"
     )
-    status = project.wm(f"remote status {project.name}").stdout
+    status = project.wm("remote status").stdout
     assert "agent:    claude: installed at /usr/local/bin/claude" in status, status
 
     daemon_pid = None
     try:
-        added = project.wm(f"add feature --project {project.name}", timeout=120.0)
+        added = project.wm("add feature", timeout=120.0)
         daemon_pid = remote_daemon_ping(env, project.exe, project.repo, project.tmp)[
             "pid"
         ]
@@ -384,7 +385,7 @@ def test_an_openshell_projects_sandbox_runs_claude_code(project: Project):
             timeout=60.0,
         )
         assert "Claude Code" in project.sh("claude --version")
-        project.wm(f"remove feature --project {project.name} --force", timeout=120.0)
+        project.wm("remove feature --force", timeout=120.0)
     finally:
         if daemon_pid is not None:
             os.kill(daemon_pid, 15)
@@ -449,20 +450,20 @@ def test_a_private_ssh_github_repo_clones_over_https_with_the_providers_credenti
     ssh = f"git@github.com:{PRIVATE_REPO}.git"
     https = f"https://github.com/{PRIVATE_REPO}.git"
     project.configure(ssh, LEARNING_IMAGE, providers=[github_provider])
-    started = project.wm(f"remote start {project.name}", timeout=900.0)
+    started = project.wm("remote start", timeout=900.0)
     assert (
         "The repository's origin uses SSH, which OpenShell sandboxes don't support; the sandbox "
         f"reaches github.com over HTTPS with `{github_provider}` credentials instead."
     ) in started.stderr, started.stderr
 
-    listed = project.wm(f"list --project {project.name}", timeout=300.0)
+    listed = project.wm("list", timeout=300.0)
     assert (
         f"Cloning {https} (rewritten from SSH: {ssh}) into /sandbox/{project.name}"
     ) in listed.stderr, listed.stderr
     assert project.sh(f"git -C /sandbox/{project.name} config remote.origin.url") == (
         f"{https}\n"
     )
-    status = project.wm(f"remote status {project.name}").stdout
+    status = project.wm("remote status").stdout
     assert f"repo:     {https} (rewritten from SSH: {ssh})" in status, status
     for url in [ssh, f"ssh://git@github.com/{PRIVATE_REPO}.git"]:
         assert "HEAD" in project.sh(f"git ls-remote {shlex.quote(url)} HEAD")
@@ -533,11 +534,11 @@ def test_a_projects_sandbox_gets_the_workstations_gh_login(
     authorised."""
     https = f"https://github.com/{PRIVATE_REPO}.git"
     project.configure(https, LEARNING_IMAGE, providers=["gh-login"])
-    started = project.wm(f"remote start {project.name}", timeout=900.0)
+    started = project.wm("remote start", timeout=900.0)
     assert "provider gh-login gives the sandbox your gh login's GitHub access" in (
         started.stderr
     ), started.stderr
-    project.wm(f"list --project {project.name}", timeout=300.0)
+    project.wm("list", timeout=300.0)
 
     assert project.sh(f"git -C /sandbox/{project.name} rev-parse --verify HEAD")
     # An empty, no-op push, as git's child: 200 is authorised, 401 is not.
@@ -557,8 +558,8 @@ def add_gh_login_project(project: Project):
     project.configure(
         f"https://github.com/{PRIVATE_REPO}.git", GH_IMAGE, providers=["gh-login"]
     )
-    project.wm(f"remote start {project.name}", timeout=900.0)
-    project.wm(f"list --project {project.name}", timeout=300.0)
+    project.wm("remote start", timeout=900.0)
+    project.wm("list", timeout=300.0)
 
 
 def gh_api(project: Project, args: str) -> tuple[str, str]:
@@ -604,12 +605,12 @@ def test_a_new_gh_login_reaches_a_running_sandbox(project: Project, gh_login: Pa
 
     gh_login.write_text("gho_wm_not_a_real_token\n")
     try:
-        project.wm(f"list --project {project.name}", timeout=300.0)
+        project.wm("list", timeout=300.0)
         status, body = gh_api(project, "user")
         assert " 401" in status, (status, body)
     finally:
         # Never leave `gh-login` the stand-in token.
         gh_login.unlink(missing_ok=True)
-        project.wm(f"list --project {project.name}", timeout=300.0)
+        project.wm("list", timeout=300.0)
     status, body = gh_api(project, "user")
     assert " 200" in status, (status, body)
