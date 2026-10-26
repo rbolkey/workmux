@@ -170,12 +170,19 @@ pub fn stop(name: Option<String>, all: bool, skip_confirm: bool) -> Result<()> {
 
 /// Ask which of `running` to stop. An empty answer picks `default`, the
 /// current repository's sandbox, when it is among them.
-fn select_interactive<'a>(running: &[&'a Listed], default: Option<&str>) -> Result<Vec<&'a Listed>> {
+fn select_interactive<'a>(
+    running: &[&'a Listed],
+    default: Option<&str>,
+) -> Result<Vec<&'a Listed>> {
     let default = default.and_then(|name| running.iter().position(|s| s.name == name));
     println!("Running workmux sandboxes:");
     println!();
     for (i, sandbox) in running.iter().enumerate() {
-        let mark = if Some(i) == default { " [this repository]" } else { "" };
+        let mark = if Some(i) == default {
+            " [this repository]"
+        } else {
+            ""
+        };
         println!(
             "  {}. {} (project {}){mark}",
             i + 1,
@@ -234,7 +241,9 @@ struct Candidate {
 impl Candidate {
     /// Whether deleting it would lose work, or might.
     fn holds_work(&self) -> bool {
-        self.risks.as_deref().is_none_or(|risks| !lost(risks).is_empty())
+        self.risks
+            .as_deref()
+            .is_none_or(|risks| !lost(risks).is_empty())
     }
 
     fn stop_again(&self) {
@@ -293,7 +302,9 @@ pub fn prune(force: bool) -> Result<()> {
         );
         match &candidate.risks {
             None if force => {}
-            None => println!("   Its worktrees could not be checked for work that exists only there"),
+            None => {
+                println!("   Its worktrees could not be checked for work that exists only there")
+            }
             Some(risks) => {
                 let lost = lost(risks);
                 if !lost.is_empty() {
@@ -321,9 +332,8 @@ pub fn prune(force: bool) -> Result<()> {
                 holding.join(", ")
             );
         }
-        let answer = read_answer(
-            "Delete all these sandboxes? Their clones and worktrees are lost. [y/N] ",
-        );
+        let answer =
+            read_answer("Delete all these sandboxes? Their clones and worktrees are lost. [y/N] ");
         match answer {
             Ok(answer) if answer.eq_ignore_ascii_case("y") => {}
             Ok(_) => {
@@ -377,7 +387,9 @@ fn check(candidate: &mut Candidate) {
     let name = &candidate.sandbox.name;
     let provisioning = lifecycle(candidate.transport.as_ref());
     if !is_running(&candidate.sandbox) {
-        eprintln!("Starting sandbox {name} to check its worktrees for work that exists only there…");
+        eprintln!(
+            "Starting sandbox {name} to check its worktrees for work that exists only there…"
+        );
         if let Err(error) = provisioning.start() {
             tracing::warn!(sandbox = %name, error = %format!("{error:#}"), "starting a sandbox to check it");
             return;
@@ -556,13 +568,20 @@ pub fn shell(project: &RemoteProject, exec: bool, command: Vec<String>) -> Resul
 
 /// The sandbox user's login shell, or `command` run by it.
 fn shell_argv(command: &[String]) -> Vec<String> {
-    let login = r#"shell=${SHELL:-$(getent passwd "$(id -u)" | cut -d: -f7)}; exec "${shell:-/bin/sh}" -l"#;
+    let login =
+        r#"shell=${SHELL:-$(getent passwd "$(id -u)" | cut -d: -f7)}; exec "${shell:-/bin/sh}" -l"#;
     if command.is_empty() {
         ["sh", "-c", login].map(String::from).to_vec()
     } else {
-        ["sh", "-c", &format!(r#"{login} -c "$1""#), "sh", &command.join(" ")]
-            .map(String::from)
-            .to_vec()
+        [
+            "sh",
+            "-c",
+            &format!(r#"{login} -c "$1""#),
+            "sh",
+            &command.join(" "),
+        ]
+        .map(String::from)
+        .to_vec()
     }
 }
 
@@ -571,11 +590,8 @@ fn shell_argv(command: &[String]) -> Vec<String> {
 /// effective policy and agents. Returns whether it was reachable (or not
 /// meant to be: stopped, or not created yet).
 pub fn status(project: &RemoteProject) -> Result<bool> {
-    let remotes: BTreeMap<String, RemoteConfig> = [(
-        project.site.remote.clone(),
-        project.remote_config.clone(),
-    )]
-    .into();
+    let remotes: BTreeMap<String, RemoteConfig> =
+        [(project.site.remote.clone(), project.remote_config.clone())].into();
     let mut all_reachable = true;
     for status in fetch_statuses(&remotes)? {
         println!("{} ({} {})", status.name, status.transport, status.target);
@@ -854,8 +870,14 @@ mod tests {
             assert!(!gateway.log("log").contains("sandbox delete"));
             let remote = gateway.log("remote-log");
             // Each is checked at its clone: recorded, else the default.
-            assert!(remote.contains(&format!("{API} remote carry at-risk /sandbox/api")), "{remote}");
-            assert!(remote.contains(&format!("{WEB} remote carry at-risk ~/web")), "{remote}");
+            assert!(
+                remote.contains(&format!("{API} remote carry at-risk /sandbox/api")),
+                "{remote}"
+            );
+            assert!(
+                remote.contains(&format!("{WEB} remote carry at-risk ~/web")),
+                "{remote}"
+            );
             assert_eq!(gateway.touched(), [API, WEB], "{}", gateway.log("log"));
             return;
         }
@@ -887,8 +909,7 @@ mod tests {
 
     #[test]
     fn prune_force_deletes_workmux_sandboxes_even_with_work() {
-        const NAME: &str =
-            "command::sandbox_openshell::tests::prune_force_deletes_workmux_sandboxes_even_with_work";
+        const NAME: &str = "command::sandbox_openshell::tests::prune_force_deletes_workmux_sandboxes_even_with_work";
         if !crate::test_support::is_isolated_child(NAME) {
             let gateway = Gateway::new(true);
             gateway.run(NAME);

@@ -1352,7 +1352,9 @@ pub(super) mod tests {
             .map(|line| line.split(' ').take(2).collect::<Vec<_>>().join(" "))
             .collect();
         assert!(
-            calls.iter().all(|call| call == "sandbox get" || call == "sandbox start"),
+            calls
+                .iter()
+                .all(|call| call == "sandbox get" || call == "sandbox start"),
             "{calls:?}"
         );
     }

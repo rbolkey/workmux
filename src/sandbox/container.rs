@@ -162,13 +162,6 @@ pub fn pull_image(config: &SandboxConfig, image: &str) -> Result<()> {
     Ok(())
 }
 
-/// Ensure the container image is ready to run.
-///
-/// - If the image is missing and it's an official image, pull it automatically.
-/// - If the image exists but is stale (per freshness cache), pull the update.
-///   If the update pull fails, warn and continue with the local image.
-/// - For custom (non-official) images, only check existence.
-/// - Kicks off a background freshness cache update for the next run.
 /// Whether `image` exists in `runtime`'s local image store.
 pub fn image_exists(runtime: SandboxRuntime, image: &str) -> bool {
     Command::new(runtime.binary_name())
@@ -180,6 +173,13 @@ pub fn image_exists(runtime: SandboxRuntime, image: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Ensure the container image is ready to run.
+///
+/// - If the image is missing and it's an official image, pull it automatically.
+/// - If the image exists but is stale (per freshness cache), pull the update.
+///   If the update pull fails, warn and continue with the local image.
+/// - For custom (non-official) images, only check existence.
+/// - Kicks off a background freshness cache update for the next run.
 pub fn ensure_image_ready(config: &SandboxConfig, image: &str) -> Result<()> {
     let runtime = config.runtime();
     let runtime_display = runtime.display_name();

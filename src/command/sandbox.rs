@@ -203,13 +203,21 @@ pub fn run(args: SandboxArgs) -> Result<()> {
 /// Whether this repository's config puts it in an OpenShell sandbox, so
 /// `stop` and `prune` act on OpenShell's sandboxes rather than Lima's VMs.
 fn openshell_here() -> Result<bool> {
-    Ok(Config::load(None)?.sandbox.remote_backend() == Some(crate::config::SandboxBackend::Openshell))
+    Ok(Config::load(None)?.sandbox.remote_backend()
+        == Some(crate::config::SandboxBackend::Openshell))
 }
 
 /// `sandbox status`: the repository's sandbox, as its backend has it.
 fn run_status() -> Result<()> {
     use crate::config::SandboxBackend;
 
+    if let Some(sandbox) = std::env::var_os(crate::remote::openshell::SANDBOX_ENV) {
+        println!(
+            "This is OpenShell sandbox {}; run `workmux sandbox status` in the repository on your workstation to see it",
+            sandbox.to_string_lossy()
+        );
+        return Ok(());
+    }
     let config = Config::load(None)?;
     if config.sandbox.remote_backend().is_some() {
         let project = super::sandbox_openshell::current_project()?;
@@ -246,7 +254,9 @@ fn lima_status(config: &Config, cwd: &Path) -> Result<Vec<String>> {
             .into_iter()
             .find(|vm| vm.name == name)
             .map(|vm| vm.status.to_lowercase())
-            .unwrap_or_else(|| "not created yet; the first command that needs it creates it".to_string())
+            .unwrap_or_else(|| {
+                "not created yet; the first command that needs it creates it".to_string()
+            })
     } else {
         "unknown: limactl is not installed".to_string()
     };
@@ -278,7 +288,11 @@ fn lima_status(config: &Config, cwd: &Path) -> Result<Vec<String>> {
         let agent = resolve_agent(config);
         let mounts = lima::mounts::generate_mounts(cwd, isolation, config, &name, agent)?;
         for (i, mount) in mounts.iter().enumerate() {
-            let label = if i == 0 { "  mounts:    " } else { "             " };
+            let label = if i == 0 {
+                "  mounts:    "
+            } else {
+                "             "
+            };
             let access = if mount.read_only { "ro" } else { "rw" };
             if mount.guest_path == mount.host_path {
                 lines.push(format!("{label}{} ({access})", mount.host_path.display()));
@@ -1370,8 +1384,14 @@ mod tests {
         let missing = lima_status(&config, &cwd).unwrap();
         assert_eq!(missing[0], format!("{vm} (lima)"));
         assert!(missing[1].contains("not created yet"), "{missing:?}");
-        assert!(missing.iter().any(|l| l == "  toolchain: nix flake"), "{missing:?}");
-        assert!(!missing.iter().any(|l| l.contains("mounts:")), "{missing:?}");
+        assert!(
+            missing.iter().any(|l| l == "  toolchain: nix flake"),
+            "{missing:?}"
+        );
+        assert!(
+            !missing.iter().any(|l| l.contains("mounts:")),
+            "{missing:?}"
+        );
 
         std::fs::write(
             home.join("vm"),
@@ -1404,11 +1424,7 @@ mod tests {
                     log.display()
                 ),
             );
-            run_in_repo(
-                NAME,
-                temp.path(),
-                "sandbox:\n  enabled: true\n",
-            );
+            run_in_repo(NAME, temp.path(), "sandbox:\n  enabled: true\n");
             let log = std::fs::read_to_string(&log).unwrap();
             assert!(
                 log.lines().all(|line| line.starts_with("image inspect")),

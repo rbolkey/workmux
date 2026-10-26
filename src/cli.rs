@@ -1577,7 +1577,9 @@ mod tests {
             .unwrap_or_else(|| panic!("{help}"));
         for sub in ["stop", "prune", "rebuild"] {
             assert!(
-                openshell.lines().any(|line| line.trim_start().starts_with(sub)),
+                openshell
+                    .lines()
+                    .any(|line| line.trim_start().starts_with(sub)),
                 "{sub} in {openshell}"
             );
         }
