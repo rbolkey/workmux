@@ -524,8 +524,7 @@ def test_a_failed_remote_add_leaves_no_worktree_and_can_be_retried(
             timeout=60.0,
         )
 
-    wm(f"remote add lb --transport loopback --target {root}")
-    wm(f"project add remote api --remote lb --repo {origin} --path code/api")
+    project_in_sandbox(env, workmux_exe_path, "api", origin, short_tmp, root=root)
     daemon_pid = None
     try:
         failed = wm("add feature --project api", expect_fail=True)
