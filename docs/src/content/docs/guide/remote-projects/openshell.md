@@ -8,45 +8,44 @@ An OpenShell project lives in an [OpenShell](https://github.com/NVIDIA/OpenShell
 - The repository is cloned inside the sandbox, and its worktrees live beside the clone.
 - workmux never requests a bind mount, so no workstation file is visible in the sandbox.
 - The control channel runs over `openshell sandbox exec`, so the sandbox's network policy needs no rule for workmux.
-- The OpenShell sandbox is the project's sandbox. workmux ignores a `sandbox:` setting from the project's `.workmux.yaml` or global config there, and prints a note. The rest of the config, hooks included, still applies.
+- The OpenShell sandbox is the project's sandbox. In it, workmux runs no container or Lima sandbox: a `sandbox:` setting that asks for one, from the project's `.workmux.yaml` or global config, is ignored there with a note. The rest of the config, hooks included, still applies.
 
-## Add a project
+## Set up a project
 
-```bash
-workmux project add openshell api --repo https://github.com/me/api.git \
-  --image ghcr.io/me/api-dev:1 \
-  --policy ./api-policy.yaml \
-  --provider github
-```
-
-| Option            | Meaning                                                                                                                                                                 |
-| ----------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--image`         | Image the sandbox is built from. It must contain git and dtach. Default: workmux's own image                                                                            |
-| `--policy FILE`   | Policy file merged on top of workmux's [base policy](#policy). Stored as an absolute path                                                                               |
-| `--provider NAME` | OpenShell provider to attach, for credentials (repeatable). No other provider is attached. `gh-login` is special: see [Your gh login](#your-gh-login-provider-gh-login) |
-| `--agent NAME`    | Agent the image installs (repeatable); the first is the sandbox's default agent                                                                                         |
-| `--sandbox NAME`  | Sandbox name. Default: the project name                                                                                                                                 |
-| `--path`          | The clone's path in the sandbox. Default: `~/<name>`                                                                                                                    |
-
-OpenShell sandbox names allow only lowercase letters, digits and hyphens, up to 19 characters. When the project name doesn't fit, the sandbox is named with a prefix of it plus a short hash.
-
-The settings are saved under the project's `openshell:` key in global config:
+Commit the sandbox settings in the repository's `.workmux.yaml`, and list providers in your global config (`~/.config/workmux/config.yaml`):
 
 ```yaml
-projects:
-  api:
-    git_url: https://github.com/me/api.git
-    path: ~/api
-    openshell:
-      image: ghcr.io/me/api-dev:1
-      policy: /Users/me/api-policy.yaml
-      providers: [github]
-      agents: [claude]
+# .workmux.yaml, in the repository
+sandbox:
+  enabled: true
+  backend: openshell
+  openshell:
+    image: ghcr.io/me/api-dev:1
+    policy: api-policy.yaml
+    agents: [claude]
 ```
 
-A project added with `--provider gh-login` lists `gh-login` among its `providers:`.
+```yaml
+# ~/.config/workmux/config.yaml
+sandbox:
+  openshell:
+    providers: [github]
+```
 
-The project's remote is implicit and has the project's name, so commands such as `workmux remote status api` work without a `remote add`.
+| `sandbox.openshell` key | Meaning                                                                                                                                                                                                    |
+| ----------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `image`                 | Image the sandbox is built from. It must contain git and dtach. Default: workmux's own image                                                                                                               |
+| `policy`                | Policy file merged on top of workmux's [base policy](#policy), relative to the repository                                                                                                                  |
+| `providers`             | OpenShell providers to attach, for credentials. No other provider is attached. Global config only. `gh-login` is special: see [Your gh login](#your-gh-login-provider-gh-login)                          |
+| `agents`                | Agents the image installs; the first is the sandbox's default agent                                                                                                                                       |
+| `sandbox`               | Sandbox name. Default: the project name                                                                                                                                                                    |
+| `path`                  | The clone's path in the sandbox. Default: `~/<project>`                                                                                                                                                    |
+
+Settings merge as any other setting does: the repository's value overrides your global config's, key by key. `providers` is the exception. It is read only from global config, and a repository's `.workmux.yaml` setting it is ignored with a warning, so a repository can't commit `providers: [gh-login]` and receive your GitHub login. Every OpenShell sandbox gets the same providers; tokens scoped to what your projects need bound what each one can reach.
+
+The project is named after the repository: the directory name of your clone. The sandbox clones the repository from your clone's `origin`. OpenShell sandbox names allow only lowercase letters, digits and hyphens, up to 19 characters. When the project name doesn't fit, the sandbox is named with a prefix of it plus a short hash.
+
+The sandbox is the project's remote and has the project's name, so commands such as `workmux remote status api` work with nothing registered. Run in the repository, `workmux remote status` shows the sandbox before any other command has created it.
 
 Git credentials and agent API keys should come from OpenShell providers, so that secrets never sit in the sandbox environment. See [Git and GitHub](#git-and-github) for git.
 
@@ -61,12 +60,15 @@ When an attached provider's profile reaches `github.com`, workmux's image sets a
 What git and agents may do on GitHub is set by the provider's profile and the token's scope:
 
 - **OpenShell's stock `github` profile is read-only:** clone and fetch work; push (`git-receive-pack`) and API writes, such as creating a pull request, are denied. The stock profiles aren't installed in a gateway by default; import one with `openshell provider profile import`.
-- **Push and pull requests** need a profile that allows `git-receive-pack` and API writes. The easy path is [`--provider gh-login`](#your-gh-login-provider-gh-login), which gives the sandbox your workstation's `gh` login. For tighter access, [bring your own provider](#bring-your-own-provider) made from a fine-grained personal access token.
+- **Push and pull requests** need a profile that allows `git-receive-pack` and API writes. The easy path is [`gh-login`](#your-gh-login-provider-gh-login), which gives the sandbox your workstation's `gh` login. For tighter access, [bring your own provider](#bring-your-own-provider) made from a fine-grained personal access token.
 
-### Your gh login (`--provider gh-login`)
+### Your gh login (provider `gh-login`)
 
-```bash
-workmux project add openshell api --provider gh-login --repo https://github.com/me/api.git
+```yaml
+# ~/.config/workmux/config.yaml
+sandbox:
+  openshell:
+    providers: [gh-login]
 ```
 
 `gh-login` is a provider name workmux reserves. Attaching it gives the sandbox your workstation's `gh` login, with nothing else to create: no token, profile or provider.
@@ -75,8 +77,8 @@ workmux project add openshell api --provider gh-login --repo https://github.com/
 - On first use, workmux creates the provider `gh-login` from that profile, labelled `workmux.managed=gh-login`, holding the token `gh auth token` prints. It passes the token to `openshell` in the environment, never on its command line, and never logs it.
 - A `gh-login` provider on the gateway without that label isn't workmux's: attaching it is an error, and workmux never changes it.
 - OpenShell's proxy can only read credentials from the gateway, so the gateway keeps a copy of the token. workmux updates it from `gh` each time it creates the sandbox, runs a command in it (such as `workmux add`) or attaches a pane to it, so a new `gh` login reaches a running sandbox at the next attach.
-- `gh` missing or logged out is an error naming `gh auth login`, at `project add` and whenever the token is refreshed. workmux never falls back to no credentials.
-- At most one attached provider may give GitHub credentials: `gh-login` beside another provider whose profile reaches github.com is an error, at `project add` and when the sandbox is created. It is also an error when workmux can't ask the gateway which providers give GitHub credentials.
+- `gh` missing or logged out is an error naming `gh auth login`, when the sandbox is created and whenever the token is refreshed. workmux never falls back to no credentials.
+- At most one attached provider may give GitHub credentials: `gh-login` beside another provider whose profile reaches github.com is an error when the sandbox is created. It is also an error when workmux can't ask the gateway which providers give GitHub credentials.
 
 The gateway normally runs on your workstation, so the copy stays there. If your OpenShell gateway runs on another machine, the token is stored on that machine.
 
@@ -92,8 +94,8 @@ A fine-grained personal access token limits the agent to the repositories and pe
 
 1. Import a GitHub profile into the gateway. OpenShell's stock profiles aren't preinstalled, so even the stock `github` profile must be imported first (`openshell provider profile import --global -f github.yaml`). The stock profile is read-only.
 2. Create a provider from the token, passing it through the environment: `GITHUB_TOKEN=… openshell provider create --name api-github --type github --global-profile --credential GITHUB_TOKEN`.
-3. Attach it with `--provider api-github`.
-4. To allow push for just the project's repository on top of the read-only profile, add a `--policy` file:
+3. Attach it by listing `api-github` in `sandbox.openshell.providers`.
+4. To allow push for just the project's repository on top of the read-only profile, add a `policy` file:
 
    ```yaml
    network_policies:
@@ -117,15 +119,15 @@ A fine-grained personal access token limits the agent to the repositories and pe
 
 The proxy substitutes credentials only in HTTPS, and no profile allows SSH. workmux doesn't put an SSH key in the sandbox or forward your SSH agent, because either would hand the sandbox a real secret. Instead, workmux rewrites SSH GitHub URLs to HTTPS and says so:
 
-- `project add openshell` with an SSH `--repo` on github.com (`git@github.com:me/api.git` or `ssh://git@github.com/me/api.git`) stores the HTTPS form as the project's `git_url` and the original as `ssh_git_url`, and says so:
+- When your clone's `origin` is an SSH URL on github.com (`git@github.com:me/api.git` or `ssh://git@github.com/me/api.git`), the sandbox clones its HTTPS form, and says so when it is created:
 
   ```text
-  Note: `--repo` uses SSH, which OpenShell sandboxes don't support; the sandbox reaches github.com over HTTPS with `github` credentials instead.
+  Note: The repository's origin uses SSH, which OpenShell sandboxes don't support; the sandbox reaches github.com over HTTPS with `github` credentials instead.
   ```
 
-  The sandbox's identity is the provider's, which may not be your SSH key's: a work-account key and a personal `gh` login reach different repositories. With no GitHub provider attached, the note adds that public repositories will clone, but private ones and push need `--provider gh-login` or another GitHub `--provider`. workmux can't tell whether a repository is private, so it doesn't fail.
+  The sandbox's identity is the provider's, which may not be your SSH key's: a work-account key and a personal `gh` login reach different repositories. With no GitHub provider attached, the note adds that public repositories will clone, but private ones and push need `gh-login` or another GitHub provider. workmux can't tell whether a repository is private, so it doesn't fail.
 
-- An SSH `--repo` on any other host fails at `project add`.
+- An SSH origin on any other host fails: set `origin` to an `https://` URL.
 - `remote status` and the first-use clone show the URL as `https://github.com/me/api.git (rewritten from SSH: git@github.com:me/api.git)`.
 - Inside the sandbox, the image rewrites `git@github.com:` and `ssh://git@github.com/` to `https://github.com/` with git's `url.<base>.insteadOf`, so submodules and URLs an agent types go over HTTPS too. On your workstation, workmux still clones the original URL to look for a flake devshell.
 
@@ -143,7 +145,7 @@ workmux creates and starts the sandbox for you, and stops or deletes it only whe
 workmux remote stop api      # stop the sandbox; the workspace survives
 workmux remote start api     # start it again (creating it if missing)
 workmux remote recreate api  # delete and recreate, carrying committed work across
-workmux remote rm api        # delete the sandbox and unregister the project
+workmux remote rm api        # delete the sandbox
 ```
 
 **Stopping ends every process in the sandbox**, agents included. The worktrees and status files survive, but agents do not: after `remote start`, workstation panes find their remote panes ended and close. Reopen the worktree with `workmux open`.
@@ -156,7 +158,7 @@ workmux remote rm api        # delete the sandbox and unregister the project
 - commits that are on no remote-tracking branch, so exist only in the sandbox
 - branches not merged into the project's base branch
 
-It starts a stopped sandbox to check, and stops it again if you decline. Once the sandbox is deleted, it closes the project's workstation windows and removes the project from global config. `-y` skips the confirmation.
+It starts a stopped sandbox to check, and stops it again if you decline. Once the sandbox is deleted, it closes the project's workstation windows. The next workmux command in the repository creates a new sandbox. `-y` skips the confirmation.
 
 ### Recreating a sandbox
 
@@ -176,9 +178,9 @@ If the restore fails, run `workmux remote recreate` again. It resumes from the k
 workmux builds the sandbox image with `docker build` on the Docker daemon your OpenShell gateway uses, so it is native to the sandbox's architecture. The image is tagged `workmux-openshell-<sandbox>:<hash>`, and is rebuilt when its inputs change.
 
 - **Default image:** `ubuntu:24.04` with git, dtach, curl and workmux.
-- **Git:** every image gets workmux's [git settings](#git-and-github) appended to its `/etc/gitconfig`, so your `--image` needs `/bin/sh`.
+- **Git:** every image gets workmux's [git settings](#git-and-github) appended to its `/etc/gitconfig`, so your `image` needs `/bin/sh`.
 - **Agents:** every image gets the project's [agents](#agents-in-the-sandbox) that workmux can install.
-- **Your image (`--image`):** used as the base as it is. It must contain git and dtach, because nothing can be installed in a running sandbox.
+- **Your image (`image`):** used as the base as it is. It must contain git and dtach, because nothing can be installed in a running sandbox.
 
 Every image gets a workmux matching yours at `/usr/local/bin/workmux`:
 
@@ -194,22 +196,22 @@ Published workmux releases don't include remote support yet, so a release workmu
 
 ### Agents in the sandbox
 
-The image installs the agents the project names, and the first one is the sandbox's default agent. Name them with `--agent` (repeatable) or `agents:` under the project's `openshell:` key. By default the sandbox gets your default agent's type: a workstation path such as `~/.local/bin/claude`, or a named agent with `type: claude`, means `claude`.
+The image installs the agents the project names, and the first one is the sandbox's default agent. Name them with `sandbox.openshell.agents`. By default the sandbox gets your default agent's type: a workstation path such as `~/.local/bin/claude`, or a named agent with `type: claude`, means `claude`.
 
 | Agent    | Installed at            | Stock provider type |
 | -------- | ----------------------- | ------------------- |
 | `claude` | `/usr/local/bin/claude` | `claude-code`       |
 | `codex`  | `/usr/local/bin/codex`  | `codex`             |
 
-These are the paths OpenShell's example provider profiles allow, so a provider made from one of those profiles gives the agent its credentials. So does a provider made from a custom profile whose `binaries` include the agent's path, such as a `claude-code-oauth` profile that authenticates Claude Code with a subscription OAuth token. Each agent is installed in a build stage of its own, so your `--image` needs no curl. Claude Code is the glibc build, so it needs a glibc base image. Codex is a static musl build and runs on any base. workmux can't install other agents, so `project add` warns and your `--image` must already contain them.
+These are the paths OpenShell's example provider profiles allow, so a provider made from one of those profiles gives the agent its credentials. So does a provider made from a custom profile whose `binaries` include the agent's path, such as a `claude-code-oauth` profile that authenticates Claude Code with a subscription OAuth token. Each agent is installed in a build stage of its own, so your `image` needs no curl. Claude Code is the glibc build, so it needs a glibc base image. Codex is a static musl build and runs on any base. workmux can't install other agents, so creating the sandbox warns and your `image` must already contain them.
 
 The sandbox runs the agent's plain CLI, not your workstation's agent command. The image records the default agent in `/etc/workmux/default-agent`. Remote workmux uses it when no config in the sandbox names an agent, and counts it as a configured agent, so a project without panes of its own gets an agent pane. A `--agent` given to `add` is passed to remote workmux as it is, so give it the agent's plain CLI (`-a codex`) rather than a workstation alias.
 
-`project add openshell` and `remote status` list each agent and the attached providers whose profile allows its binary, whatever the provider's type. Both warn when none does, and so does creating the sandbox:
+`remote status` lists each agent and the attached providers whose profile allows its binary, whatever the provider's type. It warns when none does, and so does creating the sandbox:
 
 ```text
-Agent claude: installed at /usr/local/bin/claude; its credentials come from a provider whose profile allows it, such as one of type claude-code
-warning: no provider attached to the sandbox has a profile that allows /usr/local/bin/claude, so claude has no credentials there; create one with `openshell provider create --type claude-code` and list it in the project's `openshell: providers:`
+agent:    claude: installed at /usr/local/bin/claude; its credentials come from a provider whose profile allows it, such as one of type claude-code
+warning: no provider attached to the sandbox has a profile that allows /usr/local/bin/claude, so claude has no credentials there; create one with `openshell provider create --type claude-code` and list it in sandbox.openshell.providers in your global config
 ```
 
 The agent still starts without one, but it can't authenticate. The sandbox's network policy reaches the agent's endpoints only through its provider.
@@ -222,17 +224,17 @@ Nix cannot install or build inside an OpenShell sandbox. Instead, for a project 
 2. A `nixos/nix` build stage builds the devshell and copies its closure into the image's `/nix/store`.
 3. A wrapper at `/usr/local/bin/workmux-devshell` enters it. Agents start as `workmux-devshell bash -c '…'`.
 
-**Private flake inputs.** The bake fetches private GitHub inputs only for a project that attaches `--provider gh-login`, because that project already gives its sandbox your `gh` login. workmux hands the build the token `gh auth token` prints as a Docker build secret, never on a command line and never in the image. Only the step that fetches the inputs gets it, before anything of the project's is built:
+**Private flake inputs.** The bake fetches private GitHub inputs only for a sandbox that attaches `gh-login`, because that project already gives its sandbox your `gh` login. workmux hands the build the token `gh auth token` prints as a Docker build secret, never on a command line and never in the image. Only the step that fetches the inputs gets it, before anything of the project's is built:
 
 - `github:` inputs get it as nix's `access-tokens` for github.com.
 - `git+https://github.com/…` inputs get it from a git credential helper.
 - `git+ssh://git@github.com/…` inputs go over HTTPS with it, because the build has no SSH.
 
-The step that builds the devshell has no secret, so the flake's builders and `shellHook` can't read the token. Any other project's bake gets no token: a private input fails it with nix's `HTTP error 404` or `Cannot find Git revision`, and workmux says private GitHub flake inputs need `--provider gh-login`. Private inputs on other git servers aren't covered. Nothing fetches flake inputs inside the sandbox, because nix can't write its read-only `/nix`.
+The step that builds the devshell has no secret, so the flake's builders and `shellHook` can't read the token. Any other project's bake gets no token: a private input fails it with nix's `HTTP error 404` or `Cannot find Git revision`, and workmux says private GitHub flake inputs need `gh-login` in `sandbox.openshell.providers`. Private inputs on other git servers aren't covered. Nothing fetches flake inputs inside the sandbox, because nix can't write its read-only `/nix`.
 
 The image is fixed when the sandbox is created. When the clone's `flake.lock` no longer matches the baked one, `remote status` warns, and `workmux remote recreate` rebuilds the image.
 
-A devbox project gets no devshell in a sandbox. Put its toolchain in your `--image`. `project add openshell` and `remote status` both say so.
+A devbox project gets no devshell in a sandbox. Put its toolchain in your `image`. `remote status` says so.
 
 ## Policy
 
@@ -250,7 +252,7 @@ landlock:
 
 The PTY devices are there because the session holder allocates terminals, and `/nix` for the baked devshell. There are no network rules.
 
-Your `--policy` file is merged on top:
+Your `policy` file is merged on top:
 
 - `filesystem_policy`: each list is the union of both, without duplicates. A full filesystem section is always written, so your file can't drop what workmux needs.
 - `network_policies`: the rules of both. A rule name in both files is refused.
@@ -259,10 +261,6 @@ Your `--policy` file is merged on top:
 `workmux remote status api` shows the sandbox's effective policy (read-only and read-write paths, workdir, network rules) and warns when it differs from the project's.
 
 When you edit the policy file, the next command brings a running sandbox in line. Network rules apply at once. Filesystem grants that are added take effect after `remote stop` and `remote start`. A grant that is removed needs `workmux remote recreate`, because OpenShell can't narrow a live sandbox's filesystem policy; workmux warns instead.
-
-## Registering an OpenShell remote yourself
-
-`workmux remote add NAME --transport openshell --target SANDBOX` registers an existing sandbox that you manage. workmux can start and stop it, but never creates it, and `remote rm` only unregisters it. To have workmux create and own the sandbox, use `project add openshell` instead.
 
 ## Troubleshooting
 

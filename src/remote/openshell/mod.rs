@@ -1018,7 +1018,7 @@ pub(super) mod tests {
             ),
             "{without}"
         );
-        assert!(!with.contains("--provider gh-login"), "{with}");
+        assert!(!with.contains("can only be fetched with"), "{with}");
     }
 
     #[test]

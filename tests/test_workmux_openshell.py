@@ -77,6 +77,27 @@ class Project:
         config.mkdir(parents=True, exist_ok=True)
         (config / "openshell").symlink_to(Path.home() / ".config" / "openshell")
 
+    def configure(self, origin: str, image: str, providers=()):
+        """A workstation repository named after the project, with `origin`,
+        whose `.workmux.yaml` puts it in an OpenShell sandbox of `image`
+        (ADR 0004); `providers` go in global config, the only place they
+        may be set. Commands run in it from now on."""
+        repo = self.env.tmp_path / "workstation" / self.name
+        repo.mkdir(parents=True)
+        self.env.run_command(["git", "init", "-q", "-b", "main"], cwd=repo)
+        self.env.run_command(["git", "remote", "add", "origin", origin], cwd=repo)
+        (repo / ".workmux.yaml").write_text(
+            "nerdfont: false\nsandbox:\n  enabled: true\n  backend: openshell\n"
+            f"  openshell:\n    image: {image}\n"
+        )
+        if providers:
+            config = self.env.home_path / ".config" / "workmux" / "config.yaml"
+            config.parent.mkdir(parents=True, exist_ok=True)
+            config.write_text(
+                f"sandbox:\n  openshell:\n    providers: [{', '.join(providers)}]\n"
+            )
+        self.repo = repo
+
     def wm(self, command: str, expect_fail=False, timeout=60.0, stdin=None):
         return run_workmux_command(
             self.env,
@@ -157,11 +178,7 @@ def project(mux_server, workmux_exe_path, repo_path, short_tmp):
 
 
 def add_project(project: Project):
-    added = project.wm(
-        f"project add openshell {project.name} --repo /sandbox/origin "
-        f"--image {LEARNING_IMAGE}"
-    )
-    assert "the sandbox is created on first use" in added.stdout
+    project.configure("/sandbox/origin", LEARNING_IMAGE)
     started = project.wm(f"remote start {project.name}", timeout=600.0)
     assert f"Creating remote {project.name} on first use" in started.stderr
     assert project.phase() == "Ready"
@@ -255,8 +272,6 @@ def test_an_openshell_project_lives_stops_resumes_and_is_removed_with_its_sandbo
     removed = project.wm(f"remote rm {project.name} --yes", timeout=300.0)
     assert "Deleted sandbox" in removed.stdout
     assert project.phase() is None
-    config = (env.home_path / ".config" / "workmux" / "config.yaml").read_text()
-    assert project.name not in config
 
 
 def test_a_recreate_carries_a_worktree_and_its_commit_across(project: Project):
@@ -333,18 +348,12 @@ def test_an_openshell_projects_sandbox_runs_claude_code(project: Project):
     claude-code provider profile expects it, and `add` starts it in the
     sandbox with no credentials attached."""
     env = project.env
-    added = project.wm(
-        f"project add openshell {project.name} --repo /sandbox/origin "
-        f"--image {LEARNING_IMAGE}"
-    )
-    assert "Agent claude: installed at /usr/local/bin/claude" in added.stdout, (
-        added.stdout
-    )
+    project.configure("/sandbox/origin", LEARNING_IMAGE)
+    started = project.wm(f"remote start {project.name}", timeout=900.0)
     assert (
         "no provider attached to the sandbox has a profile that allows /usr/local/bin/claude"
-        in added.stderr
-    ), added.stderr
-    project.wm(f"remote start {project.name}", timeout=900.0)
+        in started.stderr
+    ), started.stderr
     # A project with no panes of its own: its agent pane runs the agent.
     project.sh(
         "set -e; mkdir -p /sandbox/origin; git -C /sandbox/origin init -q -b main; "
@@ -433,21 +442,18 @@ def github_provider(project: Project):
 def test_a_private_ssh_github_repo_clones_over_https_with_the_providers_credentials(
     project: Project, github_provider: str
 ):
-    """An SSH `--repo` on github.com is rewritten to HTTPS, visibly; the
+    """An SSH origin on github.com is rewritten to HTTPS, visibly; the
     image's credential helper hands git the provider's placeholder, so the
     first-use clone of a private repository succeeds, and SSH GitHub URLs
     typed in the sandbox go over HTTPS too."""
     ssh = f"git@github.com:{PRIVATE_REPO}.git"
     https = f"https://github.com/{PRIVATE_REPO}.git"
-    added = project.wm(
-        f"project add openshell {project.name} --repo {ssh} "
-        f"--image {LEARNING_IMAGE} --provider {github_provider}"
-    )
+    project.configure(ssh, LEARNING_IMAGE, providers=[github_provider])
+    started = project.wm(f"remote start {project.name}", timeout=900.0)
     assert (
-        "`--repo` uses SSH, which OpenShell sandboxes don't support; the sandbox "
+        "The repository's origin uses SSH, which OpenShell sandboxes don't support; the sandbox "
         f"reaches github.com over HTTPS with `{github_provider}` credentials instead."
-    ) in added.stdout, added.stdout
-    project.wm(f"remote start {project.name}", timeout=900.0)
+    ) in started.stderr, started.stderr
 
     listed = project.wm(f"list --project {project.name}", timeout=300.0)
     assert (
@@ -521,19 +527,16 @@ def gh_login(project: Project):
 def test_a_projects_sandbox_gets_the_workstations_gh_login(
     project: Project, gh_login: Path
 ):
-    """`--provider gh-login` needs only a `gh` login: workmux keeps its token
+    """Provider `gh-login` needs only a `gh` login: workmux keeps its token
     in that gateway provider, of its own full-access profile, so the
     first-use clone of a private repository succeeds and push is
     authorised."""
     https = f"https://github.com/{PRIVATE_REPO}.git"
-    added = project.wm(
-        f"project add openshell {project.name} --provider gh-login --repo {https} "
-        f"--image {LEARNING_IMAGE}"
-    )
+    project.configure(https, LEARNING_IMAGE, providers=["gh-login"])
+    started = project.wm(f"remote start {project.name}", timeout=900.0)
     assert "provider gh-login gives the sandbox your gh login's GitHub access" in (
-        added.stdout
-    ), added.stdout
-    project.wm(f"remote start {project.name}", timeout=900.0)
+        started.stderr
+    ), started.stderr
     project.wm(f"list --project {project.name}", timeout=300.0)
 
     assert project.sh(f"git -C /sandbox/{project.name} rev-parse --verify HEAD")
@@ -548,12 +551,11 @@ def test_a_projects_sandbox_gets_the_workstations_gh_login(
 
 
 def add_gh_login_project(project: Project):
-    """A `--provider gh-login` project of the private repository, from an
-    image with `gh`, cloned and ready."""
+    """A `gh-login` project of the private repository, from an image with
+    `gh`, cloned and ready."""
     build_gh_image()
-    project.wm(
-        f"project add openshell {project.name} --provider gh-login "
-        f"--repo https://github.com/{PRIVATE_REPO}.git --image {GH_IMAGE}"
+    project.configure(
+        f"https://github.com/{PRIVATE_REPO}.git", GH_IMAGE, providers=["gh-login"]
     )
     project.wm(f"remote start {project.name}", timeout=900.0)
     project.wm(f"list --project {project.name}", timeout=300.0)
