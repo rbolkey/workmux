@@ -203,12 +203,12 @@ pub fn installed_workmux() -> Option<PathBuf> {
 /// finds it. Written beside `dest` and moved there, so a failed copy
 /// leaves the earlier one.
 pub fn install_workmux(binary: &Path, dest: &Path) -> Result<()> {
-    let dir = dest.parent().context("The Linux workmux has no directory")?;
-    std::fs::create_dir_all(dir)
-        .with_context(|| format!("Failed to create {}", dir.display()))?;
+    let dir = dest
+        .parent()
+        .context("The Linux workmux has no directory")?;
+    std::fs::create_dir_all(dir).with_context(|| format!("Failed to create {}", dir.display()))?;
     let tmp = dir.join(format!(".workmux.{}", std::process::id()));
-    std::fs::copy(binary, &tmp)
-        .with_context(|| format!("Failed to copy {}", binary.display()))?;
+    std::fs::copy(binary, &tmp).with_context(|| format!("Failed to copy {}", binary.display()))?;
     std::fs::rename(&tmp, dest).with_context(|| format!("Failed to install {}", dest.display()))
 }
 
@@ -1179,7 +1179,9 @@ mod contract {
     fn installed() -> PathBuf {
         let installed = installed_workmux();
         linux_workmux(installed.as_deref())
-            .expect("the contract tests run the Linux workmux `workmux sandbox install-dev` installs")
+            .expect(
+                "the contract tests run the Linux workmux `workmux sandbox install-dev` installs",
+            )
             .to_path_buf()
     }
 
