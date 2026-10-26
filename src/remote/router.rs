@@ -138,9 +138,9 @@ fn invoking_project_tag() -> Option<String> {
 /// The project tag in a `<window tag>\t<session tag>` line: the window's,
 /// else the session's.
 fn project_tag_of(tags: &str) -> Option<String> {
-    let (window, session) = tags.trim_end_matches('\n').split_once('\t')?;
-    [window, session]
-        .into_iter()
+    // The query may come back trimmed, losing the tab before a session
+    // tag when the window has none.
+    tags.split('\t')
         .map(str::trim)
         .find(|tag| !tag.is_empty())
         .map(str::to_string)
@@ -880,6 +880,7 @@ agents:
             project_tag_of("\tdevbox:web\n").as_deref(),
             Some("devbox:web")
         );
+        assert_eq!(project_tag_of("devbox:web").as_deref(), Some("devbox:web"));
         assert_eq!(project_tag_of("\t\n"), None);
     }
 

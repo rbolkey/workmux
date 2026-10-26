@@ -271,7 +271,8 @@ def test_remote_project_is_cloned_on_first_use_and_answers_list_and_path(
         listing = wm("list", cwd=workstation)
         assert clone.joinpath(".git").is_dir()
         assert "Cloning" in listing.stderr
-        header, main_row = listing.stdout.splitlines()[:2]
+        target, header, main_row = listing.stdout.splitlines()[:3]
+        assert target == "Worktrees in remote lb (project api)"
         assert header.split()[:2] == ["PROJECT", "BRANCH"]
         assert main_row.split()[:2] == ["api@lb", "main"]
 
@@ -965,7 +966,9 @@ def test_a_prompt_file_is_read_on_the_workstation_for_a_remote_project(
             "pid"
         ]
         env.tmux(["select-window", "-t", env.runner_pane_id or "test:0"])
-        (repo_path / "prompt.md").write_text("Use the workstation's prompt\n")
+        (clone_of(env, "api") / "prompt.md").write_text(
+            "Use the workstation's prompt\n"
+        )
         (clone / "prompt.md").write_text("Not the remote's prompt\n")
 
         wm("add feature -P prompt.md --prompt-file-only", cwd=clone_of(env, "api"))
