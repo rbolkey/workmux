@@ -19,7 +19,7 @@ from pathlib import Path
 
 import pytest
 
-from .conftest import MuxEnvironment, TmuxEnvironment, run_workmux_command
+from .conftest import MuxEnvironment, TmuxEnvironment
 from .support.openshell import (
     GH_IMAGE,
     LEARNING_IMAGE,
@@ -32,6 +32,7 @@ from .test_workmux_remote import (
     agent_in,
     openshell_sandbox_name,
     remote_daemon_ping,
+    run_workmux_command,
     tmux_value,
     wait_until,
 )
@@ -238,7 +239,7 @@ def test_an_openshell_project_lives_stops_resumes_and_is_removed_with_its_sandbo
         daemon_pid = remote_daemon_ping(env, project.exe, project.repo, project.tmp)[
             "pid"
         ]
-        pane = tmux_value(env, f"={project.name}:wm-feature", "#{pane_id}")
+        pane = tmux_value(env, "=test:wm-feature", "#{pane_id}")
         feed = SidebarFeed(project.tmp["TMPDIR"])
         wait_until(
             lambda: (

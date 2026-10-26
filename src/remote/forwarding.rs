@@ -1210,7 +1210,6 @@ mod tests {
                 name: "api".to_string(),
                 path: project.display().to_string(),
                 git_url: None,
-                session: None,
             },
             argv: [
                 "sh".to_string(),
@@ -1225,6 +1224,7 @@ mod tests {
             invoking_window_token: None,
             prompt_file: None,
             env: Default::default(),
+            placement: Default::default(),
         };
         let (env, received) = mpsc::channel();
         let session = std::thread::spawn(move || {

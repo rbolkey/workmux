@@ -16,8 +16,7 @@ use super::git_url::GitUrl;
 use super::router::RemoteProject;
 use super::session::ProjectSite;
 use crate::config::{
-    Config, OpenshellRemote, ProjectPlacement, RemoteConfig, SandboxBackend, TransportKind,
-    openshell_sandbox_name,
+    Config, OpenshellRemote, RemoteConfig, SandboxBackend, TransportKind, openshell_sandbox_name,
 };
 use crate::multiplexer::{InvocationContext, TmuxBackend};
 use crate::project::{ProjectTag, RemoteProjectId};
@@ -228,16 +227,6 @@ fn project_in(config: &Config, root: &Path, origin: Option<&str>) -> Result<Remo
             )
         }
     };
-    let session = match config.project_placement.unwrap_or_default() {
-        ProjectPlacement::ProjectSession => Some(
-            config
-                .project_session
-                .clone()
-                .filter(|session| !session.trim().is_empty())
-                .unwrap_or_else(|| name.clone()),
-        ),
-        ProjectPlacement::CurrentSession => None,
-    };
     Ok(RemoteProject {
         root: root.to_path_buf(),
         site: ProjectSite {
@@ -245,7 +234,6 @@ fn project_in(config: &Config, root: &Path, origin: Option<&str>) -> Result<Remo
             name,
             path,
             git_url: Some(git_url),
-            session,
         },
         remote_config,
     })
@@ -354,7 +342,6 @@ mod tests {
         assert_eq!(project.site.name, "api");
         assert_eq!(project.site.remote, sandbox);
         assert_eq!(project.site.path, "~/api");
-        assert_eq!(project.site.session.as_deref(), Some("api"));
         let git_url = GitUrl {
             url: "https://github.com/me/api.git".to_string(),
             ssh: Some("git@github.com:me/api.git".to_string()),
@@ -380,10 +367,9 @@ mod tests {
     }
 
     #[test]
-    fn a_project_may_name_its_clone_path_and_session() {
+    fn a_project_may_name_its_clone_path() {
         let config = config(
-            "project_session: work\nsandbox:\n  enabled: true\n  backend: openshell\n  openshell:\n    \
-             path: src/api\n",
+            "sandbox:\n  enabled: true\n  backend: openshell\n  openshell:\n    path: src/api\n",
         );
 
         let project = project_in(
@@ -394,16 +380,6 @@ mod tests {
         .unwrap();
 
         assert_eq!(project.site.path, "src/api");
-        assert_eq!(project.site.session.as_deref(), Some("work"));
-
-        let config = self::config(&format!("project_placement: current-session\n{OPENSHELL}"));
-        let project = project_in(
-            &config,
-            Path::new("/src/api"),
-            Some("https://github.com/me/api.git"),
-        )
-        .unwrap();
-        assert_eq!(project.site.session, None);
     }
 
     #[test]

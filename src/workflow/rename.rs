@@ -109,8 +109,8 @@ pub fn rename(
     let old_full = prefixed(&context.prefix, &old_handle);
     let new_full = prefixed(&context.prefix, &new_handle);
     let mux_running = context.mux.is_running().unwrap_or(false);
-    // A window placed in another session (a remote project's session, say)
-    // is looked up there rather than in the current session.
+    // A window placed in another session (with --parent-session) is looked
+    // up there rather than in the current session.
     let window_session = git::get_worktree_window_session(&old_handle);
     let window_names = || match &window_session {
         Some(session) => context.mux.get_window_names_in_session(session),

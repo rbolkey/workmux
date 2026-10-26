@@ -205,6 +205,7 @@ pub fn request<T: DeserializeOwned>(
             &socket,
             DAEMON_METHOD,
             serde_json::json!({
+                "root": project.root,
                 "remote": project.site.remote,
                 "project": project.site.name,
                 "request": request,
@@ -254,7 +255,6 @@ mod tests {
             name: "api".to_string(),
             path: clone.display().to_string(),
             git_url: None,
-            session: None,
         }
     }
 
