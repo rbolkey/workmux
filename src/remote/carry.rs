@@ -32,8 +32,9 @@ pub struct AtRisk {
     /// Commits on no remote-tracking branch: unpushed, and unmerged into
     /// anything pushed.
     pub unpushed: usize,
-    /// The project's base branch, when the branch has commits not merged
-    /// into it (pushed or not).
+    /// The branch's base (the one `workmux add` stored for it, else the
+    /// default branch), when the branch has commits not merged into it
+    /// (pushed or not), as `workmux remove` decides.
     #[serde(default)]
     pub unmerged_into: Option<String>,
 }
@@ -163,7 +164,7 @@ fn unpushed(clone: &Path, rev: &str) -> Result<usize> {
 }
 
 /// Every worktree and branch of the clone at `clone` whose work exists
-/// only here, or is not merged into the project's base branch.
+/// only here, or is not merged into its base.
 pub fn at_risk(clone: &Path) -> Result<Vec<AtRisk>> {
     let worktrees = worktrees(clone)?;
     // As `workmux remove` decides, so remove, rebuild and prune agree.
