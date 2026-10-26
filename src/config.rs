@@ -1757,6 +1757,14 @@ pub enum SandboxBackend {
     Loopback,
 }
 
+impl SandboxBackend {
+    /// Whether the backend puts the project on a remote, a sandbox of its
+    /// own, rather than wrapping its panes in a container or Lima VM.
+    pub fn is_remote(&self) -> bool {
+        matches!(self, SandboxBackend::Openshell | SandboxBackend::Loopback)
+    }
+}
+
 /// Container runtime for sandbox
 #[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[serde(rename_all = "lowercase")]
@@ -2625,12 +2633,7 @@ impl SandboxConfig {
     /// enabled with one: OpenShell, or the hidden loopback backend.
     pub fn remote_backend(&self) -> Option<SandboxBackend> {
         let backend = self.backend();
-        (self.enabled.unwrap_or(false)
-            && matches!(
-                backend,
-                SandboxBackend::Openshell | SandboxBackend::Loopback
-            ))
-        .then_some(backend)
+        (self.enabled.unwrap_or(false) && backend.is_remote()).then_some(backend)
     }
 
     pub fn backend(&self) -> SandboxBackend {

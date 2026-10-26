@@ -1217,12 +1217,7 @@ pub fn run() -> Result<()> {
                 config.as_deref(),
             )
         }
-        Commands::Close { name } => {
-            if let Some(project) = crate::remote::router::resolve()? {
-                return crate::remote::router::relay(&project);
-            }
-            command::close::run(name.as_deref())
-        }
+        Commands::Close { name } => here_or_relayed(|| command::close::run(name.as_deref())),
         Commands::Resurrect { dry_run } => command::resurrect::run(dry_run),
         Commands::Merge {
             name,
@@ -1235,10 +1230,7 @@ pub fn run() -> Result<()> {
             no_verify,
             no_hooks,
             notification,
-        } => {
-            if let Some(project) = crate::remote::router::resolve()? {
-                return crate::remote::router::relay(&project);
-            }
+        } => here_or_relayed(|| {
             command::merge::run(
                 name.as_deref(),
                 into.as_deref(),
@@ -1251,30 +1243,17 @@ pub fn run() -> Result<()> {
                 no_hooks,
                 notification,
             )
-        }
-        Commands::Rebase { name } => {
-            if let Some(project) = crate::remote::router::resolve()? {
-                return crate::remote::router::relay(&project);
-            }
-            command::rebase::run(name.as_deref())
-        }
+        }),
+        Commands::Rebase { name } => here_or_relayed(|| command::rebase::run(name.as_deref())),
         Commands::Remove {
             names,
             gone,
             all,
             force,
             keep_branch,
-        } => {
-            if let Some(project) = crate::remote::router::resolve()? {
-                return crate::remote::router::relay(&project);
-            }
-            command::remove::run(names, gone, all, force, keep_branch)
-        }
+        } => here_or_relayed(|| command::remove::run(names, gone, all, force, keep_branch)),
         Commands::Rename { names, branch } => {
-            if let Some(project) = crate::remote::router::resolve()? {
-                return crate::remote::router::relay(&project);
-            }
-            command::rename::run(names, branch)
+            here_or_relayed(|| command::rename::run(names, branch))
         }
         Commands::List {
             pr,
@@ -1305,28 +1284,13 @@ pub fn run() -> Result<()> {
             background,
             keep,
             timeout,
-        } => {
-            if let Some(project) = crate::remote::router::resolve()? {
-                return crate::remote::router::relay(&project);
-            }
-            command::run::run(&name, command, background, keep, timeout)
-        }
+        } => here_or_relayed(|| command::run::run(&name, command, background, keep, timeout)),
         Commands::ReapAgents { hours, force } => {
             command::reap_agents::run(hours.saturating_mul(3600), force)
         }
         Commands::Exec { run_dir } => command::exec::run(&run_dir),
-        Commands::SyncFiles { all } => {
-            if let Some(project) = crate::remote::router::resolve()? {
-                return crate::remote::router::relay(&project);
-            }
-            command::sync_files::run(all)
-        }
-        Commands::Init => {
-            if let Some(project) = crate::remote::router::resolve()? {
-                return crate::remote::router::relay(&project);
-            }
-            crate::config::Config::init()
-        }
+        Commands::SyncFiles { all } => here_or_relayed(|| command::sync_files::run(all)),
+        Commands::Init => here_or_relayed(crate::config::Config::init),
         Commands::Setup {
             hooks,
             skills,
@@ -1419,12 +1383,7 @@ pub fn run() -> Result<()> {
         Commands::Remote(args) => command::remote::run(args),
         Commands::SetWindowStatus { command } => command::set_window_status::run(command),
         Commands::RegisterAgent => command::set_window_status::register_agent(),
-        Commands::SetBase { base } => {
-            if let Some(project) = crate::remote::router::resolve()? {
-                return crate::remote::router::relay(&project);
-            }
-            command::set_base::run(&base)
-        }
+        Commands::SetBase { base } => here_or_relayed(|| command::set_base::run(&base)),
         Commands::LastDone => command::last_done::run(),
         Commands::LastAgent => command::last_agent::run(),
         Commands::HostExec { args } => {
@@ -1467,6 +1426,15 @@ pub fn run() -> Result<()> {
             Ok(())
         }
         Commands::CheckUpdate => command::update::run_background_check(),
+    }
+}
+
+/// Run `local`, the command on the workstation, unless the project it
+/// targets is on a remote: then relay the command there as typed.
+fn here_or_relayed(local: impl FnOnce() -> Result<()>) -> Result<()> {
+    match crate::remote::router::resolve()? {
+        Some(project) => crate::remote::router::relay(&project),
+        None => local(),
     }
 }
 

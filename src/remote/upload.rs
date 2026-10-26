@@ -227,7 +227,10 @@ mod tests {
             releases_for(true, Some("file:///releases".to_string())).as_deref(),
             Some("file:///releases")
         );
-        assert_eq!(releases_for(false, Some("file:///releases".to_string())), None);
+        assert_eq!(
+            releases_for(false, Some("file:///releases".to_string())),
+            None
+        );
     }
     use crate::remote::handshake::{Hello, PROTOCOL_VERSION, SENTINEL};
     use crate::remote::ssh::tests::{install_remote_workmux, serve_script, transport};

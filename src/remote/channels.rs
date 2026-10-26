@@ -62,7 +62,7 @@ impl Default for ChannelPolicy {
             tmux_socket: InvocationContext::current()
                 .tmux_socket_path()
                 .map(str::to_string),
-            still_tagged: still_tagged,
+            still_tagged,
             clipboard: crate::sandbox::clipboard::read_png_from_clipboard,
         }
     }
