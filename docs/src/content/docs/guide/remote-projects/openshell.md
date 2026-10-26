@@ -150,7 +150,7 @@ Not covered: SSH hosts other than github.com. For private nix flake inputs, in t
 workmux creates and starts the sandbox for you, and stops, rebuilds or deletes it only when you ask, with the [`workmux sandbox`](/reference/commands/sandbox/#openshell-commands) commands Lima VMs use.
 
 - **Create.** The first command that acts in the project, such as `workmux add`, builds the image, creates the sandbox and clones the repository, with the notice `Creating remote api on first use; …`.
-- **Start.** A command that acts in a stopped sandbox starts it first (`Starting remote api…`).
+- **Start.** A command that acts in a stopped sandbox starts it first (`Starting remote api...`).
 - **Never just to look.** Commands that only report never create or start a sandbox: `list`, `path`, `status`, `wait`, `sandbox status`, the sidebar and the dashboard. With no sandbox yet, they say `workmux add <branch>` creates it; with a stopped one, that the next command that needs it starts it. `resurrect` and `reap-agents` don't create or start one either; they skip it with a notice and don't count it as a failure.
 
 ```bash
@@ -158,13 +158,13 @@ workmux creates and starts the sandbox for you, and stops, rebuilds or deletes i
 workmux sandbox status   # the sandbox's state, versions, policy and agents
 workmux sandbox shell    # a shell in the sandbox, in the current worktree
 workmux sandbox stop     # stop sandboxes; their workspaces survive
-workmux sandbox rebuild  # delete and recreate, carrying committed work across
+workmux sandbox rebuild  # delete and create again, carrying committed work across
 workmux sandbox prune    # delete workmux's sandboxes, after naming the work they hold
 ```
 
 **Stopping ends every process in the sandbox**, agents included. The worktrees and status files survive, but agents do not: once the sandbox starts again, workstation panes find their remote panes ended and close. There is no start command; the next command that needs the sandbox, such as `workmux open`, starts it. Reopen the worktree with `workmux open`.
 
-`stop` and `prune` act on every sandbox whose name has workmux's `wm-` prefix, and on no other: a sandbox named by an older workmux, without the prefix, is no longer found, and the next command in its repository creates a `wm-` one. Delete the old one with `openshell sandbox delete <name>` once its work is pushed.
+Run `stop` and `prune` in a repository whose config puts it in an OpenShell sandbox: there they act on OpenShell sandboxes, and anywhere else on Lima VMs, as they always have, even when the repository's config fails to load. They act on every sandbox whose name has workmux's `wm-` prefix, and on no other: a sandbox named by an older workmux, without the prefix, is no longer found, and the next command in its repository creates a `wm-` one. Delete the old one with `openshell sandbox delete <name>` once its work is pushed.
 
 ### Deleting sandboxes
 
@@ -239,7 +239,7 @@ An OpenShell sandbox follows `sandbox.toolchain` as a Lima sandbox does. When it
 2. A `nixos/nix` build stage builds the devshell. The image gets nix, the devshell's closure and the flake's inputs, in a store under `/nix` that the sandbox user owns.
 3. A wrapper at `/usr/local/bin/workmux-devshell` enters the devshell. Agents start as `workmux-devshell bash -c '…'`, so they start at once, with nothing to build.
 
-`toolchain: off` gives a sandbox without nix, with `/nix` read-only and no nix network rules. So does `toolchain: devbox`, or `auto` when the repository has a `devbox.json`.
+`toolchain: off` gives a sandbox without nix, as it gives a Lima VM no flake environment: no devshell is baked, even with a `flake.nix` in the repository, `/nix` is read-only and there are no nix network rules. So does `toolchain: devbox`, or `auto` when the repository has a `devbox.json`.
 
 ### Working on the flake
 

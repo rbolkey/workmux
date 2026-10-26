@@ -87,6 +87,9 @@ pub fn project_name(
     }
 }
 
+/// The longest name workmux gives a project's Lima VM.
+const VM_NAME_MAX: usize = 30;
+
 /// Generate a unique instance name for a worktree based on isolation level.
 ///
 /// For project isolation, the name includes the project directory name for
@@ -105,8 +108,10 @@ pub fn instance_name(
         }
         IsolationLevel::Project => {
             let project_root = determine_project_root(worktree)?;
-            // Budget: "wm-" (3) + project (up to 18) + "-" (1) + hash (8) = 30 max
-            project_name(&project_root, 18, |key| hash_key(key, 8))
+            // "wm-" + project + "-" + hash8 within the limit.
+            project_name(&project_root, VM_NAME_MAX - "wm-".len() - 1 - 8, |key| {
+                hash_key(key, 8)
+            })
         }
     };
 

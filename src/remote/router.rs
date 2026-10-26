@@ -81,12 +81,10 @@ impl RemoteProject {
                 ),
             }),
             RemoteState::Stopped => {
-                let target = self.target();
-                let mut first = target.chars();
-                let target = first
-                    .next()
-                    .map(|c| c.to_uppercase().chain(first).collect::<String>())
-                    .unwrap_or_default();
+                let target = match self.remote_config.transport {
+                    crate::config::TransportKind::Openshell => self.target(),
+                    _ => format!("Remote {} (project {})", self.site.remote, self.site.name),
+                };
                 Some(format!(
                     "{target} is stopped; the next command that needs it, such as `workmux open`, starts it"
                 ))
@@ -356,10 +354,11 @@ fn sandbox_env(
 ) -> BTreeMap<String, String> {
     let config = &project.remote_config;
     config
-        .env_passthrough
+        .env
+        .passthrough
         .iter()
         .filter_map(|name| Some((name.clone(), workstation(name)?)))
-        .chain(config.env.clone())
+        .chain(config.env.vars.clone())
         .collect()
 }
 
@@ -810,7 +809,7 @@ mod tests {
     #[test]
     fn a_command_carries_the_workstation_values_of_the_variables_sandbox_env() {
         let mut project = api();
-        project.remote_config.env_passthrough =
+        project.remote_config.env.passthrough =
             ["GITHUB_TOKEN", "UNSET"].map(String::from).to_vec();
         let workstation = |name: &str| (name == "GITHUB_TOKEN").then(|| "ghp_x".to_string());
 
@@ -825,9 +824,9 @@ mod tests {
     #[test]
     fn a_command_carries_the_variables_config_sets_over_those_sandbox_env() {
         let mut project = api();
-        project.remote_config.env_passthrough =
+        project.remote_config.env.passthrough =
             ["API_URL", "GITHUB_TOKEN"].map(String::from).to_vec();
-        project.remote_config.env =
+        project.remote_config.env.vars =
             BTreeMap::from([("API_URL".to_string(), "https://api.test".to_string())]);
         let workstation = |name: &str| Some(format!("workstation {name}"));
 
@@ -983,6 +982,13 @@ agents:
             api.not_running(RemoteState::Stopped).as_deref(),
             Some(
                 "OpenShell sandbox wm-api (project api) is stopped; the next command that needs it, such as `workmux open`, starts it"
+            )
+        );
+        api.remote_config.transport = crate::config::TransportKind::Loopback;
+        assert_eq!(
+            api.not_running(RemoteState::Stopped).as_deref(),
+            Some(
+                "Remote devbox (project api) is stopped; the next command that needs it, such as `workmux open`, starts it"
             )
         );
     }

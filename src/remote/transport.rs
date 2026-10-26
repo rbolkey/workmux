@@ -101,12 +101,12 @@ pub fn ensure_running(
         RemoteState::Running => {}
         found if !start => return Ok(found),
         RemoteState::Stopped => {
-            notice(&format!("Starting remote {name}…"));
+            notice(&format!("Starting remote {name}..."));
             provisioning.start()?;
         }
         RemoteState::Missing => {
             notice(&format!(
-                "Creating remote {name} on first use; building its image can take a few minutes…"
+                "Creating remote {name} on first use; building its image can take a few minutes..."
             ));
             provisioning.create()?;
         }
@@ -512,7 +512,7 @@ mod tests {
         assert_eq!(
             notices,
             [
-                "Creating remote api on first use; building its image can take a few minutes…",
+                "Creating remote api on first use; building its image can take a few minutes...",
                 "Note: extra_mounts is ignored",
                 "updated the policy"
             ]
@@ -530,7 +530,7 @@ mod tests {
         assert_eq!(
             notices,
             [
-                "Starting remote api…",
+                "Starting remote api...",
                 "Note: extra_mounts is ignored",
                 "updated the policy"
             ]

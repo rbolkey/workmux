@@ -30,7 +30,7 @@ Lima commands:
 OpenShell commands:
   stop             Stop OpenShell sandboxes to free resources
   prune            Delete OpenShell sandboxes, refusing while one holds work
-  rebuild          Delete and recreate this repository's sandbox, keeping its committed work
+  rebuild          Delete this repository's sandbox and create it again, keeping its committed work
 
 General commands:
   status           Show this repository's sandbox
@@ -66,8 +66,8 @@ pub enum SandboxCommand {
         #[arg(short, long)]
         force: bool,
     },
-    /// Delete and recreate this repository's OpenShell sandbox from the current
-    /// image and config, carrying committed work on every branch across.
+    /// Delete this repository's OpenShell sandbox and create it again from the
+    /// current image and config, carrying committed work on every branch across.
     Rebuild {
         /// Don't ask for confirmation
         #[arg(short, long)]
@@ -184,14 +184,20 @@ pub fn run(args: SandboxArgs) -> Result<()> {
             release,
         } => run_install_dev(skip_build, release),
         SandboxCommand::Agent { command } => run_agent(command),
-        SandboxCommand::Prune { force } => match openshell_here()? {
-            true => super::sandbox_openshell::prune(force),
-            false => run_prune(force),
-        },
-        SandboxCommand::Stop { name, all, yes } => match openshell_here()? {
-            true => super::sandbox_openshell::stop(name, all, yes),
-            false => run_stop(name, all, yes),
-        },
+        SandboxCommand::Prune { force } => {
+            if config_puts_in_remote_sandbox() {
+                super::sandbox_openshell::prune(force)
+            } else {
+                run_prune(force)
+            }
+        }
+        SandboxCommand::Stop { name, all, yes } => {
+            if config_puts_in_remote_sandbox() {
+                super::sandbox_openshell::stop(name, all, yes)
+            } else {
+                run_stop(name, all, yes)
+            }
+        }
         SandboxCommand::Rebuild { yes } => {
             super::sandbox_openshell::rebuild(&super::sandbox_openshell::current_project()?, yes)
         }
@@ -200,11 +206,24 @@ pub fn run(args: SandboxArgs) -> Result<()> {
     }
 }
 
-/// Whether this repository's config puts it in an OpenShell sandbox, so
-/// `stop` and `prune` act on OpenShell's sandboxes rather than Lima's VMs.
-fn openshell_here() -> Result<bool> {
-    Ok(Config::load(None)?.sandbox.remote_backend()
-        == Some(crate::config::SandboxBackend::Openshell))
+/// Whether `config` puts the repository in a sandbox on a remote (OpenShell,
+/// or the hidden loopback backend), so the `sandbox` commands act on that
+/// sandbox rather than on Lima's VMs or the containers.
+fn in_remote_sandbox(config: &Config) -> bool {
+    config.sandbox.remote_backend().is_some()
+}
+
+/// [`in_remote_sandbox`] for `stop` and `prune`, which act on Lima's VMs
+/// without the repository's config: one that fails to load leaves them
+/// acting on Lima.
+fn config_puts_in_remote_sandbox() -> bool {
+    match Config::load(None) {
+        Ok(config) => in_remote_sandbox(&config),
+        Err(error) => {
+            debug!(error = %format!("{error:#}"), "config not loaded; acting on Lima's VMs");
+            false
+        }
+    }
 }
 
 /// `sandbox status`: the repository's sandbox, as its backend has it.
@@ -219,7 +238,7 @@ fn run_status() -> Result<()> {
         return Ok(());
     }
     let config = Config::load(None)?;
-    if config.sandbox.remote_backend().is_some() {
+    if in_remote_sandbox(&config) {
         let project = super::sandbox_openshell::current_project()?;
         if !super::sandbox_openshell::status(&project)? {
             std::process::exit(1);
@@ -243,24 +262,38 @@ fn run_status() -> Result<()> {
     Ok(())
 }
 
+/// A Lima VM as `sandbox status` finds it.
+enum LimaVm {
+    /// Lima lists it, with this status.
+    Listed(String),
+    NotCreated,
+    /// limactl is not installed.
+    Unknown,
+}
+
 /// The Lima VM `config` gives the repository at `cwd`: its name and state,
 /// its toolchain, and the mounts workmux gives it. Only lists VMs: never
 /// starts or creates one.
 fn lima_status(config: &Config, cwd: &Path) -> Result<Vec<String>> {
     let isolation = config.sandbox.lima.isolation();
     let name = lima::instance_name(cwd, isolation.clone(), config)?;
-    let state = if LimaInstance::is_lima_available() {
+    let vm = if !LimaInstance::is_lima_available() {
+        LimaVm::Unknown
+    } else {
         LimaInstance::list()?
             .into_iter()
             .find(|vm| vm.name == name)
-            .map(|vm| vm.status.to_lowercase())
-            .unwrap_or_else(|| {
-                "not created yet; the first command that needs it creates it".to_string()
+            .map_or(LimaVm::NotCreated, |vm| {
+                LimaVm::Listed(vm.status.to_lowercase())
             })
-    } else {
-        "unknown: limactl is not installed".to_string()
     };
-    let exists = !state.starts_with("not created") && !state.starts_with("unknown");
+    let state = match &vm {
+        LimaVm::Listed(status) => status.clone(),
+        LimaVm::NotCreated => {
+            "not created yet; the first command that needs it creates it".to_string()
+        }
+        LimaVm::Unknown => "unknown: limactl is not installed".to_string(),
+    };
     let project_root = lima::mounts::determine_project_root(cwd)?;
     let toolchain = match crate::sandbox::toolchain::resolve_toolchain(
         &config.sandbox.toolchain(),
@@ -284,7 +317,7 @@ fn lima_status(config: &Config, cwd: &Path) -> Result<Vec<String>> {
     ];
     // The mounts are made when the VM is created; their directories exist
     // only then.
-    if exists {
+    if matches!(vm, LimaVm::Listed(_)) {
         let agent = resolve_agent(config);
         let mounts = lima::mounts::generate_mounts(cwd, isolation, config, &name, agent)?;
         for (i, mount) in mounts.iter().enumerate() {

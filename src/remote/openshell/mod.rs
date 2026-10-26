@@ -55,6 +55,21 @@ pub struct Listed {
     pub phase: String,
 }
 
+impl Listed {
+    pub fn state(&self) -> RemoteState {
+        state_in(&self.phase)
+    }
+}
+
+/// The state of an existing sandbox in `phase`: running only once ready.
+fn state_in(phase: &str) -> RemoteState {
+    if phase == "Ready" {
+        RemoteState::Running
+    } else {
+        RemoteState::Stopped
+    }
+}
+
 /// The sandboxes on the gateway that workmux made, by its annotation.
 /// None when OpenShell is not installed.
 pub fn workmux_sandboxes() -> Result<Vec<Listed>> {
@@ -714,8 +729,7 @@ impl Provisioning for OpenShell {
     fn status(&self) -> Result<RemoteState> {
         Ok(match self.phase()? {
             Phase::Missing => RemoteState::Missing,
-            Phase::Is(phase) if phase == "Ready" => RemoteState::Running,
-            Phase::Is(_) => RemoteState::Stopped,
+            Phase::Is(phase) => state_in(&phase),
         })
     }
 
@@ -843,6 +857,20 @@ pub(super) mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn a_listed_sandbox_runs_only_in_phase_ready() {
+        let listed = |phase: &str| Listed {
+            name: "wm-api".to_string(),
+            project: "api".to_string(),
+            path: "~/api".to_string(),
+            phase: phase.to_string(),
+        };
+
+        assert_eq!(listed("Ready").state(), RemoteState::Running);
+        assert_eq!(listed("Stopped").state(), RemoteState::Stopped);
+        assert_eq!(listed("Provisioning").state(), RemoteState::Stopped);
     }
     use std::os::unix::fs::PermissionsExt;
 

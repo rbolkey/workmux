@@ -3042,6 +3042,36 @@ elif args[:2] == ["sandbox", "exec"]:
 
 
 @pytest.mark.tmux_only
+def test_stop_and_prune_act_on_lima_in_a_repository_whose_config_fails_to_load(
+    mux_server: MuxEnvironment,
+    workmux_exe_path: Path,
+    repo_path: Path,
+    short_tmp: dict,
+):
+    """`sandbox stop` and `sandbox prune` never needed the repository's
+    config for Lima's VMs: one that fails to load leaves them acting on
+    Lima, never on OpenShell. `limactl` and `openshell` are fakes on PATH
+    that log every call."""
+    env = mux_server
+    log = env.tmp_path / "calls"
+    for tool in ("limactl", "openshell"):
+        env.install_script(
+            env.fake_bin_dir / tool,
+            f"#!/bin/sh\nprintf '{tool} %s\\n' \"$*\" >> {log}\n",
+        )
+    (repo_path / ".workmux.yaml").write_text("sandbox: [not, a, mapping\n")
+
+    stopped = sandbox(env, workmux_exe_path, repo_path, "stop --all", short_tmp)
+    pruned = sandbox(env, workmux_exe_path, repo_path, "prune", short_tmp)
+
+    assert "No running workmux VMs found" in stopped.stdout
+    assert "VM" in pruned.stdout, pruned.stdout
+    calls = log.read_text().splitlines()
+    assert "limactl list --json" in calls, calls
+    assert not [call for call in calls if call.startswith("openshell")], calls
+
+
+@pytest.mark.tmux_only
 def test_a_command_for_every_project_checks_each_remotes_state_once(
     mux_server: MuxEnvironment,
     workmux_exe_path: Path,
@@ -3139,20 +3169,12 @@ def test_a_command_for_every_project_checks_each_remotes_state_once(
         shutil.rmtree(state, ignore_errors=True)
 
 
-@pytest.mark.tmux_only
-def test_read_only_commands_never_create_or_start_an_openshell_sandbox(
-    mux_server: MuxEnvironment,
-    workmux_exe_path: Path,
-    repo_path: Path,
-    short_tmp: dict,
-):
-    """In a repository whose config puts it in an OpenShell sandbox,
-    commands that only report (`sandbox status` among them) say the
-    sandbox doesn't exist yet, or is
-    stopped, and never create, start or build it. `openshell` and `docker`
-    are fakes on PATH that log every call."""
-    env = mux_server
-    state = env.tmp_path / "openshell"
+def reporting_gateway(env, state: Path):
+    """Fake `openshell` and `docker` on PATH that log every call into
+    `state`: `sandbox get` reports the phase in `state/phase` (no file: no
+    sandbox), `sandbox list` lists nothing and anything else fails, as
+    `docker` always does. Returns a function giving the `openshell`
+    subcommands called since it was last called."""
     state.mkdir()
     env.install_script(
         env.fake_bin_dir / "openshell",
@@ -3171,6 +3193,31 @@ esac
         env.fake_bin_dir / "docker",
         f"#!/bin/sh\nprintf '%s\\n' \"$*\" >> {state}/docker-log\nexit 1\n",
     )
+
+    def calls() -> set:
+        log = state / "log"
+        lines = log.read_text().splitlines() if log.exists() else []
+        log.unlink(missing_ok=True)
+        return {" ".join(line.split()[:2]) for line in lines}
+
+    return calls
+
+
+@pytest.mark.tmux_only
+def test_read_only_commands_never_create_or_start_an_openshell_sandbox(
+    mux_server: MuxEnvironment,
+    workmux_exe_path: Path,
+    repo_path: Path,
+    short_tmp: dict,
+):
+    """In a repository whose config puts it in an OpenShell sandbox,
+    commands that only report (`sandbox status` among them) say the
+    sandbox doesn't exist yet, or is
+    stopped, and never create, start or build it. `openshell` and `docker`
+    are fakes on PATH that log every call."""
+    env = mux_server
+    state = env.tmp_path / "openshell"
+    calls = reporting_gateway(env, state)
     clone = project_in_sandbox(
         env, workmux_exe_path, "trellis", env.tmp_path / "origin", short_tmp
     )
@@ -3186,12 +3233,6 @@ esac
             expect_fail=expect_fail,
             timeout=30.0,
         )
-
-    def calls() -> set:
-        log = state / "log"
-        lines = log.read_text().splitlines() if log.exists() else []
-        log.unlink(missing_ok=True)
-        return {" ".join(line.split()[:2]) for line in lines}
 
     # No sandbox yet.
     listed = wm("list")
@@ -3219,3 +3260,119 @@ esac
     assert calls() <= {"sandbox get", "sandbox list"}
     assert (state / "phase").read_text() == "Stopped"
     assert not (state / "docker-log").exists()
+
+
+@pytest.mark.tmux_only
+def test_capture_wait_and_the_dashboard_and_sidebar_never_create_or_start_an_openshell_sandbox(
+    mux_server: MuxEnvironment,
+    workmux_exe_path: Path,
+    repo_path: Path,
+    short_tmp: dict,
+):
+    """With an agent of the repository's OpenShell sandbox in the state
+    store, `capture`, `wait`, the sidebar's refresh of the agent's git status
+    and the dashboard's never create or start the sandbox, whether it
+    doesn't exist yet or is stopped. `openshell` and `docker` are fakes on
+    PATH that log every call."""
+    env = mux_server
+    assert isinstance(env, TmuxEnvironment)
+    control = Path(short_tmp["TMPDIR"])
+    state = env.tmp_path / "openshell"
+    calls = reporting_gateway(env, state)
+    clone = project_in_sandbox(
+        env, workmux_exe_path, "trellis", env.tmp_path / "origin", short_tmp
+    )
+    sandbox = openshell_sandbox_name(clone)
+
+    def wm(command, expect_fail=False):
+        return run_workmux_command(
+            env,
+            workmux_exe_path,
+            clone,
+            command,
+            pre_run_env=short_tmp,
+            expect_fail=expect_fail,
+            timeout=30.0,
+        )
+
+    # The sandbox's agent: a workstation pane that reported a status, filed
+    # as the agent of a remote pane in the sandbox.
+    agent = control / "agent.sh"
+    agent.write_text(
+        f"export PATH={shlex.quote(env.env['PATH'])} "
+        f"HOME={shlex.quote(str(env.home_path))}\n"
+        f"cd {clone} && {workmux_exe_path} set-window-status working"
+        f" && touch {control}/reported\n"
+        # Block in the shell itself, so the pane's command stays the agent's.
+        f"mkfifo {control}/hold && read _ < {control}/hold\n"
+    )
+    env.tmux(["new-window", "-d", "-t", "test:", "-n", "wm-feature", f"sh {agent}"])
+    wait_until(lambda: (control / "reported").exists(), "the agent's status")
+    env.tmux(
+        [
+            "set-option",
+            "-w",
+            "-t",
+            "=test:wm-feature",
+            "@workmux_project_window",
+            project_tag(env, sandbox, "trellis"),
+        ]
+    )
+    (agent_file,) = (state_dir(env) / "agents").glob("*.json")
+    entry = json.loads(agent_file.read_text())
+    entry["workdir"] = "/sandbox/trellis__worktrees/feature"
+    entry["remote"] = {
+        "remote": sandbox,
+        "pane": "trellis/feature/0",
+        "work_gen": 0,
+    }
+    agent_file.write_text(json.dumps(entry))
+    calls()
+
+    env.tmux(["new-window", "-d", "-t", "test:", "-n", "dash"])
+    env.tmux(["resize-window", "-t", "=test:dash", "-x", "220", "-y", "50"])
+    launch = control / "dashboard.sh"
+    launch.write_text(
+        f"export PATH={shlex.quote(env.env['PATH'])} "
+        f"HOME={shlex.quote(str(env.home_path))} "
+        f"TMPDIR={short_tmp['TMPDIR']} WORKMUX_TEST=1\n"
+        f"cd {clone}\n"
+        f"exec {workmux_exe_path} dashboard\n"
+    )
+
+    def screen() -> str:
+        return env.capture_pane("=test:dash") or ""
+
+    for phase in [None, "Stopped"]:
+        if phase:
+            (state / "phase").write_text(phase)
+
+        wm("capture feature")
+        wm("wait feature --timeout 1", expect_fail=True)
+        wm("wait other --timeout 1", expect_fail=True)
+
+        wm("sidebar on")
+        feed = SidebarFeed(short_tmp["TMPDIR"])
+        try:
+            feed.wait(
+                lambda s: any(a.get("remote") for a in s.get("agents", [])),
+                "the sandbox's agent in the sidebar",
+            )
+            # Longer than the sidebar's interval between remote git refreshes.
+            time.sleep(6)
+        finally:
+            feed.close()
+        wm("sidebar off")
+
+        env.send_keys("=test:dash", f"sh {launch}", enter=True)
+        wait_until(lambda: "feature" in screen(), "the agent in the dashboard")
+        time.sleep(3)
+        env.send_keys("=test:dash", "q", enter=False)
+        wait_until(lambda: "feature" not in screen(), "the dashboard to quit")
+
+        assert calls() <= {"sandbox get", "sandbox list"}
+        if phase:
+            assert (state / "phase").read_text() == phase
+        else:
+            assert not (state / "phase").exists()
+        assert not (state / "docker-log").exists()

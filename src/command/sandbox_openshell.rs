@@ -44,10 +44,6 @@ fn workmux_sandboxes() -> Result<Vec<Listed>> {
         .collect())
 }
 
-fn is_running(sandbox: &Listed) -> bool {
-    sandbox.phase == "Ready"
-}
-
 /// The sandbox `sandbox` names, with the current repository's settings when
 /// it is the current repository's: a sandbox started without them keeps its
 /// policy as it is.
@@ -67,10 +63,6 @@ fn lifecycle(transport: &dyn Transport) -> &dyn Provisioning {
         .expect("an OpenShell sandbox has a lifecycle")
 }
 
-fn print_notice(notice: &str) {
-    eprintln!("{notice}");
-}
-
 /// Read one line of input after `prompt`.
 fn read_answer(prompt: &str) -> Result<String> {
     print!("{prompt}");
@@ -86,7 +78,10 @@ fn read_answer(prompt: &str) -> Result<String> {
 /// those picked from a list that defaults to the current repository's.
 pub fn stop(name: Option<String>, all: bool, skip_confirm: bool) -> Result<()> {
     let sandboxes = workmux_sandboxes()?;
-    let running: Vec<&Listed> = sandboxes.iter().filter(|s| is_running(s)).collect();
+    let running: Vec<&Listed> = sandboxes
+        .iter()
+        .filter(|sandbox| sandbox.state() == RemoteState::Running)
+        .collect();
 
     let to_stop: Vec<&Listed> = if all {
         if running.is_empty() {
@@ -96,7 +91,7 @@ pub fn stop(name: Option<String>, all: bool, skip_confirm: bool) -> Result<()> {
         running
     } else if let Some(name) = &name {
         match sandboxes.iter().find(|sandbox| sandbox.name == *name) {
-            Some(sandbox) if is_running(sandbox) => vec![sandbox],
+            Some(sandbox) if sandbox.state() == RemoteState::Running => vec![sandbox],
             Some(sandbox) => {
                 println!(
                     "Sandbox '{name}' is already stopped (phase: {}).",
@@ -239,7 +234,7 @@ impl Candidate {
 
     fn stop_again(&self) {
         if self.started {
-            eprintln!("Stopping sandbox {} again…", self.sandbox.name);
+            eprintln!("Stopping sandbox {} again...", self.sandbox.name);
             if let Err(error) = lifecycle(self.transport.as_ref()).stop() {
                 eprintln!(
                     "warning: sandbox {} was left running: {error:#}",
@@ -406,9 +401,9 @@ pub fn prune(force: bool) -> Result<()> {
 fn check(candidate: &mut Candidate) {
     let name = &candidate.sandbox.name;
     let provisioning = lifecycle(candidate.transport.as_ref());
-    if !is_running(&candidate.sandbox) {
+    if candidate.sandbox.state() != RemoteState::Running {
         eprintln!(
-            "Starting sandbox {name} to check its worktrees for work that exists only there…"
+            "Starting sandbox {name} to check its worktrees for work that exists only there..."
         );
         if let Err(error) = provisioning.start() {
             tracing::warn!(sandbox = %name, error = %format!("{error:#}"), "starting a sandbox to check it");
@@ -455,14 +450,6 @@ fn openshell_only(project: &RemoteProject, what: &str) -> Result<()> {
     Ok(())
 }
 
-/// Ask `prompt`, unless `yes`.
-fn confirmed(prompt: &str, yes: bool) -> Result<bool> {
-    if yes {
-        return Ok(true);
-    }
-    crate::ui::confirm::confirm(prompt, crate::ui::confirm::ConfirmDefault::No)
-}
-
 /// The confirmation for rebuilding `sandbox`, naming the work only it
 /// holds and the branches not merged into the project's base branch, which
 /// the rebuild carries across.
@@ -498,9 +485,14 @@ pub fn rebuild(project: &RemoteProject, yes: bool) -> Result<()> {
     // work; this one creates the sandbox if need be and restores it.
     let resuming = crate::remote::carry::has_kept_work(&keep);
     if provisioning.status()? == RemoteState::Missing && !resuming {
-        return ensure_running(name, transport.as_ref(), true, &mut print_notice).map(|_| ());
+        return ensure_running(name, transport.as_ref(), true, &mut |notice| {
+            eprintln!("{notice}")
+        })
+        .map(|_| ());
     }
-    ensure_running(name, transport.as_ref(), true, &mut print_notice)?;
+    ensure_running(name, transport.as_ref(), true, &mut |notice| {
+        eprintln!("{notice}")
+    })?;
     if !resuming && !yes {
         let risks = match crate::remote::carry::remote_at_risk(
             transport.as_ref(),
@@ -512,13 +504,13 @@ pub fn rebuild(project: &RemoteProject, yes: bool) -> Result<()> {
                 None
             }
         };
-        if !confirmed(
+        if !crate::ui::confirm::confirm(
             &rebuild_prompt(
                 &project.site.name,
                 &project.remote_config.target,
                 risks.as_deref(),
             ),
-            yes,
+            crate::ui::confirm::ConfirmDefault::No,
         )? {
             println!("Kept sandbox {name} as it is");
             return Ok(());
@@ -529,12 +521,12 @@ pub fn rebuild(project: &RemoteProject, yes: bool) -> Result<()> {
         &project.site.path,
         &keep,
         &mut || {
-            eprintln!("Deleting sandbox {}…", project.remote_config.target);
+            eprintln!("Deleting sandbox {}...", project.remote_config.target);
             provisioning.delete()?;
-            eprintln!("Creating sandbox {}…", project.remote_config.target);
+            eprintln!("Creating sandbox {}...", project.remote_config.target);
             provisioning.create()
         },
-        &mut print_notice,
+        &mut |notice| eprintln!("{notice}"),
     )
     .with_context(|| format!("Failed to rebuild sandbox {name}"))?;
     let hooks =

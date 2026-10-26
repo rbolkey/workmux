@@ -3,7 +3,7 @@ title: "sandbox"
 description: Manage sandbox backends and tooling
 ---
 
-Commands for managing sandbox functionality across container (Docker/Podman/Apple Container), Lima and OpenShell backends. `stop`, `prune`, `status` and `shell` act on the backend the current repository's config picks with `sandbox.backend`.
+Commands for managing sandbox functionality across container (Docker/Podman/Apple Container), Lima and OpenShell backends. `stop`, `prune`, `status` and `shell` act on the backend the current repository's config picks with `sandbox.backend`. `stop` and `prune` act on Lima VMs anywhere but an OpenShell repository, including one whose config fails to load.
 
 ## Container commands
 
@@ -152,7 +152,7 @@ Delete all these sandboxes? Their clones and worktrees are lost. [y/N]
 
 ### sandbox rebuild
 
-Delete and recreate the current repository's sandbox from the current image and config, carrying its committed work across. Refused while any worktree has uncommitted changes. On a sandbox that doesn't exist yet, it only creates it. See [Rebuilding a sandbox](/guide/remote-projects/openshell/#rebuilding-a-sandbox).
+Delete the current repository's sandbox and create it again from the current image and config, carrying its committed work across. Refused while any worktree has uncommitted changes. On a sandbox that doesn't exist yet, it only creates it. See [Rebuilding a sandbox](/guide/remote-projects/openshell/#rebuilding-a-sandbox).
 
 ```bash
 workmux sandbox rebuild [-y]
