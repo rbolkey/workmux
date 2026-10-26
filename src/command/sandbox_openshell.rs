@@ -44,10 +44,6 @@ fn workmux_sandboxes() -> Result<Vec<Listed>> {
         .collect())
 }
 
-fn is_running(sandbox: &Listed) -> bool {
-    sandbox.phase == "Ready"
-}
-
 /// The sandbox `sandbox` names, with the current repository's settings when
 /// it is the current repository's: a sandbox started without them keeps its
 /// policy as it is.
@@ -82,7 +78,10 @@ fn read_answer(prompt: &str) -> Result<String> {
 /// those picked from a list that defaults to the current repository's.
 pub fn stop(name: Option<String>, all: bool, skip_confirm: bool) -> Result<()> {
     let sandboxes = workmux_sandboxes()?;
-    let running: Vec<&Listed> = sandboxes.iter().filter(|s| is_running(s)).collect();
+    let running: Vec<&Listed> = sandboxes
+        .iter()
+        .filter(|sandbox| sandbox.state() == RemoteState::Running)
+        .collect();
 
     let to_stop: Vec<&Listed> = if all {
         if running.is_empty() {
@@ -92,7 +91,7 @@ pub fn stop(name: Option<String>, all: bool, skip_confirm: bool) -> Result<()> {
         running
     } else if let Some(name) = &name {
         match sandboxes.iter().find(|sandbox| sandbox.name == *name) {
-            Some(sandbox) if is_running(sandbox) => vec![sandbox],
+            Some(sandbox) if sandbox.state() == RemoteState::Running => vec![sandbox],
             Some(sandbox) => {
                 println!(
                     "Sandbox '{name}' is already stopped (phase: {}).",
@@ -402,7 +401,7 @@ pub fn prune(force: bool) -> Result<()> {
 fn check(candidate: &mut Candidate) {
     let name = &candidate.sandbox.name;
     let provisioning = lifecycle(candidate.transport.as_ref());
-    if !is_running(&candidate.sandbox) {
+    if candidate.sandbox.state() != RemoteState::Running {
         eprintln!(
             "Starting sandbox {name} to check its worktrees for work that exists only there..."
         );

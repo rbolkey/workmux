@@ -262,24 +262,38 @@ fn run_status() -> Result<()> {
     Ok(())
 }
 
+/// A Lima VM as `sandbox status` finds it.
+enum LimaVm {
+    /// Lima lists it, with this status.
+    Listed(String),
+    NotCreated,
+    /// limactl is not installed.
+    Unknown,
+}
+
 /// The Lima VM `config` gives the repository at `cwd`: its name and state,
 /// its toolchain, and the mounts workmux gives it. Only lists VMs: never
 /// starts or creates one.
 fn lima_status(config: &Config, cwd: &Path) -> Result<Vec<String>> {
     let isolation = config.sandbox.lima.isolation();
     let name = lima::instance_name(cwd, isolation.clone(), config)?;
-    let state = if LimaInstance::is_lima_available() {
+    let vm = if !LimaInstance::is_lima_available() {
+        LimaVm::Unknown
+    } else {
         LimaInstance::list()?
             .into_iter()
             .find(|vm| vm.name == name)
-            .map(|vm| vm.status.to_lowercase())
-            .unwrap_or_else(|| {
-                "not created yet; the first command that needs it creates it".to_string()
+            .map_or(LimaVm::NotCreated, |vm| {
+                LimaVm::Listed(vm.status.to_lowercase())
             })
-    } else {
-        "unknown: limactl is not installed".to_string()
     };
-    let exists = !state.starts_with("not created") && !state.starts_with("unknown");
+    let state = match &vm {
+        LimaVm::Listed(status) => status.clone(),
+        LimaVm::NotCreated => {
+            "not created yet; the first command that needs it creates it".to_string()
+        }
+        LimaVm::Unknown => "unknown: limactl is not installed".to_string(),
+    };
     let project_root = lima::mounts::determine_project_root(cwd)?;
     let toolchain = match crate::sandbox::toolchain::resolve_toolchain(
         &config.sandbox.toolchain(),
@@ -303,7 +317,7 @@ fn lima_status(config: &Config, cwd: &Path) -> Result<Vec<String>> {
     ];
     // The mounts are made when the VM is created; their directories exist
     // only then.
-    if exists {
+    if matches!(vm, LimaVm::Listed(_)) {
         let agent = resolve_agent(config);
         let mounts = lima::mounts::generate_mounts(cwd, isolation, config, &name, agent)?;
         for (i, mount) in mounts.iter().enumerate() {

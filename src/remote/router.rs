@@ -81,12 +81,10 @@ impl RemoteProject {
                 ),
             }),
             RemoteState::Stopped => {
-                let target = self.target();
-                let mut first = target.chars();
-                let target = first
-                    .next()
-                    .map(|c| c.to_uppercase().chain(first).collect::<String>())
-                    .unwrap_or_default();
+                let target = match self.remote_config.transport {
+                    crate::config::TransportKind::Openshell => self.target(),
+                    _ => format!("Remote {} (project {})", self.site.remote, self.site.name),
+                };
                 Some(format!(
                     "{target} is stopped; the next command that needs it, such as `workmux open`, starts it"
                 ))
@@ -984,6 +982,13 @@ agents:
             api.not_running(RemoteState::Stopped).as_deref(),
             Some(
                 "OpenShell sandbox wm-api (project api) is stopped; the next command that needs it, such as `workmux open`, starts it"
+            )
+        );
+        api.remote_config.transport = crate::config::TransportKind::Loopback;
+        assert_eq!(
+            api.not_running(RemoteState::Stopped).as_deref(),
+            Some(
+                "Remote devbox (project api) is stopped; the next command that needs it, such as `workmux open`, starts it"
             )
         );
     }
