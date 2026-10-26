@@ -40,8 +40,8 @@ pub(crate) fn release_source() -> Option<String> {
 fn require_release_source(source: Option<String>) -> Result<String> {
     source.with_context(|| {
         format!(
-            "Updates are not available for this build: it has no release source. \
-             Set {RELEASES_URL_VAR} to where its releases are published."
+            "Updates are not available for this build: it has no release source, so set \
+             {RELEASES_URL_VAR} to where its releases are published"
         )
     })
 }

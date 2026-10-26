@@ -717,6 +717,9 @@ mod tests {
                     ("XDG_STATE_HOME", temp.path()),
                     ("HOME", temp.path()),
                     ("PATH", std::path::Path::new(&path)),
+                    // No tmux server: closing windows never reaches a real one.
+                    ("TMUX", &temp.path().join("no-tmux")),
+                    ("TMUX_PANE", std::path::Path::new("%0")),
                 ],
             );
             let log = std::fs::read_to_string(temp.path().join("log")).unwrap_or_default();

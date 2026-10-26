@@ -1069,14 +1069,13 @@ impl<'de, K: WithdrawnKey> Deserialize<'de> for Withdrawn<K> {
 }
 
 /// How the workstation reaches a remote.
-#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum TransportKind {
     Ssh,
     Openshell,
     /// Runs remote workmux as a local child process rooted in the target
     /// directory. Stands in for a real remote in tests.
-    #[value(hide = true)]
     Loopback,
 }
 

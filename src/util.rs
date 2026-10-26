@@ -145,8 +145,8 @@ fn expand_tilde_with_home(path: &str, home: Option<&Path>) -> PathBuf {
 pub const PROJECT_PLACEHOLDER: &str = "{project}";
 
 /// Replace `{project}` in a template with the name of the project whose main
-/// worktree is `project_root`: its registered name for a remote project,
-/// else its directory name.
+/// worktree is `project_root`: the name of the remote project remote workmux
+/// runs this command for, else its directory name.
 pub fn expand_project_placeholder(template: &str, project_root: &Path) -> Result<String> {
     let project =
         crate::project::Project::at_main_worktree_root(project_root).ok_or_else(|| {
