@@ -46,7 +46,7 @@ The first command that needs the sandbox creates it, clones the repository from 
 
 A command acts on the project it runs in; there is no flag naming another project. Commands that act on a project (`add`, `open`, `close`, `remove`, `merge`, `list`, `path`, `run`, `rename`, `rebase`, `set-base`, `sync-files` and `init`, and plain worktree names given to `send`, `capture` and `wait`) find it in this order:
 
-1. the project of the tmux window, or else the session, you typed the command in. workmux tags each remote project's windows and session with the path of your clone, and reads the clone's config again for every command typed there, so a config change applies at once. If the config no longer puts the project in a sandbox, the window is no longer the project's; if the clone is gone, commands typed there fail and say so.
+1. the project of the tmux window, or else the session, you typed the command in. workmux tags each remote project's windows (and, in session mode, its sessions) with the path of your clone, and reads the clone's config again for every command typed there, so a config change applies at once. If the config no longer puts the project in a sandbox, the window is no longer the project's; if the clone is gone, commands typed there fail and say so.
 2. the repository of the current directory: its config decides whether the project is on the workstation or in a sandbox
 
 Outside any repository and any project window, they fail and tell you to run them inside a clone of the repository. A command relayed to a sandbox says so once (`Running in OpenShell sandbox wm-api (project api)`), and `list` names the sandbox in its first line.
@@ -59,15 +59,9 @@ A remote project is named after its repository: the directory name of your clone
 
 ## Where the windows go
 
-In window mode, a remote project's windows go in a workstation session named after the project, whichever session you typed the command in. workmux creates the session if it is missing and adopts it if you already made one with that name.
+A remote project's windows go where a local project's do. In window mode, the default, a new window opens in the session you typed the command in, after the current window, and takes focus. `mode`, `window_placement` and `default_session` work as for any project: see [Configuration](/guide/configuration/#basic-options) and [session mode](/guide/session-mode/).
 
-| Setting                              | Effect                                                                                  |
-| ------------------------------------ | --------------------------------------------------------------------------------------- |
-| `project_session: NAME`              | Use session `NAME` instead of the project name                                          |
-| `project_placement: current-session` | Put windows in the session you ran the command from, as for projects on the workstation |
-| `--mode session` on `add`            | A session per worktree, as in [session mode](/guide/session-mode/)                      |
-
-Set them in the repository's `.workmux.yaml` or in global config; the project's value wins, as for any other setting. Everything else, including `mode`, comes from the `.workmux.yaml` in the sandbox's clone.
+workmux reads these three settings from your global config on the workstation and from the `.workmux.yaml` in the sandbox's clone; the project's value wins, as for any other setting. Everything else comes from the `.workmux.yaml` in the sandbox's clone.
 
 ## Commands typed in a remote pane
 

@@ -629,7 +629,7 @@ mod tests {
     }
 
     #[test]
-    fn a_new_project_session_is_tagged_and_its_window_attaches_to_the_remote_pane() {
+    fn a_new_session_is_tagged_and_its_window_attaches_to_the_remote_pane() {
         let Some(ws) = Workstation::start() else {
             return;
         };
@@ -859,7 +859,7 @@ mod tests {
         };
         create("api", "api");
         let web = create("web", "web");
-        // The user's own window in the project's session.
+        // The user's own window in a session-mode worktree's session.
         let own = ws.server.new_window("api");
 
         let closed = close_project_windows(&ws.server_tmux(), "devbox", "api").unwrap();

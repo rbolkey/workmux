@@ -85,7 +85,7 @@ fn resolve_target(name: &str, mux: &dyn crate::multiplexer::Multiplexer) -> Resu
 /// A remote project's worktree that exists on its remote, for a target
 /// whose agent the state store does not know yet: `project:handle` naming a
 /// remote project (or `project@remote:handle`), or a plain handle typed in a
-/// remote project's session.
+/// remote project's window or session.
 fn unstarted_remote_target(name: &str) -> Result<Option<WaitTarget>> {
     let (qualifier, handle) = match name.split_once(':') {
         Some((project, handle)) if !project.is_empty() && !handle.is_empty() => {
