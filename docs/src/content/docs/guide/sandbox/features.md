@@ -191,7 +191,7 @@ During development, the macOS host binary cannot run inside Linux containers or 
 rustup target add aarch64-unknown-linux-gnu
 brew install messense/macos-cross-toolchains/aarch64-unknown-linux-gnu
 
-# Cross-compile and install into containers and running VMs
+# Cross-compile and install into containers, running VMs and OpenShell images
 workmux sandbox install-dev
 
 # After code changes, rebuild and reinstall
@@ -204,4 +204,4 @@ workmux sandbox install-dev --release
 workmux sandbox install-dev --skip-build
 ```
 
-For containers, this builds a thin overlay image (`FROM <image>` + `COPY workmux`) on top of the configured sandbox image, replacing it in-place. For Lima VMs, the binary is installed to `~/.local/bin/workmux` inside each running VM.
+For containers, this builds a thin overlay image (`FROM <image>` + `COPY workmux`) on top of the configured sandbox image, replacing it in-place. For Lima VMs, the binary is installed to `~/.local/bin/workmux` inside each running VM. For OpenShell, it is kept at `~/.local/state/workmux/openshell/workmux`, and the next sandbox created or rebuilt gets it in its image.

@@ -1,9 +1,8 @@
 """End-to-end tests of OpenShell projects against a real gateway.
 
-Env-gated: `WORKMUX_TEST_OPENSHELL=1`. The workmux under test is a dev
-build, so workmux builds a Linux workmux from this checkout into the sandbox
-image; `WORKMUX_OPENSHELL_WORKMUX`, when set, points at a Linux build to use
-instead. Each test owns one `wm-e20-…` project and its sandbox
+Env-gated: `WORKMUX_TEST_OPENSHELL=1`. Sandbox images get a Linux workmux
+built from this checkout, installed where `workmux sandbox install-dev`
+installs it. Each test owns one `wm-e20-…` project and its sandbox
 (`wm-wm-e20-…`), and deletes the sandbox and the images built for it.
 """
 
@@ -25,6 +24,7 @@ from .support.openshell import (
     LEARNING_IMAGE,
     build_gh_image,
     build_learning_image,
+    install_linux_workmux,
     openshell,
 )
 from .test_workmux_remote import (
@@ -36,8 +36,6 @@ from .test_workmux_remote import (
     tmux_value,
     wait_until,
 )
-
-LINUX_WORKMUX = os.environ.get("WORKMUX_OPENSHELL_WORKMUX", "")
 
 pytestmark = [
     pytest.mark.skipif(
@@ -73,13 +71,13 @@ class Project:
         self.configured = False
         self.tmp = {
             **tmp,
-            **({"WORKMUX_OPENSHELL_WORKMUX": LINUX_WORKMUX} if LINUX_WORKMUX else {}),
             "DOCKER_CONFIG": str(Path.home() / ".docker"),
         }
         # The test's isolated HOME must still reach the user's gateway.
         config = env.home_path / ".config"
         config.mkdir(parents=True, exist_ok=True)
         (config / "openshell").symlink_to(Path.home() / ".config" / "openshell")
+        install_linux_workmux(Path(env.env["XDG_STATE_HOME"]))
 
     def configure(self, origin: str, image: str, providers=()):
         """A workstation repository named after the project, with `origin`,

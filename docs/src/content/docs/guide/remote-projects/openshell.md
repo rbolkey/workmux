@@ -197,16 +197,10 @@ workmux builds the sandbox image with `docker build` on the Docker daemon your O
 - **Agents:** every image gets the project's [agents](#agents-in-the-sandbox) that workmux can install.
 - **Your image (`image`):** used as the base as it is. It must contain git and dtach, because nothing can be installed in a running sandbox.
 
-Every image gets a workmux matching yours at `/usr/local/bin/workmux`:
-
-| Your workmux                       | The image gets                                                                         |
-| ---------------------------------- | -------------------------------------------------------------------------------------- |
-| `WORKMUX_OPENSHELL_WORKMUX` is set | That Linux binary, copied in                                                           |
-| A build from a source checkout     | A Linux workmux built from that checkout, uncommitted files included, in a build stage |
-| A release                          | The release of the same version, installed with workmux's install script               |
+Every image gets the Linux workmux that [`workmux sandbox install-dev`](/reference/commands/sandbox/#sandbox-install-dev) installed, at `/usr/local/bin/workmux`. Run it from your workmux checkout. It keeps one Linux workmux per user, under `~/.local/state/workmux/openshell/`, for every project's image. Run it again after changing workmux; the next sandbox created or rebuilt gets the new build, and a running sandbox keeps its workmux until `workmux sandbox rebuild`.
 
 :::caution
-Published workmux releases don't include remote support yet, so a release workmux gets an image whose workmux cannot serve the control channel. Until they do, build workmux from source, or point `WORKMUX_OPENSHELL_WORKMUX` at a Linux build.
+Published workmux releases don't include remote support yet, so workmux never installs one into a sandbox image. Without `install-dev`, creating or rebuilding a sandbox fails before building the image: "No workmux release for this build can serve OpenShell sandboxes yet; run `workmux sandbox install-dev`".
 :::
 
 ### Agents in the sandbox

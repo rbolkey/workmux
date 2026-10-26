@@ -1169,8 +1169,8 @@ mod tests {
 }
 
 /// Env-gated like the OpenShell contract tests (`WORKMUX_TEST_OPENSHELL=1`),
-/// but needing only Docker: the image's workmux is this workmux's version,
-/// whether it comes from the release or from this dev build's source.
+/// but needing only Docker and the Linux workmux `workmux sandbox
+/// install-dev` installed: the image runs it.
 #[cfg(test)]
 mod contract {
     use super::*;

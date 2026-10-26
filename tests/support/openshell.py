@@ -5,10 +5,13 @@ the fixture that created it; nothing here touches other sandboxes.
 """
 
 import functools
+import io
 import json
 import os
 import shutil
 import subprocess
+import tarfile
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -22,6 +25,7 @@ LEARNING_IMAGE = "wm-learn-openshell:latest"
 DEVSHELL_IMAGE = "wm-learn-devshell:latest"
 GH_IMAGE = "wm-learn-gh:latest"
 FIXTURE_DIR = Path(__file__).parent.parent / "fixtures" / "openshell"
+CHECKOUT = Path(__file__).parent.parent.parent
 READY_TIMEOUT = float(os.environ.get("WORKMUX_TEST_OPENSHELL_READY_TIMEOUT", "300"))
 
 requires_openshell = pytest.mark.skipif(
@@ -93,6 +97,65 @@ def build_gh_image() -> str:
         capture_output=True,
     )
     return GH_IMAGE
+
+
+# Builds this checkout's workmux as a static Linux binary: Alpine's Rust
+# targets musl, so it runs on any base image.
+LINUX_WORKMUX_DOCKERFILE = """\
+FROM docker.io/library/rust:1.98-alpine AS build
+RUN apk add --no-cache musl-dev
+COPY . /src
+WORKDIR /src
+RUN --mount=type=cache,id=workmux-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \\
+    --mount=type=cache,id=workmux-cargo-target,target=/target,sharing=locked \\
+    cargo build --locked --bin workmux --target-dir /target \\
+    && cp /target/debug/workmux /workmux
+FROM scratch
+COPY --from=build /workmux /workmux
+"""
+
+
+@functools.cache
+def build_linux_workmux() -> Path:
+    """This checkout's workmux, working tree included, built for Linux in
+    Docker: the workstation may have no cross-linker for `workmux sandbox
+    install-dev` to build with. No image is tagged."""
+    files = subprocess.run(
+        ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+        cwd=CHECKOUT,
+        check=True,
+        capture_output=True,
+    ).stdout.split(b"\0")
+    context = io.BytesIO()
+    with tarfile.open(fileobj=context, mode="w") as tar:
+        for name in filter(None, files):
+            path = CHECKOUT / name.decode()
+            if path.is_file():
+                tar.add(path, arcname=name.decode())
+        dockerfile = LINUX_WORKMUX_DOCKERFILE.encode()
+        info = tarfile.TarInfo("Dockerfile.workmux-linux")
+        info.size = len(dockerfile)
+        tar.addfile(info, io.BytesIO(dockerfile))
+    out = Path(tempfile.mkdtemp(prefix="wm-linux-workmux-"))
+    subprocess.run(
+        ["docker", "build", "-q", "-f", "Dockerfile.workmux-linux"]
+        + ["--output", f"type=local,dest={out}", "-"],
+        input=context.getvalue(),
+        check=True,
+        capture_output=True,
+        env={**os.environ, "DOCKER_BUILDKIT": "1"},
+    )
+    return out / "workmux"
+
+
+def install_linux_workmux(state_home: Path) -> None:
+    """Put the Linux workmux where `workmux sandbox install-dev` installs it
+    for OpenShell sandbox images, under the test's `XDG_STATE_HOME`.
+    install-dev itself would also patch the user's container image and
+    running Lima VMs."""
+    dest = state_home / "workmux" / "openshell" / "workmux"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy(build_linux_workmux(), dest)
 
 
 @dataclass
