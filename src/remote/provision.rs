@@ -137,7 +137,7 @@ fn devshell_warning(toolchain: &DetectedToolchain, devshell: Devshell) -> Option
 }
 
 /// Where remote workmux keeps the devshell warning provisioning gave, for
-/// `workmux remote status` to repeat.
+/// `workmux sandbox status` to repeat.
 fn devshell_warning_record() -> Option<std::path::PathBuf> {
     crate::xdg::state_dir()
         .ok()
@@ -189,7 +189,7 @@ pub fn has_command(name: &str) -> bool {
     which::which(name).is_ok() || Path::new(NIX_PROFILE_BIN).join(name).is_file()
 }
 
-/// Problems `workmux remote status` warns about: no session holder, and
+/// Problems `workmux sandbox status` warns about: no session holder, and
 /// agents whose status would never reach the sidebar.
 pub fn warnings(has: impl Fn(&str) -> bool, agents: &[AgentCheck]) -> Vec<String> {
     let mut warnings: Vec<String> = holder_warning(&has).into_iter().collect();
@@ -238,7 +238,7 @@ fn baked_devshell_warning(source: &Path) -> Option<String> {
     (clone.is_dir() && devshell_digest(clone) != source.devshell_sha256).then(|| {
         format!(
             "the devshell baked into this sandbox was built from other flake files than {} has now; \
-             run `workmux remote recreate` for the project to rebuild it",
+             run `workmux sandbox rebuild` in the project's repository",
             source.clone
         )
     })
@@ -420,7 +420,7 @@ mod tests {
         ] {
             write(file, contents);
             let warning = baked_devshell_warning(&source).expect(file);
-            assert!(warning.contains("workmux remote recreate"), "{warning}");
+            assert!(warning.contains("workmux sandbox rebuild"), "{warning}");
             bake();
         }
     }

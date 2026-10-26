@@ -543,7 +543,7 @@ impl OpenShell {
         let narrowed = policy::narrowed(&current_yaml, &desired);
         if !narrowed.is_empty() {
             return Ok(vec![format!(
-                "the policy of sandbox {} no longer grants {}, which OpenShell cannot take away from a sandbox; run `workmux remote recreate` in the repository to apply it",
+                "the policy of sandbox {} no longer grants {}, which OpenShell cannot take away from a sandbox; run `workmux sandbox rebuild` in the repository to apply it",
                 self.sandbox,
                 narrowed.join(", "),
             )]);
@@ -560,7 +560,7 @@ impl OpenShell {
             current_yaml.get("filesystem_policy") != desired.get("filesystem_policy");
         Ok(if running && filesystem_changed {
             vec![format!(
-                "updated the policy of sandbox {}; its new filesystem grants apply after `workmux remote stop` and `workmux remote start`",
+                "updated the policy of sandbox {}; its new filesystem grants apply once `workmux sandbox stop` has stopped it and the next command that needs it has started it",
                 self.sandbox
             )]
         } else {
@@ -569,7 +569,7 @@ impl OpenShell {
     }
 }
 
-/// The lines `workmux remote status` shows for a sandbox's effective
+/// The lines `workmux sandbox status` shows for a sandbox's effective
 /// policy.
 pub fn describe_policy(policy: &Value) -> Vec<String> {
     let paths = |list: &str| -> String {
@@ -606,7 +606,7 @@ pub fn describe_policy(policy: &Value) -> Vec<String> {
 }
 
 impl OpenShell {
-    /// The sandbox's effective policy for `workmux remote status`, and
+    /// The sandbox's effective policy for `workmux sandbox status`, and
     /// what differs from the project's settings.
     pub fn policy_report(&self) -> Result<Option<(Vec<String>, Vec<String>)>> {
         let Some(current) = self.current_policy()? else {
@@ -622,7 +622,7 @@ impl OpenShell {
                     "the project's policy has changed; the next command that needs the sandbox applies it".to_string()
                 } else {
                     format!(
-                        "the project's policy no longer grants {}; run `workmux remote recreate` to apply it",
+                        "the project's policy no longer grants {}; run `workmux sandbox rebuild` to apply it",
                         narrowed.join(", ")
                     )
                 });

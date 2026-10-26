@@ -543,7 +543,7 @@ pub fn recreate(
         )
     };
     let (bundle, manifest) = if let Some(kept_work) = kept_work(keep)? {
-        notice("Restoring the work an earlier recreate kept…");
+        notice("Restoring the work an earlier rebuild kept…");
         kept_work
     } else {
         let uncommitted: Vec<String> = remote_at_risk(transport, path)?
@@ -553,7 +553,7 @@ pub fn recreate(
             .collect();
         if !uncommitted.is_empty() {
             bail!(
-                "These worktrees have uncommitted changes, which a recreate would lose; commit or discard them first:\n  {}",
+                "These worktrees have uncommitted changes, which a rebuild would lose; commit or discard them first:\n  {}",
                 uncommitted.join("\n  ")
             );
         }
