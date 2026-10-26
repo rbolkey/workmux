@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import re
@@ -95,8 +96,7 @@ def project_in_sandbox(
     whose `.workmux.yaml` puts it in a sandbox (ADR 0004): on the hidden
     loopback backend rooted in `root`, as remote `remote` with its clone at
     `path` (default code/<name>), or with no `root` in an OpenShell
-    sandbox. `config` adds lines to that file. `remote list` run in the
-    repository makes the project known, as any command run there would."""
+    sandbox. `config` adds lines to that file."""
     repo = env.tmp_path / "workstation" / name
     repo.mkdir(parents=True)
     env.run_command(["git", "init", "-q", "-b", "main"], cwd=repo)
@@ -110,10 +110,27 @@ def project_in_sandbox(
             f"    path: {path or f'code/{name}'}\n"
         )
     (repo / ".workmux.yaml").write_text("nerdfont: false\n" + sandbox + config)
-    run_workmux_command(
-        env, exe, repo, "remote list", pre_run_env=tmp_env, timeout=30.0
-    )
     return repo
+
+
+def project_tag(env, remote: str, name: str) -> str:
+    """The tag on project `name`'s workstation windows and session: the
+    project and the path of the clone `project_in_sandbox` made for it."""
+    return f"{remote}:{name}:{os.path.realpath(clone_of(env, name))}"
+
+
+def openshell_sandbox_name(clone: Path) -> str:
+    """The OpenShell sandbox name workmux derives from a clone's path."""
+    root = os.path.realpath(clone)
+    digest = hashlib.sha256(root.encode()).hexdigest()[:8]
+    prefix = ""
+    for c in os.path.basename(root):
+        if c.isascii() and c.isalnum():
+            prefix += c.lower()
+        elif prefix and not prefix.endswith("-"):
+            prefix += "-"
+    prefix = prefix[:10].strip("-")
+    return f"{prefix}-{digest}" if prefix else f"wm-{digest}"
 
 
 @pytest.mark.tmux_only
@@ -123,15 +140,23 @@ def test_remote_list_and_status_against_a_loopback_remote(
     repo_path: Path,
     short_tmp: dict,
 ):
-    """A repository whose config puts it on a loopback remote makes that
-    remote known; it is reachable through the workstation daemon's control
-    channel, and an unreachable one shows the transport's error."""
+    """A repository whose config puts it on a loopback remote lists that
+    remote when run in it; it is reachable through the workstation daemon's
+    control channel, and an unreachable one shows the transport's error."""
     env = mux_server
     root = env.tmp_path / "remote-root"
     root.mkdir()
     missing = env.tmp_path / "no-such-root"
     origin = env.tmp_path / "origin"
     version = env.run_command([str(workmux_exe_path), "--version"]).stdout.split()[-1]
+    # A gateway with no sandboxes, whatever OpenShell this machine has.
+    stub = env.tmp_path / "stub-bin"
+    stub.mkdir()
+    (stub / "openshell").write_text(
+        "#!/bin/sh\necho '{\"next_page_token\":\"\",\"sandboxes\":[]}'\n"
+    )
+    (stub / "openshell").chmod(0o755)
+    short_tmp = {**short_tmp, "PATH": f"{stub}:{env.env['PATH']}"}
 
     nothing = remote(env, workmux_exe_path, repo_path, "list", short_tmp).stdout
     assert "No remotes." in nothing
@@ -148,12 +173,20 @@ def test_remote_list_and_status_against_a_loopback_remote(
     )
     daemon_pid = None
     try:
-        listing = remote(env, workmux_exe_path, repo_path, "list", short_tmp).stdout
-        rows = {
-            line.split()[0]: line for line in listing.splitlines()[1:] if line.strip()
-        }
-        assert rows["lb"].rstrip().endswith("reachable")
-        assert f"unreachable: Loopback root {missing} does not exist" in rows["gone"]
+
+        def rows(clone):
+            listing = remote(env, workmux_exe_path, clone, "list", short_tmp).stdout
+            return {
+                line.split()[0]: line
+                for line in listing.splitlines()[1:]
+                if line.strip()
+            }
+
+        assert rows(clone_of(env, "api"))["lb"].rstrip().endswith("reachable")
+        assert (
+            f"unreachable: Loopback root {missing} does not exist"
+            in rows(clone_of(env, "web"))["gone"]
+        )
 
         status = remote(
             env, workmux_exe_path, clone_of(env, "api"), "status", short_tmp
@@ -181,7 +214,7 @@ def test_remote_list_and_status_against_a_loopback_remote(
         assert f"Loopback root {missing} does not exist" in failed.stdout
 
         refused = remote(env, workmux_exe_path, web, "rm", short_tmp, expect_fail=True)
-        assert "workmux deletes only those" in refused.stderr
+        assert "only those are deleted" in refused.stderr
     finally:
         if daemon_pid is not None:
             os.kill(daemon_pid, signal.SIGTERM)
@@ -317,6 +350,20 @@ def test_remote_project_is_cloned_on_first_use_and_answers_list_and_path(
         rows = {line.split()[1]: line.split() for line in listing[2:]}
         assert rows["feature"][-1] == str(worktree)
 
+        # list --all covers the remote projects with open workstation
+        # windows; nothing about a project is stored.
+        assert "api@lb" not in wm("list --all").stdout
+        env.tmux(["new-window", "-d", "-t", "test:", "-n", "api-window"])
+        env.tmux(
+            [
+                "set-option",
+                "-w",
+                "-t",
+                "=test:api-window",
+                "@workmux_project_window",
+                f"lb:api:{os.path.realpath(workstation)}",
+            ]
+        )
         everything = wm("list --all").stdout
         assert any(
             line.split()[:2] == ["api@lb", "feature"]
@@ -459,7 +506,7 @@ def test_remote_add_places_windows_in_the_project_session(
         worktree = root / "home" / "code" / "api__worktrees" / "feature"
         assert worktree.is_dir()
         assert tmux_value(env, "=api:wm-feature", "#{session_name}") == "api"
-        assert session_tag(env, "api") == "lb:api"
+        assert session_tag(env, "api") == project_tag(env, "lb", "api")
         # The branch lives in the remote's clone, not on the workstation.
         for repo in [origin, repo_path]:
             branches = env.run_command(
@@ -474,7 +521,7 @@ def test_remote_add_places_windows_in_the_project_session(
         env.tmux(["new-session", "-d", "-s", "frontend"])
         wm("add other", cwd=clone_of(env, "web"))
         assert tmux_value(env, "=frontend:wm-other", "#{session_name}") == "frontend"
-        assert session_tag(env, "frontend") == "lb:web"
+        assert session_tag(env, "frontend") == project_tag(env, "lb", "web")
 
         # Current-session placement keeps the window where the command ran.
         wm("add notes", cwd=clone_of(env, "docs"))
@@ -486,7 +533,7 @@ def test_remote_add_places_windows_in_the_project_session(
 
         # Session mode gives the worktree its own session.
         wm("add solo --mode session", cwd=clone_of(env, "api"))
-        assert session_tag(env, "wm-solo") == "lb:api"
+        assert session_tag(env, "wm-solo") == project_tag(env, "lb", "api")
 
         # Typed outside any repository in the project's session (in a pane of the
         # user's own), the command targets the tagged project.
@@ -1740,11 +1787,13 @@ def test_open_and_resurrect_reattach_to_surviving_remote_panes(
         env.start_server()
         assert pid_alive(agent_pid)
 
-        planned = wm("resurrect --dry-run")
+        # No window is left to name the project: resurrect is run in its
+        # clone.
+        planned = wm("resurrect --dry-run", cwd=clone_of(env, "api"))
         assert "feature" in planned.stdout and "restoring" in planned.stdout
         assert window_gone(window)
 
-        restored = wm("resurrect")
+        restored = wm("resurrect", cwd=clone_of(env, "api"))
         assert "✓ Restored 1 worktree(s): feature" in restored.stdout
         assert remote_panes(window) == shown
         assert started.read_text().split() == [str(agent_pid)]
@@ -2145,7 +2194,7 @@ def test_commands_typed_in_a_remote_pane_reach_the_workstation(
             env.tmux(
                 ["show-options", "-wqv", "-t", second, "@workmux_project_window"]
             ).stdout.strip()
-            == "lb:api"
+            == project_tag(env, "lb", "api")
         )
 
         # An allowlisted host command runs on the workstation; anything
@@ -2899,11 +2948,12 @@ esac
             timeout=30.0,
         )
 
-    project_in_sandbox(
+    clone = project_in_sandbox(
         env, workmux_exe_path, "api", "https://example.com/api.git", short_tmp
     )
+    tag = project_tag(env, openshell_sandbox_name(clone), "api")
     env.tmux(["new-session", "-d", "-s", "api", "-n", "wm-feature"])
-    env.tmux(["set-option", "-t", "=api:", "@workmux_project", "api:api"])
+    env.tmux(["set-option", "-t", "=api:", "@workmux_project", tag])
     env.tmux(
         [
             "set-option",
@@ -2911,7 +2961,7 @@ esac
             "-t",
             "=api:wm-feature",
             "@workmux_project_window",
-            "api:api",
+            tag,
         ]
     )
     env.tmux(["new-window", "-d", "-t", "test:", "-n", "wm-other"])
@@ -2922,7 +2972,7 @@ esac
             "-t",
             "=test:wm-other",
             "@workmux_project_window",
-            "api:api",
+            tag,
         ]
     )
     env.tmux(["new-window", "-d", "-t", "test:", "-n", "mine"])
@@ -3004,8 +3054,6 @@ def test_a_command_for_every_project_checks_each_remotes_state_once(
         env.fake_bin_dir / "openshell",
         FAKE_OPENSHELL.format(state=str(state), exe=str(workmux_exe_path)),
     )
-    (state / "api.phase").write_text("Ready")
-    (state / "web.phase").write_text("Stopped")
     log = state / "log"
 
     def wm(command, cwd=None):
@@ -3030,8 +3078,9 @@ def test_a_command_for_every_project_checks_each_remotes_state_once(
 
     daemon_pid = None
     try:
+        sandbox = {}
         for name in ("api", "web"):
-            project_in_sandbox(
+            clone = project_in_sandbox(
                 env,
                 workmux_exe_path,
                 name,
@@ -3039,12 +3088,21 @@ def test_a_command_for_every_project_checks_each_remotes_state_once(
                 short_tmp,
                 config=f"  openshell:\n    path: {state}/{name}/{name}\n",
             )
-        # Making the projects known opened channels; start cold.
-        setup_daemon = remote_daemon_ping(env, workmux_exe_path, repo_path, short_tmp)
-        os.kill(setup_daemon["pid"], signal.SIGTERM)
-        wait_until(
-            lambda: not pid_alive(setup_daemon["pid"]), "the setup daemon to exit"
-        )
+            sandbox[name] = openshell_sandbox_name(clone)
+            # Every project with an open workstation window is visited.
+            env.tmux(["new-window", "-d", "-t", "test:", "-n", f"{name}-window"])
+            env.tmux(
+                [
+                    "set-option",
+                    "-w",
+                    "-t",
+                    f"=test:{name}-window",
+                    "@workmux_project_window",
+                    project_tag(env, sandbox[name], name),
+                ]
+            )
+        (state / f"{sandbox['api']}.phase").write_text("Ready")
+        (state / f"{sandbox['web']}.phase").write_text("Stopped")
         log.unlink(missing_ok=True)
         cold = wm("reap-agents")
         daemon_pid = remote_daemon_ping(env, workmux_exe_path, repo_path, short_tmp)[
@@ -3053,9 +3111,9 @@ def test_a_command_for_every_project_checks_each_remotes_state_once(
         assert "Skipping remote project 'web'" in cold.stderr
         assert (state / "api" / "api" / ".git").is_dir()
         first = calls()
-        assert first["web"] == ["sandbox get"], first
-        assert "sandbox exec" in first["api"], first
-        assert [call for call in first["api"] if call != "sandbox exec"] == [
+        assert first[sandbox["web"]] == ["sandbox get"], first
+        assert "sandbox exec" in first[sandbox["api"]], first
+        assert [call for call in first[sandbox["api"]] if call != "sandbox exec"] == [
             "sandbox get",
             "policy set",
         ], first
@@ -3063,10 +3121,10 @@ def test_a_command_for_every_project_checks_each_remotes_state_once(
         wm("reap-agents")
 
         assert calls() == {
-            "api": ["sandbox get", "policy set"],
-            "web": ["sandbox get"],
+            sandbox["api"]: ["sandbox get", "policy set"],
+            sandbox["web"]: ["sandbox get"],
         }
-        assert (state / "web.phase").read_text() == "Stopped"
+        assert (state / f"{sandbox['web']}.phase").read_text() == "Stopped"
     finally:
         if daemon_pid is not None:
             os.kill(daemon_pid, signal.SIGTERM)

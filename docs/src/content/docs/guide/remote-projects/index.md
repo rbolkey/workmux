@@ -46,16 +46,16 @@ The first command that needs the sandbox creates it, clones the repository from 
 
 A command acts on the project it runs in; there is no flag naming another project. Commands that act on a project (`add`, `open`, `close`, `remove`, `merge`, `list`, `path`, `run`, `rename`, `rebase`, `set-base`, `sync-files` and `init`, and plain worktree names given to `send`, `capture` and `wait`) find it in this order:
 
-1. the project of the tmux window, or else the session, you typed the command in. workmux tags each remote project's windows and session, so commands typed there act on it.
+1. the project of the tmux window, or else the session, you typed the command in. workmux tags each remote project's windows and session with the path of your clone, and reads the clone's config again for every command typed there, so a config change applies at once. If the config no longer puts the project in a sandbox, the window is no longer the project's; if the clone is gone, commands typed there fail and say so.
 2. the repository of the current directory: its config decides whether the project is local or in a sandbox
 
 Outside any repository and any project window, they fail and tell you to run them inside a clone of the repository. A command relayed to a sandbox says so once (`Running in OpenShell sandbox wm-api (project api)`), and `list` names the sandbox in its first line.
 
 Run from a remote worktree's window, commands with no worktree name act on that worktree, as they do locally.
 
-A remote project is named after its repository: the directory name of your clone. A clone named like another remote project from a different origin gets a short hash of its origin added to the name, so the two stay apart. In the sidebar, dashboard and `workmux status` a remote project shows as `name@remote`, for example `api@api`, so it never merges with a local project of the same name. Agent selectors accept `feature`, `api:feature` and `api@api:feature`.
+A remote project is named after its repository: the directory name of your clone. Its sandbox is named after the clone's path (see [OpenShell projects](/guide/remote-projects/openshell/)), so two clones get two sandboxes, even of the same repository. workmux stores nothing about a project. In the sidebar, dashboard and `workmux status` a remote project shows as `name@remote`, for example `api@api-1a2b3c4d`, so it never merges with a local project of the same name. Agent selectors accept `feature`, `api:feature` and `api@api-1a2b3c4d:feature`.
 
-`resurrect` and `reap-agents` run locally and then on every remote project workmux knows. Each project's output appears under a `<project> (on <remote>):` heading.
+`resurrect` and `reap-agents` run locally and then on every remote project with an open window on the workstation, and on the project of the clone you run them in (after the tmux server restarts no window is left, so run `resurrect` in the clone). Each project's output appears under a `<project> (on <remote>):` heading.
 
 ## Where the windows go
 

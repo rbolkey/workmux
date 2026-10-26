@@ -659,14 +659,21 @@ fn read_prompt_file(path: &Path) -> Result<String> {
     std::fs::read_to_string(path).with_context(failed)
 }
 
-/// Relay this command, as it was typed, to every remote project, printing
+/// Relay this command, as it was typed, to every remote project with an
+/// open workstation window and to the one this command runs in, printing
 /// each one's output under its name; a project with nothing to say prints
 /// nothing. Returns how many projects failed or could not be reached.
 pub fn relay_to_every_project() -> Result<usize> {
     let argv = relayed_argv();
     let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let mut projects = remote_projects();
+    if let Some(here) = resolve()?
+        && !projects.iter().any(|project| project.id() == here.id())
+    {
+        projects.insert(0, here);
+    }
     let mut failures = 0;
-    for project in remote_projects() {
+    for project in projects {
         let (name, remote) = (&project.site.name, &project.site.remote);
         // A stopped sandbox is never started just to visit it.
         match ready(&project, false) {
