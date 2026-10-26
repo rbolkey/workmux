@@ -126,7 +126,7 @@ fn run_specified(
         // Check unmerged (promptable), only if configured and we're deleting the branch
         if confirm_unmerged
             && !keep_branch
-            && let Some(base) = is_unmerged(&branch)?
+            && let Some(base) = git::branch_unmerged_base_in(&branch, None)?
         {
             unmerged.push((handle, branch, base));
             continue;
@@ -176,35 +176,6 @@ fn run_specified(
     }
 
     Ok(())
-}
-
-/// Check if a branch has unmerged commits. Returns Some(base) if unmerged, None otherwise.
-fn is_unmerged(branch: &str) -> Result<Option<String>> {
-    let main_branch = git::get_default_branch().unwrap_or_else(|_| "main".to_string());
-
-    let base = git::get_branch_base(branch)
-        .ok()
-        .unwrap_or_else(|| main_branch.clone());
-
-    let base_commit = match git::get_merge_base(&base) {
-        Ok(b) => b,
-        Err(_) => {
-            // If we can't determine base, try falling back to main
-            match git::get_merge_base(&main_branch) {
-                Ok(b) => b,
-                Err(error) => {
-                    return Err(error.context("Cannot establish whether the branch is merged"));
-                }
-            }
-        }
-    };
-
-    let unmerged_branches = git::get_unmerged_branches(&base_commit)?;
-    if unmerged_branches.contains(branch) {
-        Ok(Some(base))
-    } else {
-        Ok(None)
-    }
 }
 
 fn print_skipped_summary(label: &str, uncommitted: &[String], unmerged: &[String]) {

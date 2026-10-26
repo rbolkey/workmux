@@ -253,6 +253,37 @@ pub fn get_merge_base_in(workdir: Option<&Path>, main_branch: &str) -> Result<St
     }
 }
 
+/// The base `branch` has commits not merged into, when it has any: the
+/// base `workmux add` stored for it, else the default branch. `workmux
+/// remove` asks before deleting such a branch; a sandbox's checks name it.
+pub fn branch_unmerged_base_in(branch: &str, workdir: Option<&Path>) -> Result<Option<String>> {
+    let main_branch = get_default_branch_in(workdir).unwrap_or_else(|_| "main".to_string());
+
+    let base = get_branch_base_in(branch, workdir)
+        .ok()
+        .unwrap_or_else(|| main_branch.clone());
+
+    let base_commit = match get_merge_base_in(workdir, &base) {
+        Ok(b) => b,
+        Err(_) => {
+            // If we can't determine base, try falling back to main
+            match get_merge_base_in(workdir, &main_branch) {
+                Ok(b) => b,
+                Err(error) => {
+                    return Err(error.context("Cannot establish whether the branch is merged"));
+                }
+            }
+        }
+    };
+
+    let unmerged_branches = get_unmerged_branches_in(workdir, &base_commit)?;
+    if unmerged_branches.contains(branch) {
+        Ok(Some(base))
+    } else {
+        Ok(None)
+    }
+}
+
 /// Get a set of all branches not merged into the base branch
 pub fn get_unmerged_branches(base_branch: &str) -> Result<HashSet<String>> {
     get_unmerged_branches_in(None, base_branch)
