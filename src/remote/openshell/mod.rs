@@ -1529,7 +1529,7 @@ mod contract {
     }
 
     #[test]
-    fn a_flake_projects_devshell_is_baked_into_the_image_and_runs_in_the_sandbox() {
+    fn a_flake_projects_sandbox_has_its_baked_devshell_and_a_working_nix() {
         if !enabled() {
             return;
         }
@@ -1550,6 +1550,7 @@ mod contract {
             origin.git_url = Some(crate::remote::git_url::GitUrl::new(
                 repo.path().display().to_string(),
             ));
+            origin.nix = true;
         }
         let transport = &owned.0;
 
@@ -1575,6 +1576,78 @@ mod contract {
         let source: image::DevshellSource = serde_json::from_slice(&source.stdout).unwrap();
         assert_eq!(source.clone, "/sandbox/api");
         assert_eq!(source.devshell_sha256, image::devshell_digest(repo.path()));
+
+        // nix works on the flake: the devshell and the flake's inputs are
+        // in the store already, so `nix develop` needs no network.
+        let sh = |script: &str| {
+            let output = transport
+                .exec_captured(&argv(&["sh", "-c", script]))
+                .unwrap();
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(output.status.success(), "{script}: {text}");
+            text
+        };
+        assert!(sh("nix --version").contains("2.24"));
+        for file in ["flake.nix", "flake.lock"] {
+            sh(&format!(
+                "mkdir -p /tmp/flake && cat > /tmp/flake/{file} <<'EOF'\n{}\nEOF",
+                std::fs::read_to_string(repo.path().join(file)).unwrap()
+            ));
+        }
+        let develop = sh(
+            "nix develop --offline /tmp/flake -c sh -c 'jq --version; echo devshell=$WM_LEARN_DEVSHELL'",
+        );
+        assert!(develop.contains("devshell=1"), "{develop}");
+        sh("nix develop /tmp/flake -c true");
+        // A check that builds, from the same nixpkgs and the binary cache.
+        sh("mkdir -p /tmp/check && cp /tmp/flake/flake.lock /tmp/check/ && cat > /tmp/check/flake.nix <<'EOF'
+{
+  inputs.nixpkgs.url = \"github:NixOS/nixpkgs/nixos-25.05\";
+  outputs = { nixpkgs, ... }: {
+    checks = nixpkgs.lib.genAttrs [ \"x86_64-linux\" \"aarch64-linux\" ] (system: {
+      ok = nixpkgs.legacyPackages.${system}.runCommand \"ok\" { } \"touch $out\";
+    });
+  };
+}
+EOF");
+        sh("nix flake check /tmp/check");
+        let hello = sh("nix profile install nixpkgs#hello && ~/.nix-profile/bin/hello");
+        assert!(hello.contains("Hello, world!"), "{hello}");
+        // The devshell and the flake's inputs are garbage collection roots.
+        sh("nix store gc && nix-collect-garbage && nix develop --offline /tmp/flake -c true");
+    }
+
+    #[test]
+    fn a_sandbox_whose_toolchain_is_off_has_no_nix() {
+        if !enabled() {
+            return;
+        }
+        let owned = sandbox("nonix");
+        let transport = &owned.0;
+
+        transport.create().unwrap();
+
+        let nix = transport
+            .exec_captured(&argv(&["sh", "-c", "command -v nix"]))
+            .unwrap();
+        assert!(!nix.status.success(), "{nix:?}");
+        let policy = transport.current_policy().unwrap().unwrap();
+        let read_only: Vec<String> =
+            serde_json::from_value(policy["filesystem_policy"]["read_only"].clone()).unwrap();
+        let read_write: Vec<String> =
+            serde_json::from_value(policy["filesystem_policy"]["read_write"].clone()).unwrap();
+        assert!(read_only.contains(&"/nix".to_string()), "{policy}");
+        assert!(!read_write.contains(&"/nix".to_string()), "{policy}");
+        assert!(
+            policy["network_policies"]
+                .as_object()
+                .is_none_or(|rules| rules.is_empty()),
+            "{policy}"
+        );
     }
 
     #[test]

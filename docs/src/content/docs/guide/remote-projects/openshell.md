@@ -130,7 +130,7 @@ The proxy substitutes credentials only in HTTPS, and no profile allows SSH. work
 - `remote status` and the first-use clone show the URL as `https://github.com/me/api.git (rewritten from SSH: git@github.com:me/api.git)`.
 - Inside the sandbox, the image rewrites `git@github.com:` and `ssh://git@github.com/` to `https://github.com/` with git's `url.<base>.insteadOf`, so submodules and URLs an agent types go over HTTPS too. On your workstation, workmux still clones the original URL to look for a flake devshell.
 
-Not covered: SSH hosts other than github.com. Private nix flake inputs are fetched on your workstation when the devshell is baked, not in the sandbox: see [Nix devshells](#nix-devshells).
+Not covered: SSH hosts other than github.com. For private nix flake inputs, in the devshell bake and in the sandbox, see [Nix devshells](#nix-devshells).
 
 ## Lifecycle
 
@@ -218,11 +218,21 @@ The agent still starts without one, but it can't authenticate. The sandbox's net
 
 ## Nix devshells
 
-Nix cannot install or build inside an OpenShell sandbox. Instead, for a project with a `flake.nix`, workmux bakes the devshell into the image:
+An OpenShell sandbox follows `sandbox.toolchain` as a Lima sandbox does. When it resolves to `flake` (the default `auto` with a `flake.nix` in the repository, or `toolchain: flake`), the sandbox has nix and the project's devshell, baked into its image:
 
 1. On your workstation, workmux shallow-clones the project's git URL.
-2. A `nixos/nix` build stage builds the devshell and copies its closure into the image's `/nix/store`.
-3. A wrapper at `/usr/local/bin/workmux-devshell` enters it. Agents start as `workmux-devshell bash -c '…'`.
+2. A `nixos/nix` build stage builds the devshell. The image gets nix, the devshell's closure and the flake's inputs, in a store under `/nix` that the sandbox user owns.
+3. A wrapper at `/usr/local/bin/workmux-devshell` enters the devshell. Agents start as `workmux-devshell bash -c '…'`, so they start at once, with nothing to build.
+
+`toolchain: off` gives a sandbox without nix, with `/nix` read-only and no nix network rules. So does `toolchain: devbox`, or `auto` when the repository has a `devbox.json`.
+
+### Working on the flake
+
+nix in the sandbox is for working on the flake itself: `nix flake check`, `nix develop` while you change the flake, or `nix profile install` to test that it installs. It builds without nix's own build sandbox (`sandbox = false`), which needs kernel namespaces OpenShell sandboxes don't have. The devshell and the flake's inputs are in its store already, and are garbage collection roots, so `nix develop` doesn't fetch them again. `nix profile install` puts commands in `~/.nix-profile/bin`, which isn't on `PATH`.
+
+`nix develop` sees your edits to the flake at once. Panes and agents keep the baked devshell until `workmux remote recreate` builds a new image, so changing the environment for agents still means committing the flake change, pushing it and recreating the sandbox.
+
+nix reaches the binary cache (`cache.nixos.org`), the flake registry (`channels.nixos.org`, `releases.nixos.org`) and GitHub (`github.com`, `api.github.com`, `codeload.github.com`, read-only), through the `workmux-nix` rule in the sandbox's [policy](#policy). For private `github:` inputs, the sandbox's `nix` command gives nix the placeholder token of the provider that gives GitHub credentials (`GH_TOKEN` or `GITHUB_TOKEN`) as its access token for github.com, and OpenShell's proxy swaps in the real token. `git+https://github.com/…` inputs use git's credential helper, as git does. The sandbox has no network interface besides loopback, so nix warns `you don't have Internet access` and fetches anyway. Other hosts, such as another binary cache, need a rule in your policy file for the nix binary (`/nix/store/*/bin/nix`). The token and a fix for garbage collection come from the image's `nix` command (`/usr/local/bin/nix` and the `nix-*` commands beside it); a nix your devshell puts first on `PATH` reads the same configuration but goes without them.
 
 **Private flake inputs.** The bake fetches private GitHub inputs only for a sandbox that attaches `gh-login`, because that project already gives its sandbox your `gh` login. workmux hands the build the token `gh auth token` prints as a Docker build secret, never on a command line and never in the image. Only the step that fetches the inputs gets it, before anything of the project's is built:
 
@@ -230,11 +240,11 @@ Nix cannot install or build inside an OpenShell sandbox. Instead, for a project 
 - `git+https://github.com/…` inputs get it from a git credential helper.
 - `git+ssh://git@github.com/…` inputs go over HTTPS with it, because the build has no SSH.
 
-The step that builds the devshell has no secret, so the flake's builders and `shellHook` can't read the token. Any other project's bake gets no token: a private input fails it with nix's `HTTP error 404` or `Cannot find Git revision`, and workmux says private GitHub flake inputs need `gh-login` in `sandbox.openshell.providers`. Private inputs on other git servers aren't covered. Nothing fetches flake inputs inside the sandbox, because nix can't write its read-only `/nix`.
+The step that builds the devshell has no secret, so the flake's builders and `shellHook` can't read the token. Any other project's bake gets no token: a private input fails it with nix's `HTTP error 404` or `Cannot find Git revision`, and workmux says private GitHub flake inputs need `gh-login` in `sandbox.openshell.providers`. Private inputs on other git servers aren't covered.
 
 The image is fixed when the sandbox is created. It follows what the bake reads: `flake.nix`, `flake.lock`, and the files and directories the flake names by path (`./nix/shell.nix`, `"${self}/nix"`), followed through the `.nix` files among them. When any of them in the clone no longer match the baked ones, `remote status` warns, and `workmux remote recreate` gives the sandbox a new image. Changes to the rest of the repository don't. Neither does a file the flake reads through a path it builds from a string at evaluation time.
 
-A devbox project gets no devshell in a sandbox. Put its toolchain in your `image`. `remote status` says so.
+A devbox project gets no devshell and no nix in a sandbox. Put its toolchain in your `image`. `remote status` says so.
 
 ## Policy
 
@@ -250,7 +260,7 @@ landlock:
   compatibility: best_effort
 ```
 
-The PTY devices are there because the session holder allocates terminals, and `/nix` for the baked devshell. There are no network rules.
+The PTY devices are there because the session holder allocates terminals, and `/nix` for the baked devshell. There are no network rules. A sandbox with nix also gets `/nix` read-write and the `workmux-nix` network rule (see [Working on the flake](#working-on-the-flake)).
 
 Your `policy` file is merged on top:
 

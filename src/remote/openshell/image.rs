@@ -107,18 +107,19 @@ fn gitconfig(git_credential_helper: bool) -> String {
 
 /// Lays out the sandbox's nix in `/store`, which the image copies to
 /// `/nix`: nix and, with a baked devshell, the devshell and its flake's
-/// inputs, all registered in the store's database, so the sandbox's nix
-/// neither fetches them again nor collects them as garbage. nix is the
-/// store's default profile, where the nix installer puts it, and `/links`
-/// holds its classic commands for `/usr/local/bin`.
+/// inputs, registered in the store's database and as garbage collection
+/// roots, so the sandbox's nix neither fetches them again nor collects
+/// them. nix is the store's default profile, where the nix installer puts
+/// it, and `/links` holds its classic commands for `/usr/local/bin`, as
+/// links to the wrapper [`nix_wrapper`] that the image puts at
+/// `/usr/local/bin/nix`.
 fn nix_store_layout() -> String {
     format!(
         "#!/bin/sh
 # Added by workmux: lay out the OpenShell sandbox's nix store in /store.
 set -e
-nix() {{ command nix --extra-experimental-features \"nix-command flakes\" \"$@\"; }}
-tool=$(command -v nix)
-store_nix=$(dirname \"$(dirname \"$(readlink -f \"$tool\")\")\")
+export NIX_CONFIG=\"experimental-features = nix-command flakes\"
+store_nix=$(dirname \"$(dirname \"$(readlink -f \"$(command -v nix)\")\")\")
 paths=$store_nix
 devshell=
 if [ -e /devshell/profile ]; then
@@ -139,44 +140,55 @@ mkdir -p /store/nix/var/nix/profiles /store/nix/var/nix/gcroots /links
 ln -s \"$store_nix\" /store/nix/var/nix/profiles/default-1-link
 ln -s default-1-link /store/nix/var/nix/profiles/default
 ln -s /nix/var/nix/profiles /store/nix/var/nix/gcroots/profiles
-[ -z \"$devshell\" ] || ln -s \"$devshell\" /store/nix/var/nix/gcroots/workmux-devshell
+n=0
+for root in $devshell $inputs; do
+  n=$((n + 1))
+  ln -s \"$root\" /store/nix/var/nix/gcroots/workmux-devshell-$n
+done
 for tool in \"$store_nix\"/bin/nix-*; do
-  ln -s \"{NIX_PROFILE_BIN}/${{tool##*/}}\" /links/
+  ln -s nix \"/links/${{tool##*/}}\"
 done
 "
     )
 }
 
-/// The sandbox's `nix`: the store's, with the placeholder token of the
-/// provider that gives GitHub credentials as nix's access token for
-/// github.com. OpenShell's proxy swaps it for the real token, so private
-/// `github:` flake inputs fetch. The placeholder differs per sandbox, so it
-/// can't be in `nix.conf`.
+/// The sandbox's `nix` and its classic commands, linked to it: the
+/// store's, with two additions. The placeholder token of the provider that
+/// gives GitHub credentials is nix's access token for github.com, and
+/// OpenShell's proxy swaps it for the real token, so private `github:`
+/// flake inputs fetch; the placeholder differs per sandbox, so it can't be
+/// in `nix.conf`. And SQLite's temporary files go to `/tmp`: it would pick
+/// `/var/tmp`, which the sandbox can't write, and garbage collection fails.
 fn nix_wrapper() -> String {
     format!(
         "#!/bin/sh
 # Added by workmux: nix with the sandbox's GitHub placeholder token, which
-# OpenShell's proxy swaps for the real one.
+# OpenShell's proxy swaps for the real one, and SQLite's temporary files in
+# /tmp, because the sandbox can't write /var/tmp.
+export SQLITE_TMPDIR=${{SQLITE_TMPDIR:-/tmp}}
 token=${{GH_TOKEN:-$GITHUB_TOKEN}}
 if [ -n \"$token\" ]; then
   NIX_CONFIG=\"access-tokens = github.com=$token
 $NIX_CONFIG\"
   export NIX_CONFIG
 fi
-exec {NIX_PROFILE_BIN}/nix \"$@\"
+exec \"{NIX_PROFILE_BIN}/${{0##*/}}\" \"$@\"
 "
     )
 }
 
-/// The sandbox's `/etc/nix/nix.conf`.
+/// The sandbox's nix configuration. It is in `/etc/xdg/nix/nix.conf`, a
+/// user configuration file, because nix keeps the settings it turns off
+/// when it thinks it is offline only when a user configuration file (or
+/// `NIX_CONFIG`) sets them, not `/etc/nix/nix.conf`.
 const NIX_CONF: &str = "# Added by workmux: single-user nix in an OpenShell sandbox.
 experimental-features = nix-command flakes
 # nix's build sandbox needs kernel namespaces the sandbox doesn't have.
 sandbox = false
 build-users-group =
 # The sandbox's only network interface is loopback (OpenShell's proxy carries
-# its traffic), so nix thinks it is offline and turns these off unless they
-# are set. These are nix's defaults.
+# its traffic), so nix thinks it is offline and turns these off unless a user
+# configuration file like this one sets them. These are nix's defaults.
 substitute = true
 tarball-ttl = 3600
 download-attempts = 5
@@ -354,7 +366,7 @@ pub fn dockerfile(recipe: &Recipe) -> String {
             "COPY --from=nix --chown=1000:1000 /store/nix /nix\n\
              COPY --from=nix /links/ /usr/local/bin/\n\
              COPY --chmod=0755 nix-wrapper /usr/local/bin/nix\n\
-             COPY nix.conf /etc/nix/nix.conf\n",
+             COPY nix.conf /etc/xdg/nix/nix.conf\n",
         );
     } else if recipe.devshell.is_some() {
         out.push_str("COPY --from=devshell /closure /nix/store\n");
@@ -863,7 +875,7 @@ mod tests {
              COPY --from=nix --chown=1000:1000 /store/nix /nix\n\
              COPY --from=nix /links/ /usr/local/bin/\n\
              COPY --chmod=0755 nix-wrapper /usr/local/bin/nix\n\
-             COPY nix.conf /etc/nix/nix.conf\n\
+             COPY nix.conf /etc/xdg/nix/nix.conf\n\
              COPY --from=devshell /devshell/env.sh /nix/devshell-env.sh\n\
              COPY devshell-source.json /nix/devshell-source.json\n\
              COPY --chmod=0755 workmux-devshell /usr/local/bin/workmux-devshell\n\
@@ -914,15 +926,15 @@ mod tests {
     }
 
     #[test]
-    fn nix_gets_the_github_placeholder_as_its_access_token() {
+    fn nix_gets_the_github_placeholder_as_its_access_token_and_sqlite_a_writable_temp_dir() {
         let context = tempfile::tempdir().unwrap();
         prepare(&nix_recipe(None), "api", "/sandbox/api", context.path()).unwrap();
-        // The wrapper runs a stand-in for the store's nix that prints its
-        // NIX_CONFIG and arguments.
+        // The wrapper runs a stand-in for the store's command that prints
+        // its SQLITE_TMPDIR, NIX_CONFIG and arguments.
         let stand_in = context.path().join("real-nix");
         std::fs::write(
             &stand_in,
-            "#!/bin/sh\nprintf '%s|' \"$NIX_CONFIG\" \"$@\"\n",
+            "#!/bin/sh\nprintf '%s|' \"$SQLITE_TMPDIR\" \"$NIX_CONFIG\" \"$@\"\n",
         )
         .unwrap();
         std::fs::set_permissions(
@@ -932,13 +944,11 @@ mod tests {
         .unwrap();
         let wrapper = std::fs::read_to_string(context.path().join("nix-wrapper"))
             .unwrap()
-            .replace(
-                &format!("{NIX_PROFILE_BIN}/nix"),
-                &stand_in.display().to_string(),
-            );
+            .replace(NIX_PROFILE_BIN, &context.path().display().to_string());
+        // Run as the command named `real-nix`, which runs the store's.
         let nix = |env: &[(&str, &str)]| {
             let output = Command::new("sh")
-                .args(["-c", &wrapper, "nix", "flake", "check"])
+                .args(["-c", &wrapper, "/usr/local/bin/real-nix", "flake", "check"])
                 .env_clear()
                 .env("PATH", "/usr/bin:/bin")
                 .envs(env.iter().copied())
@@ -949,13 +959,13 @@ mod tests {
 
         assert_eq!(
             nix(&[("GH_TOKEN", "gh-ph"), ("GITHUB_TOKEN", "ghp-ph")]),
-            "access-tokens = github.com=gh-ph\n|flake|check|"
+            "/tmp|access-tokens = github.com=gh-ph\n|flake|check|"
         );
         assert_eq!(
             nix(&[("GITHUB_TOKEN", "ghp-ph"), ("NIX_CONFIG", "cores = 2")]),
-            "access-tokens = github.com=ghp-ph\ncores = 2|flake|check|"
+            "/tmp|access-tokens = github.com=ghp-ph\ncores = 2|flake|check|"
         );
-        assert_eq!(nix(&[]), "|flake|check|");
+        assert_eq!(nix(&[]), "/tmp||flake|check|");
     }
 
     #[test]
