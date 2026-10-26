@@ -153,7 +153,7 @@ def test_remote_list_and_status_against_a_loopback_remote(
     stub = env.tmp_path / "stub-bin"
     stub.mkdir()
     (stub / "openshell").write_text(
-        "#!/bin/sh\necho '{\"next_page_token\":\"\",\"sandboxes\":[]}'\n"
+        '#!/bin/sh\necho \'{"next_page_token":"","sandboxes":[]}\'\n'
     )
     (stub / "openshell").chmod(0o755)
     short_tmp = {**short_tmp, "PATH": f"{stub}:{env.env['PATH']}"}
@@ -267,6 +267,7 @@ def test_remote_project_is_cloned_on_first_use_and_answers_list_and_path(
     there by the first command run in it, with no registration; list and
     path run on the remote and keep their output and exit codes."""
     env = mux_server
+    assert isinstance(env, TmuxEnvironment)
     root = env.tmp_path / "remote-root"
     root.mkdir()
     origin = env.tmp_path / "origin"
@@ -2190,12 +2191,9 @@ def test_commands_typed_in_a_remote_pane_reach_the_workstation(
         assert "api:wm-second" in windows()
         second = tmux_value(env, "=api:wm-second", "#{pane_id}")
         shows_prompt(env, second)
-        assert (
-            env.tmux(
-                ["show-options", "-wqv", "-t", second, "@workmux_project_window"]
-            ).stdout.strip()
-            == project_tag(env, "lb", "api")
-        )
+        assert env.tmux(
+            ["show-options", "-wqv", "-t", second, "@workmux_project_window"]
+        ).stdout.strip() == project_tag(env, "lb", "api")
 
         # An allowlisted host command runs on the workstation; anything
         # else is refused.
