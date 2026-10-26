@@ -125,7 +125,7 @@ fn merge_network(merged: &mut Mapping, user: Value) -> Result<()> {
 
 /// Filesystem grants `current` has that `desired` takes away: paths no
 /// longer granted, or no longer writable. OpenShell cannot remove a
-/// create-time grant, so these need a recreate.
+/// create-time grant, so these need a rebuild.
 pub fn narrowed(current: &Value, desired: &Value) -> Vec<String> {
     let paths = |policy: &Value, list: &str| -> Vec<String> {
         policy

@@ -510,7 +510,7 @@ pub fn recreate(
         )
     };
     let (bundle, manifest) = if let Some(kept_work) = kept_work(keep)? {
-        notice("Restoring the work an earlier rebuild kept…");
+        notice("Restoring the work an earlier rebuild kept...");
         kept_work
     } else {
         let uncommitted: Vec<String> = remote_at_risk(transport, path)?
@@ -524,7 +524,7 @@ pub fn recreate(
                 uncommitted.join("\n  ")
             );
         }
-        notice("Bundling every branch of the project…");
+        notice("Bundling every branch of the project...");
         let manifest = carry(transport, "manifest", path, None, None)?;
         let bundle = carry(transport, "bundle", path, None, None)?;
         let parsed: Manifest = serde_json::from_slice(&manifest)
@@ -534,7 +534,7 @@ pub fn recreate(
         std::fs::write(&bundle_file, &bundle)?;
         std::fs::write(&manifest_file, &manifest)?;
         rebuild().with_context(kept)?;
-        notice("Restoring every branch and worktree…");
+        notice("Restoring every branch and worktree...");
         (
             bundle,
             String::from_utf8(manifest).context("Unreadable manifest")?,

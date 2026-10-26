@@ -198,7 +198,7 @@ pub fn install(remote: &str, ssh: &Ssh, builds: &Builds) -> Result<()> {
     let dir = tempfile::tempdir().context("Failed to create a temp directory")?;
     let binary = builds.binary_for(remote, &platform, dir.path())?;
     eprintln!(
-        "Installing workmux {} on {remote}…",
+        "Installing workmux {} on {remote}...",
         env!("CARGO_PKG_VERSION")
     );
     ssh.upload_workmux(&binary)
