@@ -30,7 +30,7 @@ Lima commands:
 OpenShell commands:
   stop             Stop OpenShell sandboxes to free resources
   prune            Delete OpenShell sandboxes, refusing while one holds work
-  rebuild          Delete and recreate this repository's sandbox, keeping its committed work
+  rebuild          Delete this repository's sandbox and create it again, keeping its committed work
 
 General commands:
   status           Show this repository's sandbox
@@ -66,8 +66,8 @@ pub enum SandboxCommand {
         #[arg(short, long)]
         force: bool,
     },
-    /// Delete and recreate this repository's OpenShell sandbox from the current
-    /// image and config, carrying committed work on every branch across.
+    /// Delete this repository's OpenShell sandbox and create it again from the
+    /// current image and config, carrying committed work on every branch across.
     Rebuild {
         /// Don't ask for confirmation
         #[arg(short, long)]
@@ -184,14 +184,20 @@ pub fn run(args: SandboxArgs) -> Result<()> {
             release,
         } => run_install_dev(skip_build, release),
         SandboxCommand::Agent { command } => run_agent(command),
-        SandboxCommand::Prune { force } => match openshell_here()? {
-            true => super::sandbox_openshell::prune(force),
-            false => run_prune(force),
-        },
-        SandboxCommand::Stop { name, all, yes } => match openshell_here()? {
-            true => super::sandbox_openshell::stop(name, all, yes),
-            false => run_stop(name, all, yes),
-        },
+        SandboxCommand::Prune { force } => {
+            if config_puts_in_remote_sandbox() {
+                super::sandbox_openshell::prune(force)
+            } else {
+                run_prune(force)
+            }
+        }
+        SandboxCommand::Stop { name, all, yes } => {
+            if config_puts_in_remote_sandbox() {
+                super::sandbox_openshell::stop(name, all, yes)
+            } else {
+                run_stop(name, all, yes)
+            }
+        }
         SandboxCommand::Rebuild { yes } => {
             super::sandbox_openshell::rebuild(&super::sandbox_openshell::current_project()?, yes)
         }
@@ -200,11 +206,24 @@ pub fn run(args: SandboxArgs) -> Result<()> {
     }
 }
 
-/// Whether this repository's config puts it in an OpenShell sandbox, so
-/// `stop` and `prune` act on OpenShell's sandboxes rather than Lima's VMs.
-fn openshell_here() -> Result<bool> {
-    Ok(Config::load(None)?.sandbox.remote_backend()
-        == Some(crate::config::SandboxBackend::Openshell))
+/// Whether `config` puts the repository in a sandbox on a remote (OpenShell,
+/// or the hidden loopback backend), so the `sandbox` commands act on that
+/// sandbox rather than on Lima's VMs or the containers.
+fn in_remote_sandbox(config: &Config) -> bool {
+    config.sandbox.remote_backend().is_some()
+}
+
+/// [`in_remote_sandbox`] for `stop` and `prune`, which act on Lima's VMs
+/// without the repository's config: one that fails to load leaves them
+/// acting on Lima.
+fn config_puts_in_remote_sandbox() -> bool {
+    match Config::load(None) {
+        Ok(config) => in_remote_sandbox(&config),
+        Err(error) => {
+            debug!(error = %format!("{error:#}"), "config not loaded; acting on Lima's VMs");
+            false
+        }
+    }
 }
 
 /// `sandbox status`: the repository's sandbox, as its backend has it.
@@ -219,7 +238,7 @@ fn run_status() -> Result<()> {
         return Ok(());
     }
     let config = Config::load(None)?;
-    if config.sandbox.remote_backend().is_some() {
+    if in_remote_sandbox(&config) {
         let project = super::sandbox_openshell::current_project()?;
         if !super::sandbox_openshell::status(&project)? {
             std::process::exit(1);
