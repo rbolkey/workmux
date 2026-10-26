@@ -683,8 +683,7 @@ fn run_install_dev(skip_build: bool, release: bool) -> Result<()> {
 
     // --- OpenShell image ---
     let installed = crate::remote::openshell::image::installed_workmux();
-    let openshell =
-        config.sandbox.remote_backend() == Some(crate::config::SandboxBackend::Openshell);
+    let openshell = which::which("openshell").is_ok();
     if install_dev_openshell(&binary_path, installed.as_deref(), openshell)? {
         did_something = true;
     }
@@ -731,7 +730,7 @@ fn run_install_dev(skip_build: bool, release: bool) -> Result<()> {
 
     if !did_something {
         bail!(
-            "Nothing to do: no container image '{}' found, no running Lima VMs, and this repository's sandbox is not OpenShell.",
+            "Nothing to do: no container image '{}' found, no running Lima VMs, and no OpenShell.",
             image_name
         );
     }
@@ -741,17 +740,17 @@ fn run_install_dev(skip_build: bool, release: bool) -> Result<()> {
 }
 
 /// Install `binary` as the Linux workmux OpenShell sandbox images get, at
-/// `installed`: for an OpenShell repository, or to replace one installed
+/// `installed`: when OpenShell is installed, or to replace one installed
 /// before. Returns whether it did.
 fn install_dev_openshell(
     binary_path: &Path,
     installed: Option<&Path>,
-    openshell_repository: bool,
+    openshell_available: bool,
 ) -> Result<bool> {
     let Some(installed) = installed else {
         bail!("Could not determine where to keep the Linux workmux for OpenShell sandboxes");
     };
-    if !openshell_repository && !installed.exists() {
+    if !openshell_available && !installed.exists() {
         return Ok(false);
     }
     println!("Installing workmux for OpenShell sandboxes...");
@@ -1377,7 +1376,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn install_dev_installs_the_linux_workmux_for_an_openshell_repository() {
+    fn install_dev_installs_the_linux_workmux_when_openshell_is_installed() {
         let dir = tempfile::tempdir().unwrap();
         let built = dir.path().join("built");
         std::fs::write(&built, "linux workmux").unwrap();
@@ -1392,7 +1391,7 @@ mod tests {
     }
 
     #[test]
-    fn install_dev_elsewhere_replaces_only_a_linux_workmux_installed_before() {
+    fn without_openshell_install_dev_replaces_only_a_linux_workmux_installed_before() {
         let dir = tempfile::tempdir().unwrap();
         let built = dir.path().join("built");
         std::fs::write(&built, "second build").unwrap();
