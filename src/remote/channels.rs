@@ -702,6 +702,7 @@ mod tests {
             builtin_shims: None,
             host_commands: vec![],
             env_passthrough: vec![],
+            env: Default::default(),
             openshell: None,
         }
     }

@@ -31,9 +31,6 @@ pub struct RemoteProject {
     pub site: ProjectSite,
     /// How the workstation reaches that remote.
     pub remote_config: RemoteConfig,
-    /// What the repository's config asks of the sandbox that its backend
-    /// ignores, said once with the target.
-    pub notes: Vec<String>,
 }
 
 impl RemoteProject {
@@ -297,7 +294,7 @@ fn session_once(
         argv: argv.iter().map(|arg| arg.to_string()).collect(),
         invoking_window_token: invoking_window_token(project),
         prompt_file,
-        env: passed_through(project, |name| std::env::var(name).ok()),
+        env: sandbox_env(project, |name| std::env::var(name).ok()),
     };
     let Some(socket) = daemon_socket() else {
         return super::channels().run_command(
@@ -348,18 +345,20 @@ fn session_once(
     Ok(exit.exit_code)
 }
 
-/// The values `workstation` gives the variables `project`'s config passes
-/// through to its sandbox; a variable it has no value for is left out, as a
-/// container or Lima sandbox leaves it out.
-fn passed_through(
+/// The environment `project`'s config gives its sandbox: the values
+/// `workstation` gives the variables it passes through (one it has no value
+/// for is left out, as a container or Lima sandbox leaves it out), then the
+/// variables it sets, which win, as they do there.
+fn sandbox_env(
     project: &RemoteProject,
     workstation: impl Fn(&str) -> Option<String>,
 ) -> BTreeMap<String, String> {
-    project
-        .remote_config
+    let config = &project.remote_config;
+    config
         .env_passthrough
         .iter()
         .filter_map(|name| Some((name.clone(), workstation(name)?)))
+        .chain(config.env.clone())
         .collect()
 }
 
@@ -681,15 +680,7 @@ pub fn relay(project: &RemoteProject) -> Result<()> {
 /// Say once which remote a relayed command runs on, so the target is
 /// always visible.
 fn announce(project: &RemoteProject) {
-    announce_to(project, &mut std::io::stderr());
-}
-
-/// [`announce`] on `out`, followed by the project's notes.
-fn announce_to(project: &RemoteProject, out: &mut impl Write) {
-    let _ = writeln!(out, "Running in {}", project.target());
-    for note in &project.notes {
-        let _ = writeln!(out, "{note}");
-    }
+    eprintln!("Running in {}", project.target());
 }
 
 /// Run `argv` on `project`'s remote and exit with its exit code.
@@ -816,31 +807,40 @@ mod tests {
     }
 
     #[test]
-    fn a_relayed_command_says_its_target_then_what_the_sandbox_ignores() {
-        let mut project = api();
-        project.notes = vec!["Note: extra_mounts is ignored".to_string()];
-        let mut said = Vec::new();
-
-        announce_to(&project, &mut said);
-
-        assert_eq!(
-            String::from_utf8(said).unwrap(),
-            "Running in remote devbox (project api)\nNote: extra_mounts is ignored\n"
-        );
-    }
-
-    #[test]
-    fn a_command_carries_the_workstation_values_of_the_variables_passed_through() {
+    fn a_command_carries_the_workstation_values_of_the_variables_sandbox_env() {
         let mut project = api();
         project.remote_config.env_passthrough =
             ["GITHUB_TOKEN", "UNSET"].map(String::from).to_vec();
         let workstation = |name: &str| (name == "GITHUB_TOKEN").then(|| "ghp_x".to_string());
 
-        let env = passed_through(&project, workstation);
+        let env = sandbox_env(&project, workstation);
 
         assert_eq!(
             env,
             BTreeMap::from([("GITHUB_TOKEN".to_string(), "ghp_x".to_string())])
+        );
+    }
+
+    #[test]
+    fn a_command_carries_the_variables_config_sets_over_those_sandbox_env() {
+        let mut project = api();
+        project.remote_config.env_passthrough =
+            ["API_URL", "GITHUB_TOKEN"].map(String::from).to_vec();
+        project.remote_config.env =
+            BTreeMap::from([("API_URL".to_string(), "https://api.test".to_string())]);
+        let workstation = |name: &str| Some(format!("workstation {name}"));
+
+        let env = sandbox_env(&project, workstation);
+
+        assert_eq!(
+            env,
+            BTreeMap::from([
+                ("API_URL".to_string(), "https://api.test".to_string()),
+                (
+                    "GITHUB_TOKEN".to_string(),
+                    "workstation GITHUB_TOKEN".to_string()
+                ),
+            ])
         );
     }
 

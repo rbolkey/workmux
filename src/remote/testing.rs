@@ -226,9 +226,9 @@ pub fn devbox_api() -> super::router::RemoteProject {
             builtin_shims: None,
             host_commands: Vec::new(),
             env_passthrough: Vec::new(),
+            env: Default::default(),
             openshell: None,
         },
-        notes: Vec::new(),
     }
 }
 
@@ -243,12 +243,14 @@ pub fn openshell_api() -> super::router::RemoteProject {
         builtin_shims: None,
         host_commands: Vec::new(),
         env_passthrough: Vec::new(),
+        env: Default::default(),
         openshell: Some(crate::config::OpenshellRemote {
             project: "api".to_string(),
             git_url: project.site.git_url.clone(),
             path: "~/api".to_string(),
             settings: crate::config::OpenshellProject::default(),
             agents: vec!["claude".to_string()],
+            extra_mounts: false,
         }),
     };
     project

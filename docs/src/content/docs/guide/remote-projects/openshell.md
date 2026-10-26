@@ -54,10 +54,11 @@ The `sandbox:` settings every backend reads mean the same for OpenShell as for c
 
 - **`host_commands`**: the commands the sandbox may run on your workstation (see [Shims and host commands](/guide/remote-projects/#shims-and-host-commands)). Each one listed is a way out of the sandbox, so list only what the project needs; a command you used for Lima, such as a credential helper, may not be needed here.
 - **`env_passthrough`**: workstation environment variables set in the sandbox for each command workmux runs there, and so in the panes it starts. A variable that is unset on your workstation is left out.
-- **`extra_mounts`**: ignored, since OpenShell never mounts workstation directories. workmux says so, with a note, when it runs a command in the sandbox.
+- **`env`**: variables set to the values in your config, in the same places. A variable in both `env` and `env_passthrough` gets the value from `env`.
+- **`extra_mounts`**: ignored, since OpenShell never mounts workstation directories. workmux says so, with a note, when it creates or starts the sandbox.
 
 :::caution
-`env_passthrough` puts the real value in the sandbox. A variable that a provider also supplies, such as `CLAUDE_CODE_OAUTH_TOKEN` or `GITHUB_TOKEN`, then overrides the provider's placeholder, and the agent can read the secret. Leave such variables to the provider.
+`env_passthrough` and `env` put the real value in the sandbox. A variable that a provider also supplies, such as `CLAUDE_CODE_OAUTH_TOKEN` or `GITHUB_TOKEN`, then overrides the provider's placeholder, and the agent can read the secret. Leave such variables to the provider.
 :::
 
 ## Git and GitHub

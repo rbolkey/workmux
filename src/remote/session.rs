@@ -98,9 +98,10 @@ pub struct CommandRequest {
     /// them in a file of its own, as the command's prompt file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_file: Option<String>,
-    /// The workstation's values of the variables `sandbox.env_passthrough`
-    /// names, set in remote workmux's environment and so in the panes it
-    /// starts.
+    /// The sandbox's environment from the project's config: the workstation's
+    /// values of the variables `sandbox.env_passthrough` names, and those
+    /// `sandbox.env` sets. They are set in remote workmux's environment and
+    /// so in the panes it starts.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
 }
@@ -740,6 +741,7 @@ mod tests {
             builtin_shims: None,
             host_commands: vec![],
             env_passthrough: vec![],
+            env: Default::default(),
             openshell: None,
         }
     }
