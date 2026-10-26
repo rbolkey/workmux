@@ -168,8 +168,7 @@ fn unpushed(clone: &Path, rev: &str) -> Result<usize> {
 pub fn at_risk(clone: &Path) -> Result<Vec<AtRisk>> {
     let worktrees = worktrees(clone)?;
     // As `workmux remove` decides, so remove, rebuild and prune agree.
-    let unmerged_into =
-        |branch: &str| crate::git::branch_unmerged_base_in(branch, Some(clone));
+    let unmerged_into = |branch: &str| crate::git::branch_unmerged_base_in(branch, Some(clone));
     let mut risks = Vec::new();
     let mut checked_out = Vec::new();
     for worktree in &worktrees {
@@ -685,9 +684,17 @@ mod tests {
         run_git(&feature, &["push", "--quiet", "-u", "origin", "feature"]);
         run_git(
             &project.clone,
-            &["config", "--local", "branch.feature.workmux-base", "develop"],
+            &[
+                "config",
+                "--local",
+                "branch.feature.workmux-base",
+                "develop",
+            ],
         );
-        run_git(&project.clone, &["branch", "--quiet", "-f", "develop", "feature"]);
+        run_git(
+            &project.clone,
+            &["branch", "--quiet", "-f", "develop", "feature"],
+        );
 
         let risks: Vec<String> = at_risk(&project.clone)
             .unwrap()
