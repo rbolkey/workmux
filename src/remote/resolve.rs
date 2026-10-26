@@ -15,8 +15,7 @@ use super::git_url::GitUrl;
 use super::router::RemoteProject;
 use super::session::ProjectSite;
 use crate::config::{
-    Config, OpenshellRemote, RemoteConfig, SandboxBackend, TransportKind,
-    openshell_sandbox_name,
+    Config, OpenshellRemote, RemoteConfig, SandboxBackend, TransportKind, openshell_sandbox_name,
 };
 use crate::multiplexer::{InvocationContext, TmuxBackend};
 use crate::project::{ProjectTag, RemoteProjectId};

@@ -8,7 +8,11 @@ pub fn run(name: &str, json: bool) -> Result<()> {
         if json {
             argv.push("--json");
         }
-        return router::exit_with(router::run(&project, &argv)?);
+        // Looking a worktree up never creates or starts the sandbox.
+        if let Some(why) = router::not_running(&project)? {
+            return Err(anyhow!(why));
+        }
+        return router::exit_with(router::run_running(&project, &argv)?);
     }
 
     if !git::is_git_repo()? {

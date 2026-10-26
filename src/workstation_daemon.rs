@@ -106,7 +106,11 @@ fn dispatch(request: &Request) -> Response {
 
 /// Remote project `name` on `remote`, resolved from the config of the
 /// workstation clone at `root`.
-fn project_at(root: &Path, remote: &str, name: &str) -> Result<crate::remote::router::RemoteProject> {
+fn project_at(
+    root: &Path,
+    remote: &str,
+    name: &str,
+) -> Result<crate::remote::router::RemoteProject> {
     crate::remote::resolve::at(root)?
         .filter(|project| project.site.remote == remote && project.site.name == name)
         .ok_or_else(|| {

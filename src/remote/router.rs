@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 use super::forwarded;
 use super::session::ServedProject;
 use super::session::{Answer, CommandRequest, OutputParams, ProjectSite, Stream, Terminal};
+use super::transport::RemoteState;
 use crate::config::{Config, Placement, RemoteConfig};
 use crate::multiplexer::{InvocationContext, TmuxBackend, create_backend, detect_backend};
 use crate::project::{Project, ProjectTag, RemoteProjectId};
@@ -59,6 +60,36 @@ impl RemoteProject {
                 self.remote_config.target, self.site.name
             ),
             _ => format!("remote {} (project {})", self.site.remote, self.site.name),
+        }
+    }
+
+    /// Why a command that only reports finds nothing to look at, for a
+    /// remote in `state`: it doesn't exist yet, or it is stopped. `None`
+    /// when it is running.
+    pub fn not_running(&self, state: RemoteState) -> Option<String> {
+        match state {
+            RemoteState::Running => None,
+            RemoteState::Missing => Some(match self.remote_config.transport {
+                crate::config::TransportKind::Openshell => format!(
+                    "No OpenShell sandbox for {} yet; `workmux add <branch>` creates it",
+                    self.site.name
+                ),
+                _ => format!(
+                    "No remote {} for project {} yet; `workmux add <branch>` creates it",
+                    self.site.remote, self.site.name
+                ),
+            }),
+            RemoteState::Stopped => {
+                let target = self.target();
+                let mut first = target.chars();
+                let target = first
+                    .next()
+                    .map(|c| c.to_uppercase().chain(first).collect::<String>())
+                    .unwrap_or_default();
+                Some(format!(
+                    "{target} is stopped; `workmux remote start` starts it"
+                ))
+            }
         }
     }
 }
@@ -362,12 +393,38 @@ pub fn run(project: &RemoteProject, argv: &[&str]) -> Result<i32> {
 /// it reports to this terminal: with `start`, a missing remote is created
 /// and a stopped one started. Returns whether it is running.
 pub fn ready(project: &RemoteProject, start: bool) -> Result<bool> {
+    Ok(state(project, start)? == RemoteState::Running)
+}
+
+/// Like [`ready`], returning the remote's state: running, else as it was
+/// found.
+fn state(project: &RemoteProject, start: bool) -> Result<RemoteState> {
     let transport = super::transport::build(&project.remote_config)?;
     super::transport::ensure_running(
         &project.site.remote,
         transport.as_ref(),
         start,
         &mut |notice| eprintln!("{notice}"),
+    )
+}
+
+/// For a command that only reports: why `project`'s remote has nothing to
+/// look at, as [`RemoteProject::not_running`] says, or `None` when it is
+/// running. A missing remote is never created to look, nor a stopped one
+/// started (ADR 0004: the sandbox is created on the first `workmux add`).
+pub fn not_running(project: &RemoteProject) -> Result<Option<String>> {
+    Ok(project.not_running(state(project, false)?))
+}
+
+/// Run `argv` for `project` on its remote like [`run`], on a remote the
+/// caller has just found running with [`not_running`].
+pub fn run_running(project: &RemoteProject, argv: &[&str]) -> Result<i32> {
+    session(
+        project,
+        argv,
+        None,
+        &mut Invoking { output: write_to },
+        Readiness::Running,
     )
 }
 
@@ -676,12 +733,13 @@ pub fn relay_to_every_project() -> Result<usize> {
     let mut failures = 0;
     for project in projects {
         let (name, remote) = (&project.site.name, &project.site.remote);
-        // A stopped sandbox is never started just to visit it.
-        match ready(&project, false) {
-            Ok(true) => {}
-            Ok(false) => {
+        // A stopped sandbox is never started just to visit it, nor a
+        // missing one created.
+        match not_running(&project) {
+            Ok(None) => {}
+            Ok(Some(why)) => {
                 eprintln!(
-                    "Skipping remote project '{name}': remote {remote} is stopped (start it with `workmux remote start` in a clone of its repository)"
+                    "Skipping remote project '{name}': {why} (run it in a clone of its repository)"
                 );
                 continue;
             }
@@ -851,6 +909,25 @@ agents:
         api.remote_config.transport = crate::config::TransportKind::Openshell;
         api.remote_config.target = "wm-api".to_string();
         assert_eq!(api.target(), "OpenShell sandbox wm-api (project api)");
+    }
+
+    #[test]
+    fn a_command_that_only_reports_says_why_the_sandbox_has_nothing_to_show() {
+        let mut api = api();
+        api.remote_config.transport = crate::config::TransportKind::Openshell;
+        api.remote_config.target = "wm-api".to_string();
+
+        assert_eq!(api.not_running(RemoteState::Running), None);
+        assert_eq!(
+            api.not_running(RemoteState::Missing).as_deref(),
+            Some("No OpenShell sandbox for api yet; `workmux add <branch>` creates it")
+        );
+        assert_eq!(
+            api.not_running(RemoteState::Stopped).as_deref(),
+            Some(
+                "OpenShell sandbox wm-api (project api) is stopped; `workmux remote start` starts it"
+            )
+        );
     }
 
     #[test]

@@ -4660,7 +4660,10 @@ sandbox:
 
     #[test]
     fn a_config_with_the_withdrawn_placement_keys_fails_naming_main_placement_settings() {
-        for key in ["project_session: frontend", "project_placement: current-session"] {
+        for key in [
+            "project_session: frontend",
+            "project_placement: current-session",
+        ] {
             let error = serde_yaml::from_str::<Config>(&format!("{key}\n"))
                 .unwrap_err()
                 .to_string();

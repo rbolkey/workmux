@@ -151,11 +151,14 @@ impl Transport for ScriptTransport {
     }
 }
 
-/// A remote whose transport reports it stopped. Counts what it is asked to do.
+/// A remote whose transport reports it stopped, or missing. Counts what it
+/// is asked to do.
 #[derive(Default)]
 pub struct StoppedTransport {
     pub execs: AtomicUsize,
     pub starts: AtomicUsize,
+    /// Reports no remote yet rather than a stopped one.
+    pub missing: bool,
 }
 
 impl Transport for StoppedTransport {
@@ -180,7 +183,11 @@ impl Transport for StoppedTransport {
 
 impl Provisioning for StoppedTransport {
     fn status(&self) -> Result<RemoteState> {
-        Ok(RemoteState::Stopped)
+        Ok(if self.missing {
+            RemoteState::Missing
+        } else {
+            RemoteState::Stopped
+        })
     }
 
     fn create(&self) -> Result<()> {

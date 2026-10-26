@@ -3129,3 +3129,84 @@ def test_a_command_for_every_project_checks_each_remotes_state_once(
             os.kill(daemon_pid, signal.SIGTERM)
         subprocess.run(["pkill", "-f", f"{state}/"], check=False)
         shutil.rmtree(state, ignore_errors=True)
+
+
+@pytest.mark.tmux_only
+def test_read_only_commands_never_create_or_start_an_openshell_sandbox(
+    mux_server: MuxEnvironment,
+    workmux_exe_path: Path,
+    repo_path: Path,
+    short_tmp: dict,
+):
+    """In a repository whose config puts it in an OpenShell sandbox,
+    commands that only report say the sandbox doesn't exist yet, or is
+    stopped, and never create, start or build it. `openshell` and `docker`
+    are fakes on PATH that log every call."""
+    env = mux_server
+    state = env.tmp_path / "openshell"
+    state.mkdir()
+    env.install_script(
+        env.fake_bin_dir / "openshell",
+        f"""#!/bin/sh
+printf '%s\\n' "$*" >> {state}/log
+case "$1 $2" in
+'sandbox get')
+  [ -e {state}/phase ] || {{ echo "sandbox not found" >&2; exit 1; }}
+  printf '{{"phase":"%s","policy":{{}}}}' "$(cat {state}/phase)" ;;
+'sandbox list') echo '{{"next_page_token":"","sandboxes":[]}}' ;;
+*) echo "unexpected: $*" >&2; exit 1 ;;
+esac
+""",
+    )
+    env.install_script(
+        env.fake_bin_dir / "docker",
+        f"#!/bin/sh\nprintf '%s\\n' \"$*\" >> {state}/docker-log\nexit 1\n",
+    )
+    clone = project_in_sandbox(
+        env, workmux_exe_path, "trellis", env.tmp_path / "origin", short_tmp
+    )
+    sandbox = openshell_sandbox_name(clone)
+
+    def wm(command, expect_fail=False):
+        return run_workmux_command(
+            env,
+            workmux_exe_path,
+            clone,
+            command,
+            pre_run_env=short_tmp,
+            expect_fail=expect_fail,
+            timeout=30.0,
+        )
+
+    def calls() -> set:
+        log = state / "log"
+        lines = log.read_text().splitlines() if log.exists() else []
+        log.unlink(missing_ok=True)
+        return {" ".join(line.split()[:2]) for line in lines}
+
+    # No sandbox yet.
+    listed = wm("list")
+    assert (
+        "No OpenShell sandbox for trellis yet; `workmux add <branch>` creates it"
+        in listed.stdout
+    )
+    assert wm("list --json").stdout.strip() == "[]"
+    missing = wm("path feature", expect_fail=True)
+    assert "No OpenShell sandbox for trellis yet" in missing.stderr
+    wm("status")
+    assert "not created yet" in wm("remote status").stdout
+    assert "not created yet" in wm("remote list").stdout
+    assert calls() <= {"sandbox get", "sandbox list"}
+
+    # A stopped sandbox.
+    (state / "phase").write_text("Stopped")
+    stopped = f"OpenShell sandbox {sandbox} (project trellis) is stopped"
+    assert stopped in wm("list").stdout
+    assert wm("list --json").stdout.strip() == "[]"
+    assert stopped in wm("path feature", expect_fail=True).stderr
+    wm("status")
+    assert "stopped" in wm("remote status").stdout
+    assert "stopped" in wm("remote list").stdout
+    assert calls() <= {"sandbox get", "sandbox list"}
+    assert (state / "phase").read_text() == "Stopped"
+    assert not (state / "docker-log").exists()

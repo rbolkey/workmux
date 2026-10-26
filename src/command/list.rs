@@ -341,6 +341,16 @@ fn save_list(path: &Path, stdout: &[u8]) -> Result<()> {
 
 pub fn run(show_pr: bool, json: bool, all: bool, filter: &[String]) -> Result<()> {
     if !all && let Some(remote) = router::resolve()? {
+        // Listing never creates or starts the sandbox.
+        if let Some(why) = router::not_running(&remote)? {
+            if json {
+                eprintln!("{why}");
+                println!("[]");
+            } else {
+                println!("{why}");
+            }
+            return Ok(());
+        }
         let mut argv = vec!["workmux", "list"];
         if show_pr {
             argv.push("--pr");
@@ -351,7 +361,7 @@ pub fn run(show_pr: bool, json: bool, all: bool, filter: &[String]) -> Result<()
             println!("Worktrees in {}", remote.target());
         }
         argv.extend(filter.iter().map(String::as_str));
-        return router::exit_with(router::run(&remote, &argv)?);
+        return router::exit_with(router::run_running(&remote, &argv)?);
     }
 
     let display_config = config::Config::load(None)?;
@@ -363,12 +373,10 @@ pub fn run(show_pr: bool, json: bool, all: bool, filter: &[String]) -> Result<()
             worktrees.extend(list_project(&root, mux.as_ref(), show_pr && !json, filter)?);
         }
         for remote in router::remote_projects() {
-            // A stopped sandbox is never started just to list it.
-            if !router::ready(&remote, false).unwrap_or(true) {
-                eprintln!(
-                    "warning: project {} is not listed: remote {} is stopped",
-                    remote.site.name, remote.site.remote
-                );
+            // A stopped sandbox is never started just to list it, nor a
+            // missing one created.
+            if let Ok(Some(why)) = router::not_running(&remote) {
+                eprintln!("warning: project {} is not listed: {why}", remote.site.name);
                 continue;
             }
             match list_remote_project(&remote, filter) {

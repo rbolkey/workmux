@@ -19,7 +19,7 @@ from pathlib import Path
 
 import pytest
 
-from .conftest import MuxEnvironment, TmuxEnvironment, run_workmux_command
+from .conftest import MuxEnvironment, TmuxEnvironment
 from .support.openshell import (
     GH_IMAGE,
     LEARNING_IMAGE,
@@ -32,6 +32,7 @@ from .test_workmux_remote import (
     agent_in,
     openshell_sandbox_name,
     remote_daemon_ping,
+    run_workmux_command,
     tmux_value,
     wait_until,
 )
@@ -197,6 +198,28 @@ def add_project(project: Project):
     project.make_origin()
 
 
+def test_listing_a_new_openshell_project_creates_nothing(project: Project):
+    """`list` in a repository whose sandbox doesn't exist yet says so, and
+    neither builds an image nor creates the sandbox (ADR 0004: the first
+    `workmux add` does)."""
+    project.configure("/sandbox/origin", LEARNING_IMAGE)
+
+    listed = project.wm("list", timeout=60.0)
+
+    assert (
+        f"No OpenShell sandbox for {project.name} yet; `workmux add <branch>` creates it"
+        in listed.stdout
+    ), listed
+    assert "Creating remote" not in listed.stderr, listed.stderr
+    assert project.phase() is None
+    images = subprocess.run(
+        ["docker", "image", "ls", "-q", f"workmux-openshell-{project.sandbox}"],
+        capture_output=True,
+        text=True,
+    ).stdout.split()
+    assert images == []
+
+
 def test_an_openshell_project_lives_stops_resumes_and_is_removed_with_its_sandbox(
     project: Project,
 ):
@@ -216,7 +239,7 @@ def test_an_openshell_project_lives_stops_resumes_and_is_removed_with_its_sandbo
         daemon_pid = remote_daemon_ping(env, project.exe, project.repo, project.tmp)[
             "pid"
         ]
-        pane = tmux_value(env, f"={project.name}:wm-feature", "#{pane_id}")
+        pane = tmux_value(env, "=test:wm-feature", "#{pane_id}")
         feed = SidebarFeed(project.tmp["TMPDIR"])
         wait_until(
             lambda: (

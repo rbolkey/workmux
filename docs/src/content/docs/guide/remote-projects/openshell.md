@@ -136,9 +136,9 @@ Not covered: SSH hosts other than github.com. Private nix flake inputs are fetch
 
 workmux creates and starts the sandbox for you, and stops or deletes it only when you ask.
 
-- **Create.** The first command that needs the project builds the image, creates the sandbox and clones the repository, with the notice `Creating remote api on first use; …`.
-- **Start.** A command that needs a stopped sandbox starts it first (`Starting remote api…`).
-- **Never in the background.** The sidebar, the dashboard, `wait`, `list --all`, `resurrect` and `reap-agents` never create or start a sandbox. `resurrect` and `reap-agents` skip a stopped one with a notice and don't count it as a failure.
+- **Create.** The first command that acts in the project, such as `workmux add`, builds the image, creates the sandbox and clones the repository, with the notice `Creating remote api on first use; …`.
+- **Start.** A command that acts in a stopped sandbox starts it first (`Starting remote api…`).
+- **Never just to look.** Commands that only report never create or start a sandbox: `list`, `path`, `status`, `wait`, `remote status`, `remote list`, the sidebar and the dashboard. With no sandbox yet, they say `workmux add <branch>` creates it; with a stopped one, they say `workmux remote start` starts it. `resurrect` and `reap-agents` don't create or start one either; they skip it with a notice and don't count it as a failure.
 
 ```bash
 # run in your clone of the repository
@@ -232,7 +232,7 @@ Nix cannot install or build inside an OpenShell sandbox. Instead, for a project 
 
 The step that builds the devshell has no secret, so the flake's builders and `shellHook` can't read the token. Any other project's bake gets no token: a private input fails it with nix's `HTTP error 404` or `Cannot find Git revision`, and workmux says private GitHub flake inputs need `gh-login` in `sandbox.openshell.providers`. Private inputs on other git servers aren't covered. Nothing fetches flake inputs inside the sandbox, because nix can't write its read-only `/nix`.
 
-The image is fixed when the sandbox is created. When the clone's `flake.lock` no longer matches the baked one, `remote status` warns, and `workmux remote recreate` rebuilds the image.
+The image is fixed when the sandbox is created. It follows what the bake reads: `flake.nix`, `flake.lock`, and the files and directories the flake names by path (`./nix/shell.nix`, `"${self}/nix"`), followed through the `.nix` files among them. When any of them in the clone no longer match the baked ones, `remote status` warns, and `workmux remote recreate` gives the sandbox a new image. Changes to the rest of the repository don't. Neither does a file the flake reads through a path it builds from a string at evaluation time.
 
 A devbox project gets no devshell in a sandbox. Put its toolchain in your `image`. `remote status` says so.
 

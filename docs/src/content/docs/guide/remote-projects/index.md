@@ -40,7 +40,7 @@ Creating remote api on first use…
 Cloning https://github.com/me/api.git into ~/api on api
 ```
 
-The first command that needs the sandbox creates it, clones the repository from your clone's `origin` and provisions it. See [OpenShell projects](/guide/remote-projects/openshell/) for the settings, credentials and lifecycle.
+The first command that acts in the project, such as `workmux add`, creates the sandbox, clones the repository from your clone's `origin` and provisions it. A command that only reports, such as `workmux list`, never creates it: it says the sandbox doesn't exist yet. See [OpenShell projects](/guide/remote-projects/openshell/) for the settings, credentials and lifecycle.
 
 ## Which project a command acts on
 
