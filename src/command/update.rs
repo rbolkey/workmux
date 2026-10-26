@@ -3,7 +3,11 @@ use serde::{Deserialize, Serialize};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const REPO: &str = "raine/workmux";
+/// Names this build's release source: the base URL its released builds are
+/// downloaded from, as `<base>/v<version>/workmux-<platform>.tar.gz`. Unset
+/// until this fork publishes its own releases, so a fork build never offers
+/// upstream's.
+pub(crate) const RELEASES_URL_VAR: &str = "WORKMUX_RELEASES_URL";
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const CHECK_INTERVAL_SECS: u64 = 24 * 60 * 60;
 const NOTIFY_COOLDOWN_SECS: u64 = 7 * 24 * 60 * 60;
@@ -26,21 +30,63 @@ fn is_homebrew_install(exe_path: &std::path::Path) -> bool {
     path_str.contains("/Cellar/") || path_str.contains("/homebrew/")
 }
 
-/// Fetch the latest release tag from GitHub API using curl.
-fn fetch_latest_version() -> Result<String> {
-    fetch_latest_version_with_options(None, "Failed to run curl. Is curl installed?")
+/// This build's release source, if one is configured.
+pub(crate) fn release_source() -> Option<String> {
+    std::env::var(RELEASES_URL_VAR)
+        .ok()
+        .filter(|base| !base.is_empty())
 }
 
-/// Fetch latest release tag from GitHub API using curl with optional timeouts.
-fn fetch_latest_version_with_timeout() -> Result<String> {
-    fetch_latest_version_with_options(Some((5, 10)), "Failed to run curl")
+fn require_release_source(source: Option<String>) -> Result<String> {
+    source.with_context(|| {
+        format!(
+            "Updates are not available for this build: it has no release source. \
+             Set {RELEASES_URL_VAR} to where its releases are published."
+        )
+    })
+}
+
+/// Where a release source says which version is its latest.
+#[derive(Debug, PartialEq)]
+enum LatestRelease {
+    /// GitHub's API for a source on GitHub releases.
+    GitHub(String),
+    /// A `latest` file beside the release directories, holding its tag.
+    File(String),
+}
+
+fn latest_release_url(base: &str) -> LatestRelease {
+    let base = base.trim_end_matches('/');
+    if let Some(repo) = base
+        .strip_prefix("https://github.com/")
+        .and_then(|rest| rest.strip_suffix("/releases/download"))
+    {
+        return LatestRelease::GitHub(format!(
+            "https://api.github.com/repos/{repo}/releases/latest"
+        ));
+    }
+    LatestRelease::File(format!("{base}/latest"))
+}
+
+/// Fetch the latest release version from the release source using curl.
+fn fetch_latest_version(source: &str) -> Result<String> {
+    fetch_latest_version_with_options(source, None, "Failed to run curl. Is curl installed?")
+}
+
+/// Fetch the latest release version using curl with timeouts.
+fn fetch_latest_version_with_timeout(source: &str) -> Result<String> {
+    fetch_latest_version_with_options(source, Some((5, 10)), "Failed to run curl")
 }
 
 fn fetch_latest_version_with_options(
+    source: &str,
     timeout_secs: Option<(u64, u64)>,
     run_ctx: &str,
 ) -> Result<String> {
-    let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
+    let latest = latest_release_url(source);
+    let url = match &latest {
+        LatestRelease::GitHub(url) | LatestRelease::File(url) => url,
+    };
     let mut command = Command::new("curl");
     command.arg("-sSf");
 
@@ -52,7 +98,7 @@ fn fetch_latest_version_with_options(
     }
 
     let output = command
-        .arg(&url)
+        .arg(url)
         .output()
         .with_context(|| run_ctx.to_string())?;
 
@@ -61,7 +107,20 @@ fn fetch_latest_version_with_options(
         bail!("Failed to fetch latest release: {}", stderr.trim());
     }
 
-    parse_latest_release_tag(&output.stdout)
+    match latest {
+        LatestRelease::GitHub(_) => parse_latest_release_tag(&output.stdout),
+        LatestRelease::File(_) => parse_latest_file(&output.stdout),
+    }
+}
+
+fn parse_latest_file(payload: &[u8]) -> Result<String> {
+    let tag = std::str::from_utf8(payload)
+        .context("Latest release file is not text")?
+        .trim();
+    if tag.is_empty() {
+        bail!("Latest release file is empty");
+    }
+    Ok(tag.strip_prefix('v').unwrap_or(tag).to_string())
 }
 
 fn parse_latest_release_tag(payload: &[u8]) -> Result<String> {
@@ -181,10 +240,11 @@ fn replace_binary(new_binary: &std::path::Path, current_exe: &std::path::Path) -
 
 fn do_update(
     pb: &indicatif::ProgressBar,
+    source: &str,
     artifact_name: &str,
     current_exe: &std::path::Path,
 ) -> Result<String> {
-    let latest_version = fetch_latest_version()?;
+    let latest_version = fetch_latest_version(source)?;
 
     if latest_version == CURRENT_VERSION {
         return Ok(format!("Already up to date (v{CURRENT_VERSION})"));
@@ -196,7 +256,7 @@ fn do_update(
     let tar_path = tmp.path().join(format!("{artifact_name}.tar.gz"));
     let sha_path = tmp.path().join(format!("{artifact_name}.sha256"));
 
-    let base_url = format!("https://github.com/{REPO}/releases/download/v{latest_version}");
+    let base_url = format!("{}/v{latest_version}", source.trim_end_matches('/'));
 
     download(&format!("{base_url}/{artifact_name}.tar.gz"), &tar_path)?;
     download(&format!("{base_url}/{artifact_name}.sha256"), &sha_path)?;
@@ -223,6 +283,7 @@ fn do_update(
 }
 
 pub fn run() -> Result<()> {
+    let source = require_release_source(release_source())?;
     let current_exe =
         std::env::current_exe().context("Could not determine current executable path")?;
 
@@ -245,7 +306,7 @@ pub fn run() -> Result<()> {
     pb.enable_steady_tick(std::time::Duration::from_millis(120));
     pb.set_message("Checking for updates...");
 
-    match do_update(&pb, &artifact_name, &current_exe) {
+    match do_update(&pb, &source, &artifact_name, &current_exe) {
         Ok(msg) => {
             pb.finish_with_message(format!("✔ {msg}"));
             Ok(())
@@ -259,9 +320,11 @@ pub fn run() -> Result<()> {
 
 // --- Auto-update check ---
 
-#[derive(Debug, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct UpdateCache {
     latest_version: Option<String>,
+    /// The release source `latest_version` was found at.
+    source: Option<String>,
     last_checked: Option<u64>,
     last_notified: Option<u64>,
     notify_count: Option<u64>,
@@ -301,6 +364,14 @@ fn is_newer_version(latest: &str, current: &str) -> bool {
     l > c
 }
 
+/// The cached latest version, if it is newer than this build and was found
+/// at `source`.
+fn newer_release<'a>(cache: &'a UpdateCache, source: &str) -> Option<&'a str> {
+    let latest = cache.latest_version.as_deref()?;
+    (cache.source.as_deref() == Some(source) && is_newer_version(latest, CURRENT_VERSION))
+        .then_some(latest)
+}
+
 /// Called on CLI startup to show an update notice if one is cached.
 /// Also spawns a background check if the cache is stale.
 /// Designed to be completely non-blocking and fail-silent.
@@ -314,6 +385,11 @@ pub fn check_and_notify(config: &crate::config::Config) {
     if std::env::var("WORKMUX_NO_UPDATE_CHECK").is_ok() {
         return;
     }
+
+    // Nothing to check without a release source
+    let Some(source) = release_source() else {
+        return;
+    };
 
     // Don't print notices in non-interactive contexts
     use std::io::IsTerminal;
@@ -350,9 +426,7 @@ pub fn check_and_notify(config: &crate::config::Config) {
 
     // Show notice if a newer version is available.
     // Pattern: burst of 3 consecutive notifications, then 7-day cooldown, repeat.
-    if let Some(ref latest) = cache.latest_version
-        && is_newer_version(latest, CURRENT_VERSION)
-    {
+    if let Some(latest) = newer_release(&cache, &source).map(str::to_string) {
         let count = cache.notify_count.unwrap_or(0);
         let in_cooldown = count >= NOTIFY_BURST_COUNT
             && now.saturating_sub(cache.last_notified.unwrap_or(0)) <= NOTIFY_COOLDOWN_SECS;
@@ -389,18 +463,24 @@ pub fn check_and_notify(config: &crate::config::Config) {
 
 /// Hidden subcommand handler: fetch the latest version and update the cache.
 pub fn run_background_check() -> Result<()> {
-    let latest = fetch_latest_version_with_timeout()?;
+    let Some(source) = release_source() else {
+        return Ok(());
+    };
+    let latest = fetch_latest_version_with_timeout(&source)?;
     let now = now_secs();
 
     let cache_path = update_cache_path().context("Could not determine cache path")?;
     let mut cache = load_cache(&cache_path);
 
     // Reset notification counter when a new version is discovered
-    if cache.latest_version.as_deref() != Some(&latest) {
+    if cache.latest_version.as_deref() != Some(&latest)
+        || cache.source.as_deref() != Some(&source)
+    {
         cache.notify_count = Some(0);
     }
 
     cache.latest_version = Some(latest);
+    cache.source = Some(source);
     cache.last_checked = Some(now);
     save_cache(&cache_path, &cache);
 
@@ -469,6 +549,65 @@ mod tests {
     #[test]
     fn test_is_not_newer_older() {
         assert!(!is_newer_version("0.1.9", "0.1.10"));
+    }
+
+    #[test]
+    fn a_github_release_source_reads_latest_from_the_github_api() {
+        assert_eq!(
+            latest_release_url("https://github.com/someone/workmux/releases/download/"),
+            LatestRelease::GitHub(
+                "https://api.github.com/repos/someone/workmux/releases/latest".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn another_release_source_names_its_latest_version_in_a_file() {
+        assert_eq!(
+            latest_release_url("file:///srv/workmux-releases"),
+            LatestRelease::File("file:///srv/workmux-releases/latest".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_latest_file_strips_v_prefix_and_whitespace() {
+        assert_eq!(parse_latest_file(b"v1.2.3\n").unwrap(), "1.2.3");
+    }
+
+    #[test]
+    fn updating_without_a_release_source_says_updates_are_not_available() {
+        let err = require_release_source(None).unwrap_err().to_string();
+
+        assert!(err.contains("not available for this build"), "{err}");
+        assert!(err.contains("WORKMUX_RELEASES_URL"), "{err}");
+    }
+
+    #[test]
+    fn a_newer_release_from_the_release_source_is_offered() {
+        let cache = UpdateCache {
+            latest_version: Some("99.0.0".to_string()),
+            source: Some("file:///releases".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(newer_release(&cache, "file:///releases"), Some("99.0.0"));
+    }
+
+    #[test]
+    fn a_release_found_at_another_source_is_not_offered() {
+        // A cache written before release sources existed holds upstream's
+        // latest version, with no source.
+        let upstream = UpdateCache {
+            latest_version: Some("99.0.0".to_string()),
+            ..Default::default()
+        };
+        let elsewhere = UpdateCache {
+            source: Some("file:///old".to_string()),
+            ..upstream.clone()
+        };
+
+        assert_eq!(newer_release(&upstream, "file:///releases"), None);
+        assert_eq!(newer_release(&elsewhere, "file:///releases"), None);
     }
 
     #[test]
