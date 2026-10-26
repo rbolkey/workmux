@@ -9,9 +9,9 @@ use std::path::Path;
 use crate::agent_setup::{AgentCheck, StatusCheck};
 use crate::sandbox::toolchain::DetectedToolchain;
 
-/// Where the nix installer puts nix; a non-interactive shell may not have
-/// it on PATH.
-const NIX_PROFILE_BIN: &str = "/nix/var/nix/profiles/default/bin";
+/// Where the nix installer puts nix, and an OpenShell image with nix too; a
+/// non-interactive shell may not have it on PATH.
+pub const NIX_PROFILE_BIN: &str = "/nix/var/nix/profiles/default/bin";
 
 /// Installs nix with the Determinate Systems installer, which asks for
 /// root itself.

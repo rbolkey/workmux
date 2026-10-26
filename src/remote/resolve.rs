@@ -221,6 +221,10 @@ fn project_in(config: &Config, root: &Path, origin: Option<&str>) -> Result<Remo
                         path: path.clone(),
                         settings,
                         agents,
+                        nix: crate::sandbox::toolchain::resolve_toolchain(
+                            &config.sandbox.toolchain(),
+                            root,
+                        ) == crate::sandbox::toolchain::DetectedToolchain::Flake,
                         extra_mounts: !config.sandbox.extra_mounts().is_empty(),
                     }),
                 },
@@ -451,6 +455,34 @@ mod tests {
         );
         // An agent workmux knows no type of names none.
         assert!(agents("agent: my-agent\n").is_empty());
+    }
+
+    #[test]
+    fn an_openshell_sandbox_gets_nix_when_the_toolchain_resolves_to_a_flake() {
+        let nix = |files: &[&str], toolchain: &str| {
+            let root = tempfile::tempdir().unwrap();
+            for file in files {
+                std::fs::write(root.path().join(file), "{}").unwrap();
+            }
+            project_in(
+                &config(&format!("{OPENSHELL}  toolchain: {toolchain}\n")),
+                root.path(),
+                Some("https://github.com/me/api.git"),
+            )
+            .unwrap()
+            .remote_config
+            .openshell
+            .unwrap()
+            .nix
+        };
+
+        assert!(nix(&["flake.nix"], "auto"));
+        assert!(!nix(&[], "auto"));
+        // devbox wins over a flake, as with Lima.
+        assert!(!nix(&["devbox.json", "flake.nix"], "auto"));
+        assert!(nix(&[], "flake"));
+        assert!(!nix(&["flake.nix"], "off"));
+        assert!(!nix(&["flake.nix"], "devbox"));
     }
 
     #[test]

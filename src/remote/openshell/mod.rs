@@ -259,8 +259,9 @@ impl OpenShell {
         })
     }
 
-    /// The policy the sandbox should have: the base policy with the
-    /// project's policy file merged on top.
+    /// The policy the sandbox should have: the base policy, with nix's
+    /// grants when the sandbox has nix, and the project's policy file merged
+    /// on top.
     pub fn desired_policy(&self) -> Result<serde_yaml::Value> {
         let user =
             match self
@@ -276,7 +277,10 @@ impl OpenShell {
                 }
                 None => None,
             };
-        policy::effective(user.as_deref())
+        policy::effective(
+            user.as_deref(),
+            self.origin.as_ref().is_some_and(|origin| origin.nix),
+        )
     }
 
     /// The sandbox's effective policy, as OpenShell reports it: from the
@@ -414,12 +418,15 @@ impl OpenShell {
     /// Build the sandbox's image, returning its tag.
     fn build_image(&self, origin: &OpenshellRemote, context: &std::path::Path) -> Result<String> {
         let checkout = context.join("project");
-        // The workstation has SSH: clone the way the user gave the URL.
-        let devshell = origin
-            .git_url
-            .as_ref()
-            .is_some_and(|url| self.fetch_flake(url.original(), &checkout))
-            .then_some(checkout);
+        // A devshell is baked when the toolchain is a flake, as nix is, and
+        // the clone has one. The workstation has SSH: clone the way the
+        // user gave the URL.
+        let devshell = (origin.nix
+            && origin
+                .git_url
+                .as_ref()
+                .is_some_and(|url| self.fetch_flake(url.original(), &checkout)))
+        .then_some(checkout);
         let workmux = image::Workmux::current();
         if let image::Workmux::Source(source) = &workmux {
             eprintln!(
@@ -433,6 +440,7 @@ impl OpenShell {
             agents: origin.agents.clone(),
             devshell,
             git_credential_helper: self.needs_git_credential_helper(),
+            nix: origin.nix,
         };
         let tag = image::prepare(&recipe, &self.sandbox, &sandbox_path(&origin.path), context)?;
         // The bake fetches the flake's inputs, private GitHub ones with the
@@ -474,11 +482,7 @@ impl OpenShell {
             );
             return false;
         }
-        let mode = crate::config::Config::load_with_location_from(checkout, None)
-            .map(|(config, _)| config.sandbox.toolchain())
-            .unwrap_or_default();
-        crate::sandbox::toolchain::resolve_toolchain(&mode, checkout)
-            == crate::sandbox::toolchain::DetectedToolchain::Flake
+        checkout.join("flake.nix").is_file()
     }
 
     /// The arguments that create the sandbox from `image` with the policy
@@ -835,6 +839,7 @@ pub(super) mod tests {
                 ..OpenshellProject::default()
             },
             agents: Vec::new(),
+            nix: false,
             extra_mounts: false,
         }
     }
@@ -857,7 +862,8 @@ pub(super) mod tests {
                  'sandbox get')\n\
                    if [ -f \"$dir/phase\" ]; then printf '{{\"phase\":\"%s\",\"policy\":{{}}}}' \"$(cat \"$dir/phase\")\";\n\
                    else echo \"Error:   × code: 'Some requested entity was not found', message: \\\"sandbox not found\\\"\" >&2; exit 1; fi ;;\n\
-                 'sandbox create'|'sandbox start') if [ -f \"$dir/fail\" ]; then cat \"$dir/fail\" >&2; exit 1; fi;\n\
+                 'sandbox create'|'sandbox start') prev=; for arg; do [ \"$prev\" = --policy ] && cp \"$arg\" \"$dir/created-policy\"; prev=$arg; done;\n\
+                   if [ -f \"$dir/fail\" ]; then cat \"$dir/fail\" >&2; exit 1; fi;\n\
                    echo Ready > \"$dir/phase\" ;;\n\
                  'sandbox stop') echo Stopped > \"$dir/phase\" ;;\n\
                  'sandbox delete') rm -f \"$dir/phase\" ;;\n\
@@ -883,10 +889,11 @@ pub(super) mod tests {
                 dir = dir.path().display()
             );
             // A stand-in `docker` that logs its arguments and the build
-            // secret it was handed.
+            // secret it was handed, and keeps the Dockerfile.
             let docker = format!(
                 "#!/bin/sh\n\
                  printf '%s\\n' \"$*\" >> {dir}/docker-log\n\
+                 [ ! -f Dockerfile ] || cp Dockerfile {dir}/Dockerfile\n\
                  printf 'secret %s\\n' \"$WORKMUX_GITHUB_TOKEN\" >> {dir}/docker-log\n\
                  [ ! -f {dir}/docker-fail ]\n",
                 dir = dir.path().display()
@@ -1061,7 +1068,8 @@ pub(super) mod tests {
         }
     }
 
-    /// `origin()` with a git URL to a local repository holding a flake.
+    /// `origin()` with a git URL to a local repository holding a flake, its
+    /// toolchain.
     fn flake_origin(repo: &std::path::Path) -> OpenshellRemote {
         std::fs::write(repo.join("flake.nix"), "{ outputs = _: { }; }\n").unwrap();
         crate::test_support::init_repo(repo);
@@ -1071,6 +1079,7 @@ pub(super) mod tests {
             git_url: Some(crate::remote::git_url::GitUrl::new(
                 repo.display().to_string(),
             )),
+            nix: true,
             ..origin()
         }
     }
@@ -1080,6 +1089,53 @@ pub(super) mod tests {
         let mut origin = flake_origin(repo);
         origin.settings.providers = providers.iter().map(|p| p.to_string()).collect();
         origin
+    }
+
+    /// The Dockerfile and the policy the fake built and created the
+    /// sandbox with.
+    fn built_and_created(fake: &FakeOpenShell) -> (String, serde_yaml::Value) {
+        let dockerfile = std::fs::read_to_string(fake.dir.path().join("Dockerfile")).unwrap();
+        let policy = std::fs::read_to_string(fake.dir.path().join("created-policy")).unwrap();
+        (dockerfile, serde_yaml::from_str(&policy).unwrap())
+    }
+
+    fn paths(policy: &serde_yaml::Value, list: &str) -> Vec<String> {
+        serde_yaml::from_value(policy["filesystem_policy"][list].clone()).unwrap()
+    }
+
+    #[test]
+    fn a_flake_toolchains_sandbox_gets_nix_the_baked_devshell_and_a_writable_store() {
+        let fake = FakeOpenShell::new();
+        let repo = tempfile::tempdir().unwrap();
+        let transport = fake.transport(Some(flake_origin(repo.path())));
+
+        transport.create().unwrap();
+
+        let (dockerfile, policy) = built_and_created(&fake);
+        assert!(dockerfile.contains(" AS devshell\n"), "{dockerfile}");
+        assert!(dockerfile.contains(" AS nix\n"), "{dockerfile}");
+        assert!(paths(&policy, "read_write").contains(&"/nix".to_string()));
+        assert!(!policy["network_policies"]["workmux-nix"].is_null());
+    }
+
+    #[test]
+    fn without_a_flake_toolchain_a_flake_gets_neither_nix_nor_a_baked_devshell() {
+        let fake = FakeOpenShell::new();
+        let repo = tempfile::tempdir().unwrap();
+        // The repository has a flake, but its toolchain is off.
+        let origin = OpenshellRemote {
+            nix: false,
+            ..flake_origin(repo.path())
+        };
+        let transport = fake.transport(Some(origin));
+
+        transport.create().unwrap();
+
+        let (dockerfile, policy) = built_and_created(&fake);
+        assert!(!dockerfile.contains("nixos/nix"), "{dockerfile}");
+        assert!(paths(&policy, "read_only").contains(&"/nix".to_string()));
+        assert!(!paths(&policy, "read_write").contains(&"/nix".to_string()));
+        assert!(policy["network_policies"].is_null(), "{policy:?}");
     }
 
     #[test]
@@ -1301,7 +1357,11 @@ pub(super) mod tests {
     #[test]
     fn status_shows_the_effective_policy() {
         let policy = serde_json::to_value(
-            policy::effective(Some("network_policies:\n  github: {endpoints: []}\n")).unwrap(),
+            policy::effective(
+                Some("network_policies:\n  github: {endpoints: []}\n"),
+                false,
+            )
+            .unwrap(),
         )
         .unwrap();
 
@@ -1318,9 +1378,13 @@ pub(super) mod tests {
 
     #[test]
     fn a_policy_that_only_widens_is_applied_in_place() {
-        let current = serde_json::to_value(policy::effective(None).unwrap()).unwrap();
+        let current = serde_json::to_value(policy::effective(None, false).unwrap()).unwrap();
         let widened = serde_json::to_value(
-            policy::effective(Some("network_policies:\n  github: {endpoints: []}\n")).unwrap(),
+            policy::effective(
+                Some("network_policies:\n  github: {endpoints: []}\n"),
+                false,
+            )
+            .unwrap(),
         )
         .unwrap();
 
@@ -1411,6 +1475,7 @@ mod contract {
                 ..Default::default()
             },
             agents: Vec::new(),
+            nix: false,
             extra_mounts: false,
         };
         Owned(OpenShell::new(name, Some(origin)))
@@ -1501,7 +1566,7 @@ mod contract {
     }
 
     #[test]
-    fn a_flake_projects_devshell_is_baked_into_the_image_and_runs_in_the_sandbox() {
+    fn a_flake_projects_sandbox_has_its_baked_devshell_and_a_working_nix() {
         if !enabled() {
             return;
         }
@@ -1522,6 +1587,7 @@ mod contract {
             origin.git_url = Some(crate::remote::git_url::GitUrl::new(
                 repo.path().display().to_string(),
             ));
+            origin.nix = true;
         }
         let transport = &owned.0;
 
@@ -1547,6 +1613,78 @@ mod contract {
         let source: image::DevshellSource = serde_json::from_slice(&source.stdout).unwrap();
         assert_eq!(source.clone, "/sandbox/api");
         assert_eq!(source.devshell_sha256, image::devshell_digest(repo.path()));
+
+        // nix works on the flake: the devshell and the flake's inputs are
+        // in the store already, so `nix develop` needs no network.
+        let sh = |script: &str| {
+            let output = transport
+                .exec_captured(&argv(&["sh", "-c", script]))
+                .unwrap();
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(output.status.success(), "{script}: {text}");
+            text
+        };
+        assert!(sh("nix --version").contains("2.24"));
+        for file in ["flake.nix", "flake.lock"] {
+            sh(&format!(
+                "mkdir -p /tmp/flake && cat > /tmp/flake/{file} <<'EOF'\n{}\nEOF",
+                std::fs::read_to_string(repo.path().join(file)).unwrap()
+            ));
+        }
+        let develop = sh(
+            "nix develop --offline /tmp/flake -c sh -c 'jq --version; echo devshell=$WM_LEARN_DEVSHELL'",
+        );
+        assert!(develop.contains("devshell=1"), "{develop}");
+        sh("nix develop /tmp/flake -c true");
+        // A check that builds, from the same nixpkgs and the binary cache.
+        sh("mkdir -p /tmp/check && cp /tmp/flake/flake.lock /tmp/check/ && cat > /tmp/check/flake.nix <<'EOF'
+{
+  inputs.nixpkgs.url = \"github:NixOS/nixpkgs/nixos-25.05\";
+  outputs = { nixpkgs, ... }: {
+    checks = nixpkgs.lib.genAttrs [ \"x86_64-linux\" \"aarch64-linux\" ] (system: {
+      ok = nixpkgs.legacyPackages.${system}.runCommand \"ok\" { } \"touch $out\";
+    });
+  };
+}
+EOF");
+        sh("nix flake check /tmp/check");
+        let hello = sh("nix profile install nixpkgs#hello && ~/.nix-profile/bin/hello");
+        assert!(hello.contains("Hello, world!"), "{hello}");
+        // The devshell and the flake's inputs are garbage collection roots.
+        sh("nix store gc && nix-collect-garbage && nix develop --offline /tmp/flake -c true");
+    }
+
+    #[test]
+    fn a_sandbox_whose_toolchain_is_off_has_no_nix() {
+        if !enabled() {
+            return;
+        }
+        let owned = sandbox("nonix");
+        let transport = &owned.0;
+
+        transport.create().unwrap();
+
+        let nix = transport
+            .exec_captured(&argv(&["sh", "-c", "command -v nix"]))
+            .unwrap();
+        assert!(!nix.status.success(), "{nix:?}");
+        let policy = transport.current_policy().unwrap().unwrap();
+        let read_only: Vec<String> =
+            serde_json::from_value(policy["filesystem_policy"]["read_only"].clone()).unwrap();
+        let read_write: Vec<String> =
+            serde_json::from_value(policy["filesystem_policy"]["read_write"].clone()).unwrap();
+        assert!(read_only.contains(&"/nix".to_string()), "{policy}");
+        assert!(!read_write.contains(&"/nix".to_string()), "{policy}");
+        assert!(
+            policy["network_policies"]
+                .as_object()
+                .is_none_or(|rules| rules.is_empty()),
+            "{policy}"
+        );
     }
 
     #[test]

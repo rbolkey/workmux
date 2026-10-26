@@ -1,0 +1,27 @@
+# Added to workmux's base policy when the sandbox has nix (the project's
+# sandbox.toolchain resolves to a flake): the store writable, and HTTPS for
+# nix to the binary cache, the flake registry and GitHub flake inputs.
+# GitHub is read-only here, and the hosts are inspected (L7), which OpenShell
+# requires for hosts an attached provider holds credentials for; the proxy
+# swaps nix's placeholder access token for the provider's token. git that
+# nix runs for git+https inputs matches by ancestry.
+filesystem_policy:
+  read_write: [/nix]
+network_policies:
+  workmux-nix:
+    endpoints:
+      - { host: cache.nixos.org, port: 443 }
+      - { host: channels.nixos.org, port: 443 }
+      - { host: releases.nixos.org, port: 443 }
+      - host: github.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow: {method: GET, path: "**"}
+          - allow: {method: HEAD, path: "**"}
+          - allow: {method: POST, path: /**/git-upload-pack}
+      - { host: api.github.com, port: 443, protocol: rest, access: read-only, enforcement: enforce }
+      - { host: codeload.github.com, port: 443, protocol: rest, access: read-only, enforcement: enforce }
+    binaries:
+      - path: /nix/store/*/bin/nix

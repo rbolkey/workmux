@@ -249,6 +249,7 @@ pub fn openshell_api() -> super::router::RemoteProject {
             path: "~/api".to_string(),
             settings: crate::config::OpenshellProject::default(),
             agents: vec!["claude".to_string()],
+            nix: false,
             extra_mounts: false,
         }),
     };

@@ -1,8 +1,10 @@
 //! The image an OpenShell project sandbox runs, built with `docker build` on
 //! the workstation before create: the project's image, or
-//! workmux's default, plus a Linux workmux matching this one and, for a
-//! flake project, the devshell's closure baked into `/nix`. Nothing is
-//! installed or built inside the sandbox.
+//! workmux's default, plus a Linux workmux matching this one and, when the
+//! project's toolchain is a flake, nix with the devshell's closure baked
+//! into its store. The sandbox's nix is for working on the flake; panes
+//! start in the baked devshell, so nothing has to be built inside the
+//! sandbox.
 
 use anyhow::{Context, Result, bail};
 use std::collections::{BTreeMap, HashSet};
@@ -10,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use super::agents::SandboxAgent;
-use crate::remote::provision::BAKED_DEVSHELL;
+use crate::remote::provision::{BAKED_DEVSHELL, NIX_PROFILE_BIN};
 
 /// Points at a Linux workmux binary to put in the image instead of the
 /// one workmux would install or build.
@@ -103,6 +105,92 @@ fn gitconfig(git_credential_helper: bool) -> String {
     out
 }
 
+/// Lays out the sandbox's nix in `/store`, which the image copies to
+/// `/nix`: nix and, with a baked devshell, the devshell and its flake's
+/// inputs, registered in the store's database and as garbage collection
+/// roots, so the sandbox's nix neither fetches them again nor collects
+/// them. nix is the store's default profile, where the nix installer puts
+/// it, and `/links` holds its classic commands for `/usr/local/bin`, as
+/// links to the wrapper [`nix_wrapper`] that the image puts at
+/// `/usr/local/bin/nix`.
+const NIX_STORE_LAYOUT: &str = "#!/bin/sh
+# Added by workmux: lay out the OpenShell sandbox's nix store in /store.
+set -e
+export NIX_CONFIG=\"experimental-features = nix-command flakes\"
+store_nix=$(dirname \"$(dirname \"$(readlink -f \"$(command -v nix)\")\")\")
+paths=$store_nix
+devshell=
+if [ -e /devshell/profile ]; then
+  devshell=$(readlink -f /devshell/profile)
+  # The flake's inputs, not the project's own source.
+  nix flake archive --json --dry-run /devshell/project > /tmp/archive.json
+  inputs=$(nix eval --impure --raw --expr '
+    let
+      archive = builtins.fromJSON (builtins.readFile /tmp/archive.json);
+      paths = inputs: builtins.concatMap
+        (name: [ inputs.${name}.path ] ++ paths (inputs.${name}.inputs or { }))
+        (builtins.attrNames inputs);
+    in toString (paths (archive.inputs or { }))')
+  paths=\"$paths $devshell $inputs\"
+fi
+nix copy --no-check-sigs --to /store $paths
+mkdir -p /store/nix/var/nix/profiles /store/nix/var/nix/gcroots /links
+ln -s \"$store_nix\" /store/nix/var/nix/profiles/default-1-link
+ln -s default-1-link /store/nix/var/nix/profiles/default
+ln -s /nix/var/nix/profiles /store/nix/var/nix/gcroots/profiles
+n=0
+for root in $devshell $inputs; do
+  n=$((n + 1))
+  ln -s \"$root\" /store/nix/var/nix/gcroots/workmux-devshell-$n
+done
+for tool in \"$store_nix\"/bin/nix-*; do
+  ln -s nix \"/links/${tool##*/}\"
+done
+";
+
+/// The sandbox's `nix` and its classic commands, linked to it: the
+/// store's, with two additions. The placeholder token of the provider that
+/// gives GitHub credentials is nix's access token for github.com, and
+/// OpenShell's proxy swaps it for the real token, so private `github:`
+/// flake inputs fetch; the placeholder differs per sandbox, so it can't be
+/// in `nix.conf`. And SQLite's temporary files go to `/tmp`: it would pick
+/// `/var/tmp`, which the sandbox can't write, and garbage collection fails.
+fn nix_wrapper() -> String {
+    format!(
+        "#!/bin/sh
+# Added by workmux: nix with the sandbox's GitHub placeholder token, which
+# OpenShell's proxy swaps for the real one, and SQLite's temporary files in
+# /tmp, because the sandbox can't write /var/tmp.
+export SQLITE_TMPDIR=${{SQLITE_TMPDIR:-/tmp}}
+token=${{GH_TOKEN:-$GITHUB_TOKEN}}
+if [ -n \"$token\" ]; then
+  NIX_CONFIG=\"access-tokens = github.com=$token
+$NIX_CONFIG\"
+  export NIX_CONFIG
+fi
+exec \"{NIX_PROFILE_BIN}/${{0##*/}}\" \"$@\"
+"
+    )
+}
+
+/// The sandbox's nix configuration. It is in `/etc/xdg/nix/nix.conf`, a
+/// user configuration file, because nix keeps the settings it turns off
+/// when it thinks it is offline only when a user configuration file (or
+/// `NIX_CONFIG`) sets them, not `/etc/nix/nix.conf`.
+const NIX_CONF: &str = "# Added by workmux: single-user nix in an OpenShell sandbox.
+experimental-features = nix-command flakes
+# nix's build sandbox needs kernel namespaces the sandbox doesn't have.
+sandbox = false
+build-users-group =
+# The sandbox's only network interface is loopback (OpenShell's proxy carries
+# its traffic), so nix thinks it is offline and turns these off unless a user
+# configuration file like this one sets them. These are nix's defaults.
+substitute = true
+tarball-ttl = 3600
+download-attempts = 5
+connect-timeout = 0
+";
+
 const DEVSHELL_WRAPPER: &str = "#!/bin/bash
 # Run a command in the project's devshell, baked into this image by workmux:
 # load the environment recorded with `nix print-dev-env`, then exec it.
@@ -172,11 +260,15 @@ pub struct Recipe {
     /// Whether the image's git gets workmux's credential helper for
     /// github.com, because an attached provider gives GitHub credentials.
     pub git_credential_helper: bool,
+    /// Whether the sandbox gets nix, owning a store with the baked
+    /// devshell in it.
+    pub nix: bool,
 }
 
 /// The Dockerfile for `recipe`. Its context holds `workmux`,
 /// `workmux-source`, `default-agent`, `project`, `devshell-source.json`,
-/// `workmux-devshell` and `fetch-flake-inputs` as the recipe needs them.
+/// `workmux-devshell`, `fetch-flake-inputs`, `nix-store-layout`,
+/// `nix-wrapper` and `nix.conf` as the recipe needs them.
 pub fn dockerfile(recipe: &Recipe) -> String {
     let mut out = String::from("# Generated by workmux for an OpenShell project sandbox.\n");
     if recipe.base.is_none() {
@@ -232,6 +324,18 @@ pub fn dockerfile(recipe: &Recipe) -> String {
              && cp -a $(nix-store -qR /devshell/profile) /closure/\n"
         ));
     }
+    if recipe.nix {
+        let from = if recipe.devshell.is_some() {
+            "devshell"
+        } else {
+            NIX_IMAGE
+        };
+        out.push_str(&format!(
+            "\nFROM {from} AS nix\n\
+             COPY --chmod=0755 nix-store-layout /devshell/nix-store-layout\n\
+             RUN /devshell/nix-store-layout\n"
+        ));
+    }
     let base = recipe.base.as_deref().unwrap_or("base");
     // Appended to the base's own system config, in a stage of its own so
     // the image's user is left as it is.
@@ -253,10 +357,19 @@ pub fn dockerfile(recipe: &Recipe) -> String {
     if !recipe.agents.is_empty() {
         out.push_str(&format!("COPY default-agent {DEFAULT_AGENT}\n"));
     }
+    if recipe.nix {
+        out.push_str(
+            "COPY --from=nix --chown=1000:1000 /store/nix /nix\n\
+             COPY --from=nix /links/ /usr/local/bin/\n\
+             COPY --chmod=0755 nix-wrapper /usr/local/bin/nix\n\
+             COPY nix.conf /etc/xdg/nix/nix.conf\n",
+        );
+    } else if recipe.devshell.is_some() {
+        out.push_str("COPY --from=devshell /closure /nix/store\n");
+    }
     if recipe.devshell.is_some() {
         out.push_str(&format!(
-            "COPY --from=devshell /closure /nix/store\n\
-             COPY --from=devshell /devshell/env.sh /nix/devshell-env.sh\n\
+            "COPY --from=devshell /devshell/env.sh /nix/devshell-env.sh\n\
              COPY devshell-source.json {DEVSHELL_SOURCE}\n\
              COPY --chmod=0755 workmux-devshell {BAKED_DEVSHELL}\n"
         ));
@@ -467,6 +580,16 @@ pub fn prepare(recipe: &Recipe, sandbox: &str, clone: &str, context: &Path) -> R
         digest.extend(fetch.as_bytes());
         std::fs::write(context.join("fetch-flake-inputs"), fetch)?;
     }
+    if recipe.nix {
+        for (file, contents) in [
+            ("nix-store-layout", NIX_STORE_LAYOUT.to_string()),
+            ("nix-wrapper", nix_wrapper()),
+            ("nix.conf", NIX_CONF.to_string()),
+        ] {
+            digest.extend(contents.as_bytes());
+            std::fs::write(context.join(file), contents)?;
+        }
+    }
     Ok(format!(
         "workmux-openshell-{sandbox}:{}",
         &sha256_hex(&digest)[..12]
@@ -561,6 +684,7 @@ mod tests {
             agents: Vec::new(),
             devshell: None,
             git_credential_helper: false,
+            nix: false,
         });
 
         assert!(dockerfile.contains("FROM docker.io/library/ubuntu:24.04 AS base"));
@@ -582,6 +706,7 @@ mod tests {
             agents: Vec::new(),
             devshell: None,
             git_credential_helper: false,
+            nix: false,
         });
 
         assert!(dockerfile.contains(&format!("WORKMUX_VERSION=v{}", env!("CARGO_PKG_VERSION"))));
@@ -601,6 +726,7 @@ mod tests {
             agents: vec!["claude".to_string()],
             devshell: None,
             git_credential_helper: false,
+            nix: false,
         });
 
         let stage = dockerfile
@@ -631,6 +757,7 @@ mod tests {
             agents: vec!["gemini".to_string(), "codex".to_string()],
             devshell: None,
             git_credential_helper: false,
+            nix: false,
         };
         let context = tempfile::tempdir().unwrap();
 
@@ -657,6 +784,7 @@ mod tests {
             agents: Vec::new(),
             devshell: None,
             git_credential_helper: false,
+            nix: false,
         });
 
         assert!(!dockerfile.contains("install.sh"), "{dockerfile}");
@@ -683,6 +811,7 @@ mod tests {
             agents: Vec::new(),
             devshell: Some(PathBuf::from("/tmp/ctx/project")),
             git_credential_helper: false,
+            nix: false,
         });
 
         assert!(!dockerfile.contains("AS base"));
@@ -707,6 +836,134 @@ mod tests {
         );
     }
 
+    /// A recipe for a project image with nix, and the devshell at
+    /// `devshell`.
+    fn nix_recipe(devshell: Option<PathBuf>) -> Recipe {
+        Recipe {
+            base: Some("ghcr.io/me/api-dev:1".to_string()),
+            workmux: Workmux::Release,
+            agents: Vec::new(),
+            devshell,
+            git_credential_helper: false,
+            nix: true,
+        }
+    }
+
+    #[test]
+    fn with_nix_the_sandbox_user_owns_a_store_with_nix_and_the_baked_devshell_registered() {
+        let dockerfile = dockerfile(&nix_recipe(Some(PathBuf::from("/tmp/ctx/project"))));
+
+        let stage = dockerfile
+            .split("\nFROM ")
+            .find(|s| s.contains(" AS nix\n"))
+            .unwrap();
+        assert_eq!(
+            stage,
+            "devshell AS nix\n\
+             COPY --chmod=0755 nix-store-layout /devshell/nix-store-layout\n\
+             RUN /devshell/nix-store-layout\n"
+        );
+        let last_stage = dockerfile.rsplit("\nFROM ").next().unwrap();
+        assert_eq!(
+            last_stage,
+            "ghcr.io/me/api-dev:1\n\
+             COPY --from=workmux /usr/local/bin/workmux /usr/local/bin/workmux\n\
+             COPY --from=nix --chown=1000:1000 /store/nix /nix\n\
+             COPY --from=nix /links/ /usr/local/bin/\n\
+             COPY --chmod=0755 nix-wrapper /usr/local/bin/nix\n\
+             COPY nix.conf /etc/xdg/nix/nix.conf\n\
+             COPY --from=devshell /devshell/env.sh /nix/devshell-env.sh\n\
+             COPY devshell-source.json /nix/devshell-source.json\n\
+             COPY --chmod=0755 workmux-devshell /usr/local/bin/workmux-devshell\n\
+             COPY --from=gitconfig /etc/gitconfig /etc/gitconfig\n"
+        );
+    }
+
+    #[test]
+    fn with_nix_and_no_devshell_the_store_has_nix_alone() {
+        let dockerfile = dockerfile(&nix_recipe(None));
+
+        assert!(!dockerfile.contains("AS devshell"), "{dockerfile}");
+        assert!(
+            dockerfile.contains("\nFROM docker.io/nixos/nix:2.24.10 AS nix\n"),
+            "{dockerfile}"
+        );
+        let last_stage = dockerfile.rsplit("\nFROM ").next().unwrap();
+        assert!(
+            last_stage.contains("COPY --from=nix --chown=1000:1000 /store/nix /nix\n"),
+            "{last_stage}"
+        );
+        assert!(!last_stage.contains("devshell"), "{last_stage}");
+    }
+
+    #[test]
+    fn nix_builds_without_its_sandbox_and_substitutes_although_it_sees_no_network() {
+        let context = tempfile::tempdir().unwrap();
+
+        prepare(&nix_recipe(None), "api", "/sandbox/api", context.path()).unwrap();
+
+        let conf = std::fs::read_to_string(context.path().join("nix.conf")).unwrap();
+        let settings: Vec<&str> = conf
+            .lines()
+            .filter(|line| !line.starts_with('#') && !line.is_empty())
+            .collect();
+        assert_eq!(
+            settings,
+            [
+                "experimental-features = nix-command flakes",
+                "sandbox = false",
+                "build-users-group =",
+                "substitute = true",
+                "tarball-ttl = 3600",
+                "download-attempts = 5",
+                "connect-timeout = 0",
+            ]
+        );
+    }
+
+    #[test]
+    fn nix_gets_the_github_placeholder_as_its_access_token_and_sqlite_a_writable_temp_dir() {
+        let context = tempfile::tempdir().unwrap();
+        prepare(&nix_recipe(None), "api", "/sandbox/api", context.path()).unwrap();
+        // The wrapper runs a stand-in for the store's command that prints
+        // its SQLITE_TMPDIR, NIX_CONFIG and arguments.
+        let stand_in = context.path().join("real-nix");
+        std::fs::write(
+            &stand_in,
+            "#!/bin/sh\nprintf '%s|' \"$SQLITE_TMPDIR\" \"$NIX_CONFIG\" \"$@\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            &stand_in,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        let wrapper = std::fs::read_to_string(context.path().join("nix-wrapper"))
+            .unwrap()
+            .replace(NIX_PROFILE_BIN, &context.path().display().to_string());
+        // Run as the command named `real-nix`, which runs the store's.
+        let nix = |env: &[(&str, &str)]| {
+            let output = Command::new("sh")
+                .args(["-c", &wrapper, "/usr/local/bin/real-nix", "flake", "check"])
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .envs(env.iter().copied())
+                .output()
+                .unwrap();
+            String::from_utf8(output.stdout).unwrap()
+        };
+
+        assert_eq!(
+            nix(&[("GH_TOKEN", "gh-ph"), ("GITHUB_TOKEN", "ghp-ph")]),
+            "/tmp|access-tokens = github.com=gh-ph\n|flake|check|"
+        );
+        assert_eq!(
+            nix(&[("GITHUB_TOKEN", "ghp-ph"), ("NIX_CONFIG", "cores = 2")]),
+            "/tmp|access-tokens = github.com=ghp-ph\ncores = 2|flake|check|"
+        );
+        assert_eq!(nix(&[]), "/tmp||flake|check|");
+    }
+
     #[test]
     fn with_github_credentials_git_gets_the_placeholder_from_a_credential_helper() {
         let recipe = Recipe {
@@ -715,6 +972,7 @@ mod tests {
             agents: Vec::new(),
             devshell: None,
             git_credential_helper: true,
+            nix: false,
         };
         let context = tempfile::tempdir().unwrap();
 
@@ -802,6 +1060,7 @@ mod tests {
             agents: Vec::new(),
             devshell: None,
             git_credential_helper: false,
+            nix: false,
         };
         let context = tempfile::tempdir().unwrap();
 
@@ -891,6 +1150,7 @@ mod tests {
             agents: Vec::new(),
             devshell: None,
             git_credential_helper: false,
+            nix: false,
         };
         let context = tempfile::tempdir().unwrap();
 
@@ -925,6 +1185,7 @@ mod tests {
             agents: Vec::new(),
             devshell: Some(project.clone()),
             git_credential_helper: false,
+            nix: false,
         };
 
         let first = prepare(&recipe, "api", "/sandbox/api", context.path()).unwrap();
@@ -971,6 +1232,7 @@ mod tests {
                 agents: Vec::new(),
                 devshell: Some(self.context.path().join("project")),
                 git_credential_helper: false,
+                nix: false,
             };
             prepare(&recipe, "api", "/sandbox/api", self.context.path()).unwrap()
         }
@@ -1087,6 +1349,7 @@ mod contract {
             agents: agents.iter().map(|a| a.to_string()).collect(),
             devshell: None,
             git_credential_helper: false,
+            nix: false,
         };
         let context = tempfile::tempdir().unwrap();
         run_recipe(context.path(), &recipe, label, None, argv)
@@ -1186,6 +1449,7 @@ mod contract {
             agents: Vec::new(),
             devshell: None,
             git_credential_helper: true,
+            nix: false,
         };
         let context = tempfile::tempdir().unwrap();
         let out = run_recipe(
@@ -1287,6 +1551,7 @@ mod contract {
             agents: Vec::new(),
             devshell: Some(project),
             git_credential_helper: false,
+            nix: false,
         };
 
         let out = run_recipe(
