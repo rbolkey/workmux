@@ -356,6 +356,42 @@ def test_a_projects_lima_sandbox_is_ignored_inside_its_openshell_sandbox(
     )
 
 
+def test_an_openshell_sandbox_follows_the_sandbox_settings_of_every_backend(
+    project: Project,
+):
+    """`env_passthrough` reaches the agent pane with the workstation's value;
+    `extra_mounts` is ignored with a note, since OpenShell never mounts."""
+    add_project(project)
+    config = project.env.home_path / ".config" / "workmux" / "config.yaml"
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text(
+        "sandbox:\n  env_passthrough: [WM_E20_PASSED]\n  extra_mounts: [/tmp]\n"
+    )
+    project.tmp["WM_E20_PASSED"] = "from the workstation"
+    project.sh(
+        "set -e; "
+        "printf 'panes:\\n  - command: printenv WM_E20_PASSED "
+        "> /sandbox/control/passed; sh /sandbox/agent.sh\\n' "
+        "> /sandbox/origin/.workmux.yaml; "
+        "git -C /sandbox/origin -c user.name=t -c user.email=t@t "
+        "commit -q -am 'passthrough pane'"
+    )
+
+    added = project.wm("add feature", timeout=120.0)
+
+    output = added.stdout + added.stderr
+    assert (
+        f"Note: extra_mounts is ignored for OpenShell sandbox {project.sandbox}"
+        in output
+    ), output
+    wait_until(
+        lambda: project.sh("cat /sandbox/control/passed 2>/dev/null || true") != "",
+        "the agent pane to start",
+        timeout=60.0,
+    )
+    assert project.sh("cat /sandbox/control/passed") == "from the workstation\n"
+
+
 def test_an_openshell_projects_sandbox_runs_claude_code(project: Project):
     """The image installs the default agent, Claude Code, where OpenShell's
     claude-code provider profile expects it, and `add` starts it in the
