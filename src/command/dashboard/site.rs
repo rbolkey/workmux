@@ -122,7 +122,7 @@ impl WorktreeSite {
 
     /// The remote project a remote worktree belongs to, as a command last
     /// resolved it.
-    fn remote_project(&self) -> Result<Option<RemoteProject>, String> {
+    pub fn remote_project(&self) -> Result<Option<RemoteProject>, String> {
         let Self::Remote {
             remote, project, ..
         } = self
@@ -256,15 +256,12 @@ impl WorktreeSite {
         }
     }
 
-    /// End `pane`, a remote pane of this remote worktree's project.
-    pub fn kill_remote_pane(&self, pane: crate::remote::pane::RemotePaneId) -> Result<(), String> {
-        match self.remote_project()? {
-            None => Ok(()),
-            Some(project) => {
-                Self::ask::<serde_json::Value>(&project, DashboardRequest::KillPane { pane }, true)
-                    .map(drop)
-            }
-        }
+    /// End `pane`, a remote pane of `project`.
+    pub fn kill_remote_pane(
+        project: &RemoteProject,
+        pane: crate::remote::pane::RemotePaneId,
+    ) -> Result<(), String> {
+        Self::ask::<serde_json::Value>(project, DashboardRequest::KillPane { pane }, true).map(drop)
     }
 
     /// Stage `patch` in the worktree's index; `reverse` unstages it.

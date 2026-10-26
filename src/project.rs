@@ -192,7 +192,6 @@ mod tests {
         let served = ServedProject {
             remote: "devbox".to_string(),
             name: "api".to_string(),
-            session: None,
         };
         let project = Project::at_main_worktree_root_served(
             Path::new("/home/me/code/api-clone"),

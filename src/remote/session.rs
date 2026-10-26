@@ -14,8 +14,9 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::config::Placement;
 use crate::remote::git_url::GitUrl;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -57,8 +58,8 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(7 * 24 * 3600);
 /// project: the remote's name and the project's name.
 pub const REMOTE_ENV: &str = "WORKMUX_REMOTE_NAME";
 pub const PROJECT_ENV: &str = "WORKMUX_PROJECT_NAME";
-/// The workstation session for the project's windows, when it has one.
-pub const PROJECT_SESSION_ENV: &str = "WORKMUX_PROJECT_SESSION";
+/// The workstation's placement settings, as JSON, when it has any.
+pub const PLACEMENT_ENV: &str = "WORKMUX_WORKSTATION_PLACEMENT";
 
 /// A remote project as remote workmux needs it to run a command.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -70,10 +71,6 @@ pub struct ProjectSite {
     pub path: String,
     #[serde(flatten)]
     pub git_url: Option<GitUrl>,
-    /// Workstation session for the project's windows in window mode; `None`
-    /// places them in the invoking session.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session: Option<String>,
 }
 
 impl ProjectSite {
@@ -98,6 +95,15 @@ pub struct CommandRequest {
     /// them in a file of its own, as the command's prompt file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_file: Option<String>,
+    /// The sandbox's environment from the project's config: the workstation's
+    /// values of the variables `sandbox.env_passthrough` names, and those
+    /// `sandbox.env` sets. They are set in remote workmux's environment and
+    /// so in the panes it starts.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+    /// The workstation's placement settings, from its global config.
+    #[serde(default, skip_serializing_if = "Placement::is_unset")]
+    pub placement: Placement,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -640,12 +646,14 @@ pub fn run_on_remote(
         .unwrap_or(path);
     command
         .current_dir(&workdir)
+        .envs(&request.env)
         .env(REMOTE_ENV, &request.project.remote)
         .env(PROJECT_ENV, &request.project.name);
-    match &request.project.session {
-        Some(session) => command.env(PROJECT_SESSION_ENV, session),
-        None => command.env_remove(PROJECT_SESSION_ENV),
-    };
+    if request.placement.is_unset() {
+        command.env_remove(PLACEMENT_ENV);
+    } else {
+        command.env(PLACEMENT_ENV, serde_json::to_string(&request.placement)?);
+    }
     if let Some(forwarding) = forwarding {
         command
             .env(forwarding::SOCKET_ENV, forwarding.socket)
@@ -688,8 +696,15 @@ fn worktree_with_window_token(clone: &Path, token: &str) -> Option<PathBuf> {
 pub struct ServedProject {
     pub remote: String,
     pub name: String,
-    /// Workstation session for the project's windows in window mode.
-    pub session: Option<String>,
+}
+
+/// The workstation's placement settings, when remote workmux runs this
+/// command for it in a command session.
+pub fn workstation_placement() -> Option<Placement> {
+    let json = std::env::var(PLACEMENT_ENV).ok()?;
+    serde_json::from_str(&json)
+        .inspect_err(|error| tracing::warn!(%error, "unreadable workstation placement"))
+        .ok()
 }
 
 impl ServedProject {
@@ -698,7 +713,6 @@ impl ServedProject {
         Some(Self {
             remote: var(REMOTE_ENV)?,
             name: var(PROJECT_ENV)?,
-            session: var(PROJECT_SESSION_ENV),
         })
     }
 }
@@ -733,6 +747,8 @@ mod tests {
             target: "/remote".to_string(),
             builtin_shims: None,
             host_commands: vec![],
+            env_passthrough: vec![],
+            env: Default::default(),
             openshell: None,
         }
     }
@@ -744,11 +760,12 @@ mod tests {
                 name: "api".to_string(),
                 path: path.display().to_string(),
                 git_url: git_url.map(|url| GitUrl::new(url.display().to_string())),
-                session: None,
             },
             argv: ["sh", "-c", script].map(String::from).to_vec(),
             invoking_window_token: None,
             prompt_file: None,
+            env: BTreeMap::new(),
+            placement: Default::default(),
         }
     }
 
@@ -823,6 +840,18 @@ mod tests {
         // The file lasts only as long as the command.
         let seen = std::fs::read_to_string(project.path().join("seen")).unwrap();
         assert!(!Path::new(seen.trim()).exists());
+    }
+
+    #[test]
+    fn the_workstation_environment_passed_through_reaches_the_command() {
+        let project = tempfile::tempdir().unwrap();
+        let mut request = request(project.path(), None, r#"printf '%s' "$GITHUB_TOKEN""#);
+        request.env = BTreeMap::from([("GITHUB_TOKEN".to_string(), "it's $ecret".to_string())]);
+
+        let (exit, captured) = run(&request, |_| {});
+
+        assert_eq!(exit.unwrap(), 0, "{}", captured.stderr);
+        assert_eq!(captured.stdout, "it's $ecret");
     }
 
     /// A terminal whose user presses Ctrl-C once the command has printed

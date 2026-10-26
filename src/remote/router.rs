@@ -8,6 +8,7 @@
 //! another project: a command targets the project it runs in.
 
 use anyhow::{Context, Result, anyhow};
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -17,7 +18,7 @@ use super::forwarded;
 use super::session::ServedProject;
 use super::session::{Answer, CommandRequest, OutputParams, ProjectSite, Stream, Terminal};
 use super::transport::RemoteState;
-use crate::config::{Config, RemoteConfig};
+use crate::config::{Config, Placement, RemoteConfig};
 use crate::multiplexer::{InvocationContext, TmuxBackend, create_backend, detect_backend};
 use crate::project::{Project, ProjectTag, RemoteProjectId};
 
@@ -293,6 +294,8 @@ fn session_once(
         argv: argv.iter().map(|arg| arg.to_string()).collect(),
         invoking_window_token: invoking_window_token(project),
         prompt_file,
+        env: sandbox_env(project, |name| std::env::var(name).ok()),
+        placement: Placement::of(&Config::load_global_only()?),
     };
     let Some(socket) = daemon_socket() else {
         return super::channels().run_command(
@@ -341,6 +344,23 @@ fn session_once(
     let exit: super::session::Exit =
         serde_json::from_value(result).context("Workstation daemon sent no exit code")?;
     Ok(exit.exit_code)
+}
+
+/// The environment `project`'s config gives its sandbox: the values
+/// `workstation` gives the variables it passes through (one it has no value
+/// for is left out, as a container or Lima sandbox leaves it out), then the
+/// variables it sets, which win, as they do there.
+fn sandbox_env(
+    project: &RemoteProject,
+    workstation: impl Fn(&str) -> Option<String>,
+) -> BTreeMap<String, String> {
+    let config = &project.remote_config;
+    config
+        .env_passthrough
+        .iter()
+        .filter_map(|name| Some((name.clone(), workstation(name)?)))
+        .chain(config.env.clone())
+        .collect()
 }
 
 /// This process's terminal: output to stdout and stderr, prompts answered
@@ -785,6 +805,44 @@ mod tests {
 
     fn api() -> RemoteProject {
         crate::remote::testing::devbox_api()
+    }
+
+    #[test]
+    fn a_command_carries_the_workstation_values_of_the_variables_sandbox_env() {
+        let mut project = api();
+        project.remote_config.env_passthrough =
+            ["GITHUB_TOKEN", "UNSET"].map(String::from).to_vec();
+        let workstation = |name: &str| (name == "GITHUB_TOKEN").then(|| "ghp_x".to_string());
+
+        let env = sandbox_env(&project, workstation);
+
+        assert_eq!(
+            env,
+            BTreeMap::from([("GITHUB_TOKEN".to_string(), "ghp_x".to_string())])
+        );
+    }
+
+    #[test]
+    fn a_command_carries_the_variables_config_sets_over_those_sandbox_env() {
+        let mut project = api();
+        project.remote_config.env_passthrough =
+            ["API_URL", "GITHUB_TOKEN"].map(String::from).to_vec();
+        project.remote_config.env =
+            BTreeMap::from([("API_URL".to_string(), "https://api.test".to_string())]);
+        let workstation = |name: &str| Some(format!("workstation {name}"));
+
+        let env = sandbox_env(&project, workstation);
+
+        assert_eq!(
+            env,
+            BTreeMap::from([
+                ("API_URL".to_string(), "https://api.test".to_string()),
+                (
+                    "GITHUB_TOKEN".to_string(),
+                    "workstation GITHUB_TOKEN".to_string()
+                ),
+            ])
+        );
     }
 
     #[test]

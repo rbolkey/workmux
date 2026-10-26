@@ -75,6 +75,12 @@ pub trait Provisioning: Send + Sync {
     fn refresh_credentials(&self) -> Result<()> {
         Ok(())
     }
+
+    /// Notes on what the remote ignores of its configuration, told when it
+    /// is created or started rather than on every command.
+    fn notes(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// Make a remote that manages its lifecycle ready for a command that
@@ -90,7 +96,8 @@ pub fn ensure_running(
     let Some(provisioning) = transport.provisioning() else {
         return Ok(RemoteState::Running);
     };
-    match provisioning.status()? {
+    let found = provisioning.status()?;
+    match found {
         RemoteState::Running => {}
         found if !start => return Ok(found),
         RemoteState::Stopped => {
@@ -102,6 +109,11 @@ pub fn ensure_running(
                 "Creating remote {name} on first use; building its image can take a few minutes…"
             ));
             provisioning.create()?;
+        }
+    }
+    if found != RemoteState::Running {
+        for note in provisioning.notes() {
+            notice(&note);
         }
     }
     for message in provisioning.reconcile()? {
@@ -475,6 +487,9 @@ mod tests {
             self.calls.lock().unwrap().push("reconcile");
             Ok(vec!["updated the policy".to_string()])
         }
+        fn notes(&self) -> Vec<String> {
+            vec!["Note: extra_mounts is ignored".to_string()]
+        }
     }
 
     fn ensure(remote: &Managed, start: bool) -> (RemoteState, Vec<String>) {
@@ -498,6 +513,7 @@ mod tests {
             notices,
             [
                 "Creating remote api on first use; building its image can take a few minutes…",
+                "Note: extra_mounts is ignored",
                 "updated the policy"
             ]
         );
@@ -511,7 +527,14 @@ mod tests {
 
         assert_eq!(state, RemoteState::Running);
         assert_eq!(remote.calls(), ["start", "reconcile"]);
-        assert_eq!(notices[0], "Starting remote api…");
+        assert_eq!(
+            notices,
+            [
+                "Starting remote api…",
+                "Note: extra_mounts is ignored",
+                "updated the policy"
+            ]
+        );
     }
 
     #[test]
@@ -530,7 +553,10 @@ mod tests {
     #[test]
     fn a_running_remote_or_one_without_a_lifecycle_is_used_as_it_is() {
         let remote = Managed::new(RemoteState::Running);
-        assert_eq!(ensure(&remote, false).0, RemoteState::Running);
+        assert_eq!(
+            ensure(&remote, false),
+            (RemoteState::Running, vec!["updated the policy".to_string()])
+        );
         assert_eq!(remote.calls(), ["reconcile"]);
 
         let root = tempfile::tempdir().unwrap();

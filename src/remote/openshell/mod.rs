@@ -773,6 +773,20 @@ impl Provisioning for OpenShell {
     fn refresh_credentials(&self) -> Result<()> {
         self.refresh_gh_login(false)
     }
+
+    fn notes(&self) -> Vec<String> {
+        self.origin
+            .as_ref()
+            .filter(|origin| origin.extra_mounts)
+            .map(|_| {
+                format!(
+                    "Note: extra_mounts is ignored for OpenShell sandbox {}: OpenShell does not mount workstation directories",
+                    self.sandbox
+                )
+            })
+            .into_iter()
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -826,6 +840,7 @@ pub(super) mod tests {
             },
             agents: Vec::new(),
             nix: false,
+            extra_mounts: false,
         }
     }
 
@@ -950,6 +965,27 @@ pub(super) mod tests {
                 "serve"
             ])
         );
+    }
+
+    #[test]
+    fn a_sandbox_notes_on_create_or_start_that_it_ignores_extra_mounts() {
+        let openshell = |extra_mounts| {
+            OpenShell::new(
+                "api-1a2b3c4d",
+                Some(OpenshellRemote {
+                    extra_mounts,
+                    ..origin()
+                }),
+            )
+        };
+
+        assert_eq!(
+            openshell(true).notes(),
+            [
+                "Note: extra_mounts is ignored for OpenShell sandbox api-1a2b3c4d: OpenShell does not mount workstation directories"
+            ]
+        );
+        assert!(openshell(false).notes().is_empty());
     }
 
     #[test]
@@ -1440,6 +1476,7 @@ mod contract {
             },
             agents: Vec::new(),
             nix: false,
+            extra_mounts: false,
         };
         Owned(OpenShell::new(name, Some(origin)))
     }

@@ -113,9 +113,7 @@ fn gitconfig(git_credential_helper: bool) -> String {
 /// it, and `/links` holds its classic commands for `/usr/local/bin`, as
 /// links to the wrapper [`nix_wrapper`] that the image puts at
 /// `/usr/local/bin/nix`.
-fn nix_store_layout() -> String {
-    format!(
-        "#!/bin/sh
+const NIX_STORE_LAYOUT: &str = "#!/bin/sh
 # Added by workmux: lay out the OpenShell sandbox's nix store in /store.
 set -e
 export NIX_CONFIG=\"experimental-features = nix-command flakes\"
@@ -130,9 +128,9 @@ if [ -e /devshell/profile ]; then
     let
       archive = builtins.fromJSON (builtins.readFile /tmp/archive.json);
       paths = inputs: builtins.concatMap
-        (name: [ inputs.${{name}}.path ] ++ paths (inputs.${{name}}.inputs or {{ }}))
+        (name: [ inputs.${name}.path ] ++ paths (inputs.${name}.inputs or { }))
         (builtins.attrNames inputs);
-    in toString (paths (archive.inputs or {{ }}))')
+    in toString (paths (archive.inputs or { }))')
   paths=\"$paths $devshell $inputs\"
 fi
 nix copy --no-check-sigs --to /store $paths
@@ -146,11 +144,9 @@ for root in $devshell $inputs; do
   ln -s \"$root\" /store/nix/var/nix/gcroots/workmux-devshell-$n
 done
 for tool in \"$store_nix\"/bin/nix-*; do
-  ln -s nix \"/links/${{tool##*/}}\"
+  ln -s nix \"/links/${tool##*/}\"
 done
-"
-    )
-}
+";
 
 /// The sandbox's `nix` and its classic commands, linked to it: the
 /// store's, with two additions. The placeholder token of the provider that
@@ -586,7 +582,7 @@ pub fn prepare(recipe: &Recipe, sandbox: &str, clone: &str, context: &Path) -> R
     }
     if recipe.nix {
         for (file, contents) in [
-            ("nix-store-layout", nix_store_layout()),
+            ("nix-store-layout", NIX_STORE_LAYOUT.to_string()),
             ("nix-wrapper", nix_wrapper()),
             ("nix.conf", NIX_CONF.to_string()),
         ] {

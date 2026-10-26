@@ -9,14 +9,14 @@
 //! does.
 
 use anyhow::{Result, anyhow, bail};
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use super::git_url::GitUrl;
 use super::router::RemoteProject;
 use super::session::ProjectSite;
 use crate::config::{
-    Config, OpenshellRemote, ProjectPlacement, RemoteConfig, SandboxBackend, TransportKind,
-    openshell_sandbox_name,
+    Config, OpenshellRemote, RemoteConfig, SandboxBackend, TransportKind, openshell_sandbox_name,
 };
 use crate::multiplexer::{InvocationContext, TmuxBackend};
 use crate::project::{ProjectTag, RemoteProjectId};
@@ -162,6 +162,18 @@ fn project_in(config: &Config, root: &Path, origin: Option<&str>) -> Result<Remo
         _ => config.sandbox.openshell.path.clone(),
     }
     .unwrap_or_else(|| format!("~/{name}"));
+    let passthrough: Vec<String> = config
+        .sandbox
+        .env_passthrough()
+        .into_iter()
+        .map(String::from)
+        .collect();
+    let env: BTreeMap<String, String> = config
+        .sandbox
+        .env_vars()
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect();
     let (remote_name, remote_config) = match backend {
         SandboxBackend::Loopback => (
             config
@@ -177,6 +189,8 @@ fn project_in(config: &Config, root: &Path, origin: Option<&str>) -> Result<Remo
                 })?,
                 builtin_shims: None,
                 host_commands: config.sandbox.host_commands().to_vec(),
+                env_passthrough: passthrough.clone(),
+                env: env.clone(),
                 openshell: None,
             },
         ),
@@ -199,6 +213,8 @@ fn project_in(config: &Config, root: &Path, origin: Option<&str>) -> Result<Remo
                     target: sandbox,
                     builtin_shims: None,
                     host_commands: config.sandbox.host_commands().to_vec(),
+                    env_passthrough: passthrough.clone(),
+                    env: env.clone(),
                     openshell: Some(OpenshellRemote {
                         project: name.clone(),
                         git_url: Some(git_url.clone()),
@@ -209,20 +225,11 @@ fn project_in(config: &Config, root: &Path, origin: Option<&str>) -> Result<Remo
                             &config.sandbox.toolchain(),
                             root,
                         ) == crate::sandbox::toolchain::DetectedToolchain::Flake,
+                        extra_mounts: !config.sandbox.extra_mounts().is_empty(),
                     }),
                 },
             )
         }
-    };
-    let session = match config.project_placement.unwrap_or_default() {
-        ProjectPlacement::ProjectSession => Some(
-            config
-                .project_session
-                .clone()
-                .filter(|session| !session.trim().is_empty())
-                .unwrap_or_else(|| name.clone()),
-        ),
-        ProjectPlacement::CurrentSession => None,
     };
     Ok(RemoteProject {
         root: root.to_path_buf(),
@@ -231,7 +238,6 @@ fn project_in(config: &Config, root: &Path, origin: Option<&str>) -> Result<Remo
             name,
             path,
             git_url: Some(git_url),
-            session,
         },
         remote_config,
     })
@@ -340,7 +346,6 @@ mod tests {
         assert_eq!(project.site.name, "api");
         assert_eq!(project.site.remote, sandbox);
         assert_eq!(project.site.path, "~/api");
-        assert_eq!(project.site.session.as_deref(), Some("api"));
         let git_url = GitUrl {
             url: "https://github.com/me/api.git".to_string(),
             ssh: Some("git@github.com:me/api.git".to_string()),
@@ -366,10 +371,9 @@ mod tests {
     }
 
     #[test]
-    fn a_project_may_name_its_clone_path_and_session() {
+    fn a_project_may_name_its_clone_path() {
         let config = config(
-            "project_session: work\nsandbox:\n  enabled: true\n  backend: openshell\n  openshell:\n    \
-             path: src/api\n",
+            "sandbox:\n  enabled: true\n  backend: openshell\n  openshell:\n    path: src/api\n",
         );
 
         let project = project_in(
@@ -380,16 +384,6 @@ mod tests {
         .unwrap();
 
         assert_eq!(project.site.path, "src/api");
-        assert_eq!(project.site.session.as_deref(), Some("work"));
-
-        let config = self::config(&format!("project_placement: current-session\n{OPENSHELL}"));
-        let project = project_in(
-            &config,
-            Path::new("/src/api"),
-            Some("https://github.com/me/api.git"),
-        )
-        .unwrap();
-        assert_eq!(project.site.session, None);
     }
 
     #[test]
@@ -521,6 +515,59 @@ mod tests {
         .unwrap();
 
         assert_eq!(project.remote_config.host_commands, ["just"]);
+    }
+
+    #[test]
+    fn a_remote_gets_the_environment_global_config_passes_through() {
+        let global = config("sandbox:\n  env_passthrough: [GITHUB_TOKEN]\n");
+        let project = config(&format!(
+            "{OPENSHELL}  env_passthrough: [AWS_SECRET_ACCESS_KEY]\n"
+        ));
+
+        let project = project_in(
+            &global.merge_for_test(project),
+            Path::new("/src/api"),
+            Some("https://github.com/me/api.git"),
+        )
+        .unwrap();
+
+        assert_eq!(project.remote_config.env_passthrough, ["GITHUB_TOKEN"]);
+    }
+
+    #[test]
+    fn a_remote_gets_the_environment_global_config_sets() {
+        let global = config("sandbox:\n  env:\n    API_URL: https://api.test\n");
+        let project = config(&format!(
+            "{OPENSHELL}  env:\n    API_URL: https://evil.test\n"
+        ));
+
+        let project = project_in(
+            &global.merge_for_test(project),
+            Path::new("/src/api"),
+            Some("https://github.com/me/api.git"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            project.remote_config.env,
+            BTreeMap::from([("API_URL".to_string(), "https://api.test".to_string())])
+        );
+    }
+
+    #[test]
+    fn an_openshell_sandbox_knows_the_config_asks_for_extra_mounts() {
+        let global = config("sandbox:\n  extra_mounts: [/notes]\n");
+
+        let project = project_in(
+            &global.merge_for_test(config(OPENSHELL)),
+            Path::new("/src/api"),
+            Some("https://github.com/me/api.git"),
+        )
+        .unwrap();
+
+        assert!(project.remote_config.openshell.unwrap().extra_mounts);
+        let plain = openshell_at("/src/api").remote_config.openshell.unwrap();
+        assert!(!plain.extra_mounts);
     }
 
     #[test]
