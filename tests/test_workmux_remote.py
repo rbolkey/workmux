@@ -494,6 +494,65 @@ def test_remote_add_places_windows_in_the_project_session(
             os.kill(daemon_pid, signal.SIGTERM)
 
 
+@requires_dtach
+@pytest.mark.tmux_only
+def test_a_failed_remote_add_leaves_no_worktree_and_can_be_retried(
+    mux_server: MuxEnvironment,
+    workmux_exe_path: Path,
+    repo_path: Path,
+    short_tmp: dict,
+    remote_root: Path,
+):
+    """When a post-create command fails, `add` on a remote project removes the
+    worktree and the branch it created on the remote, says so, and a retry
+    succeeds once the command does."""
+    env = mux_server
+    assert isinstance(env, TmuxEnvironment)
+    root = remote_root
+    (root / "home" / ".zshrc").write_text("")
+    workmux_yaml = 'post_create:\n  - test -f "$HOME/setup-works"\n'
+    origin = make_origin(env, env.tmp_path / "origin", workmux_yaml)
+
+    def wm(command, expect_fail=False):
+        return run_workmux_command(
+            env,
+            workmux_exe_path,
+            repo_path,
+            command,
+            pre_run_env=short_tmp,
+            expect_fail=expect_fail,
+            timeout=60.0,
+        )
+
+    wm(f"remote add lb --transport loopback --target {root}")
+    wm(f"project add remote api --remote lb --repo {origin} --path code/api")
+    daemon_pid = None
+    try:
+        failed = wm("add feature --project api", expect_fail=True)
+        daemon_pid = remote_daemon_ping(env, workmux_exe_path, repo_path, short_tmp)[
+            "pid"
+        ]
+        output = failed.stdout + failed.stderr
+        assert "post-create command" in output, output
+        assert "removed the new worktree and branch 'feature'" in output, output
+        clone = root / "home" / "code" / "api"
+        worktree = root / "home" / "code" / "api__worktrees" / "feature"
+        assert not worktree.exists()
+        branches = env.run_command(
+            ["git", "branch", "--list", "feature"], cwd=clone
+        ).stdout
+        assert branches.strip() == ""
+        windows = env.tmux(["list-windows", "-a", "-F", "#{window_name}"]).stdout
+        assert "wm-feature" not in windows.split()
+
+        (root / "home" / "setup-works").write_text("")
+        wm("add feature --project api")
+        assert worktree.is_dir()
+    finally:
+        if daemon_pid is not None:
+            os.kill(daemon_pid, signal.SIGTERM)
+
+
 def git_in(env, repo: Path, *args: str) -> str:
     return env.run_command(
         ["git", "-c", "user.name=t", "-c", "user.email=t@t", *args], cwd=repo

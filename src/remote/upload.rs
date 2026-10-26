@@ -41,9 +41,8 @@ impl Builds {
             .ok()
             .zip(std::env::current_exe().ok())
             .map(|(platform, exe)| (platform.to_string(), exe));
-        let releases = RELEASE_BUILD.then(|| {
-            std::env::var("WORKMUX_RELEASES_URL").unwrap_or_else(|_| RELEASES_URL.to_string())
-        });
+        let releases = RELEASE_BUILD
+            .then(|| update::release_source().unwrap_or_else(|| RELEASES_URL.to_string()));
         Self { own, releases }
     }
 
