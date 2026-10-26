@@ -94,7 +94,7 @@ fn unstarted_remote_target(name: &str) -> Result<Option<WaitTarget>> {
         _ => (None, name),
     };
     let project = match qualifier {
-        Some(qualifier) => crate::remote::router::remote_projects()?
+        Some(qualifier) => crate::remote::router::remote_projects()
             .into_iter()
             .find(|project| {
                 project.site.name == qualifier || project.project().group_label() == qualifier
@@ -171,9 +171,21 @@ fn worktree_removed(target: &WaitTarget) -> Option<bool> {
     match target {
         WaitTarget::Path(path) => Some(!path.exists()),
         WaitTarget::Remote {
-            project, worktree, ..
+            remote,
+            project,
+            worktree,
         } => {
-            let project = crate::remote::router::remote_project(project).ok()?;
+            // The project of an open window, else of the working directory.
+            let project = crate::remote::router::remote_project_on(remote, project)
+                .ok()
+                .or_else(|| {
+                    crate::remote::router::resolve()
+                        .ok()
+                        .flatten()
+                        .filter(|here| {
+                            here.id() == crate::project::RemoteProjectId::new(remote, project)
+                        })
+                })?;
             match crate::remote::router::quietly(&project, &["workmux", "path", worktree]) {
                 Ok(exit) => Some(exit != 0),
                 Err(error) => {

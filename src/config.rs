@@ -1028,7 +1028,7 @@ pub struct Config {
 
 /// A config key workmux no longer reads. Deserializing one fails with the
 /// key's [`WithdrawnKey::MESSAGE`].
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Withdrawn<K>(std::marker::PhantomData<K>);
 
 pub(crate) trait WithdrawnKey {
@@ -1051,6 +1051,15 @@ pub(crate) struct RemotesWithdrawn;
 impl WithdrawnKey for RemotesWithdrawn {
     const MESSAGE: &'static str = "remotes: is no longer read. SSH remotes are withdrawn, and an \
 OpenShell sandbox comes from its repository's config (sandbox.backend: openshell in .workmux.yaml)";
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct SandboxNameWithdrawn;
+
+impl WithdrawnKey for SandboxNameWithdrawn {
+    const MESSAGE: &'static str = "sandbox.openshell.sandbox is no longer read: a sandbox's name \
+derives from the path of the repository's clone, so no repository can name another's sandbox. \
+Remove it";
 }
 
 impl<'de, K: WithdrawnKey> Deserialize<'de> for Withdrawn<K> {
@@ -1129,9 +1138,10 @@ pub struct OpenshellRemote {
 /// OpenShell sandbox settings, under `sandbox.openshell`.
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, Default)]
 pub struct OpenshellProject {
-    /// Sandbox name (default: derived from the project name).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sandbox: Option<String>,
+    /// A sandbox name, withdrawn: the name derives from the clone's path.
+    #[serde(default, skip_serializing)]
+    #[allow(dead_code)]
+    pub(crate) sandbox: Withdrawn<SandboxNameWithdrawn>,
 
     /// Image the sandbox runs (default: workmux's OpenShell image).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1173,7 +1183,7 @@ impl OpenshellProject {
             );
         }
         Self {
-            sandbox: project.sandbox.or(global.sandbox),
+            sandbox: Withdrawn::default(),
             image: project.image.or(global.image),
             policy: project.policy.or(global.policy),
             path: project.path.or(global.path),
@@ -1220,30 +1230,31 @@ impl LoopbackConfig {
 /// OpenShell's limit on sandbox name length.
 const SANDBOX_NAME_MAX: usize = 19;
 
-/// The sandbox name for OpenShell project `project`: the name itself when
-/// OpenShell accepts it (lowercase letters, digits and hyphens, at most 19
-/// characters), else a readable prefix and a hash of the name.
-pub fn openshell_sandbox_name(project: &str) -> String {
-    let fits = project.len() <= SANDBOX_NAME_MAX
-        && !project.starts_with('-')
-        && project
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
-    if fits {
-        return project.to_string();
-    }
+/// The sandbox name for the OpenShell project whose clone is `root`, as
+/// Lima's VM names are derived: its directory's name and a hash of its
+/// canonical path, within OpenShell's rules (lowercase letters, digits and
+/// hyphens, at most 19 characters). Config cannot name a sandbox, so no
+/// repository can reach another's.
+pub fn openshell_sandbox_name(root: &Path) -> String {
     use sha2::Digest;
-    let hash = sha2::Sha256::digest(project.as_bytes());
-    let suffix: String = hash[..3].iter().map(|b| format!("{b:02x}")).collect();
-    let prefix: String = project
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let hash = sha2::Sha256::digest(root.to_string_lossy().as_bytes());
+    let suffix: String = hash[..4].iter().map(|b| format!("{b:02x}")).collect();
+    let mut prefix = String::new();
+    for c in root
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default()
         .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() {
-                c.to_ascii_lowercase()
-            } else {
-                '-'
-            }
-        })
+    {
+        if c.is_ascii_alphanumeric() {
+            prefix.push(c.to_ascii_lowercase());
+        } else if !prefix.is_empty() && !prefix.ends_with('-') {
+            prefix.push('-');
+        }
+    }
+    let prefix: String = prefix
+        .chars()
         .take(SANDBOX_NAME_MAX - suffix.len() - 1)
         .collect();
     let prefix = prefix.trim_matches('-');
@@ -4601,25 +4612,43 @@ sandbox:
     }
 
     #[test]
-    fn an_openshell_sandbox_name_fits_openshells_rules() {
-        let name = super::openshell_sandbox_name;
+    fn an_openshell_sandbox_is_named_after_its_clones_directory_and_path() {
+        let name = |path: &str| super::openshell_sandbox_name(std::path::Path::new(path));
+        let fits = |name: &str| {
+            name.len() <= 19
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        };
 
-        assert_eq!(name("api"), "api");
-        assert_eq!(name("web-app-2"), "web-app-2");
-        // Too long, upper case, or with characters OpenShell refuses: a
-        // readable prefix and a hash that keeps distinct projects apart.
-        let long = name("a-very-long-project-name");
-        assert!(long.len() <= 19, "{long}");
-        assert!(long.starts_with("a-very-long-"), "{long}");
-        assert_ne!(long, name("a-very-long-project-name2"));
-        let odd = name("My_App.v2");
-        assert!(odd.starts_with("my-app-v2-"), "{odd}");
-        assert!(
-            odd.chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
-            "{odd}"
-        );
-        assert_ne!(odd, name("my-app-v2"));
+        let api = name("/src/api");
+        assert!(api.starts_with("api-"), "{api}");
+        assert_eq!(api.len(), "api-".len() + 8, "{api}");
+        assert_eq!(name("/src/api"), api);
+        // Two repositories with the same directory name get two sandboxes.
+        assert_ne!(name("/work/api"), api);
+        for odd in [
+            "/src/a-very-long-project-name",
+            "/src/My_App.v2",
+            "/src/___",
+            "/",
+        ] {
+            assert!(fits(&name(odd)), "{}", name(odd));
+        }
+        assert!(name("/src/a-very-long-project-name").starts_with("a-very-lon-"));
+        assert!(name("/src/My_App.v2").starts_with("my-app-v2-"));
+        assert!(name("/src/___").starts_with("wm-"));
+    }
+
+    #[test]
+    fn a_project_config_cannot_name_its_openshell_sandbox() {
+        let error = serde_yaml::from_str::<Config>(
+            "sandbox:\n  backend: openshell\n  openshell:\n    sandbox: someone-elses\n",
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("sandbox.openshell.sandbox"), "{error}");
     }
 
     #[test]

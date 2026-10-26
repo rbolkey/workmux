@@ -213,11 +213,10 @@ impl StatusApplier {
         };
         let mut changed = false;
         for record in records {
-            let tag = RemoteProjectId::new(remote, &record.pane.project).tag();
-            for (pane_id, _) in views
-                .iter()
-                .filter(|(_, view)| view.0 == tag && view.1 == record.pane)
-            {
+            let id = Some(RemoteProjectId::new(remote, &record.pane.project));
+            for (pane_id, _) in views.iter().filter(|(_, view)| {
+                RemoteProjectId::from_tag(&view.0) == id && view.1 == record.pane
+            }) {
                 match self.apply_to_pane(remote, pane_id, record) {
                     Ok(applied) => changed |= applied,
                     Err(error) => tracing::warn!(
@@ -419,7 +418,7 @@ mod tests {
             "-t",
             &pane,
             WINDOW_TAG,
-            &format!("{remote}:api"),
+            &format!("{remote}:api:/src/api"),
         ]);
         server.query(&[
             "set-option",

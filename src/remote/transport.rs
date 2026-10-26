@@ -13,6 +13,27 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::config::{RemoteConfig, TransportKind};
+
+/// Build the transport that reaches `remote`.
+pub fn build(remote: &RemoteConfig) -> Result<Arc<dyn Transport>> {
+    match remote.transport {
+        TransportKind::Loopback => Ok(Arc::new(Loopback::new(crate::util::expand_tilde(
+            &remote.target,
+        ))?)),
+        TransportKind::Ssh => Ok(Arc::new(super::ssh::Ssh::new(&remote.target))),
+        TransportKind::Openshell => Ok(Arc::new(super::openshell::OpenShell::new(
+            &remote.target,
+            remote.openshell.clone(),
+        ))),
+    }
+}
+
+/// Builds the transport for each remote a control channel opens to.
+pub fn factory() -> super::channels::TransportFactory {
+    Arc::new(|_, remote| build(remote))
+}
+
 /// How much of a process's stderr is kept to explain a failure.
 const STDERR_TAIL_BYTES: usize = 4096;
 

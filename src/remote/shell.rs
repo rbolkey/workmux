@@ -456,8 +456,8 @@ mod tests {
             }
             pane
         };
-        let ours = tagged("api", Some("devbox:api"));
-        let other_remote = tagged("web", Some("buildbox:web"));
+        let ours = tagged("api", Some("devbox:api:/src/api"));
+        let other_remote = tagged("web", Some("buildbox:web:/src/web"));
         let local = tagged("mine", None);
         let tmux = crate::multiplexer::TmuxBackend::for_socket(&server.socket);
 

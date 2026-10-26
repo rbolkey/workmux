@@ -18,13 +18,14 @@ use super::dashboard::{self, DashboardRequest};
 use super::forwarded;
 use super::forwarding::{FORWARD_METHOD, Forwarded};
 use super::pane::RemotePaneId;
+use super::router::RemoteProject;
 use super::session::{self, CommandRequest, ProjectSite, SessionParams, Sessions, Terminal};
 use super::status::{self, StatusSink};
 use super::transport::{RemoteState, Transport};
 use super::{Remote, shell, shims};
 use crate::config::{RemoteConfig, TransportKind};
 use crate::multiplexer::{InvocationContext, TmuxBackend};
-use crate::project::RemoteProjectId;
+use crate::project::{ProjectTag, RemoteProjectId};
 
 /// Builds the transport for a configured remote.
 pub type TransportFactory =
@@ -43,8 +44,9 @@ pub struct ChannelPolicy {
     /// The workstation's tmux server (its socket path); `None` for tmux's
     /// default.
     pub tmux_socket: Option<String>,
-    /// Whether a project of this name is known to be on a remote.
-    pub registered: fn(remote: &str, project: &str) -> bool,
+    /// Whether a tagged window's clone still puts its project on its
+    /// remote, by the clone's config now.
+    pub still_tagged: fn(tag: &ProjectTag) -> bool,
     /// Reads the workstation clipboard's PNG image, for clipboard shims.
     pub clipboard: fn() -> Result<Option<Vec<u8>>>,
 }
@@ -60,14 +62,14 @@ impl Default for ChannelPolicy {
             tmux_socket: InvocationContext::current()
                 .tmux_socket_path()
                 .map(str::to_string),
-            registered: known_on_the_remote,
+            still_tagged: still_tagged,
             clipboard: crate::sandbox::clipboard::read_png_from_clipboard,
         }
     }
 }
 
-fn known_on_the_remote(remote: &str, project: &str) -> bool {
-    super::router::remote_project_on(remote, project).is_ok()
+fn still_tagged(tag: &ProjectTag) -> bool {
+    matches!(super::resolve::tagged(tag), Ok(Some(_)))
 }
 
 /// How long a remote may take to install its shims.
@@ -111,7 +113,7 @@ struct WorkstationHandler {
     /// The remote's settings, which its shims are checked against.
     config: RemoteConfig,
     tmux_socket: Option<String>,
-    registered: fn(&str, &str) -> bool,
+    still_tagged: fn(&ProjectTag) -> bool,
     clipboard: fn() -> Result<Option<Vec<u8>>>,
     status: Arc<Mutex<Option<StatusSink>>>,
 }
@@ -140,17 +142,18 @@ impl WorkstationHandler {
     /// invoked from the workstation pane showing it, if one does.
     fn open_shell(&self, params: Value) -> Result<Value> {
         let shell::OpenParams { pane } = serde_json::from_value(params)?;
-        if !(self.registered)(&self.remote, &pane.project) {
+        let (invocation, tag) = self.viewing(&pane);
+        let Some(tag) = tag.filter(|tag| (self.still_tagged)(tag)) else {
             bail!(
                 "Refused: project {} is not on remote {}",
                 pane.project,
                 self.remote
             );
-        }
-        let invocation = self.viewing(&pane);
+        };
         let session = self.sessions.open_shell(forwarded::SessionScope {
             remote: self.remote.clone(),
             project: pane.project,
+            root: tag.root,
             invocation,
         });
         Ok(serde_json::to_value(shell::Opened { session })?)
@@ -158,10 +161,11 @@ impl WorkstationHandler {
 
     /// The invocation context of a command run in remote pane `pane`'s
     /// shell: the workstation pane in one of the project's windows showing
-    /// it, else none in the workstation's tmux.
-    fn viewing(&self, pane: &RemotePaneId) -> InvocationContext {
+    /// it, else none in the workstation's tmux. With it, the tag of a window
+    /// of the project, preferring the one showing the pane.
+    fn viewing(&self, pane: &RemotePaneId) -> (InvocationContext, Option<ProjectTag>) {
         let socket = self.tmux_socket.as_deref().unwrap_or("default");
-        let tag = RemoteProjectId::new(&self.remote, &pane.project).tag();
+        let id = RemoteProjectId::new(&self.remote, &pane.project);
         let listing = TmuxBackend::for_socket(socket)
             .query(&[
                 "list-panes",
@@ -171,18 +175,25 @@ impl WorkstationHandler {
             ])
             .unwrap_or_default();
         let shown = pane.to_string();
-        listing
+        let panes: Vec<_> = listing
             .lines()
             .filter_map(|line| {
                 let mut fields = line.split('\t');
-                Some((
+                let (pane_id, remote_pane, tag, client) = (
                     fields.next()?,
                     fields.next()?,
                     fields.next()?,
                     fields.next()?,
-                ))
+                );
+                let tag = ProjectTag::parse(tag).filter(|tag| tag.id == id)?;
+                Some((pane_id, remote_pane, tag, client))
             })
-            .find(|(_, remote_pane, window_tag, _)| *remote_pane == shown && *window_tag == tag)
+            .collect();
+        let showing = panes
+            .iter()
+            .find(|(_, remote_pane, _, _)| *remote_pane == shown);
+        let tag = showing.or(panes.first()).map(|(_, _, tag, _)| tag.clone());
+        let invocation = showing
             .map(|(pane_id, _, _, client)| InvocationContext {
                 pane_id: Some(pane_id.to_string()),
                 tmux: Some(client.replace('$', "")),
@@ -191,7 +202,8 @@ impl WorkstationHandler {
             .unwrap_or_else(|| InvocationContext {
                 tmux: Some(socket.to_string()),
                 ..InvocationContext::default()
-            })
+            });
+        (invocation, tag)
     }
 
     fn prompt(&self, params: Value) -> Result<Value> {
@@ -425,7 +437,7 @@ impl Channels {
                 sessions: self.shared.sessions.clone(),
                 config: config.clone(),
                 tmux_socket: self.shared.policy.tmux_socket.clone(),
-                registered: self.shared.policy.registered,
+                still_tagged: self.shared.policy.still_tagged,
                 clipboard: self.shared.policy.clipboard,
                 status: self.shared.status.clone(),
             },
@@ -544,18 +556,22 @@ impl Channels {
     /// Returns the command's exit code.
     pub fn run_command(
         &self,
-        remote: Remote<'_>,
+        project: &RemoteProject,
         request: &CommandRequest,
         invocation: &InvocationContext,
         terminal: &mut dyn Terminal,
         running: bool,
     ) -> Result<i32> {
+        let remote = project.host();
         let connection = self.channel_checked(remote, true, running)?;
         self.hold(remote.name, 1);
-        let exit = self
-            .shared
-            .sessions
-            .run(&connection.peer, request, invocation, terminal);
+        let exit = self.shared.sessions.run(
+            &connection.peer,
+            &project.root,
+            request,
+            invocation,
+            terminal,
+        );
         self.hold(remote.name, -1);
         exit
     }

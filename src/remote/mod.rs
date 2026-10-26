@@ -16,7 +16,7 @@ pub mod handshake;
 pub mod openshell;
 pub mod pane;
 pub mod provision;
-pub mod registry;
+pub mod resolve;
 pub mod router;
 pub mod serve;
 pub mod session;
@@ -59,7 +59,7 @@ impl<'a> Remote<'a> {
 /// or a command running without one.
 pub fn channels() -> &'static Channels {
     static CHANNELS: OnceLock<Channels> = OnceLock::new();
-    CHANNELS.get_or_init(|| Channels::new(registry::transport_factory(), ChannelPolicy::default()))
+    CHANNELS.get_or_init(|| Channels::new(transport::factory(), ChannelPolicy::default()))
 }
 
 /// Status of the remote `name`, or of every remote, checked in parallel.

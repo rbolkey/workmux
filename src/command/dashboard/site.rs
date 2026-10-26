@@ -544,7 +544,6 @@ pub(crate) mod tests {
     fn a_remote_projects_worktree_rows_are_keyed_and_asked_about_by_remote_and_project() {
         let temp = tempfile::tempdir().unwrap();
         crate::test_support::init_repo(temp.path());
-        let records = tempfile::tempdir().unwrap();
         let remote = ProjectScope::Remote {
             remote: "devbox".to_string(),
             project: "api".to_string(),
@@ -563,7 +562,7 @@ pub(crate) mod tests {
             remote: "other".to_string(),
             project: "api".to_string(),
         };
-        crate::remote::registry::with_recorded(records.path(), &[devbox_api()], || {
+        crate::remote::resolve::with_open(&[crate::remote::testing::devbox_api()], || {
             assert_eq!(
                 remote.repo_source(temp.path()),
                 Some(crate::github::RepoSource::GitUrl(
@@ -578,27 +577,5 @@ pub(crate) mod tests {
             );
             assert_eq!(elsewhere.repo_source(temp.path()), None);
         });
-    }
-
-    /// Project `api` on remote `devbox`, cloned from GitHub over SSH.
-    pub(crate) fn devbox_api() -> crate::remote::router::RemoteProject {
-        crate::remote::router::RemoteProject {
-            site: crate::remote::session::ProjectSite {
-                remote: "devbox".to_string(),
-                name: "api".to_string(),
-                path: "~/api".to_string(),
-                git_url: Some(crate::remote::git_url::GitUrl::new(
-                    "git@github.com:me/api.git",
-                )),
-                session: Some("api".to_string()),
-            },
-            remote: crate::config::RemoteConfig {
-                transport: crate::config::TransportKind::Loopback,
-                target: "/tmp/devbox".to_string(),
-                builtin_shims: None,
-                host_commands: Vec::new(),
-                openshell: None,
-            },
-        }
     }
 }
