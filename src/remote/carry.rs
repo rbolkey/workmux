@@ -706,6 +706,26 @@ mod tests {
     }
 
     #[test]
+    fn a_default_branch_ahead_of_origins_is_unpushed_not_unmerged() {
+        let project = Project::new();
+        project.commit(&project.clone, "a.txt");
+
+        let risks: Vec<String> = at_risk(&project.clone)
+            .unwrap()
+            .iter()
+            .map(AtRisk::describe)
+            .collect();
+
+        assert_eq!(
+            risks,
+            [format!(
+                "{} (branch main): 1 commit not on any remote",
+                project.clone.display()
+            )]
+        );
+    }
+
+    #[test]
     fn a_restore_brings_back_every_branch_worktree_and_the_origin() {
         let project = Project::new();
         let feature = project.worktree("feature");
