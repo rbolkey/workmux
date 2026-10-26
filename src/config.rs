@@ -3135,15 +3135,9 @@ impl Config {
         )?;
         let openshell = std::env::var(crate::remote::openshell::SANDBOX_ENV).ok();
         if openshell.is_some() {
-            // Say so once per command, however often it loads config.
-            static NOTE: std::sync::Once = std::sync::Once::new();
             let mut note = Vec::new();
             ignore_sandbox_in_openshell(&mut config, openshell.as_deref(), &mut note);
-            if !note.is_empty() {
-                NOTE.call_once(|| {
-                    let _ = std::io::Write::write_all(&mut std::io::stderr(), &note);
-                });
-            }
+            note_once(&note);
         }
         Ok((config, location))
     }
@@ -4353,12 +4347,49 @@ fn ignore_sandbox_in_openshell(
         return;
     };
     if config.sandbox.is_enabled() {
-        let _ = writeln!(
-            note,
-            "Note: the sandbox: setting is ignored inside OpenShell sandbox {sandbox}, which is already the project's sandbox"
-        );
+        write_ignored_note(sandbox, note);
     }
     config.sandbox.enabled = Some(false);
+}
+
+/// Whether `add --sandbox`, `flag`, starts workmux's own sandbox: never in
+/// OpenShell sandbox `sandbox`, where it is ignored with the note the
+/// `sandbox:` setting gets.
+fn sandbox_flag_in(flag: bool, sandbox: Option<&str>, note: &mut impl std::io::Write) -> bool {
+    match sandbox {
+        Some(sandbox) if flag => {
+            write_ignored_note(sandbox, note);
+            false
+        }
+        _ => flag,
+    }
+}
+
+/// [`sandbox_flag_in`] the OpenShell sandbox this process runs in, if any,
+/// with its note on stderr.
+pub fn sandbox_flag(flag: bool) -> bool {
+    let openshell = std::env::var(crate::remote::openshell::SANDBOX_ENV).ok();
+    let mut note = Vec::new();
+    let flag = sandbox_flag_in(flag, openshell.as_deref(), &mut note);
+    note_once(&note);
+    flag
+}
+
+fn write_ignored_note(sandbox: &str, note: &mut impl std::io::Write) {
+    let _ = writeln!(
+        note,
+        "Note: the sandbox: setting is ignored inside OpenShell sandbox {sandbox}, which is already the project's sandbox"
+    );
+}
+
+/// Print `note` on stderr once per command, however often config loads.
+fn note_once(note: &[u8]) {
+    static NOTE: std::sync::Once = std::sync::Once::new();
+    if !note.is_empty() {
+        NOTE.call_once(|| {
+            let _ = std::io::Write::write_all(&mut std::io::stderr(), note);
+        });
+    }
 }
 
 #[cfg(test)]
@@ -4404,6 +4435,26 @@ mod tests {
 
         assert!(config.sandbox.is_enabled());
         assert!(note.is_empty());
+    }
+
+    #[test]
+    fn an_openshell_sandbox_ignores_the_sandbox_flag_with_the_same_note() {
+        let mut note = Vec::new();
+
+        assert!(!super::sandbox_flag_in(true, Some("api"), &mut note));
+
+        let note = String::from_utf8(note).unwrap();
+        let mut config = Config::default();
+        config.sandbox.enabled = Some(true);
+        let mut setting_note = Vec::new();
+        super::ignore_sandbox_in_openshell(&mut config, Some("api"), &mut setting_note);
+        assert_eq!(note, String::from_utf8(setting_note).unwrap());
+
+        // Unasked, or outside a sandbox, the flag stands and says nothing.
+        let mut quiet = Vec::new();
+        assert!(!super::sandbox_flag_in(false, Some("api"), &mut quiet));
+        assert!(super::sandbox_flag_in(true, None, &mut quiet));
+        assert!(quiet.is_empty());
     }
 
     #[test]

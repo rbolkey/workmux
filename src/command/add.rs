@@ -447,8 +447,9 @@ pub fn run(
         check_preconditions(false)?;
     }
 
-    // Extract sandbox override before consuming setup flags
-    let sandbox_override = setup.sandbox;
+    // Extract sandbox override before consuming setup flags. Inside an
+    // OpenShell sandbox it is ignored, like the sandbox: setting.
+    let sandbox_override = config::sandbox_flag(setup.sandbox);
 
     // Load config early to determine mode
     let mut initial_config = config::Config::load_with_override(

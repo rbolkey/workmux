@@ -8,7 +8,7 @@ An OpenShell project lives in an [OpenShell](https://github.com/NVIDIA/OpenShell
 - The repository is cloned inside the sandbox, and its worktrees live beside the clone.
 - workmux never requests a bind mount, so no workstation file is visible in the sandbox.
 - The control channel runs over `openshell sandbox exec`, so the sandbox's network policy needs no rule for workmux.
-- The OpenShell sandbox is the project's sandbox. In it, workmux runs no container or Lima sandbox: a `sandbox:` setting that asks for one, from the project's `.workmux.yaml` or global config, is ignored there with a note. The rest of the config, hooks included, still applies.
+- The OpenShell sandbox is the project's sandbox. In it, workmux runs no container or Lima sandbox: a `sandbox:` setting that asks for one, from the project's `.workmux.yaml` or global config, or `add --sandbox`, is ignored there with a note. The rest of the config, hooks included, still applies.
 
 ## Set up a project
 
