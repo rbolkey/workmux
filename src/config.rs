@@ -1115,6 +1115,18 @@ pub struct RemoteConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub host_commands: Vec<String>,
 
+    /// Workstation environment variables passed through to remote workmux
+    /// and the panes it starts, as `sandbox.env_passthrough` passes them to
+    /// a container or Lima sandbox.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env_passthrough: Vec<String>,
+
+    /// Environment variables set in remote workmux's environment and the
+    /// panes it starts, as `sandbox.env` sets them in a container or Lima
+    /// sandbox.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+
     /// For an OpenShell project's remote: what its sandbox is created from.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub openshell: Option<OpenshellRemote>,
@@ -1132,6 +1144,10 @@ pub struct OpenshellRemote {
     /// The agents the sandbox runs, by plain CLI: the project's, else the
     /// default agent's type.
     pub agents: Vec<String>,
+    /// Whether the config sets `sandbox.extra_mounts`, which the sandbox
+    /// ignores: OpenShell never mounts (ADR 0003).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub extra_mounts: bool,
 }
 
 /// OpenShell sandbox settings, under `sandbox.openshell`.

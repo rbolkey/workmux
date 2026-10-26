@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::remote::git_url::GitUrl;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -98,6 +98,12 @@ pub struct CommandRequest {
     /// them in a file of its own, as the command's prompt file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_file: Option<String>,
+    /// The sandbox's environment from the project's config: the workstation's
+    /// values of the variables `sandbox.env_passthrough` names, and those
+    /// `sandbox.env` sets. They are set in remote workmux's environment and
+    /// so in the panes it starts.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -640,6 +646,7 @@ pub fn run_on_remote(
         .unwrap_or(path);
     command
         .current_dir(&workdir)
+        .envs(&request.env)
         .env(REMOTE_ENV, &request.project.remote)
         .env(PROJECT_ENV, &request.project.name);
     match &request.project.session {
@@ -733,6 +740,8 @@ mod tests {
             target: "/remote".to_string(),
             builtin_shims: None,
             host_commands: vec![],
+            env_passthrough: vec![],
+            env: Default::default(),
             openshell: None,
         }
     }
@@ -749,6 +758,7 @@ mod tests {
             argv: ["sh", "-c", script].map(String::from).to_vec(),
             invoking_window_token: None,
             prompt_file: None,
+            env: BTreeMap::new(),
         }
     }
 
@@ -823,6 +833,18 @@ mod tests {
         // The file lasts only as long as the command.
         let seen = std::fs::read_to_string(project.path().join("seen")).unwrap();
         assert!(!Path::new(seen.trim()).exists());
+    }
+
+    #[test]
+    fn the_workstation_environment_passed_through_reaches_the_command() {
+        let project = tempfile::tempdir().unwrap();
+        let mut request = request(project.path(), None, r#"printf '%s' "$GITHUB_TOKEN""#);
+        request.env = BTreeMap::from([("GITHUB_TOKEN".to_string(), "it's $ecret".to_string())]);
+
+        let (exit, captured) = run(&request, |_| {});
+
+        assert_eq!(exit.unwrap(), 0, "{}", captured.stderr);
+        assert_eq!(captured.stdout, "it's $ecret");
     }
 
     /// A terminal whose user presses Ctrl-C once the command has printed

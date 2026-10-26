@@ -284,12 +284,17 @@ def test_an_openshell_project_lives_stops_resumes_and_is_removed_with_its_sandbo
             f"Worktrees in OpenShell sandbox {project.sandbox} (project {project.name})"
         ), listing
 
-        # A command that needs a stopped sandbox starts it itself.
+        # A command that acts on a stopped sandbox starts it itself (a
+        # read-only one, such as path, never does); path then finds the
+        # worktree in it.
         project.wm("remote stop", timeout=300.0)
-        path = project.wm("path feature", timeout=300.0)
+        added = project.wm("add second", timeout=300.0)
+        assert "Starting remote" in added.stderr
+        path = project.wm("path feature", timeout=60.0)
         assert path.stdout.strip() == f"/sandbox/{project.name}__worktrees/feature"
-        assert "Starting remote" in path.stderr
+        assert "Starting remote" not in path.stderr
 
+        project.wm("remove second --force", timeout=120.0)
         project.wm("remove feature --force", timeout=120.0)
     finally:
         if feed is not None:
@@ -375,6 +380,49 @@ def test_a_projects_lima_sandbox_is_ignored_inside_its_openshell_sandbox(
         ),
         "the agent to start",
         timeout=60.0,
+    )
+
+
+def test_an_openshell_sandbox_follows_the_sandbox_settings_of_every_backend(
+    project: Project,
+):
+    """`env_passthrough` and `env` reach the agent pane, with the
+    workstation's value and config's; `extra_mounts` is ignored, with a note
+    when the sandbox is created, since OpenShell never mounts."""
+    project.configure("/sandbox/origin", LEARNING_IMAGE)
+    config = project.env.home_path / ".config" / "workmux" / "config.yaml"
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text(
+        "sandbox:\n  env_passthrough: [WM_E20_PASSED]\n"
+        "  env:\n    WM_E20_SET: from config\n  extra_mounts: [/tmp]\n"
+    )
+    project.tmp["WM_E20_PASSED"] = "from the workstation"
+    note = f"Note: extra_mounts is ignored for OpenShell sandbox {project.sandbox}"
+
+    started = project.wm("remote start", timeout=600.0)
+
+    assert note in started.stderr, started.stderr
+    project.make_origin()
+    project.sh(
+        "set -e; "
+        "printf 'panes:\\n  - command: printenv WM_E20_PASSED WM_E20_SET "
+        "> /sandbox/control/passed; sh /sandbox/agent.sh\\n' "
+        "> /sandbox/origin/.workmux.yaml; "
+        "git -C /sandbox/origin -c user.name=t -c user.email=t@t "
+        "commit -q -am 'passthrough pane'"
+    )
+
+    added = project.wm("add feature", timeout=120.0)
+
+    assert note not in added.stderr, added.stderr
+    wait_until(
+        lambda: project.sh("cat /sandbox/control/passed 2>/dev/null || true") != "",
+        "the agent pane to start",
+        timeout=60.0,
+    )
+    assert (
+        project.sh("cat /sandbox/control/passed")
+        == "from the workstation\nfrom config\n"
     )
 
 

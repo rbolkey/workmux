@@ -38,13 +38,16 @@ endpoints:
       - allow: {method: OPTIONS, path: "**"}
       - allow: {method: POST, path: /**/git-upload-pack}
       - allow: {method: POST, path: /**/git-receive-pack}
-# git's git-remote-https helper matches by ancestry. A baked flake devshell
-# has nix's git (the real binary) and gh (a wrapper that execs .gh-wrapped).
+# git's git-remote-https helper matches by ancestry; nix git's helpers are
+# listed too. A baked flake devshell has nix's git (the real binary) and gh
+# (a wrapper that execs .gh-wrapped).
 binaries:
   - /usr/bin/gh
   - /usr/local/bin/gh
   - /usr/bin/git
   - /usr/local/bin/git
   - /nix/store/*-git-*/bin/git
+  - /nix/store/*-git-*/libexec/git-core/git-remote-http
+  - /nix/store/*-git-*/libexec/git-core/git-remote-https
   - /nix/store/*-gh-*/bin/gh
   - /nix/store/*-gh-*/bin/.gh-wrapped
