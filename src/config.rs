@@ -1003,13 +1003,60 @@ pub struct Config {
     #[serde(default)]
     pub sandbox: SandboxConfig,
 
-    /// Remotes, by name, that projects can live on. Global-only.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub remotes: BTreeMap<String, RemoteConfig>,
+    /// Workstation session for the windows of a project in a sandbox
+    /// such as OpenShell's (default: the project name).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_session: Option<String>,
 
-    /// Projects registered on a remote, by name. Global-only.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub projects: BTreeMap<String, ProjectEntry>,
+    /// Where the windows of a project in a sandbox such as OpenShell's go
+    /// in window mode: its own session (default) or the session the
+    /// command was run from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_placement: Option<ProjectPlacement>,
+
+    /// The global `remotes:` registry, withdrawn (ADR 0004): reading a
+    /// config that still has it fails, naming what replaced it.
+    #[serde(default, skip_serializing)]
+    #[allow(dead_code)]
+    pub(crate) remotes: Withdrawn<RemotesWithdrawn>,
+
+    /// The global `projects:` registry, withdrawn (ADR 0004).
+    #[serde(default, skip_serializing)]
+    #[allow(dead_code)]
+    pub(crate) projects: Withdrawn<ProjectsWithdrawn>,
+}
+
+/// A config key workmux no longer reads. Deserializing one fails with the
+/// key's [`WithdrawnKey::MESSAGE`].
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Withdrawn<K>(std::marker::PhantomData<K>);
+
+pub(crate) trait WithdrawnKey {
+    const MESSAGE: &'static str;
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ProjectsWithdrawn;
+
+impl WithdrawnKey for ProjectsWithdrawn {
+    const MESSAGE: &'static str = "projects: is no longer read. Where a project runs comes from \
+its repository's config: put `sandbox: {enabled: true, backend: openshell, openshell: {image, \
+policy, agents, path}}` in the repository's .workmux.yaml, list OpenShell providers under \
+sandbox.openshell.providers in your global config, and run workmux in a clone of the repository";
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RemotesWithdrawn;
+
+impl WithdrawnKey for RemotesWithdrawn {
+    const MESSAGE: &'static str = "remotes: is no longer read. SSH remotes are withdrawn, and an \
+OpenShell sandbox comes from its repository's config (sandbox.backend: openshell in .workmux.yaml)";
+}
+
+impl<'de, K: WithdrawnKey> Deserialize<'de> for Withdrawn<K> {
+    fn deserialize<D: serde::Deserializer<'de>>(_: D) -> Result<Self, D::Error> {
+        Err(serde::de::Error::custom(K::MESSAGE))
+    }
 }
 
 /// How the workstation reaches a remote.
@@ -1040,7 +1087,9 @@ impl std::fmt::Display for TransportKind {
     }
 }
 
-/// A remote entry in global config.
+/// A remote as workmux reaches it: resolved from a project's config (an
+/// OpenShell sandbox, or the hidden loopback backend), never written in a
+/// config file.
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 pub struct RemoteConfig {
     pub transport: TransportKind,
@@ -1058,20 +1107,13 @@ pub struct RemoteConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub host_commands: Vec<String>,
 
-    /// Whether workmux may install a matching workmux in the remote's cache
-    /// directory and run that one: the user's answer the first time a
-    /// remote lacked a compatible workmux. Unset until asked.
+    /// For an OpenShell project's remote: what its sandbox is created from.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub upload_workmux: Option<bool>,
-
-    /// For an OpenShell project's implicit remote: what its sandbox is
-    /// created from. Never written to config.
-    #[serde(skip)]
     pub openshell: Option<OpenshellRemote>,
 }
 
-/// What an OpenShell project's implicit remote creates its sandbox from.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// What an OpenShell project's remote creates its sandbox from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpenshellRemote {
     /// The project the sandbox belongs to.
     pub project: String,
@@ -1084,7 +1126,7 @@ pub struct OpenshellRemote {
     pub agents: Vec<String>,
 }
 
-/// OpenShell settings of a project whose remote is its own sandbox.
+/// OpenShell sandbox settings, under `sandbox.openshell`.
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, Default)]
 pub struct OpenshellProject {
     /// Sandbox name (default: derived from the project name).
@@ -1095,13 +1137,18 @@ pub struct OpenshellProject {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
 
-    /// Policy file merged on top of workmux's base policy.
+    /// Policy file merged on top of workmux's base policy, relative to the
+    /// repository.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy: Option<String>,
 
+    /// Path of the project's clone in the sandbox (default: `~/<project>`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+
     /// OpenShell providers attached to the sandbox, for credentials;
     /// `gh-login` is the one workmux keeps from the workstation's `gh`
-    /// login.
+    /// login. Global-only.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub providers: Vec<String>,
 
@@ -1110,6 +1157,64 @@ pub struct OpenshellProject {
     /// default agent's type).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub agents: Vec<String>,
+}
+
+impl OpenshellProject {
+    /// Merge: project overrides global, per field; `providers` is
+    /// global-only.
+    fn merge(global: Self, project: Self) -> Self {
+        // Security: providers is global-only. Project config cannot set it
+        // -- otherwise a repository could commit `providers: [gh-login]`
+        // and receive the user's GitHub login.
+        if !project.providers.is_empty() {
+            tracing::warn!(
+                "sandbox.openshell.providers in project config (.workmux.yaml) is ignored -- \
+                move it to your global config (~/.config/workmux/config.yaml)"
+            );
+        }
+        Self {
+            sandbox: project.sandbox.or(global.sandbox),
+            image: project.image.or(global.image),
+            policy: project.policy.or(global.policy),
+            path: project.path.or(global.path),
+            providers: global.providers,
+            agents: if project.agents.is_empty() {
+                global.agents
+            } else {
+                project.agents
+            },
+        }
+    }
+}
+
+/// Settings of the hidden loopback backend, under `sandbox.loopback`: a
+/// remote that runs remote workmux as a local child process rooted in a
+/// directory. It stands in for a real remote in tests.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, Default)]
+pub struct LoopbackConfig {
+    /// Directory the remote is rooted in, standing in for its filesystem.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<String>,
+
+    /// Remote name (default: the project name), so several projects can
+    /// share one remote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<String>,
+
+    /// Path of the project's clone on the remote (default: `~/<project>`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+impl LoopbackConfig {
+    /// Merge: project overrides global, per field.
+    fn merge(global: Self, project: Self) -> Self {
+        Self {
+            root: project.root.or(global.root),
+            remote: project.remote.or(global.remote),
+            path: project.path.or(global.path),
+        }
+    }
 }
 
 /// OpenShell's limit on sandbox name length.
@@ -1153,37 +1258,6 @@ impl RemoteConfig {
     pub fn builtin_shims(&self) -> bool {
         self.builtin_shims.unwrap_or(true)
     }
-}
-
-/// A project entry in global config.
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, Default)]
-pub struct ProjectEntry {
-    /// Name of the remote the project lives on.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub remote: Option<String>,
-
-    /// The URL the remote clones the project from: for an OpenShell
-    /// project given an SSH URL, its HTTPS form, with the original.
-    #[serde(flatten)]
-    pub git_url: Option<GitUrl>,
-
-    /// Path of the project's clone on the remote.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub path: Option<String>,
-
-    /// Workstation session name for the project's windows.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session: Option<String>,
-
-    /// Where the project's windows go in window mode: its own session
-    /// (default) or the session the command was run from.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub placement: Option<ProjectPlacement>,
-
-    /// Set for a project in its own OpenShell sandbox, which is its
-    /// implicit remote, named after the project.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub openshell: Option<OpenshellProject>,
 }
 
 /// Workstation placement of a remote project's windows in window mode.
@@ -1666,6 +1740,11 @@ pub enum SandboxBackend {
     Container,
     /// Lima VM backend
     Lima,
+    /// An OpenShell sandbox per project: the repository is cloned in it
+    /// and the project's agents run there.
+    Openshell,
+    /// Test-only: a loopback remote, standing in for an OpenShell sandbox.
+    Loopback,
 }
 
 /// Container runtime for sandbox
@@ -2502,6 +2581,14 @@ pub struct SandboxConfig {
     #[serde(default)]
     pub lima: LimaConfig,
 
+    /// OpenShell-specific configuration
+    #[serde(default)]
+    pub openshell: OpenshellProject,
+
+    /// Loopback backend configuration (test-only)
+    #[serde(default)]
+    pub loopback: LoopbackConfig,
+
     /// Container-specific configuration
     #[serde(default)]
     pub container: ContainerConfig,
@@ -2518,8 +2605,22 @@ pub struct SandboxConfig {
 }
 
 impl SandboxConfig {
+    /// Whether the project's panes run in a container or Lima sandbox. A
+    /// project in an OpenShell sandbox has none: it lives on a remote.
     pub fn is_enabled(&self) -> bool {
-        self.enabled.unwrap_or(false)
+        self.enabled.unwrap_or(false) && self.remote_backend().is_none()
+    }
+
+    /// The backend that puts the project on a remote, when sandboxing is
+    /// enabled with one: OpenShell, or the hidden loopback backend.
+    pub fn remote_backend(&self) -> Option<SandboxBackend> {
+        let backend = self.backend();
+        (self.enabled.unwrap_or(false)
+            && matches!(
+                backend,
+                SandboxBackend::Openshell | SandboxBackend::Loopback
+            ))
+        .then_some(backend)
     }
 
     pub fn backend(&self) -> SandboxBackend {
@@ -3245,64 +3346,15 @@ impl Config {
     }
 
     /// Load only the global configuration, or the defaults if there is none.
-    /// For workstation-wide settings such as remotes, which no project
-    /// config may set.
+    /// For workstation-wide settings, which no project config may set.
     pub fn load_global_only() -> anyhow::Result<Self> {
-        Ok(Self::load_global()?
-            .unwrap_or_default()
-            .with_implicit_remotes())
-    }
-
-    /// This config with each OpenShell project's implicit remote: a remote
-    /// named after the project, reaching its sandbox. A registered remote
-    /// of the same name wins, with a warning.
-    pub fn with_implicit_remotes(mut self) -> Self {
-        let default_agent = self.default_agent_type();
-        for (name, entry) in &mut self.projects {
-            let Some(settings) = &entry.openshell else {
-                continue;
-            };
-            if self.remotes.contains_key(name) {
-                tracing::warn!(
-                    project = %name,
-                    "a registered remote has the OpenShell project's name; using that remote"
-                );
-                entry.remote = Some(name.clone());
-                continue;
-            }
-            self.remotes.insert(
-                name.clone(),
-                RemoteConfig {
-                    transport: TransportKind::Openshell,
-                    target: settings
-                        .sandbox
-                        .clone()
-                        .unwrap_or_else(|| openshell_sandbox_name(name)),
-                    builtin_shims: None,
-                    host_commands: Vec::new(),
-                    upload_workmux: None,
-                    openshell: Some(OpenshellRemote {
-                        project: name.clone(),
-                        git_url: entry.git_url.clone(),
-                        path: entry.path.clone().unwrap_or_else(|| format!("~/{name}")),
-                        settings: settings.clone(),
-                        agents: if settings.agents.is_empty() {
-                            default_agent.iter().cloned().collect()
-                        } else {
-                            settings.agents.clone()
-                        },
-                    }),
-                },
-            );
-            entry.remote = Some(name.clone());
-        }
-        self
+        Ok(Self::load_global()?.unwrap_or_default())
     }
 
     /// The type of this config's default agent, such as `claude` for a
     /// command at a workstation path or a named agent of that type; `None`
     /// when it is no agent workmux knows.
-    fn default_agent_type(&self) -> Option<String> {
+    pub fn default_agent_type(&self) -> Option<String> {
         self.agent_type_of(self.agent.as_deref().unwrap_or("claude"))
     }
 
@@ -3408,6 +3460,8 @@ impl Config {
             auto_update_check,
             prompt_file_only,
             stale_after_secs,
+            project_session,
+            project_placement,
         );
 
         // Layouts: merge maps by key so project layouts extend global ones
@@ -3671,6 +3725,8 @@ impl Config {
                 self.sandbox.agent_config_dir.clone()
             },
             lima: LimaConfig::merge(self.sandbox.lima, project.sandbox.lima),
+            openshell: OpenshellProject::merge(self.sandbox.openshell, project.sandbox.openshell),
+            loopback: LoopbackConfig::merge(self.sandbox.loopback, project.sandbox.loopback),
             // Security: sandbox.container.devices, group_add, oci_runtime,
             // cap_add and security_opt are global-only. devices/group_add
             // expose host hardware and can expand filesystem access via
@@ -3745,23 +3801,6 @@ impl Config {
         } else {
             self.agents
         };
-
-        // Security: remotes and projects are global-only, so a repository's
-        // .workmux.yaml cannot redirect where workmux sends commands.
-        if !project.remotes.is_empty() {
-            tracing::warn!(
-                "remotes in project config (.workmux.yaml) is ignored -- \
-                move it to your global config (~/.config/workmux/config.yaml)"
-            );
-        }
-        merged.remotes = self.remotes;
-        if !project.projects.is_empty() {
-            tracing::warn!(
-                "projects in project config (.workmux.yaml) is ignored -- \
-                move it to your global config (~/.config/workmux/config.yaml)"
-            );
-        }
-        merged.projects = self.projects;
 
         merged
     }
@@ -4385,112 +4424,142 @@ mod tests {
         (result, logs)
     }
 
-    const REMOTES_YAML: &str = "\
-remotes:
-  devbox:
-    transport: ssh
-    target: me@devbox
-    builtin_shims: false
-    host_commands: [just]
-projects:
-  api:
-    remote: devbox
-    git_url: git@github.com:me/api.git
-    path: ~/src/api
-    session: api-work
-";
-
     #[test]
-    fn global_config_registers_remotes_and_projects() {
-        let global: Config = serde_yaml::from_str(REMOTES_YAML).expect("config parses");
-
-        let merged = global.merge(Config::default());
-
-        let devbox = &merged.remotes["devbox"];
-        assert_eq!(devbox.transport, super::TransportKind::Ssh);
-        assert_eq!(devbox.target, "me@devbox");
-        assert!(!devbox.builtin_shims());
-        assert_eq!(devbox.host_commands, vec!["just".to_string()]);
-        let api = &merged.projects["api"];
-        assert_eq!(api.remote.as_deref(), Some("devbox"));
-        assert_eq!(
-            api.git_url,
-            Some(crate::remote::git_url::GitUrl::new(
-                "git@github.com:me/api.git"
-            ))
-        );
-        assert_eq!(api.path.as_deref(), Some("~/src/api"));
-        assert_eq!(api.session.as_deref(), Some("api-work"));
-    }
-
-    #[test]
-    fn an_openshell_project_owns_an_implicit_remote_named_after_it() {
+    fn sandbox_openshell_merges_per_field_and_providers_are_global_only() {
         let global: Config = serde_yaml::from_str(
             "\
-projects:
-  api:
-    git_url: https://github.com/me/api.git
-    openshell:
-      image: ghcr.io/me/api-dev:1
-      policy: ~/policies/api.yaml
-      providers: [github, anthropic]
+sandbox:
+  openshell:
+    image: ghcr.io/me/base:1
+    policy: global-policy.yaml
+    providers: [github, anthropic]
+    agents: [claude]
 ",
         )
-        .expect("config parses");
+        .unwrap();
+        let project: Config = serde_yaml::from_str(
+            "\
+sandbox:
+  enabled: true
+  backend: openshell
+  openshell:
+    image: ghcr.io/me/api-dev:1
+    path: ~/src/api
+    providers: [gh-login]
+",
+        )
+        .unwrap();
 
-        let config = global.with_implicit_remotes();
+        let (merged, logs) = capture_logs(|| global.merge(project));
 
-        let remote = &config.remotes["api"];
-        assert_eq!(remote.transport, super::TransportKind::Openshell);
-        assert_eq!(remote.target, "api");
-        let openshell = remote.openshell.as_ref().expect("openshell settings");
-        assert_eq!(openshell.project, "api");
-        assert_eq!(
-            openshell.git_url,
-            Some(crate::remote::git_url::GitUrl::new(
-                "https://github.com/me/api.git"
-            ))
+        let openshell = &merged.sandbox.openshell;
+        assert_eq!(openshell.image.as_deref(), Some("ghcr.io/me/api-dev:1"));
+        assert_eq!(openshell.policy.as_deref(), Some("global-policy.yaml"));
+        assert_eq!(openshell.path.as_deref(), Some("~/src/api"));
+        assert_eq!(openshell.agents, ["claude"]);
+        assert_eq!(openshell.providers, ["github", "anthropic"]);
+        assert!(
+            logs.contains(
+                "sandbox.openshell.providers in project config (.workmux.yaml) is ignored"
+            ),
+            "logs: {logs}"
         );
-        assert_eq!(
-            openshell.settings.image.as_deref(),
-            Some("ghcr.io/me/api-dev:1")
-        );
-        assert_eq!(openshell.settings.providers, ["github", "anthropic"]);
-        assert_eq!(config.projects["api"].remote.as_deref(), Some("api"));
     }
 
     #[test]
-    fn an_openshell_projects_agents_default_to_the_default_agents_type() {
-        let agents = |yaml: &str| {
-            let global: Config = serde_yaml::from_str(yaml).unwrap();
-            global.with_implicit_remotes().remotes["api"]
-                .openshell
-                .clone()
-                .unwrap()
-                .agents
-        };
+    fn project_agents_replace_the_global_openshell_agents() {
+        let global: Config =
+            serde_yaml::from_str("sandbox:\n  openshell:\n    agents: [claude]\n").unwrap();
+        let project: Config =
+            serde_yaml::from_str("sandbox:\n  openshell:\n    agents: [codex, claude]\n").unwrap();
 
-        assert_eq!(agents("projects:\n  api:\n    openshell: {}\n"), ["claude"]);
-        // A workstation path or a named agent means its plain CLI.
         assert_eq!(
-            agents(
-                "agent: /Users/me/.local/bin/codex --yolo\nprojects:\n  api:\n    openshell: {}\n"
-            ),
-            ["codex"]
-        );
-        assert_eq!(
-            agents(
-                "agent: cc\nagents:\n  cc:\n    command: ~/bin/my-claude\n    type: claude\n\
-                 projects:\n  api:\n    openshell: {}\n"
-            ),
-            ["claude"]
-        );
-        assert_eq!(
-            agents("projects:\n  api:\n    openshell:\n      agents: [codex, claude]\n"),
+            global.merge(project).sandbox.openshell.agents,
             ["codex", "claude"]
         );
-        // An agent workmux knows no type of names none.
-        assert!(agents("agent: my-agent\nprojects:\n  api:\n    openshell: {}\n").is_empty());
+    }
+
+    #[test]
+    fn an_openshell_backend_puts_the_project_on_a_remote_not_in_a_pane_sandbox() {
+        let config: Config =
+            serde_yaml::from_str("sandbox:\n  enabled: true\n  backend: openshell\n").unwrap();
+        assert_eq!(
+            config.sandbox.remote_backend(),
+            Some(super::SandboxBackend::Openshell)
+        );
+        assert!(!config.sandbox.is_enabled());
+
+        // Not enabled, it puts the project nowhere.
+        let config: Config = serde_yaml::from_str("sandbox:\n  backend: openshell\n").unwrap();
+        assert_eq!(config.sandbox.remote_backend(), None);
+
+        let config: Config =
+            serde_yaml::from_str("sandbox:\n  enabled: true\n  backend: lima\n").unwrap();
+        assert_eq!(config.sandbox.remote_backend(), None);
+        assert!(config.sandbox.is_enabled());
+    }
+
+    #[test]
+    fn the_hidden_loopback_backend_has_a_root_remote_and_path() {
+        let global: Config = serde_yaml::from_str(
+            "sandbox:\n  enabled: true\n  backend: loopback\n  loopback:\n    root: /tmp/lb\n    remote: lb\n",
+        )
+        .unwrap();
+        let project: Config =
+            serde_yaml::from_str("sandbox:\n  loopback:\n    path: code/api\n").unwrap();
+
+        let merged = global.merge(project);
+
+        assert_eq!(
+            merged.sandbox.remote_backend(),
+            Some(super::SandboxBackend::Loopback)
+        );
+        let loopback = &merged.sandbox.loopback;
+        assert_eq!(loopback.root.as_deref(), Some("/tmp/lb"));
+        assert_eq!(loopback.remote.as_deref(), Some("lb"));
+        assert_eq!(loopback.path.as_deref(), Some("code/api"));
+    }
+
+    #[test]
+    fn project_session_and_placement_merge_like_any_other_setting() {
+        let global: Config =
+            serde_yaml::from_str("project_session: work\nproject_placement: current-session\n")
+                .unwrap();
+        let project: Config = serde_yaml::from_str("project_session: frontend\n").unwrap();
+
+        let merged = global.merge(project);
+
+        assert_eq!(merged.project_session.as_deref(), Some("frontend"));
+        assert_eq!(
+            merged.project_placement,
+            Some(super::ProjectPlacement::CurrentSession)
+        );
+    }
+
+    #[test]
+    fn a_config_with_the_withdrawn_registries_fails_naming_what_replaced_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(
+            &path,
+            "projects:\n  api:\n    git_url: https://github.com/me/api.git\n    openshell: {}\n",
+        )
+        .unwrap();
+
+        let error = format!("{:#}", Config::load_from_path(&path).unwrap_err());
+
+        assert!(error.contains("projects: is no longer read"), "{error}");
+        assert!(error.contains("backend: openshell"), "{error}");
+        assert!(error.contains("sandbox.openshell.providers"), "{error}");
+
+        std::fs::write(
+            &path,
+            "remotes:\n  devbox:\n    transport: ssh\n    target: devbox\n",
+        )
+        .unwrap();
+        let error = format!("{:#}", Config::load_from_path(&path).unwrap_err());
+        assert!(error.contains("remotes: is no longer read"), "{error}");
+        assert!(error.contains("SSH remotes are withdrawn"), "{error}");
     }
 
     #[test]
@@ -4527,14 +4596,7 @@ projects:
 
     #[test]
     fn an_openshell_sandbox_name_fits_openshells_rules() {
-        let name = |project: &str| {
-            let global: Config =
-                serde_yaml::from_str(&format!("projects:\n  {project}:\n    openshell: {{}}\n"))
-                    .unwrap();
-            global.with_implicit_remotes().remotes[project]
-                .target
-                .clone()
-        };
+        let name = super::openshell_sandbox_name;
 
         assert_eq!(name("api"), "api");
         assert_eq!(name("web-app-2"), "web-app-2");
@@ -4552,49 +4614,6 @@ projects:
             "{odd}"
         );
         assert_ne!(odd, name("my-app-v2"));
-    }
-
-    #[test]
-    fn an_openshell_project_may_name_its_sandbox() {
-        let global: Config =
-            serde_yaml::from_str("projects:\n  api:\n    openshell:\n      sandbox: wm-api-dev\n")
-                .unwrap();
-
-        assert_eq!(
-            global.with_implicit_remotes().remotes["api"].target,
-            "wm-api-dev"
-        );
-    }
-
-    #[test]
-    fn builtin_shims_are_on_by_default_for_a_remote() {
-        let config: Config =
-            serde_yaml::from_str("remotes:\n  devbox:\n    transport: ssh\n    target: devbox\n")
-                .expect("config parses");
-
-        assert!(config.remotes["devbox"].builtin_shims());
-        assert!(config.remotes["devbox"].host_commands.is_empty());
-    }
-
-    #[test]
-    fn remotes_and_projects_in_project_config_are_ignored_with_a_warning() {
-        let global: Config =
-            serde_yaml::from_str("remotes:\n  devbox:\n    transport: ssh\n    target: devbox\n")
-                .expect("global config parses");
-        let project: Config = serde_yaml::from_str(REMOTES_YAML).expect("project config parses");
-
-        let (merged, logs) = capture_logs(|| global.merge(project));
-
-        assert_eq!(merged.remotes["devbox"].target, "devbox");
-        assert!(merged.projects.is_empty());
-        assert!(
-            logs.contains("remotes in project config (.workmux.yaml) is ignored"),
-            "logs: {logs}"
-        );
-        assert!(
-            logs.contains("projects in project config (.workmux.yaml) is ignored"),
-            "logs: {logs}"
-        );
     }
 
     #[test]

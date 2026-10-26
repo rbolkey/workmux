@@ -25,26 +25,17 @@ pub const DAEMON_METHOD: &str = "remote.dashboard";
 pub const TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Where to ask GitHub about `agent`'s branch: its workstation checkout,
-/// or for a remote agent its project's registered git URL, never its path.
-/// `None` for a remote agent whose project has no git URL.
-pub fn repo_source(
-    config: &crate::config::Config,
-    agent: &crate::multiplexer::AgentPane,
-) -> Option<crate::github::RepoSource> {
+/// or for a remote agent its project's git URL, never its path. `None` for
+/// a remote agent whose project has no git URL.
+pub fn repo_source(agent: &crate::multiplexer::AgentPane) -> Option<crate::github::RepoSource> {
     use crate::github::RepoSource;
     match &agent.remote {
         None => Some(RepoSource::Checkout(agent.path.clone())),
-        Some(remote) => {
-            let entry = config.projects.get(&remote.project)?;
-            (entry.remote.as_deref() == Some(remote.remote.as_str()))
-                .then(|| {
-                    entry
-                        .git_url
-                        .clone()
-                        .map(|git_url| RepoSource::GitUrl(git_url.url))
-                })
-                .flatten()
-        }
+        Some(remote) => super::router::remote_project_on(&remote.remote, &remote.project)
+            .ok()?
+            .site
+            .git_url
+            .map(|git_url| RepoSource::GitUrl(git_url.url)),
     }
 }
 
@@ -251,7 +242,6 @@ mod tests {
             target: "/remote".to_string(),
             builtin_shims: None,
             host_commands: vec![],
-            upload_workmux: None,
             openshell: None,
         }
     }
@@ -460,30 +450,32 @@ mod tests {
     }
 
     #[test]
-    fn a_remote_agents_pr_status_is_asked_by_its_registered_git_url() {
-        let config: crate::config::Config = serde_yaml::from_str(
-            "remotes:\n  devbox:\n    transport: ssh\n    target: devbox\n\
-             projects:\n  api:\n    remote: devbox\n    git_url: git@github.com:me/api.git\n",
-        )
-        .unwrap();
+    fn a_remote_agents_pr_status_is_asked_by_its_projects_git_url() {
         // The remote worktree's path is also a checkout on the workstation.
         let temp = tempfile::tempdir().unwrap();
         crate::test_support::init_repo(temp.path());
+        let records = tempfile::tempdir().unwrap();
         let agent = |remote| crate::command::dashboard::site::tests::agent(temp.path(), remote);
 
-        assert_eq!(
-            repo_source(&config, &agent(Some(("devbox", "api")))),
-            Some(crate::github::RepoSource::GitUrl(
-                "git@github.com:me/api.git".to_string()
-            ))
-        );
-        // A project registered on another remote is not this agent's.
-        assert_eq!(repo_source(&config, &agent(Some(("other", "api")))), None);
-        assert_eq!(
-            repo_source(&config, &agent(None)),
-            Some(crate::github::RepoSource::Checkout(
-                temp.path().to_path_buf()
-            ))
+        crate::remote::registry::with_recorded(
+            records.path(),
+            &[crate::command::dashboard::site::tests::devbox_api()],
+            || {
+                assert_eq!(
+                    repo_source(&agent(Some(("devbox", "api")))),
+                    Some(crate::github::RepoSource::GitUrl(
+                        "git@github.com:me/api.git".to_string()
+                    ))
+                );
+                // A project on another remote is not this agent's.
+                assert_eq!(repo_source(&agent(Some(("other", "api")))), None);
+                assert_eq!(
+                    repo_source(&agent(None)),
+                    Some(crate::github::RepoSource::Checkout(
+                        temp.path().to_path_buf()
+                    ))
+                );
+            },
         );
     }
 }

@@ -11,15 +11,11 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
-use super::Remote;
 use super::channel::Handler;
 use super::connection::{Connection, HELLO_TIMEOUT};
 use super::ssh::{Ssh, uploaded_workmux_dir};
 use super::transport::Transport;
-use crate::command::global_config::{self, REMOTES};
 use crate::command::update;
-use crate::config::TransportKind;
-use crate::ui::confirm::read_answer;
 
 /// Where released builds are downloaded from:
 /// `<base>/v<version>/workmux-<platform>.tar.gz` with its `.sha256`.
@@ -183,63 +179,6 @@ impl Offer<'_> {
             }
         }
     }
-}
-
-/// After a control channel to `remote` failed with `error`, offer to
-/// install a matching workmux there, asking on this terminal the first
-/// time and keeping the answer in global config. Returns whether one was
-/// installed, so the caller can try again.
-pub fn offer_on_terminal(remote: Remote<'_>, error: &str) -> Result<bool> {
-    let config = remote.config;
-    if config.transport != TransportKind::Ssh
-        || config.upload_workmux == Some(false)
-        || !needs_workmux(error)
-    {
-        return Ok(false);
-    }
-    let ssh = Ssh::new(&config.target);
-    let builds = Builds::current();
-    let mut answered = None;
-    let outcome = Offer {
-        remote: remote.name,
-        ssh: &ssh,
-        answer: config.upload_workmux,
-        builds: &builds,
-    }
-    .run(&mut |problem, question| {
-        // On stderr: a command's stdout may be captured.
-        eprint!("{problem}\n  {question} [y/N] ");
-        let line = read_answer()?;
-        if line.is_empty() {
-            // End of input: no one is there to answer.
-            eprintln!();
-            return Ok(None);
-        }
-        let answer = matches!(line.trim().to_lowercase().as_str(), "y" | "yes");
-        answered = Some(answer);
-        Ok(Some(answer))
-    })?;
-    if let Some(answer) = answered {
-        remember(remote, answer)?;
-    } else if outcome == Outcome::Declined {
-        eprintln!(
-            "workmux can install a matching workmux on {name}: workmux remote upload {name}",
-            name = remote.name
-        );
-    }
-    Ok(outcome == Outcome::Installed)
-}
-
-/// Keep the user's answer in `remote`'s `upload_workmux` setting.
-pub fn remember(remote: Remote<'_>, answer: bool) -> Result<()> {
-    if remote.config.upload_workmux == Some(answer) {
-        return Ok(());
-    }
-    let mut config = remote.config.clone();
-    config.upload_workmux = Some(answer);
-    let (path, content) = global_config::read()?;
-    let updated = global_config::replace_entry(&content, &REMOTES, remote.name, &config)?;
-    global_config::write(&path, &updated)
 }
 
 /// Whether a control channel failed to open for want of a compatible

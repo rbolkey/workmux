@@ -115,17 +115,7 @@ struct DashboardParams {
 /// Run a dashboard's operation on a remote project over its control channel.
 fn remote_dashboard(params: &Value) -> Result<Value> {
     let params: DashboardParams = serde_json::from_value(params.clone())?;
-    let project = crate::remote::router::remote_project(
-        &crate::config::Config::load_global_only()?,
-        &params.project,
-    )?;
-    if project.site.remote != params.remote {
-        bail!(
-            "Project {} is not on remote {}",
-            params.project,
-            params.remote
-        );
-    }
+    let project = crate::remote::router::remote_project_on(&params.remote, &params.project)?;
     crate::remote::channels().dashboard(
         project.host(),
         &project.site,
@@ -368,11 +358,9 @@ fn command_session(
 ) -> Response {
     let run = || -> Result<Value> {
         let params: CommandSessionParams = serde_json::from_value(request.params.clone())?;
-        let project = crate::remote::router::remote_project(
-            &crate::config::Config::load_global_only()?,
-            &params.request.project.name,
-        )?;
-        if project.site.remote != params.remote || params.request.project.remote != params.remote {
+        let project =
+            crate::remote::router::remote_project_on(&params.remote, &params.request.project.name)?;
+        if params.request.project.remote != params.remote {
             bail!(
                 "Project {} is not on remote {}",
                 params.request.project.name,

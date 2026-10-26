@@ -2,23 +2,24 @@
 //! command to remote workmux when the project lives on a remote.
 //!
 //! Target resolution: an explicit `--project`, then the project tag on the
-//! current tmux session, then today's cwd-based resolution for local
-//! projects.
+//! current tmux session, then the config resolved in the working
+//! directory's repository (ADR 0004), which puts the project on the
+//! workstation or in a sandbox such as OpenShell's.
 
 use anyhow::{Context, Result, anyhow};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant, SystemTime};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use super::forwarded;
 use super::session::ServedProject;
 use super::session::{Answer, CommandRequest, OutputParams, ProjectSite, Stream, Terminal};
-use crate::config::{Config, ProjectPlacement, RemoteConfig};
+use crate::config::{Config, RemoteConfig};
 use crate::multiplexer::{InvocationContext, TmuxBackend, create_backend, detect_backend};
 use crate::project::{Project, RemoteProjectId};
 
-/// A project registered on a remote, resolved from global config.
+/// A project on a remote, resolved from its repository's config.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteProject {
     pub site: ProjectSite,
@@ -51,109 +52,56 @@ pub fn refuse_editor(project: &RemoteProject, what: &str, instead: &str) -> anyh
     )
 }
 
-/// The remote project `name` in `config`.
-pub fn remote_project(config: &Config, name: &str) -> Result<RemoteProject> {
-    let entry = config
-        .projects
-        .get(name)
-        .ok_or_else(|| anyhow!("No project named {name} in your global config"))?;
-    let remote_name = entry
-        .remote
-        .as_deref()
-        .ok_or_else(|| anyhow!("Project {name} is not on a remote"))?;
-    let remote = config.remotes.get(remote_name).ok_or_else(|| {
-        anyhow!("Project {name} is on remote {remote_name}, which is not registered")
-    })?;
-    Ok(RemoteProject {
-        site: ProjectSite {
-            remote: remote_name.to_string(),
-            name: name.to_string(),
-            path: entry.path.clone().unwrap_or_else(|| format!("~/{name}")),
-            git_url: entry.git_url.clone(),
-            session: match entry.placement.unwrap_or_default() {
-                ProjectPlacement::ProjectSession => {
-                    Some(entry.session.clone().unwrap_or_else(|| name.to_string()))
-                }
-                ProjectPlacement::CurrentSession => None,
-            },
-        },
-        remote: remote.clone(),
-    })
+/// The remote project `name`, as a command last resolved it.
+pub fn remote_project(name: &str) -> Result<RemoteProject> {
+    super::registry::project(name)
 }
 
-/// What a file last held, read again only once the file changes (its
-/// modification time or length), for long-lived processes such as the
-/// dashboard that would otherwise read it for every operation.
-pub struct FileMemo<T> {
-    held: Mutex<Option<(FileVersion, Arc<T>)>>,
+/// The remote project `name` on `remote`, as a command last resolved it.
+pub fn remote_project_on(remote: &str, name: &str) -> Result<RemoteProject> {
+    super::registry::project_on(remote, name)?
+        .ok_or_else(|| anyhow!("No project {name} on remote {remote}"))
 }
 
-/// A file's modification time and length, or `None` when there is none.
-type FileVersion = Option<(SystemTime, u64)>;
-
-impl<T> Default for FileMemo<T> {
-    fn default() -> Self {
-        Self {
-            held: Mutex::new(None),
-        }
-    }
-}
-
-impl<T> FileMemo<T> {
-    /// What `read` makes of the file at `path` (`None`: no file), read
-    /// again only once the file changes.
-    pub fn get(&self, path: Option<&Path>, read: impl FnOnce() -> Result<T>) -> Result<Arc<T>> {
-        let version = path
-            .and_then(|path| std::fs::metadata(path).ok())
-            .map(|meta| {
-                (
-                    meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
-                    meta.len(),
-                )
-            });
-        let mut held = self.held.lock().unwrap();
-        if let Some((seen, value)) = held.as_ref()
-            && *seen == version
-        {
-            return Ok(value.clone());
-        }
-        let value = Arc::new(read()?);
-        *held = Some((version, value.clone()));
-        Ok(value)
-    }
-}
-
-/// Global config, read again only once its file changes.
-pub fn global_config() -> Result<Arc<Config>> {
-    static GLOBAL: OnceLock<FileMemo<Config>> = OnceLock::new();
-    GLOBAL.get_or_init(FileMemo::default).get(
-        crate::config::global_config_path().as_deref(),
-        Config::load_global_only,
-    )
-}
-
-/// Every project registered on a remote, by name.
+/// Every remote project commands have resolved.
 pub fn remote_projects() -> Result<Vec<RemoteProject>> {
-    let config = Config::load_global_only()?;
-    config
-        .projects
-        .iter()
-        .filter(|(_, entry)| entry.remote.is_some())
-        .map(|(name, _)| remote_project(&config, name))
-        .collect()
+    super::registry::projects()
 }
 
 /// The remote project a command targets, or `None` for a local project:
 /// an explicit `--project`, else the project the invoking tmux session is
-/// tagged with.
+/// tagged with, else the one the working directory's repository config
+/// puts in a sandbox. Commands remote workmux runs are never routed again.
 pub fn resolve(explicit: Option<&str>) -> Result<Option<RemoteProject>> {
+    if on_a_remote() {
+        return Ok(None);
+    }
+    let here = std::env::current_dir()
+        .ok()
+        .map(|dir| super::registry::resolve_at(&dir))
+        .transpose()?
+        .flatten();
     if let Some(name) = explicit {
-        return Ok(Some(remote_project(&Config::load_global_only()?, name)?));
+        return match here {
+            Some(project) if project.site.name == name => Ok(Some(project)),
+            _ => Ok(Some(remote_project(name)?)),
+        };
     }
-    match invoking_session_tag() {
-        Some(tag) => Ok(project_tagged(&Config::load_global_only()?, &tag)),
-        None => Ok(None),
+    if let Some(tag) = invoking_session_tag()
+        && let Some(project) = project_tagged(&tag)
+    {
+        return Ok(Some(project));
     }
+    Ok(here)
+}
+
+/// Whether this process runs on a remote (for a command session, in a
+/// remote pane's shell, or in an OpenShell sandbox), where the project's
+/// config describes the sandbox it is already in.
+fn on_a_remote() -> bool {
+    ServedProject::current().is_some()
+        || super::shell::Shell::current().is_some()
+        || std::env::var_os(super::openshell::SANDBOX_ENV).is_some()
 }
 
 /// The project tag of the tmux session this command was run from. Commands
@@ -200,13 +148,16 @@ fn window_token_for(project: &RemoteProject, window: &str) -> Option<String> {
     (tag.trim() == own && !token.trim().is_empty()).then(|| token.trim().to_string())
 }
 
-/// The registered remote project `tag` names, if it still is one.
-fn project_tagged(config: &Config, tag: &str) -> Option<RemoteProject> {
+/// The remote project `tag` names, if a command has resolved it.
+fn project_tagged(tag: &str) -> Option<RemoteProject> {
     let id = RemoteProjectId::from_tag(tag)?;
-    match remote_project(config, &id.name) {
-        Ok(project) if project.site.remote == id.remote => Some(project),
-        _ => {
-            tracing::warn!(tag, "session is tagged with a project no longer registered");
+    match remote_project_on(&id.remote, &id.name) {
+        Ok(project) => Some(project),
+        Err(_) => {
+            tracing::warn!(
+                tag,
+                "session is tagged with a project workmux does not know"
+            );
             None
         }
     }
@@ -279,19 +230,7 @@ fn session(
         Readiness::Running => true,
         Readiness::AsItIs => false,
     };
-    match session_once(project, argv, prompt_file.clone(), terminal, running) {
-        // The channel never opened, so the command never ran: run it again
-        // once the remote has a workmux that can serve it. Only a command
-        // the user runs at this terminal (one that may start its remote)
-        // offers the install; polls and captured commands don't.
-        Err(error)
-            if readiness == Readiness::Start
-                && super::upload::offer_on_terminal(project.host(), &format!("{error:#}"))? =>
-        {
-            session_once(project, argv, prompt_file, terminal, running)
-        }
-        result => result,
-    }
+    session_once(project, argv, prompt_file, terminal, running)
 }
 
 fn session_once(
@@ -682,7 +621,7 @@ pub fn relay_with_workstation_args(
 ) -> Result<()> {
     let mut argv = relayed_argv();
     if command.get_arguments().any(|a| a.get_id() == "agent") {
-        argv = with_agent_types(argv, command, &*global_config()?)?;
+        argv = with_agent_types(argv, command, &Config::load_global_only()?)?;
     }
     let Some(path) = prompt_file else {
         return relay_argv(project, &argv);
@@ -770,63 +709,23 @@ mod tests {
         serde_yaml::from_str(yaml).unwrap()
     }
 
-    const REGISTERED: &str = "\
-remotes:
-  devbox:
-    transport: ssh
-    target: me@devbox
-projects:
-  api:
-    remote: devbox
-    git_url: git@github.com:me/api.git
-    path: ~/code/api
-  web:
-    remote: devbox
-    git_url: git@github.com:me/web.git
-    session: frontend
-  docs:
-    remote: devbox
-    placement: current-session
-  stray:
-    remote: gone
-";
-
-    #[test]
-    fn a_remote_project_is_identified_by_its_registered_name() {
-        let api = remote_project(&config(REGISTERED), "api").unwrap();
-
-        assert_eq!(api.project(), Project::remote("devbox", "api"));
-        assert_eq!(api.site.path, "~/code/api");
-        assert_eq!(
-            api.site.git_url,
-            Some(crate::remote::git_url::GitUrl::new(
-                "git@github.com:me/api.git"
-            ))
-        );
-        assert_eq!(api.remote.target, "me@devbox");
-    }
-
-    #[test]
-    fn a_projects_windows_go_to_its_session_its_override_or_the_invoking_session() {
-        let config = config(REGISTERED);
-        let session = |name| remote_project(&config, name).unwrap().site.session;
-
-        assert_eq!(session("api").as_deref(), Some("api"));
-        assert_eq!(session("web").as_deref(), Some("frontend"));
-        assert_eq!(session("docs"), None);
-    }
-
-    #[test]
-    fn a_session_tag_names_a_project_only_while_it_is_registered_on_that_remote() {
-        let config = config(REGISTERED);
-
-        assert_eq!(
-            project_tagged(&config, "devbox:api").map(|p| p.project()),
-            Some(Project::remote("devbox", "api"))
-        );
-        assert_eq!(project_tagged(&config, "other:api"), None);
-        assert_eq!(project_tagged(&config, "devbox:gone"), None);
-        assert_eq!(project_tagged(&config, "garbage"), None);
+    fn api() -> RemoteProject {
+        RemoteProject {
+            site: ProjectSite {
+                remote: "devbox".to_string(),
+                name: "api".to_string(),
+                path: "~/api".to_string(),
+                git_url: None,
+                session: Some("api".to_string()),
+            },
+            remote: RemoteConfig {
+                transport: crate::config::TransportKind::Loopback,
+                target: "/tmp/devbox".to_string(),
+                builtin_shims: None,
+                host_commands: Vec::new(),
+                openshell: None,
+            },
+        }
     }
 
     #[test]
@@ -965,7 +864,7 @@ agents:
 
     #[test]
     fn only_a_window_of_the_project_tells_the_remote_its_worktree() {
-        let api = remote_project(&config(REGISTERED), "api").unwrap();
+        let api = api();
 
         assert_eq!(
             window_token_for(&api, "devbox:api\tf00d\n").as_deref(),
@@ -974,50 +873,5 @@ agents:
         assert_eq!(window_token_for(&api, "devbox:web\tf00d\n"), None);
         assert_eq!(window_token_for(&api, "\tf00d\n"), None);
         assert_eq!(window_token_for(&api, "devbox:api\t\n"), None);
-    }
-
-    #[test]
-    fn a_file_is_read_again_only_once_it_changes() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.yaml");
-        std::fs::write(&path, "one").unwrap();
-        let reads = std::cell::Cell::new(0);
-        let memo = FileMemo::default();
-        let read = || {
-            memo.get(Some(&path), || {
-                reads.set(reads.get() + 1);
-                Ok(std::fs::read_to_string(&path)?)
-            })
-            .unwrap()
-        };
-
-        assert_eq!(*read(), "one");
-        assert_eq!(*read(), "one");
-        assert_eq!(reads.get(), 1);
-
-        std::fs::write(&path, "two!").unwrap();
-        assert_eq!(*read(), "two!");
-        assert_eq!(reads.get(), 2);
-    }
-
-    #[test]
-    fn a_project_without_a_path_lives_in_the_remotes_home() {
-        let web = remote_project(&config(REGISTERED), "web").unwrap();
-
-        assert_eq!(web.site.path, "~/web");
-    }
-
-    #[test]
-    fn unknown_projects_and_remotes_are_errors() {
-        let config = config(REGISTERED);
-
-        assert_eq!(
-            remote_project(&config, "nope").unwrap_err().to_string(),
-            "No project named nope in your global config"
-        );
-        assert_eq!(
-            remote_project(&config, "stray").unwrap_err().to_string(),
-            "Project stray is on remote gone, which is not registered"
-        );
     }
 }

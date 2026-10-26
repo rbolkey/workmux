@@ -757,15 +757,14 @@ impl App {
                 .entry(name)
                 .or_insert_with(|| ProjectScope::Workstation(root.clone()));
         }
-        // Projects registered on a remote, whether or not an agent runs there.
-        for (name, entry) in &self.config.projects {
-            if let Some(remote) = &entry.remote {
-                let scope = ProjectScope::Remote {
-                    remote: remote.clone(),
-                    project: name.clone(),
-                };
-                by_name.insert(scope.project().group_label(), scope);
-            }
+        // Remote projects commands have resolved, whether or not an agent
+        // runs there.
+        for project in crate::remote::router::remote_projects().unwrap_or_default() {
+            let scope = ProjectScope::Remote {
+                remote: project.site.remote,
+                project: project.site.name,
+            };
+            by_name.insert(scope.project().group_label(), scope);
         }
 
         let projects: Vec<ProjectEntry> = by_name
@@ -1230,9 +1229,8 @@ impl App {
                     state.pr_list = Some(PrListState::Loading);
                     let tx = self.event_tx.clone();
                     let scope = state.scope.clone();
-                    let config = self.config.clone();
                     std::thread::spawn(move || {
-                        let result = scope.open_prs(&config);
+                        let result = scope.open_prs();
                         match result {
                             Ok(prs) => {
                                 let _ = tx.send(AppEvent::AddWorktreePrList(request_id, Ok(prs)));

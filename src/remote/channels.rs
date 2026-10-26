@@ -43,7 +43,7 @@ pub struct ChannelPolicy {
     /// The workstation's tmux server (its socket path); `None` for tmux's
     /// default.
     pub tmux_socket: Option<String>,
-    /// Whether a project of this name is registered on a remote.
+    /// Whether a project of this name is known to be on a remote.
     pub registered: fn(remote: &str, project: &str) -> bool,
     /// Reads the workstation clipboard's PNG image, for clipboard shims.
     pub clipboard: fn() -> Result<Option<Vec<u8>>>,
@@ -60,17 +60,14 @@ impl Default for ChannelPolicy {
             tmux_socket: InvocationContext::current()
                 .tmux_socket_path()
                 .map(str::to_string),
-            registered: registered_in_global_config,
+            registered: known_on_the_remote,
             clipboard: crate::sandbox::clipboard::read_png_from_clipboard,
         }
     }
 }
 
-fn registered_in_global_config(remote: &str, project: &str) -> bool {
-    crate::config::Config::load_global_only()
-        .ok()
-        .and_then(|config| super::router::remote_project(&config, project).ok())
-        .is_some_and(|project| project.site.remote == remote)
+fn known_on_the_remote(remote: &str, project: &str) -> bool {
+    super::router::remote_project_on(remote, project).is_ok()
 }
 
 /// How long a remote may take to install its shims.
@@ -682,7 +679,6 @@ mod tests {
             target: "/remote".to_string(),
             builtin_shims: None,
             host_commands: vec![],
-            upload_workmux: None,
             openshell: None,
         }
     }
