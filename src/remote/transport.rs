@@ -80,19 +80,19 @@ pub trait Provisioning: Send + Sync {
 /// Make a remote that manages its lifecycle ready for a command that
 /// needs it: create it on first use and start it when stopped, telling the
 /// user in one line each. Without `start`, a stopped or missing remote is
-/// left alone. Returns whether the remote is running.
+/// left alone. Returns the remote's state: running, else as it was found.
 pub fn ensure_running(
     name: &str,
     transport: &dyn Transport,
     start: bool,
     notice: &mut dyn FnMut(&str),
-) -> Result<bool> {
+) -> Result<RemoteState> {
     let Some(provisioning) = transport.provisioning() else {
-        return Ok(true);
+        return Ok(RemoteState::Running);
     };
     match provisioning.status()? {
         RemoteState::Running => {}
-        _ if !start => return Ok(false),
+        found if !start => return Ok(found),
         RemoteState::Stopped => {
             notice(&format!("Starting remote {name}…"));
             provisioning.start()?;
@@ -107,7 +107,7 @@ pub fn ensure_running(
     for message in provisioning.reconcile()? {
         notice(&message);
     }
-    Ok(true)
+    Ok(RemoteState::Running)
 }
 
 #[allow(dead_code)] // Captured and TTY exec are used by later remote commands and panes
@@ -477,22 +477,22 @@ mod tests {
         }
     }
 
-    fn ensure(remote: &Managed, start: bool) -> (bool, Vec<String>) {
+    fn ensure(remote: &Managed, start: bool) -> (RemoteState, Vec<String>) {
         let mut notices = Vec::new();
-        let running = ensure_running("api", remote, start, &mut |notice| {
+        let state = ensure_running("api", remote, start, &mut |notice| {
             notices.push(notice.to_string())
         })
         .unwrap();
-        (running, notices)
+        (state, notices)
     }
 
     #[test]
     fn a_command_that_needs_a_missing_remote_creates_it_with_a_notice() {
         let remote = Managed::new(RemoteState::Missing);
 
-        let (running, notices) = ensure(&remote, true);
+        let (state, notices) = ensure(&remote, true);
 
-        assert!(running);
+        assert_eq!(state, RemoteState::Running);
         assert_eq!(remote.calls(), ["create", "reconcile"]);
         assert_eq!(
             notices,
@@ -507,21 +507,21 @@ mod tests {
     fn a_command_that_needs_a_stopped_remote_starts_it() {
         let remote = Managed::new(RemoteState::Stopped);
 
-        let (running, notices) = ensure(&remote, true);
+        let (state, notices) = ensure(&remote, true);
 
-        assert!(running);
+        assert_eq!(state, RemoteState::Running);
         assert_eq!(remote.calls(), ["start", "reconcile"]);
         assert_eq!(notices[0], "Starting remote api…");
     }
 
     #[test]
-    fn without_start_a_stopped_or_missing_remote_is_left_alone() {
+    fn without_start_a_stopped_or_missing_remote_is_left_alone_and_reported() {
         for state in [RemoteState::Stopped, RemoteState::Missing] {
             let remote = Managed::new(state);
 
-            let (running, notices) = ensure(&remote, false);
+            let (found, notices) = ensure(&remote, false);
 
-            assert!(!running);
+            assert_eq!(found, state);
             assert!(remote.calls().is_empty());
             assert!(notices.is_empty());
         }
@@ -530,12 +530,15 @@ mod tests {
     #[test]
     fn a_running_remote_or_one_without_a_lifecycle_is_used_as_it_is() {
         let remote = Managed::new(RemoteState::Running);
-        assert!(ensure(&remote, false).0);
+        assert_eq!(ensure(&remote, false).0, RemoteState::Running);
         assert_eq!(remote.calls(), ["reconcile"]);
 
         let root = tempfile::tempdir().unwrap();
         let loopback = Loopback::with_workmux(root.path(), "/bin/echo");
-        assert!(ensure_running("api", &loopback, false, &mut |_| {}).unwrap());
+        assert_eq!(
+            ensure_running("api", &loopback, false, &mut |_| {}).unwrap(),
+            RemoteState::Running
+        );
     }
 
     #[test]
