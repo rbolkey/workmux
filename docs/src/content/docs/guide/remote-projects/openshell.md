@@ -232,7 +232,7 @@ Nix cannot install or build inside an OpenShell sandbox. Instead, for a project 
 
 The step that builds the devshell has no secret, so the flake's builders and `shellHook` can't read the token. Any other project's bake gets no token: a private input fails it with nix's `HTTP error 404` or `Cannot find Git revision`, and workmux says private GitHub flake inputs need `gh-login` in `sandbox.openshell.providers`. Private inputs on other git servers aren't covered. Nothing fetches flake inputs inside the sandbox, because nix can't write its read-only `/nix`.
 
-The image is fixed when the sandbox is created. When the clone's `flake.lock` no longer matches the baked one, `remote status` warns, and `workmux remote recreate` rebuilds the image.
+The image is fixed when the sandbox is created. It follows what the bake reads: `flake.nix`, `flake.lock`, and the files and directories the flake names by path (`./nix/shell.nix`, `"${self}/nix"`), followed through the `.nix` files among them. When any of them in the clone no longer match the baked ones, `remote status` warns, and `workmux remote recreate` gives the sandbox a new image. Changes to the rest of the repository don't. Neither does a file the flake reads through a path it builds from a string at evaluation time.
 
 A devbox project gets no devshell in a sandbox. Put its toolchain in your `image`. `remote status` says so.
 
