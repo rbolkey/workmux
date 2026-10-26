@@ -1132,6 +1132,10 @@ pub struct OpenshellRemote {
     /// The agents the sandbox runs, by plain CLI: the project's, else the
     /// default agent's type.
     pub agents: Vec<String>,
+    /// Whether the sandbox gets nix: the project's `sandbox.toolchain`
+    /// resolves to a flake, as it does for Lima.
+    #[serde(default)]
+    pub nix: bool,
 }
 
 /// OpenShell sandbox settings, under `sandbox.openshell`.

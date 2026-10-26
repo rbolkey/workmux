@@ -1,10 +1,12 @@
-//! The policy an OpenShell project sandbox gets: workmux's base policy with
-//! the project's policy file merged on top.
+//! The policy an OpenShell project sandbox gets: workmux's base policy,
+//! plus nix's grants for a sandbox with nix, with the project's policy file
+//! merged on top.
 //!
 //! OpenShell takes one policy file and fills in missing top-level sections
 //! from its default, so the merged file always carries a full
 //! `filesystem_policy`. Filesystem lists are a union (Landlock grants add
-//! up); network rules are a map union in which a clash is refused.
+//! up), and a writable path is not also listed read-only; network rules are
+//! a map union in which a clash is refused.
 
 use anyhow::{Result, anyhow, bail};
 use serde_yaml::{Mapping, Value};
@@ -30,9 +32,18 @@ fn key(name: &str) -> Value {
     Value::String(name.to_string())
 }
 
-/// The policy for a sandbox whose project's policy file reads `user`.
-pub fn effective(user: Option<&str>) -> Result<Value> {
-    merge(BASE, user.unwrap_or(""))
+/// What workmux adds to its base policy for a sandbox with nix.
+const NIX: &str = include_str!("nix-policy.yaml");
+
+/// The policy for a sandbox whose project's policy file reads `user`, with
+/// nix's grants when the sandbox has `nix`.
+pub fn effective(user: Option<&str>, nix: bool) -> Result<Value> {
+    let base = if nix {
+        serde_yaml::to_string(&merge(BASE, NIX)?)?
+    } else {
+        BASE.to_string()
+    };
+    merge(&base, user.unwrap_or(""))
 }
 
 /// `user` merged on top of `base`.
@@ -58,6 +69,11 @@ pub fn merge(base: &str, user: &str) -> Result<Value> {
                     new
                 });
             }
+        }
+        if let Some(Value::Sequence(writable)) = filesystem.get(key("read_write")).cloned()
+            && let Some(Value::Sequence(paths)) = filesystem.get_mut(key("read_only"))
+        {
+            paths.retain(|path| !writable.contains(path));
         }
     }
     Ok(Value::Mapping(merged))
@@ -149,7 +165,7 @@ mod tests {
 
     #[test]
     fn without_a_policy_file_the_sandbox_gets_the_base_policy() {
-        let policy = effective(None).unwrap();
+        let policy = effective(None, false).unwrap();
 
         assert_eq!(
             list(&policy, FILESYSTEM, "read_write"),
@@ -160,10 +176,57 @@ mod tests {
     }
 
     #[test]
+    fn a_sandbox_with_nix_gets_a_writable_store_and_nixs_network() {
+        let policy = effective(None, true).unwrap();
+
+        assert_eq!(
+            list(&policy, FILESYSTEM, "read_write"),
+            ["/tmp", "/dev/null", "/dev/pts", "/dev/ptmx", "/nix"]
+        );
+        assert!(!list(&policy, FILESYSTEM, "read_only").contains(&"/nix".to_string()));
+        let rule = &policy[NETWORK]["workmux-nix"];
+        let hosts: Vec<&str> = rule["endpoints"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .map(|endpoint| endpoint["host"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            hosts,
+            [
+                "cache.nixos.org",
+                "channels.nixos.org",
+                "releases.nixos.org",
+                "github.com",
+                "api.github.com",
+                "codeload.github.com"
+            ]
+        );
+        assert_eq!(rule["binaries"][0]["path"], "/nix/store/*/bin/nix");
+    }
+
+    #[test]
+    fn a_sandbox_without_nix_has_no_nix_network() {
+        let policy = effective(None, false).unwrap();
+
+        assert!(policy.get(NETWORK).is_none(), "{policy:?}");
+    }
+
+    #[test]
+    fn going_without_nix_narrows_the_store_back_to_read_only() {
+        let with = effective(None, true).unwrap();
+        let without = effective(None, false).unwrap();
+
+        assert_eq!(narrowed(&with, &without), ["/nix"]);
+        assert!(narrowed(&without, &with).is_empty());
+    }
+
+    #[test]
     fn a_filesystem_section_adds_to_the_base_grants_instead_of_replacing_them() {
-        let policy = effective(Some(
-            "filesystem_policy:\n  read_only: [/opt/tools, /usr]\n  read_write: [/data]\n",
-        ))
+        let policy = effective(
+            Some("filesystem_policy:\n  read_only: [/opt/tools, /usr]\n  read_write: [/data]\n"),
+            false,
+        )
         .unwrap();
 
         assert_eq!(
@@ -191,7 +254,7 @@ mod tests {
     fn the_projects_network_rules_and_other_sections_are_kept() {
         let policy = effective(Some(
             "network_policies:\n  github:\n    endpoints:\n      - { host: github.com, port: 443 }\nlandlock:\n  compatibility: hard_requirement\n",
-        ))
+        ), false)
         .unwrap();
 
         assert_eq!(
@@ -214,22 +277,26 @@ mod tests {
 
     #[test]
     fn an_unreadable_policy_file_is_an_error() {
-        assert!(effective(Some("[a, b]")).is_err());
-        assert!(effective(Some("filesystem_policy: [")).is_err());
+        assert!(effective(Some("[a, b]"), false).is_err());
+        assert!(effective(Some("filesystem_policy: ["), false).is_err());
     }
 
     #[test]
     fn removing_or_write_protecting_a_granted_path_is_a_narrowing() {
-        let current = effective(Some(
-            "filesystem_policy:\n  read_only: [/opt]\n  read_write: [/data, /cache]\n",
-        ))
+        let current = effective(
+            Some("filesystem_policy:\n  read_only: [/opt]\n  read_write: [/data, /cache]\n"),
+            false,
+        )
         .unwrap();
-        let desired =
-            effective(Some("filesystem_policy:\n  read_only: [/cache, /more]\n")).unwrap();
+        let desired = effective(
+            Some("filesystem_policy:\n  read_only: [/cache, /more]\n"),
+            false,
+        )
+        .unwrap();
 
         assert_eq!(narrowed(&current, &desired), ["/data", "/cache", "/opt"]);
         assert!(narrowed(&current, &current).is_empty());
         // Widening is applied in place.
-        assert!(narrowed(&effective(None).unwrap(), &current).is_empty());
+        assert!(narrowed(&effective(None, false).unwrap(), &current).is_empty());
     }
 }

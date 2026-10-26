@@ -1,7 +1,8 @@
 # workmux's base policy for every OpenShell project sandbox; the project's
 # policy file is merged on top. OpenShell's default policy plus /bin, the
 # pseudo-terminal devices (the session holder allocates PTYs) and /nix
-# read-only (the baked devshell). No network rules: the control channel
+# read-only (the baked devshell; nix-policy.yaml makes it writable for a
+# sandbox with nix). No network rules: the control channel
 # rides OpenShell's own exec.
 version: 1
 filesystem_policy:
