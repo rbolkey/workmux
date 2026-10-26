@@ -42,7 +42,7 @@ sandbox:
 
 Settings merge as any other setting does: the repository's value overrides your global config's, key by key. `providers` is the exception. It is read only from global config, and a repository's `.workmux.yaml` setting it is ignored with a warning, so a repository can't commit `providers: [gh-login]` and receive your GitHub login. Every OpenShell sandbox gets the same providers; tokens scoped to what your projects need bound what each one can reach.
 
-The project is named after the repository: the directory name of your clone. The sandbox clones the repository from your clone's `origin`. The sandbox is named after your clone by the rule that names a project's Lima VM: `wm-`, up to 7 characters of the directory name and a hash of the clone's full path, such as `wm-api-1a2b3c4d`, within OpenShell's rules (lowercase letters, digits and hyphens, up to 19 characters). Config can't name a sandbox, so no repository can reach another's. Two clones get two sandboxes, even of the same repository, and a clone moved to another path gets a new one.
+The project is named after the repository: the directory name of your clone. The sandbox clones the repository from your clone's `origin`. The sandbox is named after your clone in the format of a project's Lima VM name: `wm-`, up to 7 characters of the directory name and the first 8 hex digits of the sha256 of the clone's full path, such as `wm-api-79949073`, within OpenShell's rules (lowercase letters, digits and hyphens, up to 19 characters). Config can't name a sandbox, so no repository can reach another's. Two clones get two sandboxes, even of the same repository, and a clone moved to another path gets a new one.
 
 The sandbox is the project's remote, so there is nothing to register. Run in the repository, `workmux sandbox status` shows the sandbox before any other command has created it.
 
@@ -159,7 +159,7 @@ workmux sandbox status   # the sandbox's state, versions, policy and agents
 workmux sandbox shell    # a shell in the sandbox, in the current worktree
 workmux sandbox stop     # stop sandboxes; their workspaces survive
 workmux sandbox rebuild  # delete and recreate, carrying committed work across
-workmux sandbox prune    # delete workmux's sandboxes, refusing while one holds work
+workmux sandbox prune    # delete workmux's sandboxes, after naming the work they hold
 ```
 
 **Stopping ends every process in the sandbox**, agents included. The worktrees and status files survive, but agents do not: once the sandbox starts again, workstation panes find their remote panes ended and close. There is no start command; the next command that needs the sandbox, such as `workmux open`, starts it. Reopen the worktree with `workmux open`.
@@ -168,12 +168,12 @@ workmux sandbox prune    # delete workmux's sandboxes, refusing while one holds 
 
 ### Deleting sandboxes
 
-`workmux sandbox prune` deletes workmux's sandboxes and everything in them, because nothing is mounted from your workstation. Before it asks for confirmation, it checks each one for work that exists only there, worktree by worktree and branch by branch:
+`workmux sandbox prune` deletes workmux's sandboxes and everything in them, because nothing is mounted from your workstation. Before it asks for confirmation, it checks each one, worktree by worktree and branch by branch, as `workmux remove` checks a worktree:
 
-- uncommitted changes
-- commits that are on no remote-tracking branch, so exist only in the sandbox
+- **Uncommitted changes** refuse, naming each sandbox, as does a sandbox that could not be checked.
+- **Commits on no remote-tracking branch**, which exist only in the sandbox and are lost with it, and **branches not merged into their base** (the base `workmux add` recorded, else the default branch) are named in the confirmation.
 
-It refuses while any sandbox has such work, or could not be checked, naming each one. It starts a stopped sandbox to check, and stops it again if nothing is deleted. Once a sandbox is deleted, it closes its project's workstation windows. The next command in the repository that needs a sandbox creates a new one. `--force` skips the check and the confirmation and deletes them all.
+It starts a stopped sandbox to check, and stops it again if nothing is deleted. Once a sandbox is deleted, it closes its project's workstation windows. The next command in the repository that needs a sandbox creates a new one. `--force` skips the check and the confirmation and deletes them all, uncommitted changes included.
 
 ### Rebuilding a sandbox
 

@@ -99,7 +99,7 @@ Lists all workmux Lima VMs (those starting with `wm-` prefix) with their size, a
 
 ## OpenShell commands
 
-An [OpenShell sandbox](/guide/remote-projects/openshell/) holds its project's clone rather than mounting your worktrees, so deleting one loses the work that exists only there. Run these in a repository whose config sets `sandbox.backend: openshell` (or in a window workmux opened for it). Sandboxes are named like Lima VMs, `wm-<project>-<hash8>`, from the clone's path; `stop` and `prune` list and touch only workmux's `wm-` sandboxes. There is no `start`: the next command that needs the sandbox, such as `workmux add` or `workmux open`, creates or starts it.
+An [OpenShell sandbox](/guide/remote-projects/openshell/) holds its project's clone rather than mounting your worktrees, so deleting one loses the work that exists only there. Run these in a repository whose config sets `sandbox.backend: openshell` (or in a window workmux opened for it). Sandboxes are named in Lima's format, `wm-<project>-<hash8>`, from the clone's path (the hash is sha256); `stop` and `prune` list and touch only workmux's `wm-` sandboxes. There is no `start`: the next command that needs the sandbox, such as `workmux add` or `workmux open`, creates or starts it.
 
 ### sandbox stop
 
@@ -132,16 +132,22 @@ workmux sandbox prune --force
 
 **Options:**
 
-- `-f, --force` - Skip the check and the confirmation, and delete every workmux sandbox even when it holds work
+- `-f, --force` - Skip the check and the confirmation, and delete every workmux sandbox, even one with uncommitted changes
 
-Before asking, `prune` checks each sandbox's worktrees and branches, starting a stopped one to look (and stopping it again if nothing is deleted). It refuses, naming each sandbox, while any has uncommitted changes or commits not on any remote, or could not be checked:
+`prune` checks each sandbox as `workmux remove` checks a worktree, starting a stopped one to look (and stopping it again if nothing is deleted). It refuses, naming each sandbox, while any has uncommitted changes or could not be checked. Commits that exist only in a sandbox (on no remote) and branches not merged into their base are named in the confirmation instead, since deleting the sandbox loses the unpushed commits:
 
 ```text
-1. wm-api-1a2b3c4d (ready, project api)
-   Work that exists only in the sandbox:
-     /sandbox/api__worktrees/feature (branch feature): uncommitted changes, 2 commits not on any remote, not merged into main
+Found 2 workmux OpenShell sandbox(es):
 
-Error: Not deleting: wm-api-1a2b3c4d may hold uncommitted or unpushed work. Commit and push it, or delete anyway with --force
+1. wm-api-79949073 (ready, project api)
+   branch spike: 2 commits not on any remote, not merged into main
+
+2. wm-web-5e6f7a8b (stopped, project web)
+
+These have work that is unmerged or exists only in a sandbox:
+  wm-api-79949073: branch spike: 2 commits not on any remote, not merged into main
+
+Delete all these sandboxes? Their clones and worktrees are lost. [y/N]
 ```
 
 ### sandbox rebuild

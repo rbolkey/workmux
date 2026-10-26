@@ -53,7 +53,7 @@ Outside any repository and any project window, they fail and tell you to run the
 
 Run from a remote worktree's window, commands with no worktree name act on that worktree, as they do on the workstation.
 
-A remote project is named after its repository: the directory name of your clone. Its sandbox is named after the clone's path (see [OpenShell projects](/guide/remote-projects/openshell/)), so two clones get two sandboxes, even of the same repository. workmux stores nothing about a project. In the sidebar, dashboard and `workmux status` a remote project shows as `name@remote`, for example `api@api-1a2b3c4d`, so it never merges with a project of the same name on the workstation. Agent selectors accept `feature`, `api:feature` and `api@api-1a2b3c4d:feature`.
+A remote project is named after its repository: the directory name of your clone. Its sandbox is named after the clone's path (see [OpenShell projects](/guide/remote-projects/openshell/)), so two clones get two sandboxes, even of the same repository. workmux stores nothing about a project. In the sidebar, dashboard and `workmux status` a remote project shows as `name@remote`, for example `api@wm-api-79949073`, so it never merges with a project of the same name on the workstation. Agent selectors accept `feature`, `api:feature` and `api@wm-api-79949073:feature`.
 
 `resurrect` and `reap-agents` run on the workstation and then on every remote project with an open window on the workstation, and on the project of the clone you run them in (after the tmux server restarts no window is left, so run `resurrect` in the clone). Each project's output appears under a `<project> (on <remote>):` heading.
 
