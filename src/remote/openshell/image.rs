@@ -1,6 +1,7 @@
 //! The image an OpenShell project sandbox runs, built with `docker build` on
 //! the workstation before create: the project's image, or
-//! workmux's default, plus a Linux workmux matching this one and, when the
+//! workmux's default, plus the Linux workmux that `workmux sandbox
+//! install-dev` installed and, when the
 //! project's toolchain is a flake, nix with the devshell's closure baked
 //! into its store. The sandbox's nix is for working on the flake; panes
 //! start in the baked devshell, so nothing has to be built inside the
@@ -13,14 +14,6 @@ use std::process::{Command, Stdio};
 
 use super::agents::SandboxAgent;
 use crate::remote::provision::{BAKED_DEVSHELL, NIX_PROFILE_BIN};
-
-/// Points at a Linux workmux binary to put in the image instead of the
-/// one workmux would install or build.
-pub const BINARY_ENV: &str = "WORKMUX_OPENSHELL_WORKMUX";
-
-/// The builder for a dev build's Linux workmux: Alpine's Rust targets musl,
-/// so the binary is static like the release's and runs on any base image.
-const RUST_IMAGE: &str = "docker.io/library/rust:1.98-alpine";
 
 /// The builder for baked devshells.
 const NIX_IMAGE: &str = "docker.io/nixos/nix:2.24.10";
@@ -198,50 +191,37 @@ source /nix/devshell-env.sh
 exec \"${@:-bash}\"
 ";
 
-/// Where the image's workmux comes from. Whichever it is, it lands at
-/// `/usr/local/bin/workmux`, in the project's image as in the default one.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Workmux {
-    /// A Linux workmux binary to copy in (`WORKMUX_OPENSHELL_WORKMUX`).
-    Binary(PathBuf),
-    /// A dev build: this workmux's source checkout, built for Linux in the
-    /// image build with this build's profile.
-    Source(PathBuf),
-    /// The release of this workmux's version.
-    Release,
+/// Where `workmux sandbox install-dev` keeps the Linux workmux that
+/// OpenShell sandbox images get: one per user, for every project.
+pub fn installed_workmux() -> Option<PathBuf> {
+    crate::xdg::state_dir()
+        .ok()
+        .map(|dir| dir.join("openshell").join("workmux"))
 }
 
-impl Workmux {
-    /// The workmux for this build: `binary` when given; else the source
-    /// checkout at `source` (where this binary was compiled) when it is
-    /// still a git checkout, which makes it a dev build; else the release.
-    /// A release's checkout is on its build machine, and an installed
-    /// crate's source is no git checkout.
-    pub fn for_this_build(binary: Option<PathBuf>, source: &Path) -> Workmux {
-        if let Some(binary) = binary {
-            return Workmux::Binary(binary);
-        }
-        let checkout = source.join("Cargo.toml").is_file()
-            && crate::git::unattended_git(Some(source)).is_ok_and(|mut git| {
-                git.args(["rev-parse", "--is-inside-work-tree"])
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status()
-                    .is_ok_and(|status| status.success())
-            });
-        if checkout {
-            Workmux::Source(source.to_path_buf())
-        } else {
-            Workmux::Release
-        }
-    }
+/// Copy the Linux workmux `binary` to `dest`, where the next image build
+/// finds it. Written beside `dest` and moved there, so a failed copy
+/// leaves the earlier one.
+pub fn install_workmux(binary: &Path, dest: &Path) -> Result<()> {
+    let dir = dest
+        .parent()
+        .context("The Linux workmux has no directory")?;
+    std::fs::create_dir_all(dir).with_context(|| format!("Failed to create {}", dir.display()))?;
+    let tmp = dir.join(format!(".workmux.{}", std::process::id()));
+    std::fs::copy(binary, &tmp).with_context(|| format!("Failed to copy {}", binary.display()))?;
+    std::fs::rename(&tmp, dest).with_context(|| format!("Failed to install {}", dest.display()))
+}
 
-    /// The workmux for the running binary.
-    pub fn current() -> Workmux {
-        Workmux::for_this_build(
-            std::env::var_os(BINARY_ENV).map(PathBuf::from),
-            Path::new(env!("CARGO_MANIFEST_DIR")),
-        )
+/// The Linux workmux at `installed`, or why there is none. No release of
+/// workmux can serve OpenShell sandboxes yet, so there is nothing to fall
+/// back to.
+pub fn linux_workmux(installed: Option<&Path>) -> Result<&Path> {
+    match installed {
+        Some(path) if path.is_file() => Ok(path),
+        _ => bail!(
+            "No workmux release for this build can serve OpenShell sandboxes yet; \
+             run `workmux sandbox install-dev`"
+        ),
     }
 }
 
@@ -250,7 +230,8 @@ impl Workmux {
 pub struct Recipe {
     /// The project's image; `None` for workmux's default.
     pub base: Option<String>,
-    pub workmux: Workmux,
+    /// The Linux workmux to copy in, from [`installed_workmux`].
+    pub workmux: PathBuf,
     /// The agents the sandbox runs, by plain CLI: those workmux can
     /// install are, and the first is remote workmux's default agent.
     pub agents: Vec<String>,
@@ -266,7 +247,7 @@ pub struct Recipe {
 }
 
 /// The Dockerfile for `recipe`. Its context holds `workmux`,
-/// `workmux-source`, `default-agent`, `project`, `devshell-source.json`,
+/// `default-agent`, `project`, `devshell-source.json`,
 /// `workmux-devshell`, `fetch-flake-inputs`, `nix-store-layout`,
 /// `nix-wrapper` and `nix.conf` as the recipe needs them.
 pub fn dockerfile(recipe: &Recipe) -> String {
@@ -278,34 +259,6 @@ pub fn dockerfile(recipe: &Recipe) -> String {
              && apt-get install -y --no-install-recommends git dtach ca-certificates curl \\\n    \
              && rm -rf /var/lib/apt/lists/*\n"
         ));
-    }
-    match &recipe.workmux {
-        Workmux::Binary(_) => {}
-        Workmux::Release => out.push_str(&format!(
-            "\nFROM {DEFAULT_BASE} AS workmux\n\
-             RUN apt-get update \\\n    \
-             && apt-get install -y --no-install-recommends ca-certificates curl \\\n    \
-             && curl -fsSL https://raw.githubusercontent.com/raine/workmux/main/scripts/install.sh \\\n    \
-             | WORKMUX_VERSION=v{} WORKMUX_INSTALL_DIR=/usr/local/bin bash\n",
-            env!("CARGO_PKG_VERSION")
-        )),
-        Workmux::Source(_) => {
-            let (flag, dir) = if cfg!(debug_assertions) {
-                ("", "debug")
-            } else {
-                (" --release", "release")
-            };
-            out.push_str(&format!(
-                "\nFROM {RUST_IMAGE} AS workmux\n\
-                 RUN apk add --no-cache musl-dev\n\
-                 COPY workmux-source /src\n\
-                 WORKDIR /src\n\
-                 RUN --mount=type=cache,id=workmux-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \\\n    \
-                 --mount=type=cache,id=workmux-cargo-target,target=/target,sharing=locked \\\n    \
-                 cargo build --locked{flag} --bin workmux --target-dir /target \\\n    \
-                 && cp /target/{dir}/workmux /usr/local/bin/workmux\n"
-            ));
-        }
     }
     for agent in installed(recipe) {
         out.push('\n');
@@ -346,10 +299,7 @@ pub fn dockerfile(recipe: &Recipe) -> String {
          RUN cat /tmp/workmux-gitconfig >> /etc/gitconfig\n"
     ));
     out.push_str(&format!("\nFROM {base}\n"));
-    out.push_str(match recipe.workmux {
-        Workmux::Binary(_) => "COPY --chmod=0755 workmux /usr/local/bin/workmux\n",
-        _ => "COPY --from=workmux /usr/local/bin/workmux /usr/local/bin/workmux\n",
-    });
+    out.push_str("COPY --chmod=0755 workmux /usr/local/bin/workmux\n");
     for agent in installed(recipe) {
         let (_, stage) = agent.stage(DEFAULT_BASE);
         out.push_str(&format!("COPY --from={stage} {0} {0}\n", agent.path));
@@ -537,18 +487,11 @@ pub fn prepare(recipe: &Recipe, sandbox: &str, clone: &str, context: &Path) -> R
     if let Some(base) = &recipe.base {
         digest.extend(base.as_bytes());
     }
-    match &recipe.workmux {
-        Workmux::Binary(binary) => {
-            let bytes = std::fs::read(binary)
-                .with_context(|| format!("Failed to read {}", binary.display()))?;
-            digest.extend(sha256_hex(&bytes).into_bytes());
-            std::fs::write(context.join("workmux"), bytes)?;
-        }
-        Workmux::Source(source) => {
-            copy_working_tree(source, &context.join("workmux-source"), &mut digest)?;
-        }
-        Workmux::Release => {}
-    }
+    let binary = &recipe.workmux;
+    let bytes =
+        std::fs::read(binary).with_context(|| format!("Failed to read {}", binary.display()))?;
+    digest.extend(sha256_hex(&bytes).into_bytes());
+    std::fs::write(context.join("workmux"), bytes)?;
     let gitconfig = gitconfig(recipe.git_credential_helper);
     digest.extend(gitconfig.as_bytes());
     std::fs::write(context.join("gitconfig"), gitconfig)?;
@@ -596,54 +539,6 @@ pub fn prepare(recipe: &Recipe, sandbox: &str, clone: &str, context: &Path) -> R
     ))
 }
 
-/// Copy the working tree of the git checkout `source` into `dest`: every
-/// file git tracks or would track, edits and new files included, nothing
-/// it ignores (such as `target`). Each file's path and digest go into
-/// `digest`.
-fn copy_working_tree(source: &Path, dest: &Path, digest: &mut Vec<u8>) -> Result<()> {
-    let output = crate::git::unattended_git(Some(source))?
-        .args([
-            "ls-files",
-            "-z",
-            "--cached",
-            "--others",
-            "--exclude-standard",
-        ])
-        .stderr(Stdio::inherit())
-        .output()
-        .context("Failed to run git")?;
-    if !output.status.success() {
-        bail!(
-            "Failed to list workmux's source files in {}",
-            source.display()
-        );
-    }
-    let mut files: Vec<&str> = std::str::from_utf8(&output.stdout)
-        .context("workmux's source has a file name that is not UTF-8")?
-        .split('\0')
-        .filter(|file| !file.is_empty())
-        .collect();
-    files.sort_unstable();
-    files.dedup();
-    for file in files {
-        let from = source.join(file);
-        // Deleted, but not yet staged as deleted; or a submodule.
-        if !from.is_file() {
-            continue;
-        }
-        let bytes =
-            std::fs::read(&from).with_context(|| format!("Failed to read {}", from.display()))?;
-        digest.extend(file.as_bytes());
-        digest.extend(sha256_hex(&bytes).into_bytes());
-        let to = dest.join(file);
-        if let Some(parent) = to.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(to, bytes)?;
-    }
-    Ok(())
-}
-
 /// Build `tag` from the context, streaming docker's output to stderr. A
 /// `github_token` reaches the devshell bake as a build secret, through
 /// docker's environment: it is never on argv and never in the image.
@@ -676,11 +571,21 @@ pub fn build(docker: &Path, context: &Path, tag: &str, github_token: Option<&str
 mod tests {
     use super::*;
 
+    /// A stand-in for the Linux workmux `sandbox install-dev` installs.
+    fn workmux() -> PathBuf {
+        static DIR: std::sync::LazyLock<tempfile::TempDir> = std::sync::LazyLock::new(|| {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("workmux"), "linux workmux").unwrap();
+            dir
+        });
+        DIR.path().join("workmux")
+    }
+
     #[test]
-    fn the_default_image_has_git_dtach_and_this_workmux_release() {
+    fn the_default_image_has_git_dtach_and_the_installed_workmux() {
         let dockerfile = dockerfile(&Recipe {
             base: None,
-            workmux: Workmux::Release,
+            workmux: PathBuf::from("/tmp/workmux"),
             agents: Vec::new(),
             devshell: None,
             git_credential_helper: false,
@@ -689,30 +594,30 @@ mod tests {
 
         assert!(dockerfile.contains("FROM docker.io/library/ubuntu:24.04 AS base"));
         assert!(dockerfile.contains("git dtach"));
-        assert!(dockerfile.contains(&format!("WORKMUX_VERSION=v{}", env!("CARGO_PKG_VERSION"))));
+        assert!(!dockerfile.contains("AS workmux"), "{dockerfile}");
         assert!(
             dockerfile.ends_with(
-                "FROM base\nCOPY --from=workmux /usr/local/bin/workmux /usr/local/bin/workmux\nCOPY --from=gitconfig /etc/gitconfig /etc/gitconfig\n"
+                "FROM base\nCOPY --chmod=0755 workmux /usr/local/bin/workmux\nCOPY --from=gitconfig /etc/gitconfig /etc/gitconfig\n"
             ),
             "{dockerfile}"
         );
     }
 
     #[test]
-    fn a_project_image_gets_this_workmux_release_too() {
+    fn a_project_image_gets_the_installed_workmux_too() {
         let dockerfile = dockerfile(&Recipe {
             base: Some("ghcr.io/me/api-dev:1".to_string()),
-            workmux: Workmux::Release,
+            workmux: PathBuf::from("/tmp/workmux"),
             agents: Vec::new(),
             devshell: None,
             git_credential_helper: false,
             nix: false,
         });
 
-        assert!(dockerfile.contains(&format!("WORKMUX_VERSION=v{}", env!("CARGO_PKG_VERSION"))));
+        assert!(!dockerfile.contains("AS workmux"), "{dockerfile}");
         assert!(
             dockerfile.ends_with(
-                "FROM ghcr.io/me/api-dev:1\nCOPY --from=workmux /usr/local/bin/workmux /usr/local/bin/workmux\nCOPY --from=gitconfig /etc/gitconfig /etc/gitconfig\n"
+                "FROM ghcr.io/me/api-dev:1\nCOPY --chmod=0755 workmux /usr/local/bin/workmux\nCOPY --from=gitconfig /etc/gitconfig /etc/gitconfig\n"
             ),
             "{dockerfile}"
         );
@@ -722,7 +627,7 @@ mod tests {
     fn claude_code_is_installed_where_openshells_provider_profile_expects_it() {
         let dockerfile = dockerfile(&Recipe {
             base: Some("ghcr.io/me/api-dev:1".to_string()),
-            workmux: Workmux::Release,
+            workmux: workmux(),
             agents: vec!["claude".to_string()],
             devshell: None,
             git_credential_helper: false,
@@ -753,7 +658,7 @@ mod tests {
     fn the_projects_first_agent_is_remote_workmuxs_default_even_when_its_image_brings_it() {
         let recipe = Recipe {
             base: Some("ghcr.io/me/api-dev:1".to_string()),
-            workmux: Workmux::Release,
+            workmux: workmux(),
             agents: vec!["gemini".to_string(), "codex".to_string()],
             devshell: None,
             git_credential_helper: false,
@@ -777,37 +682,10 @@ mod tests {
     }
 
     #[test]
-    fn a_dev_build_is_built_from_its_source_as_a_static_linux_binary() {
-        let dockerfile = dockerfile(&Recipe {
-            base: None,
-            workmux: Workmux::Source(PathBuf::from("/src/workmux")),
-            agents: Vec::new(),
-            devshell: None,
-            git_credential_helper: false,
-            nix: false,
-        });
-
-        assert!(!dockerfile.contains("install.sh"), "{dockerfile}");
-        let stage = dockerfile
-            .split("\nFROM ")
-            .find(|s| s.contains("AS workmux"))
-            .unwrap();
-        assert!(stage.starts_with("docker.io/library/rust:"), "{stage}");
-        assert!(stage.contains("-alpine AS workmux"), "{stage}");
-        assert!(stage.contains("COPY workmux-source /src"), "{stage}");
-        assert!(stage.contains("cargo build --locked"), "{stage}");
-        assert!(
-            dockerfile.ends_with(
-                "COPY --from=workmux /usr/local/bin/workmux /usr/local/bin/workmux\nCOPY --from=gitconfig /etc/gitconfig /etc/gitconfig\n"
-            )
-        );
-    }
-
-    #[test]
-    fn a_project_image_gets_the_given_workmux_and_the_baked_devshell() {
+    fn a_project_image_gets_the_installed_workmux_and_the_baked_devshell() {
         let dockerfile = dockerfile(&Recipe {
             base: Some("ghcr.io/me/api-dev:1".to_string()),
-            workmux: Workmux::Binary(PathBuf::from("/tmp/workmux")),
+            workmux: PathBuf::from("/tmp/workmux"),
             agents: Vec::new(),
             devshell: Some(PathBuf::from("/tmp/ctx/project")),
             git_credential_helper: false,
@@ -841,7 +719,7 @@ mod tests {
     fn nix_recipe(devshell: Option<PathBuf>) -> Recipe {
         Recipe {
             base: Some("ghcr.io/me/api-dev:1".to_string()),
-            workmux: Workmux::Release,
+            workmux: workmux(),
             agents: Vec::new(),
             devshell,
             git_credential_helper: false,
@@ -867,7 +745,7 @@ mod tests {
         assert_eq!(
             last_stage,
             "ghcr.io/me/api-dev:1\n\
-             COPY --from=workmux /usr/local/bin/workmux /usr/local/bin/workmux\n\
+             COPY --chmod=0755 workmux /usr/local/bin/workmux\n\
              COPY --from=nix --chown=1000:1000 /store/nix /nix\n\
              COPY --from=nix /links/ /usr/local/bin/\n\
              COPY --chmod=0755 nix-wrapper /usr/local/bin/nix\n\
@@ -968,7 +846,7 @@ mod tests {
     fn with_github_credentials_git_gets_the_placeholder_from_a_credential_helper() {
         let recipe = Recipe {
             base: Some("ghcr.io/me/api-dev:1".to_string()),
-            workmux: Workmux::Release,
+            workmux: workmux(),
             agents: Vec::new(),
             devshell: None,
             git_credential_helper: true,
@@ -1056,7 +934,7 @@ mod tests {
     fn without_github_credentials_ssh_github_urls_still_go_over_https() {
         let recipe = Recipe {
             base: None,
-            workmux: Workmux::Release,
+            workmux: workmux(),
             agents: Vec::new(),
             devshell: None,
             git_credential_helper: false,
@@ -1098,55 +976,14 @@ mod tests {
     }
 
     #[test]
-    fn the_override_wins_then_a_source_checkout_then_the_release() {
-        let checkout = tempfile::tempdir().unwrap();
-        git(checkout.path(), &["init", "-q"]);
-        std::fs::write(checkout.path().join("Cargo.toml"), "[package]").unwrap();
-        let gone = checkout.path().join("gone");
-
-        assert_eq!(
-            Workmux::for_this_build(Some(PathBuf::from("/tmp/wm")), checkout.path()),
-            Workmux::Binary(PathBuf::from("/tmp/wm"))
-        );
-        assert_eq!(
-            Workmux::for_this_build(None, checkout.path()),
-            Workmux::Source(checkout.path().to_path_buf())
-        );
-        // A release's build machine path, or a crate's unpacked source.
-        assert_eq!(Workmux::for_this_build(None, &gone), Workmux::Release);
-        let unpacked = tempfile::tempdir().unwrap();
-        std::fs::write(unpacked.path().join("Cargo.toml"), "[package]").unwrap();
-        assert_eq!(
-            Workmux::for_this_build(None, unpacked.path()),
-            Workmux::Release
-        );
-    }
-
-    fn git(dir: &Path, args: &[&str]) {
-        let status = Command::new("git")
-            .args(args)
-            .current_dir(dir)
-            .status()
-            .unwrap();
-        assert!(status.success());
-    }
-
-    #[test]
-    fn a_dev_build_carries_its_working_tree_and_the_tag_follows_it() {
-        let source = tempfile::tempdir().unwrap();
-        git(source.path(), &["init", "-q"]);
-        std::fs::write(source.path().join(".gitignore"), "target/\n").unwrap();
-        std::fs::create_dir_all(source.path().join("src")).unwrap();
-        std::fs::create_dir_all(source.path().join("target")).unwrap();
-        std::fs::write(source.path().join("Cargo.toml"), "[package]").unwrap();
-        std::fs::write(source.path().join("src/main.rs"), "fn main() {}").unwrap();
-        std::fs::write(source.path().join("target/junk"), "built").unwrap();
-        git(source.path(), &["add", "."]);
-        // Uncommitted and untracked work is part of the build.
-        std::fs::write(source.path().join("src/new.rs"), "// new").unwrap();
+    fn the_installed_workmux_is_copied_in_and_the_tag_follows_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let installed = dir.path().join("openshell/workmux");
+        std::fs::write(dir.path().join("built"), "first build").unwrap();
+        install_workmux(&dir.path().join("built"), &installed).unwrap();
         let recipe = Recipe {
             base: None,
-            workmux: Workmux::Source(source.path().to_path_buf()),
+            workmux: linux_workmux(Some(&installed)).unwrap().to_path_buf(),
             agents: Vec::new(),
             devshell: None,
             git_credential_helper: false,
@@ -1155,21 +992,22 @@ mod tests {
         let context = tempfile::tempdir().unwrap();
 
         let first = prepare(&recipe, "api", "/sandbox/api", context.path()).unwrap();
-        let carried = context.path().join("workmux-source");
         assert_eq!(
-            std::fs::read_to_string(carried.join("src/main.rs")).unwrap(),
-            "fn main() {}"
+            std::fs::read_to_string(context.path().join("workmux")).unwrap(),
+            "first build"
         );
-        assert!(carried.join("src/new.rs").exists());
-        assert!(!carried.join("target").exists());
-
         let context = tempfile::tempdir().unwrap();
         let again = prepare(&recipe, "api", "/sandbox/api", context.path()).unwrap();
-        std::fs::write(source.path().join("src/main.rs"), "fn main() { 1; }").unwrap();
+        std::fs::write(dir.path().join("built"), "second build").unwrap();
+        install_workmux(&dir.path().join("built"), &installed).unwrap();
         let context = tempfile::tempdir().unwrap();
-        let edited = prepare(&recipe, "api", "/sandbox/api", context.path()).unwrap();
+        let reinstalled = prepare(&recipe, "api", "/sandbox/api", context.path()).unwrap();
         assert_eq!(first, again);
-        assert_ne!(first, edited);
+        assert_ne!(first, reinstalled);
+        assert_eq!(
+            std::fs::read_to_string(context.path().join("workmux")).unwrap(),
+            "second build"
+        );
     }
 
     #[test]
@@ -1181,7 +1019,7 @@ mod tests {
         std::fs::write(project.join("flake.lock"), "v1").unwrap();
         let recipe = Recipe {
             base: None,
-            workmux: Workmux::Release,
+            workmux: workmux(),
             agents: Vec::new(),
             devshell: Some(project.clone()),
             git_credential_helper: false,
@@ -1228,7 +1066,7 @@ mod tests {
         fn tag(&self) -> String {
             let recipe = Recipe {
                 base: None,
-                workmux: Workmux::Release,
+                workmux: workmux(),
                 agents: Vec::new(),
                 devshell: Some(self.context.path().join("project")),
                 git_credential_helper: false,
@@ -1331,21 +1169,27 @@ mod tests {
 }
 
 /// Env-gated like the OpenShell contract tests (`WORKMUX_TEST_OPENSHELL=1`),
-/// but needing only Docker: the image's workmux is this workmux's version,
-/// whether it comes from the release or from this dev build's source.
+/// but needing only Docker and the Linux workmux `workmux sandbox
+/// install-dev` installed: the image runs it.
 #[cfg(test)]
 mod contract {
     use super::*;
 
-    fn version_in_image(workmux: Workmux, label: &str) -> String {
-        run_in_image(workmux, &[], label, &["workmux", "--version"])
+    /// The Linux workmux `workmux sandbox install-dev` installed.
+    fn installed() -> PathBuf {
+        let installed = installed_workmux();
+        linux_workmux(installed.as_deref())
+            .expect(
+                "the contract tests run the Linux workmux `workmux sandbox install-dev` installs",
+            )
+            .to_path_buf()
     }
 
     /// Run `argv` as the sandbox user in an image built from the recipe.
-    fn run_in_image(workmux: Workmux, agents: &[&str], label: &str, argv: &[&str]) -> String {
+    fn run_in_image(agents: &[&str], label: &str, argv: &[&str]) -> String {
         let recipe = Recipe {
             base: None,
-            workmux,
+            workmux: installed(),
             agents: agents.iter().map(|a| a.to_string()).collect(),
             devshell: None,
             git_credential_helper: false,
@@ -1387,23 +1231,12 @@ mod contract {
     }
 
     #[test]
-    fn the_release_recipe_installs_this_version() {
+    fn the_installed_workmux_runs_in_the_image() {
         if !enabled() {
             return;
         }
-        let version = version_in_image(Workmux::Release, "rel");
-        assert!(version.ends_with(env!("CARGO_PKG_VERSION")), "{version}");
-    }
-
-    #[test]
-    fn a_dev_build_builds_itself_for_linux() {
-        if !enabled() {
-            return;
-        }
-        let workmux = Workmux::for_this_build(None, Path::new(env!("CARGO_MANIFEST_DIR")));
-        assert!(matches!(workmux, Workmux::Source(_)), "{workmux:?}");
-        let version = version_in_image(workmux, "dev");
-        assert!(version.ends_with(env!("CARGO_PKG_VERSION")), "{version}");
+        let version = run_in_image(&[], "dev", &["workmux", "--version"]);
+        assert!(version.starts_with("workmux "), "{version}");
     }
 
     #[test]
@@ -1412,7 +1245,6 @@ mod contract {
             return;
         }
         let out = run_in_image(
-            Workmux::Release,
             &["claude", "codex"],
             "agt",
             &[
@@ -1445,7 +1277,7 @@ mod contract {
         let base = has_base.then(|| IMAGE_WITH_GH_HELPER.to_string());
         let recipe = Recipe {
             base,
-            workmux: Workmux::Release,
+            workmux: installed(),
             agents: Vec::new(),
             devshell: None,
             git_credential_helper: true,
@@ -1547,7 +1379,7 @@ mod contract {
         .unwrap();
         let recipe = Recipe {
             base: None,
-            workmux: Workmux::Release,
+            workmux: installed(),
             agents: Vec::new(),
             devshell: Some(project),
             git_credential_helper: false,
