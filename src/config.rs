@@ -1216,12 +1216,14 @@ impl OpenshellProject {
         // list and never adds to it -- otherwise it could commit
         // `providers: [gh-login]` and receive the user's GitHub login.
         let allowed = global.providers.unwrap_or_default();
-        let (providers, unlisted_providers): (Vec<String>, Vec<String>) = project
-            .providers
-            .clone()
-            .unwrap_or_default()
-            .into_iter()
-            .partition(|name| allowed.contains(name));
+        let mut picked: Vec<String> = Vec::new();
+        for name in project.providers.clone().unwrap_or_default() {
+            if !picked.contains(&name) {
+                picked.push(name);
+            }
+        }
+        let (providers, unlisted_providers): (Vec<String>, Vec<String>) =
+            picked.into_iter().partition(|name| allowed.contains(name));
         for name in &unlisted_providers {
             tracing::warn!(
                 provider = name,
@@ -4661,6 +4663,19 @@ sandbox:
             Some(&["claude".to_string()][..])
         );
         assert_eq!(openshell.unlisted_providers, ["gh-login", "github-api"]);
+    }
+
+    #[test]
+    fn a_provider_the_repository_names_twice_is_attached_once() {
+        let openshell = merged_openshell(
+            GLOBAL_PROVIDERS,
+            "sandbox:\n  openshell:\n    providers: [claude, gh-login, claude]\n",
+        );
+
+        assert_eq!(
+            openshell.providers.as_deref(),
+            Some(&["claude".to_string(), "gh-login".to_string()][..])
+        );
     }
 
     #[test]
