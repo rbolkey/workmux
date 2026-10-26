@@ -77,6 +77,8 @@ workmux supports two sandboxing backends:
 
 Container is a good default: it's simple to set up and ephemeral, so no state accumulates between sessions. Choose Lima if you want persistent VMs with built-in Nix/Devbox toolchain support.
 
+A third backend, `openshell`, works differently: it mounts nothing from your workstation. The repository is cloned into an OpenShell sandbox of its own, and the project's worktrees and agents live there. See [OpenShell projects](/guide/remote-projects/openshell/).
+
 ## Adding tools to the sandbox
 
 Agents often need project tooling (compilers, linters, build tools) available inside the sandbox. There are several ways to provide this depending on your backend:

@@ -25,8 +25,7 @@ description: Complete reference for all workmux commands
 | [`config edit`](/reference/commands/config/)      | Edit the global configuration file                  |
 | [`init`](/reference/commands/init/)               | Generate configuration file                         |
 | [`claude prune`](/reference/commands/claude/)     | Clean up stale Claude Code entries                  |
-| [`remote`](/reference/commands/remote/)           | Manage the remotes remote projects live on          |
-| [`project`](/reference/commands/project/)         | Register and unregister projects on remotes         |
+| [`remote`](/reference/commands/remote/)           | Check and manage remote projects' sandboxes         |
 | [`completions`](/reference/commands/completions/) | Generate shell completions                          |
 | [`docs`](/reference/commands/docs/)               | Show detailed documentation                         |
 | [`update`](/reference/commands/update/)           | Update workmux to the latest version                |

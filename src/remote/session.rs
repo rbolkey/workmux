@@ -54,7 +54,7 @@ const CANCEL_POLL: Duration = Duration::from_millis(100);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(7 * 24 * 3600);
 
 /// Environment remote workmux sets for a command it runs for a remote
-/// project: the remote's name and the project's registered name.
+/// project: the remote's name and the project's name.
 pub const REMOTE_ENV: &str = "WORKMUX_REMOTE_NAME";
 pub const PROJECT_ENV: &str = "WORKMUX_PROJECT_NAME";
 /// The workstation session for the project's windows, when it has one.
@@ -480,7 +480,7 @@ fn exit_code(status: std::process::ExitStatus) -> i32 {
         .unwrap_or(1)
 }
 
-/// Clone the project to its registered path if it is missing. Returns
+/// Clone the project to its path if it is missing. Returns
 /// whether it cloned.
 fn ensure_cloned(
     project: &ProjectSite,
@@ -723,7 +723,6 @@ mod tests {
             target: "/remote".to_string(),
             builtin_shims: None,
             host_commands: vec![],
-            upload_workmux: None,
             openshell: None,
         }
     }
@@ -989,7 +988,7 @@ mod tests {
     }
 
     #[test]
-    fn first_use_clones_the_repository_to_the_registered_path() {
+    fn first_use_clones_the_repository_to_the_projects_path() {
         let temp = tempfile::tempdir().unwrap();
         let origin = temp.path().join("origin");
         std::fs::create_dir(&origin).unwrap();

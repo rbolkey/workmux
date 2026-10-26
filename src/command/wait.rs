@@ -169,11 +169,7 @@ fn worktree_removed(target: &WaitTarget) -> Option<bool> {
         WaitTarget::Remote {
             project, worktree, ..
         } => {
-            let project = crate::remote::router::remote_project(
-                &crate::config::Config::load_global_only().ok()?,
-                project,
-            )
-            .ok()?;
+            let project = crate::remote::router::remote_project(project).ok()?;
             match crate::remote::router::quietly(&project, &["workmux", "path", worktree]) {
                 Ok(exit) => Some(exit != 0),
                 Err(error) => {

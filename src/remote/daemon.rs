@@ -204,14 +204,7 @@ fn refresh_remote_git_statuses(
 /// channel only when it is already open: a disconnected or stopped remote
 /// is never dialled for this.
 fn ask_remote_git_status(entry: &RemoteGitPath) -> Result<GitStatus> {
-    let project = super::router::remote_project(&Config::load_global_only()?, &entry.project)?;
-    if project.site.remote != entry.remote {
-        anyhow::bail!(
-            "Project {} is not on remote {}",
-            entry.project,
-            entry.remote
-        );
-    }
+    let project = super::router::remote_project_on(&entry.remote, &entry.project)?;
     let answer = super::channels().dashboard(
         project.host(),
         &project.site,

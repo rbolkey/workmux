@@ -380,7 +380,7 @@ enum Commands {
         #[arg(long, value_hint = clap::ValueHint::FilePath)]
         config: Option<PathBuf>,
 
-        /// Add the worktree to a project registered on a remote
+        /// Add the worktree to a remote project
         #[arg(long)]
         project: Option<String>,
     },
@@ -430,7 +430,7 @@ enum Commands {
         #[arg(long, value_hint = clap::ValueHint::FilePath)]
         config: Option<PathBuf>,
 
-        /// Open a worktree of a project registered on a remote
+        /// Open a worktree of a remote project
         #[arg(long)]
         project: Option<String>,
     },
@@ -441,7 +441,7 @@ enum Commands {
         #[arg(value_parser = WorktreeHandleParser::new())]
         name: Option<String>,
 
-        /// Close a worktree of a project registered on a remote
+        /// Close a worktree of a remote project
         #[arg(long)]
         project: Option<String>,
     },
@@ -498,7 +498,7 @@ enum Commands {
         #[arg(long)]
         notification: bool,
 
-        /// Merge in a project registered on a remote
+        /// Merge in a remote project
         #[arg(long)]
         project: Option<String>,
     },
@@ -509,7 +509,7 @@ enum Commands {
         #[arg(value_parser = WorktreeHandleParser::new())]
         name: Option<String>,
 
-        /// Project registered on a remote that holds the worktree
+        /// Remote project that holds the worktree
         #[arg(long, value_name = "NAME")]
         project: Option<String>,
     },
@@ -524,7 +524,7 @@ enum Commands {
         #[arg(short = 'b', long)]
         branch: bool,
 
-        /// Project registered on a remote that holds the worktree
+        /// Remote project that holds the worktree
         #[arg(long, value_name = "NAME")]
         project: Option<String>,
     },
@@ -552,7 +552,7 @@ enum Commands {
         #[arg(short = 'k', long)]
         keep_branch: bool,
 
-        /// Remove worktrees of a project registered on a remote
+        /// Remove worktrees of a remote project
         #[arg(long)]
         project: Option<String>,
     },
@@ -572,7 +572,7 @@ enum Commands {
         #[arg(long)]
         all: bool,
 
-        /// List a project registered on a remote
+        /// List a remote project
         #[arg(long, value_name = "NAME", conflicts_with = "all")]
         project: Option<String>,
 
@@ -587,7 +587,7 @@ enum Commands {
         #[arg(value_parser = WorktreeHandleParser::new())]
         name: String,
 
-        /// Project registered on a remote that holds the worktree
+        /// Remote project that holds the worktree
         #[arg(long, value_name = "NAME")]
         project: Option<String>,
 
@@ -682,7 +682,7 @@ enum Commands {
         #[arg(long)]
         timeout: Option<u64>,
 
-        /// Run in a worktree of a project registered on a remote
+        /// Run in a worktree of a remote project
         #[arg(long)]
         project: Option<String>,
     },
@@ -706,14 +706,14 @@ enum Commands {
         #[arg(long)]
         all: bool,
 
-        /// Project registered on a remote that holds the worktree
+        /// Remote project that holds the worktree
         #[arg(long, value_name = "NAME")]
         project: Option<String>,
     },
 
     /// Generate example .workmux.yaml configuration file
     Init {
-        /// Project registered on a remote to write the file into
+        /// Remote project to write the file into
         #[arg(long, value_name = "NAME")]
         project: Option<String>,
     },
@@ -834,9 +834,6 @@ enum Commands {
     /// Manage remotes: project hosts reached through a transport
     Remote(command::remote::RemoteArgs),
 
-    /// Manage projects that live on a remote
-    Project(command::project::ProjectArgs),
-
     /// Set agent status for the current tmux window (used by hooks)
     #[command(hide = true)]
     SetWindowStatus {
@@ -855,7 +852,7 @@ enum Commands {
         #[arg(value_parser = GitBranchParser::new())]
         base: String,
 
-        /// Project registered on a remote that holds the worktree
+        /// Remote project that holds the worktree
         #[arg(long, value_name = "NAME")]
         project: Option<String>,
     },
@@ -1486,7 +1483,6 @@ pub fn run() -> Result<()> {
         },
         Commands::Sandbox(args) => command::sandbox::run(args),
         Commands::Remote(args) => command::remote::run(args),
-        Commands::Project(args) => command::project::run(args),
         Commands::SetWindowStatus { command } => command::set_window_status::run(command),
         Commands::RegisterAgent => command::set_window_status::register_agent(),
         Commands::SetBase { base, project } => {

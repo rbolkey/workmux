@@ -120,7 +120,8 @@ impl WorktreeSite {
         self.project().cache_key(self.path()).ok()
     }
 
-    /// The remote project a remote worktree belongs to, from global config.
+    /// The remote project a remote worktree belongs to, as a command last
+    /// resolved it.
     fn remote_project(&self) -> Result<Option<RemoteProject>, String> {
         let Self::Remote {
             remote, project, ..
@@ -128,13 +129,9 @@ impl WorktreeSite {
         else {
             return Ok(None);
         };
-        let resolved = crate::remote::router::global_config()
-            .and_then(|config| crate::remote::router::remote_project(&config, project))
-            .map_err(|error| format!("{error:#}"))?;
-        if resolved.site.remote != *remote {
-            return Err(format!("project {project} is no longer on remote {remote}"));
-        }
-        Ok(Some(resolved))
+        crate::remote::router::remote_project_on(remote, project)
+            .map(Some)
+            .map_err(|error| format!("{error:#}"))
     }
 
     fn ask<T: serde::de::DeserializeOwned>(
@@ -289,7 +286,7 @@ impl WorktreeSite {
 }
 
 /// The project whose worktrees the Worktrees tab shows: a workstation
-/// repository, or a project registered on a remote, whose worktrees remote
+/// repository, or a project on a remote, whose worktrees remote
 /// workmux lists and changes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProjectScope {
@@ -326,24 +323,16 @@ impl ProjectScope {
     }
 
     /// Where to ask GitHub about the worktree at `path`, never a remote
-    /// path: a remote project is asked about by its registered git URL.
-    pub fn repo_source(
-        &self,
-        config: &crate::config::Config,
-        path: &Path,
-    ) -> Option<crate::github::RepoSource> {
+    /// path: a remote project is asked about by its git URL.
+    pub fn repo_source(&self, path: &Path) -> Option<crate::github::RepoSource> {
         match self {
             Self::Workstation(_) => Some(crate::github::RepoSource::Checkout(path.to_path_buf())),
             Self::Remote { remote, project } => {
-                let entry = config.projects.get(project)?;
-                (entry.remote.as_deref() == Some(remote.as_str()))
-                    .then(|| {
-                        entry
-                            .git_url
-                            .clone()
-                            .map(|git_url| crate::github::RepoSource::GitUrl(git_url.url))
-                    })
-                    .flatten()
+                crate::remote::router::remote_project_on(remote, project)
+                    .ok()?
+                    .site
+                    .git_url
+                    .map(|git_url| crate::github::RepoSource::GitUrl(git_url.url))
             }
         }
     }
@@ -351,16 +340,9 @@ impl ProjectScope {
     fn remote_project(&self) -> anyhow::Result<Option<RemoteProject>> {
         match self {
             Self::Workstation(_) => Ok(None),
-            Self::Remote { remote, project } => {
-                let resolved = crate::remote::router::remote_project(
-                    &*crate::remote::router::global_config()?,
-                    project,
-                )?;
-                if resolved.site.remote != *remote {
-                    anyhow::bail!("Project {project} is no longer on remote {remote}");
-                }
-                Ok(Some(resolved))
-            }
+            Self::Remote { remote, project } => Ok(Some(crate::remote::router::remote_project_on(
+                remote, project,
+            )?)),
         }
     }
 
@@ -446,16 +428,13 @@ impl ProjectScope {
     }
 
     /// Open pull requests of the project's repository.
-    pub fn open_prs(
-        &self,
-        config: &crate::config::Config,
-    ) -> anyhow::Result<Vec<crate::github::PrListEntry>> {
+    pub fn open_prs(&self) -> anyhow::Result<Vec<crate::github::PrListEntry>> {
         let path = match self {
             Self::Workstation(path) => path.as_path(),
             Self::Remote { .. } => Path::new(""),
         };
         let source = self
-            .repo_source(config, path)
+            .repo_source(path)
             .ok_or_else(|| anyhow::anyhow!("Project {} has no git URL", self.project().name))?;
         crate::github::list_open_prs_from(&source)
     }
@@ -565,10 +544,7 @@ pub(crate) mod tests {
     fn a_remote_projects_worktree_rows_are_keyed_and_asked_about_by_remote_and_project() {
         let temp = tempfile::tempdir().unwrap();
         crate::test_support::init_repo(temp.path());
-        let config: crate::config::Config = serde_yaml::from_str(
-            "projects:\n  api:\n    remote: devbox\n    git_url: git@github.com:me/api.git\n",
-        )
-        .unwrap();
+        let records = tempfile::tempdir().unwrap();
         let remote = ProjectScope::Remote {
             remote: "devbox".to_string(),
             project: "api".to_string(),
@@ -583,22 +559,46 @@ pub(crate) mod tests {
         );
         assert_eq!(row.scope(), remote);
         assert_eq!(remote.project().group_label(), "api@devbox");
-        assert_eq!(
-            remote.repo_source(&config, temp.path()),
-            Some(crate::github::RepoSource::GitUrl(
-                "git@github.com:me/api.git".to_string()
-            ))
-        );
-        assert_eq!(
-            local.repo_source(&config, temp.path()),
-            Some(crate::github::RepoSource::Checkout(
-                temp.path().to_path_buf()
-            ))
-        );
         let elsewhere = ProjectScope::Remote {
             remote: "other".to_string(),
             project: "api".to_string(),
         };
-        assert_eq!(elsewhere.repo_source(&config, temp.path()), None);
+        crate::remote::registry::with_recorded(records.path(), &[devbox_api()], || {
+            assert_eq!(
+                remote.repo_source(temp.path()),
+                Some(crate::github::RepoSource::GitUrl(
+                    "git@github.com:me/api.git".to_string()
+                ))
+            );
+            assert_eq!(
+                local.repo_source(temp.path()),
+                Some(crate::github::RepoSource::Checkout(
+                    temp.path().to_path_buf()
+                ))
+            );
+            assert_eq!(elsewhere.repo_source(temp.path()), None);
+        });
+    }
+
+    /// Project `api` on remote `devbox`, cloned from GitHub over SSH.
+    pub(crate) fn devbox_api() -> crate::remote::router::RemoteProject {
+        crate::remote::router::RemoteProject {
+            site: crate::remote::session::ProjectSite {
+                remote: "devbox".to_string(),
+                name: "api".to_string(),
+                path: "~/api".to_string(),
+                git_url: Some(crate::remote::git_url::GitUrl::new(
+                    "git@github.com:me/api.git",
+                )),
+                session: Some("api".to_string()),
+            },
+            remote: crate::config::RemoteConfig {
+                transport: crate::config::TransportKind::Loopback,
+                target: "/tmp/devbox".to_string(),
+                builtin_shims: None,
+                host_commands: Vec::new(),
+                openshell: None,
+            },
+        }
     }
 }

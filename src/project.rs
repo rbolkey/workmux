@@ -95,8 +95,8 @@ impl Project {
     }
 }
 
-/// A project on a remote, named by its remote and the name it is
-/// registered under in global config.
+/// A project on a remote, named by its remote and its own name, which
+/// comes from its repository on the workstation.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct RemoteProjectId {
     pub remote: String,
@@ -158,7 +158,7 @@ mod tests {
     }
 
     #[test]
-    fn a_served_remote_project_is_named_by_its_registration_not_its_clone() {
+    fn a_served_remote_project_is_named_by_its_workstation_repository_not_its_clone() {
         let served = ServedProject {
             remote: "devbox".to_string(),
             name: "api".to_string(),

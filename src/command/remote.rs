@@ -1,4 +1,5 @@
-//! `workmux remote`: register remotes and check that they are reachable.
+//! `workmux remote`: check that remotes are reachable and manage the
+//! lifecycle of OpenShell sandboxes.
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Subcommand};
@@ -9,14 +10,12 @@ use tabled::{
     settings::{Padding, Style, object::Columns},
 };
 
-use super::global_config::{self, PROJECTS, REMOTES};
 use crate::config::{RemoteConfig, TransportKind};
 use crate::remote::carry::AtRisk;
 use crate::remote::channels::{Reach, RemoteStatus};
 use crate::remote::pane::{RemotePaneId, SessionHolder};
-use crate::remote::ssh::Ssh;
+use crate::remote::registry;
 use crate::remote::transport::{Provisioning, RemoteState, Transport, ensure_running};
-use crate::remote::{Remote, registry, upload};
 use std::sync::Arc;
 
 /// How long a status call may take: opening a channel can wait on a slow
@@ -31,30 +30,6 @@ pub struct RemoteArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum RemoteCommand {
-    /// Register a remote in your global config
-    Add {
-        /// Name projects use to refer to the remote
-        name: String,
-        /// How to reach the remote
-        #[arg(long, value_enum)]
-        transport: TransportKind,
-        /// Where to reach it: an SSH host (as in your SSH config) or a sandbox name
-        #[arg(long)]
-        target: String,
-        /// Disable the built-in shims (sound playback, clipboard read) for this remote
-        #[arg(long)]
-        no_builtin_shims: bool,
-        /// Allow the remote to run this command on the workstation (repeatable)
-        #[arg(long = "host-command", value_name = "COMMAND")]
-        host_commands: Vec<String>,
-    },
-    /// Install a workmux matching this one on an SSH remote, in its cache directory
-    Upload {
-        name: String,
-        /// A workmux built for the remote's platform (default: this build when the platforms match, else this version's release for the remote's platform)
-        #[arg(long, value_name = "PATH")]
-        binary: Option<std::path::PathBuf>,
-    },
     /// List remotes and whether each is reachable
     #[command(visible_alias = "ls")]
     List,
@@ -74,7 +49,7 @@ pub enum RemoteCommand {
         #[arg(short, long)]
         yes: bool,
     },
-    /// Remove a remote from your global config; for an OpenShell project, delete its sandbox and the project
+    /// Delete an OpenShell project's sandbox and close its workstation windows
     Rm {
         name: String,
         /// Don't ask for confirmation
@@ -116,25 +91,18 @@ pub enum RemoteCommand {
 }
 
 pub fn run(args: RemoteArgs) -> Result<()> {
+    if matches!(
+        args.command,
+        RemoteCommand::List
+            | RemoteCommand::Status { .. }
+            | RemoteCommand::Start { .. }
+            | RemoteCommand::Stop { .. }
+            | RemoteCommand::Recreate { .. }
+            | RemoteCommand::Rm { .. }
+    ) {
+        resolve_here();
+    }
     match args.command {
-        RemoteCommand::Add {
-            name,
-            transport,
-            target,
-            no_builtin_shims,
-            host_commands,
-        } => add(
-            &name,
-            RemoteConfig {
-                transport,
-                target,
-                builtin_shims: no_builtin_shims.then_some(false),
-                host_commands,
-                upload_workmux: None,
-                openshell: None,
-            },
-        ),
-        RemoteCommand::Upload { name, binary } => upload(&name, binary.as_deref()),
         RemoteCommand::List => list(),
         RemoteCommand::Status { name } => {
             if !status(name.as_deref())? {
@@ -175,57 +143,20 @@ pub fn run(args: RemoteArgs) -> Result<()> {
     }
 }
 
-fn add(name: &str, remote: RemoteConfig) -> Result<()> {
-    registry::validate_name(name)?;
-    let (path, content) = global_config::read()?;
-    if global_config::parse(&content)?
-        .projects
-        .get(name)
-        .is_some_and(|project| project.openshell.is_some())
+/// Resolve the working directory's project, so a repository whose config
+/// puts it in a sandbox is known here before any other command ran in it.
+fn resolve_here() {
+    if crate::remote::router::on_a_remote() {
+        return;
+    }
+    if let Ok(dir) = std::env::current_dir()
+        && let Err(error) = registry::resolve_at(&dir)
     {
-        bail!("Project {name} is in an OpenShell sandbox, which is already its remote {name}");
+        eprintln!("warning: {error:#}");
     }
-    let updated = global_config::add_entry(&content, &REMOTES, name, &remote)?;
-    global_config::write(&path, &updated)?;
-    println!(
-        "Added remote {name} ({} {}) to {}",
-        remote.transport,
-        remote.target,
-        path.display()
-    );
-    Ok(())
 }
 
-/// Install a matching workmux on the SSH remote `name`, or `binary` when
-/// given, and use it from now on.
-fn upload(name: &str, binary: Option<&std::path::Path>) -> Result<()> {
-    let remote = registry::remotes()?
-        .remove(name)
-        .ok_or_else(|| anyhow!("No remote named {name}"))?;
-    if remote.transport != TransportKind::Ssh {
-        bail!(
-            "Remote {name} is reached over {}; workmux installs itself only on SSH remotes",
-            remote.transport
-        );
-    }
-    let ssh = Ssh::new(&remote.target);
-    match binary {
-        Some(binary) => ssh.upload_workmux(binary)?,
-        None => upload::install(name, &ssh, &upload::Builds::current())?,
-    }
-    upload::remember(Remote::new(name, &remote), true)?;
-    println!(
-        "Installed workmux {} on {name} in {}",
-        env!("CARGO_PKG_VERSION"),
-        crate::remote::ssh::uploaded_workmux_dir()
-    );
-    for status in fetch_statuses_once(Some(name))? {
-        println!("{name}: {}", summary(&status.reach));
-    }
-    Ok(())
-}
-
-/// A registered remote whose transport manages its lifecycle.
+/// A remote whose transport manages its lifecycle.
 fn managed(name: &str) -> Result<(RemoteConfig, Arc<dyn Transport>)> {
     let remote = registry::remotes()?
         .remove(name)
@@ -252,8 +183,7 @@ fn start(name: &str) -> Result<()> {
     let (_, transport) = managed(name)?;
     ensure_running(name, transport.as_ref(), true, &mut print_notice)?;
     // Reconnect now rather than at the next backoff retry.
-    let statuses = fetch_statuses(Some(name))?;
-    for status in statuses {
+    for status in fetch_statuses(Some(name))? {
         println!("{name}: {}", summary(&status.reach));
     }
     Ok(())
@@ -276,13 +206,15 @@ fn stop(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// The OpenShell project whose implicit remote `name` is.
+/// The OpenShell project whose sandbox is remote `name`.
 fn openshell_project(name: &str) -> Result<Option<crate::remote::router::RemoteProject>> {
-    let config = crate::config::Config::load_global_only()?;
-    let Some(origin) = config.remotes.get(name).and_then(|r| r.openshell.clone()) else {
+    let Some(origin) = registry::remotes()?
+        .remove(name)
+        .and_then(|remote| remote.openshell)
+    else {
         return Ok(None);
     };
-    crate::remote::router::remote_project(&config, &origin.project).map(Some)
+    crate::remote::router::remote_project_on(name, &origin.project).map(Some)
 }
 
 /// Ask `prompt`, unless `yes`.
@@ -343,7 +275,7 @@ fn with_risks(mut prompt: String, risks: Option<&[AtRisk]>) -> String {
 }
 
 /// Delete an OpenShell project's sandbox, close the project's workstation
-/// windows, then unregister the project. A sandbox started only to check
+/// windows, then forget the project until a command resolves it again. A sandbox started only to check
 /// its worktrees is stopped again when the delete does not go ahead.
 fn rm_openshell(project: &crate::remote::router::RemoteProject, yes: bool) -> Result<()> {
     let name = &project.site.remote;
@@ -395,21 +327,17 @@ fn rm_openshell(project: &crate::remote::router::RemoteProject, yes: bool) -> Re
         provisioning.delete()?;
     }
     close_workstation_windows(&project.site.remote, &project.site.name);
-    let (path, content) = global_config::read()?;
-    let updated = global_config::remove_entry(&content, &PROJECTS, &project.site.name)?;
-    global_config::write(&path, &updated)?;
+    registry::forget_remote(name)?;
     println!(
-        "Deleted sandbox {} and removed project {} from {}",
-        project.remote.target,
-        project.site.name,
-        path.display()
+        "Deleted sandbox {} of project {}; the next workmux command in its repository creates it again",
+        project.remote.target, project.site.name,
     );
     Ok(())
 }
 
 /// Close the workstation windows of project `name` on `remote` and untag
-/// its adopted session, for a project being unregistered.
-pub(super) fn close_workstation_windows(remote: &str, name: &str) {
+/// its adopted session, for a project whose remote is going away.
+fn close_workstation_windows(remote: &str, name: &str) {
     use crate::multiplexer::Multiplexer as _;
     let tmux = crate::multiplexer::TmuxBackend::new();
     if !tmux.is_running().unwrap_or(false) {
@@ -527,45 +455,18 @@ fn print_policy(name: &str, remote: &RemoteConfig) {
 }
 
 fn rm(name: &str, yes: bool) -> Result<()> {
-    if let Some(project) = openshell_project(name)? {
-        return rm_openshell(&project, yes);
-    }
-    let (path, content) = global_config::read()?;
-    let users: Vec<String> = global_config::parse(&content)?
-        .projects
-        .into_iter()
-        .filter(|(_, project)| project.remote.as_deref() == Some(name))
-        .map(|(project, _)| project)
-        .collect();
-    if !users.is_empty() {
-        bail!("Remote {name} is used by project(s) {}", users.join(", "));
-    }
-    let updated = global_config::remove_entry(&content, &REMOTES, name)?;
-    global_config::write(&path, &updated)?;
-    println!("Removed remote {name} from {}", path.display());
-    Ok(())
-}
-
-/// Fetch statuses, offering to install a matching workmux on each SSH
-/// remote that lacks one and checking those that got one again.
-fn fetch_statuses(name: Option<&str>) -> Result<Vec<RemoteStatus>> {
-    let mut statuses = fetch_statuses_once(name)?;
-    let remotes = registry::remotes()?;
-    for status in &mut statuses {
-        if let Reach::Unreachable { error } = &status.reach
-            && let Some(config) = remotes.get(&status.name)
-            && upload::offer_on_terminal(Remote::new(&status.name, config), error)?
-            && let Some(checked) = fetch_statuses_once(Some(&status.name))?.pop()
-        {
-            *status = checked;
+    match openshell_project(name)? {
+        Some(project) => rm_openshell(&project, yes),
+        None if registry::remotes()?.contains_key(name) => {
+            bail!("Remote {name} is no OpenShell sandbox; workmux deletes only those")
         }
+        None => bail!("No remote named {name}"),
     }
-    Ok(statuses)
 }
 
 /// Fetch statuses through the workstation daemon, which holds the control
 /// channels, or directly when no daemon can run.
-fn fetch_statuses_once(name: Option<&str>) -> Result<Vec<RemoteStatus>> {
+fn fetch_statuses(name: Option<&str>) -> Result<Vec<RemoteStatus>> {
     let remotes = registry::remotes()?;
     if let Some(name) = name
         && !remotes.contains_key(name)
@@ -588,6 +489,11 @@ fn fetch_statuses_once(name: Option<&str>) -> Result<Vec<RemoteStatus>> {
         None => crate::remote::statuses(crate::remote::channels(), &remotes, name),
     }
 }
+
+/// What `list` and `status` say when no command has put a project on a
+/// remote yet.
+const NO_REMOTES: &str = "No remotes. A repository whose .workmux.yaml sets sandbox.backend: \
+openshell gets its sandbox the first time workmux runs in it";
 
 /// One-line summary of a remote's reachability.
 fn summary(reach: &Reach) -> String {
@@ -632,9 +538,7 @@ impl Tabled for Row {
 fn list() -> Result<()> {
     let statuses = fetch_statuses(None)?;
     if statuses.is_empty() {
-        println!(
-            "No remotes. Add one with: workmux remote add <name> --transport ssh --target <host>"
-        );
+        println!("{NO_REMOTES}");
         return Ok(());
     }
     let rows: Vec<Row> = statuses
@@ -667,9 +571,7 @@ fn list() -> Result<()> {
 fn status(name: Option<&str>) -> Result<bool> {
     let statuses = fetch_statuses(name)?;
     if statuses.is_empty() {
-        println!(
-            "No remotes. Add one with: workmux remote add <name> --transport ssh --target <host>"
-        );
+        println!("{NO_REMOTES}");
         return Ok(true);
     }
     let remotes = registry::remotes()?;
@@ -716,7 +618,6 @@ fn status(name: Option<&str>) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
 
     #[test]
     fn declining_to_delete_a_stopped_sandbox_stops_it_again() {
@@ -729,11 +630,6 @@ mod tests {
             let config = temp.path().join("config/workmux");
             std::fs::create_dir_all(&bin).unwrap();
             std::fs::create_dir_all(&config).unwrap();
-            std::fs::write(
-                config.join("config.yaml"),
-                "projects:\n  api:\n    git_url: https://example.com/api.git\n    openshell: {}\n",
-            )
-            .unwrap();
             let dir = temp.path().display();
             std::fs::write(temp.path().join("phase"), "Stopped").unwrap();
             for (name, body) in [
@@ -787,25 +683,42 @@ mod tests {
         }
         println!("{}", crate::test_support::ISOLATED_TEST_CANARY);
 
-        // stdin is closed: the confirmation reads no, the default.
-        rm("api", false).unwrap();
+        let records = tempfile::tempdir().unwrap();
+        crate::remote::registry::with_recorded(records.path(), &[openshell_api()], || {
+            // stdin is closed: the confirmation reads no, the default.
+            rm("api", false).unwrap();
 
-        assert!(openshell_project("api").unwrap().is_some());
+            assert!(openshell_project("api").unwrap().is_some());
+        });
     }
 
-    fn ssh(target: &str) -> RemoteConfig {
-        RemoteConfig {
-            transport: TransportKind::Ssh,
-            target: target.to_string(),
-            builtin_shims: None,
-            upload_workmux: None,
-            host_commands: vec![],
-            openshell: None,
+    /// Project `api` in its OpenShell sandbox `api`.
+    fn openshell_api() -> crate::remote::router::RemoteProject {
+        let git_url = Some(crate::remote::git_url::GitUrl::new(
+            "https://example.com/api.git",
+        ));
+        crate::remote::router::RemoteProject {
+            site: crate::remote::session::ProjectSite {
+                remote: "api".to_string(),
+                name: "api".to_string(),
+                path: "~/api".to_string(),
+                git_url: git_url.clone(),
+                session: Some("api".to_string()),
+            },
+            remote: RemoteConfig {
+                transport: TransportKind::Openshell,
+                target: "api".to_string(),
+                builtin_shims: None,
+                host_commands: Vec::new(),
+                openshell: Some(crate::config::OpenshellRemote {
+                    project: "api".to_string(),
+                    git_url,
+                    path: "~/api".to_string(),
+                    settings: crate::config::OpenshellProject::default(),
+                    agents: vec!["claude".to_string()],
+                }),
+            },
         }
-    }
-
-    fn parse(content: &str) -> Config {
-        serde_yaml::from_str(content).unwrap()
     }
 
     #[test]
@@ -862,138 +775,5 @@ mod tests {
              /sandbox/api__worktrees/review (branch review): not merged into main\n "
         );
         assert!(recreate_prompt("api", "api", None).contains("could not be checked"));
-    }
-
-    #[test]
-    fn adding_to_a_config_without_remotes_appends_the_section() {
-        let content = "# my settings\nnerdfont: true\n";
-
-        let updated =
-            global_config::add_entry(content, &REMOTES, "devbox", &ssh("me@devbox")).unwrap();
-
-        assert!(updated.starts_with(content), "{updated}");
-        assert_eq!(parse(&updated).remotes["devbox"], ssh("me@devbox"));
-        assert_eq!(parse(&updated).nerdfont, Some(true));
-    }
-
-    #[test]
-    fn adding_to_an_empty_config_creates_it() {
-        let updated = global_config::add_entry("", &REMOTES, "devbox", &ssh("devbox")).unwrap();
-
-        assert_eq!(parse(&updated).remotes["devbox"], ssh("devbox"));
-    }
-
-    #[test]
-    fn adding_joins_an_existing_remotes_section_and_keeps_comments() {
-        let content = "\
-remotes:
-    # the big box
-    devbox:
-        transport: ssh
-        target: devbox
-nerdfont: true
-";
-
-        let updated = global_config::add_entry(
-            content,
-            &REMOTES,
-            "gpu",
-            &RemoteConfig {
-                upload_workmux: None,
-                builtin_shims: Some(false),
-                host_commands: vec!["just".to_string()],
-                openshell: None,
-                ..ssh("gpu-box")
-            },
-        )
-        .unwrap();
-
-        let config = parse(&updated);
-        assert_eq!(config.remotes["devbox"], ssh("devbox"));
-        assert!(!config.remotes["gpu"].builtin_shims());
-        assert_eq!(config.remotes["gpu"].host_commands, vec!["just"]);
-        assert_eq!(config.nerdfont, Some(true));
-        assert!(updated.contains("# the big box"));
-    }
-
-    #[test]
-    fn adding_a_remote_that_exists_is_refused() {
-        let content = "remotes:\n  devbox:\n    transport: ssh\n    target: devbox\n";
-
-        let error =
-            global_config::add_entry(content, &REMOTES, "devbox", &ssh("other")).unwrap_err();
-
-        assert_eq!(error.to_string(), "remote devbox already exists");
-    }
-
-    #[test]
-    fn removing_a_remote_keeps_the_others_and_the_rest_of_the_file() {
-        let content = "\
-# top comment
-remotes:
-  devbox:
-    transport: ssh
-    target: devbox
-
-  gpu:
-    transport: ssh
-    target: gpu-box
-    host_commands:
-      - just
-nerdfont: true
-";
-
-        let updated = global_config::remove_entry(content, &REMOTES, "devbox").unwrap();
-
-        let config = parse(&updated);
-        assert!(!config.remotes.contains_key("devbox"));
-        assert_eq!(config.remotes["gpu"].host_commands, vec!["just"]);
-        assert_eq!(config.nerdfont, Some(true));
-        assert!(updated.starts_with("# top comment\n"));
-    }
-
-    #[test]
-    fn remembering_an_upload_answer_changes_only_that_remote() {
-        let content = "\
-# top comment
-remotes:
-  devbox:
-    transport: ssh
-    target: devbox
-  gpu:
-    transport: ssh
-    target: gpu-box
-    host_commands:
-      - just
-nerdfont: true
-";
-        let mut gpu = parse(content).remotes["gpu"].clone();
-        gpu.upload_workmux = Some(true);
-
-        let updated = global_config::replace_entry(content, &REMOTES, "gpu", &gpu).unwrap();
-
-        let config = parse(&updated);
-        assert_eq!(config.remotes["gpu"], gpu);
-        assert_eq!(config.remotes["devbox"].upload_workmux, None);
-        assert_eq!(config.nerdfont, Some(true));
-        assert!(updated.starts_with("# top comment\n"));
-    }
-
-    #[test]
-    fn removing_the_last_remote_removes_the_section() {
-        let content =
-            "remotes:\n  devbox:\n    transport: ssh\n    target: devbox\nnerdfont: true\n";
-
-        let updated = global_config::remove_entry(content, &REMOTES, "devbox").unwrap();
-
-        assert_eq!(updated, "nerdfont: true\n");
-    }
-
-    #[test]
-    fn removing_an_unknown_remote_is_an_error() {
-        let error =
-            global_config::remove_entry("nerdfont: true\n", &REMOTES, "devbox").unwrap_err();
-
-        assert_eq!(error.to_string(), "No remote named devbox");
     }
 }

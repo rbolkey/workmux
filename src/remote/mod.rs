@@ -22,11 +22,17 @@ pub mod serve;
 pub mod session;
 pub mod shell;
 pub mod shims;
+// The SSH transport, kept for when SSH remotes come back as a backend
+// (ADR 0004).
+#[allow(dead_code)]
 pub mod ssh;
 pub mod status;
 #[cfg(test)]
 pub mod testing;
 pub mod transport;
+// Installing workmux on SSH remotes, kept for when SSH remotes come back
+// as a backend (ADR 0004).
+#[allow(dead_code)]
 pub mod upload;
 
 use anyhow::{Result, anyhow};
@@ -36,8 +42,7 @@ use std::sync::OnceLock;
 use crate::config::RemoteConfig;
 use channels::{ChannelPolicy, Channels, RemoteStatus};
 
-/// A remote as its control channel needs it: the name it is registered
-/// under and its settings.
+/// A remote as its control channel needs it: its name and its settings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Remote<'a> {
     pub name: &'a str,

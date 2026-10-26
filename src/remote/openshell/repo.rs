@@ -7,7 +7,7 @@ use anyhow::{Result, bail};
 
 use super::github::GH_LOGIN;
 
-/// What workmux says about any SSH `--repo` for an OpenShell project.
+/// What workmux says about an OpenShell project's SSH origin URL.
 const SSH_UNSUPPORTED: &str = "uses SSH, which OpenShell sandboxes don't support";
 
 /// The HTTPS form of `url` when it is an SSH URL on github.com; `None`
@@ -19,8 +19,8 @@ pub fn https_for_ssh(url: &str) -> Result<Option<String>> {
     };
     if !host.eq_ignore_ascii_case("github.com") {
         bail!(
-            "--repo {url} {SSH_UNSUPPORTED}: they reach git hosts over HTTPS only, \
-             and workmux rewrites SSH URLs to HTTPS only on github.com; give an https:// URL"
+            "The repository's origin {url} {SSH_UNSUPPORTED}: they reach git hosts over HTTPS only, \
+             and workmux rewrites SSH URLs to HTTPS only on github.com; set origin to an https:// URL"
         );
     }
     Ok(Some(format!(
@@ -50,16 +50,16 @@ fn ssh_host_and_path(url: &str) -> Option<(&str, &str)> {
     Some((authority.rsplit('@').next().unwrap_or(authority), path))
 }
 
-/// What `project add` says about an SSH `--repo` it rewrote, given the
+/// What sandbox creation says about an SSH origin it rewrote, given the
 /// attached providers that give GitHub credentials, or why they could not
 /// be looked up.
 pub fn ssh_notice(github: Result<&[String], &str>) -> String {
-    let unsupported = format!("`--repo` {SSH_UNSUPPORTED}");
+    let unsupported = format!("The repository's origin {SSH_UNSUPPORTED}");
     match github {
         Ok([]) => format!(
             "{unsupported}; the sandbox reaches github.com over HTTPS instead, with no GitHub credentials attached: \
-             public repos will clone, but private repos and push need `--provider {GH_LOGIN}` (your `gh` login) \
-             or another GitHub `--provider`."
+             public repos will clone, but private repos and push need `{GH_LOGIN}` (your `gh` login) \
+             or another GitHub provider in sandbox.openshell.providers."
         ),
         Ok(providers) => format!(
             "{unsupported}; the sandbox reaches github.com over HTTPS with {} credentials instead.",
@@ -134,8 +134,8 @@ mod tests {
             assert_eq!(
                 error.to_string(),
                 format!(
-                    "--repo {url} {SSH_UNSUPPORTED}: they reach git hosts over HTTPS only, \
-                     and workmux rewrites SSH URLs to HTTPS only on github.com; give an https:// URL"
+                    "The repository's origin {url} {SSH_UNSUPPORTED}: they reach git hosts over HTTPS only, \
+                     and workmux rewrites SSH URLs to HTTPS only on github.com; set origin to an https:// URL"
                 )
             );
         }
@@ -145,12 +145,12 @@ mod tests {
     fn the_rewrite_notice_names_the_providers_giving_github_credentials() {
         assert_eq!(
             ssh_notice(Ok(&["work".to_string()])),
-            "`--repo` uses SSH, which OpenShell sandboxes don't support; \
+            "The repository's origin uses SSH, which OpenShell sandboxes don't support; \
              the sandbox reaches github.com over HTTPS with `work` credentials instead."
         );
         assert_eq!(
             ssh_notice(Ok(&["work".to_string(), "bot".to_string()])),
-            "`--repo` uses SSH, which OpenShell sandboxes don't support; \
+            "The repository's origin uses SSH, which OpenShell sandboxes don't support; \
              the sandbox reaches github.com over HTTPS with `work`, `bot` credentials instead."
         );
     }
@@ -159,7 +159,7 @@ mod tests {
     fn with_gh_login_the_notice_names_it_as_the_gh_login() {
         assert_eq!(
             ssh_notice(Ok(&["gh-login".to_string()])),
-            "`--repo` uses SSH, which OpenShell sandboxes don't support; \
+            "The repository's origin uses SSH, which OpenShell sandboxes don't support; \
              the sandbox reaches github.com over HTTPS with `gh-login` (your `gh` login's) credentials instead."
         );
     }
@@ -168,14 +168,14 @@ mod tests {
     fn without_github_credentials_the_notice_says_what_will_and_wont_work() {
         assert_eq!(
             ssh_notice(Ok(&[])),
-            "`--repo` uses SSH, which OpenShell sandboxes don't support; \
+            "The repository's origin uses SSH, which OpenShell sandboxes don't support; \
              the sandbox reaches github.com over HTTPS instead, with no GitHub credentials attached: \
-             public repos will clone, but private repos and push need `--provider gh-login` (your `gh` login) \
-             or another GitHub `--provider`."
+             public repos will clone, but private repos and push need `gh-login` (your `gh` login) \
+             or another GitHub provider in sandbox.openshell.providers."
         );
         assert_eq!(
             ssh_notice(Err("gateway down")),
-            "`--repo` uses SSH, which OpenShell sandboxes don't support; \
+            "The repository's origin uses SSH, which OpenShell sandboxes don't support; \
              the sandbox reaches github.com over HTTPS instead, with the GitHub credentials its providers give \
              (could not check which do: gateway down)."
         );

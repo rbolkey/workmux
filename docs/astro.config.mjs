@@ -185,7 +185,6 @@ export default defineConfig({
             { label: "claude prune", slug: "reference/commands/claude" },
             { label: "sandbox", slug: "reference/commands/sandbox" },
             { label: "remote", slug: "reference/commands/remote" },
-            { label: "project", slug: "reference/commands/project" },
             { label: "completions", slug: "reference/commands/completions" },
             { label: "docs", slug: "reference/commands/docs" },
             { label: "update", slug: "reference/commands/update" },

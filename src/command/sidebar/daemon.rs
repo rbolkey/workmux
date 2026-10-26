@@ -948,13 +948,13 @@ struct GithubWorkerPath {
 
 impl GithubWorkerPath {
     /// The entry for `agent`'s `branch`, or `None` for a remote agent whose
-    /// project has no registered git URL.
-    fn for_agent(config: &Config, agent: &AgentPane, branch: &str) -> Option<Self> {
+    /// project has no git URL.
+    fn for_agent(agent: &AgentPane, branch: &str) -> Option<Self> {
         Some(Self {
             path: agent.git_key(),
             branch: branch.to_string(),
             project: agent.project(),
-            source: crate::remote::dashboard::repo_source(config, agent)?,
+            source: crate::remote::dashboard::repo_source(agent)?,
         })
     }
 }
@@ -2533,7 +2533,6 @@ pub fn run() -> Result<()> {
             let _ = git_path_tx.send(entries);
 
             let github_entries: Vec<GithubWorkerPath> = if git_status_enabled {
-                let config = config.lock().unwrap();
                 output
                     .snapshot
                     .agents
@@ -2545,7 +2544,7 @@ pub fn run() -> Result<()> {
                             .get(&agent.git_key())?
                             .branch
                             .as_ref()?;
-                        GithubWorkerPath::for_agent(&config, agent, branch)
+                        GithubWorkerPath::for_agent(agent, branch)
                     })
                     .collect()
             } else {
@@ -4297,12 +4296,14 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         crate::test_support::init_repo(temp.path());
         let agent = remote_agent(temp.path());
-        let config: Config = serde_yaml::from_str(
-            "projects:\n  api:\n    remote: devbox\n    git_url: git@github.com:me/api.git\n",
+        let records = tempfile::tempdir().unwrap();
+
+        let github = crate::remote::registry::with_recorded(
+            records.path(),
+            &[crate::command::dashboard::site::tests::devbox_api()],
+            || GithubWorkerPath::for_agent(&agent, "feature"),
         )
         .unwrap();
-
-        let github = GithubWorkerPath::for_agent(&config, &agent, "feature").unwrap();
 
         assert_ne!(github.path, temp.path());
         assert_eq!(github.path, agent.git_key());

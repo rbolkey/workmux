@@ -14,7 +14,7 @@ use std::process::{Command, Stdio};
 use super::{OpenShell, agents, failure};
 
 /// The provider workmux keeps from the workstation's `gh` login, one per
-/// gateway. Attaching it (`--provider gh-login`) gives a sandbox everything
+/// gateway. Attaching it (`providers: [gh-login]`) gives a sandbox everything
 /// that login can do on GitHub.
 pub const GH_LOGIN: &str = "gh-login";
 
@@ -165,7 +165,7 @@ impl OpenShell {
             .collect())
     }
 
-    /// For `project add` and sandbox create: at most one attached provider
+    /// For sandbox create: at most one attached provider
     /// may give GitHub credentials, and with `gh-login` attached, the `gh`
     /// login must be there and a `gh-login` on the gateway must be
     /// workmux's. A check that can't run is an error.
@@ -602,7 +602,7 @@ mod tests {
     }
 
     #[test]
-    fn project_add_and_create_refuse_two_github_providers() {
+    fn create_refuses_two_github_providers() {
         let fake = FakeOpenShell::new();
         fake.providers(
             r#"[{"name":"anthropic","type":"claude-code"},{"name":"work","type":"github"}]"#,

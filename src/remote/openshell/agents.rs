@@ -114,7 +114,7 @@ pub fn report(
     if agents.is_empty() {
         report.warnings.push(
             "workmux cannot install the default agent, so the sandbox has no agent; \
-             name the sandbox's agents under the project's `openshell: agents:`"
+             name the sandbox's agents in sandbox.openshell.agents"
                 .to_string(),
         );
     }
@@ -147,7 +147,7 @@ pub fn report(
                 report.notes.push(note);
                 report.warnings.push(format!(
                     "no provider attached to the sandbox has a profile that allows {path}, so {name} has no credentials there; \
-                     create one with `openshell provider create --type {wanted}` and list it in the project's `openshell: providers:`"
+                     create one with `openshell provider create --type {wanted}` and list it in sandbox.openshell.providers in your global config"
                 ));
             }
             Ok(giving) => report
@@ -243,7 +243,7 @@ mod tests {
             report.warnings,
             [
                 "no provider attached to the sandbox has a profile that allows /usr/local/bin/codex, so codex has no credentials there; \
-                 create one with `openshell provider create --type codex` and list it in the project's `openshell: providers:`"
+                 create one with `openshell provider create --type codex` and list it in sandbox.openshell.providers in your global config"
             ]
         );
     }
@@ -281,7 +281,7 @@ mod tests {
             report.warnings,
             [
                 "workmux cannot install the default agent, so the sandbox has no agent; \
-              name the sandbox's agents under the project's `openshell: agents:`"
+              name the sandbox's agents in sandbox.openshell.agents"
             ]
         );
     }

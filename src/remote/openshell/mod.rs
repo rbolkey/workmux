@@ -192,7 +192,7 @@ impl OpenShell {
     fn origin(&self) -> Result<&OpenshellRemote> {
         self.origin.as_ref().ok_or_else(|| {
             anyhow!(
-                "Sandbox {} does not exist; workmux creates sandboxes only for projects added with `workmux project add openshell`",
+                "Sandbox {} does not exist; workmux creates a sandbox when a command runs in a repository whose config sets sandbox.backend: openshell",
                 self.sandbox
             )
         })
@@ -386,7 +386,7 @@ impl OpenShell {
             built.map_err(|error| {
                 anyhow!(
                     "{error:#}; the devshell bake had no GitHub credentials, and private GitHub \
-                     flake inputs can only be fetched with `--provider {}`",
+                     flake inputs can only be fetched with `{}` in sandbox.openshell.providers",
                     github::GH_LOGIN
                 )
             })?;
@@ -647,6 +647,23 @@ impl Provisioning for OpenShell {
     fn create(&self) -> Result<()> {
         let origin = self.origin()?;
         self.check_github_credentials()?;
+        if self.attaches_gh_login() {
+            eprintln!(
+                "Note: provider {} gives the sandbox your gh login's GitHub access, which usually \
+                 reaches every repo you can (push and pull requests included); workmux keeps its token in \
+                 that provider on the gateway and updates it whenever it creates or attaches to the sandbox",
+                github::GH_LOGIN
+            );
+        }
+        if origin.git_url.as_ref().is_some_and(|url| url.ssh.is_some()) {
+            let github = self
+                .github_providers()
+                .map_err(|error| format!("{error:#}"));
+            eprintln!(
+                "Note: {}",
+                repo::ssh_notice(github.as_deref().map_err(String::as_str))
+            );
+        }
         self.refresh_gh_login(true)?;
         let context = tempfile::tempdir()?;
         let image = self.build_image(origin, context.path())?;
@@ -997,11 +1014,11 @@ pub(super) mod tests {
 
         assert!(
             without.contains(
-                "private GitHub flake inputs can only be fetched with `--provider gh-login`"
+                "private GitHub flake inputs can only be fetched with `gh-login` in sandbox.openshell.providers"
             ),
             "{without}"
         );
-        assert!(!with.contains("--provider gh-login"), "{with}");
+        assert!(!with.contains("can only be fetched with"), "{with}");
     }
 
     #[test]
@@ -1084,7 +1101,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn a_registered_sandbox_without_a_project_is_never_created() {
+    fn a_sandbox_without_a_project_is_never_created() {
         let fake = FakeOpenShell::new();
 
         let error = fake.transport(None).create().unwrap_err();
@@ -1092,7 +1109,7 @@ pub(super) mod tests {
         assert!(
             error
                 .to_string()
-                .contains("workmux creates sandboxes only for projects"),
+                .contains("whose config sets sandbox.backend: openshell"),
             "{error}"
         );
         assert!(

@@ -1164,7 +1164,6 @@ mod tests {
             target: "/remote".to_string(),
             builtin_shims: None,
             host_commands: vec![],
-            upload_workmux: None,
             openshell: None,
         }
     }
@@ -1383,7 +1382,7 @@ mod tests {
     }
 
     /// The workstation's channels to `transport`'s remote, answering from
-    /// `server`'s tmux, with every project registered on the remote.
+    /// `server`'s tmux, with every project known on the remote.
     fn shell_channels(
         server: &PrivateTmuxServer,
         transport: Arc<ServeTransport>,

@@ -92,7 +92,7 @@ impl App {
         // Use unfiltered snapshots so filtering cannot omit branches from a fetch.
         let worktree_requests = self.all_worktrees.iter().filter_map(|wt| {
             let source = match &self.worktree_project_override {
-                Some(scope) => scope.repo_source(&self.config, &wt.path)?,
+                Some(scope) => scope.repo_source(&wt.path)?,
                 None => PrSource::Checkout(wt.path.clone()),
             };
             Some((&wt.repo_key, source, wt.branch.as_str()))
@@ -101,7 +101,7 @@ impl App {
             let site = WorktreeSite::of(agent).status_key();
             let branch = self.git_statuses.get(&site)?.branch.as_deref()?;
             let key = self.repo_keys.get(&site)?;
-            Some((key, pr_source(&self.config, agent)?, branch))
+            Some((key, pr_source(agent)?, branch))
         });
         let repo_branches = group_pr_requests(worktree_requests.chain(agent_requests));
 
