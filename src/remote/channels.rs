@@ -97,8 +97,10 @@ pub enum Reach {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         warnings: Vec<String>,
     },
-    /// The transport reports the remote stopped or missing; not started.
+    /// The transport reports the remote stopped; not started.
     Stopped,
+    /// The transport reports no remote yet; not created.
+    Missing,
     Unreachable {
         error: String,
     },
@@ -346,7 +348,8 @@ impl Channels {
                 if let Some(provisioning) = transport.provisioning() {
                     match provisioning.status() {
                         Ok(RemoteState::Running) => {}
-                        Ok(RemoteState::Stopped | RemoteState::Missing) => return Reach::Stopped,
+                        Ok(RemoteState::Stopped) => return Reach::Stopped,
+                        Ok(RemoteState::Missing) => return Reach::Missing,
                         Err(error) => return unreachable(error),
                     }
                 }
@@ -392,11 +395,14 @@ impl Channels {
             return Ok(connection);
         }
         let transport = (self.shared.factory)(remote.name, remote.config)?;
-        if !running
-            && let Some(provisioning) = transport.provisioning()
-            && provisioning.status()? != RemoteState::Running
-        {
-            return Err(anyhow!("Remote {} is stopped", remote.name));
+        if !running && let Some(provisioning) = transport.provisioning() {
+            match provisioning.status()? {
+                RemoteState::Running => {}
+                RemoteState::Stopped => return Err(anyhow!("Remote {} is stopped", remote.name)),
+                RemoteState::Missing => {
+                    return Err(anyhow!("Remote {} does not exist yet", remote.name));
+                }
+            }
         }
         self.channel_with(remote, transport, use_now)
     }
@@ -808,6 +814,20 @@ mod tests {
 
         assert_eq!(status.reach, Reach::Stopped);
         assert_eq!(transport.starts.load(Ordering::SeqCst), 0);
+        assert_eq!(transport.execs.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_missing_remote_is_never_created_to_fetch_status() {
+        let transport = Arc::new(StoppedTransport {
+            missing: true,
+            ..StoppedTransport::default()
+        });
+        let channels = channels_over(transport.clone(), fast_policy());
+
+        let status = channels.status(Remote::new("sandbox", &config()));
+
+        assert_eq!(status.reach, Reach::Missing);
         assert_eq!(transport.execs.load(Ordering::SeqCst), 0);
     }
 

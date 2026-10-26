@@ -148,9 +148,9 @@ Not covered: SSH hosts other than github.com. Private nix flake inputs are fetch
 
 workmux creates and starts the sandbox for you, and stops or deletes it only when you ask.
 
-- **Create.** The first command that needs the project builds the image, creates the sandbox and clones the repository, with the notice `Creating remote api on first use; …`.
-- **Start.** A command that needs a stopped sandbox starts it first (`Starting remote api…`).
-- **Never in the background.** The sidebar, the dashboard, `wait`, `list --all`, `resurrect` and `reap-agents` never create or start a sandbox. `resurrect` and `reap-agents` skip a stopped one with a notice and don't count it as a failure.
+- **Create.** The first command that acts in the project, such as `workmux add`, builds the image, creates the sandbox and clones the repository, with the notice `Creating remote api on first use; …`.
+- **Start.** A command that acts in a stopped sandbox starts it first (`Starting remote api…`).
+- **Never just to look.** Commands that only report never create or start a sandbox: `list`, `path`, `status`, `wait`, `remote status`, `remote list`, the sidebar and the dashboard. With no sandbox yet, they say `workmux add <branch>` creates it; with a stopped one, they say `workmux remote start` starts it. `resurrect` and `reap-agents` don't create or start one either; they skip it with a notice and don't count it as a failure.
 
 ```bash
 # run in your clone of the repository

@@ -197,6 +197,28 @@ def add_project(project: Project):
     project.make_origin()
 
 
+def test_listing_a_new_openshell_project_creates_nothing(project: Project):
+    """`list` in a repository whose sandbox doesn't exist yet says so, and
+    neither builds an image nor creates the sandbox (ADR 0004: the first
+    `workmux add` does)."""
+    project.configure("/sandbox/origin", LEARNING_IMAGE)
+
+    listed = project.wm("list", timeout=60.0)
+
+    assert (
+        f"No OpenShell sandbox for {project.name} yet; `workmux add <branch>` creates it"
+        in listed.stdout
+    ), listed
+    assert "Creating remote" not in listed.stderr, listed.stderr
+    assert project.phase() is None
+    images = subprocess.run(
+        ["docker", "image", "ls", "-q", f"workmux-openshell-{project.sandbox}"],
+        capture_output=True,
+        text=True,
+    ).stdout.split()
+    assert images == []
+
+
 def test_an_openshell_project_lives_stops_resumes_and_is_removed_with_its_sandbox(
     project: Project,
 ):
