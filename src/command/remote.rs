@@ -91,6 +91,17 @@ pub enum RemoteCommand {
 }
 
 pub fn run(args: RemoteArgs) -> Result<()> {
+    if matches!(
+        args.command,
+        RemoteCommand::List
+            | RemoteCommand::Status { .. }
+            | RemoteCommand::Start { .. }
+            | RemoteCommand::Stop { .. }
+            | RemoteCommand::Recreate { .. }
+            | RemoteCommand::Rm { .. }
+    ) {
+        resolve_here();
+    }
     match args.command {
         RemoteCommand::List => list(),
         RemoteCommand::Status { name } => {
@@ -129,6 +140,19 @@ pub fn run(args: RemoteArgs) -> Result<()> {
                 .context("Remote forward runs only in a remote shell")?;
             mux.forward(serde_json::from_str(&request).context("Unreadable request")?)
         }
+    }
+}
+
+/// Resolve the working directory's project, so a repository whose config
+/// puts it in a sandbox is known here before any other command ran in it.
+fn resolve_here() {
+    if crate::remote::router::on_a_remote() {
+        return;
+    }
+    if let Ok(dir) = std::env::current_dir()
+        && let Err(error) = registry::resolve_at(&dir)
+    {
+        eprintln!("warning: {error:#}");
     }
 }
 

@@ -3396,6 +3396,12 @@ impl Config {
 
     /// Merge a project config into a global config.
     /// Project config takes precedence. For lists, "<global>" placeholder expands to global items.
+    /// Test-only: merge `project` over this global config, as loading does.
+    #[cfg(test)]
+    pub fn merge_for_test(self, project: Self) -> Self {
+        self.merge(project)
+    }
+
     fn merge(self, project: Self) -> Self {
         /// Merge vectors with "<global>" placeholder expansion.
         /// When project contains "<global>", it expands to global items at that position.

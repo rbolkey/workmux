@@ -73,34 +73,72 @@ def remote(env, exe, repo, command, tmp_env, expect_fail=False):
     )
 
 
+def project_in_sandbox(
+    env,
+    exe,
+    name: str,
+    origin,
+    tmp_env: dict,
+    *,
+    root: Path | None = None,
+    remote: str = "lb",
+    path: str | None = None,
+    config: str = "",
+) -> Path:
+    """A workstation repository named `name` with `origin` as its origin,
+    whose `.workmux.yaml` puts it in a sandbox (ADR 0004): on the hidden
+    loopback backend rooted in `root`, as remote `remote` with its clone at
+    `path` (default code/<name>), or with no `root` in an OpenShell
+    sandbox. `config` adds lines to that file. `remote list` run in the
+    repository makes the project known, as any command run there would."""
+    repo = env.tmp_path / "workstation" / name
+    repo.mkdir(parents=True)
+    env.run_command(["git", "init", "-q", "-b", "main"], cwd=repo)
+    env.run_command(["git", "remote", "add", "origin", str(origin)], cwd=repo)
+    if root is None:
+        sandbox = "sandbox:\n  enabled: true\n  backend: openshell\n"
+    else:
+        sandbox = (
+            "sandbox:\n  enabled: true\n  backend: loopback\n  loopback:\n"
+            f"    root: {root}\n    remote: {remote}\n"
+            f"    path: {path or f'code/{name}'}\n"
+        )
+    (repo / ".workmux.yaml").write_text("nerdfont: false\n" + sandbox + config)
+    run_workmux_command(
+        env, exe, repo, "remote list", pre_run_env=tmp_env, timeout=30.0
+    )
+    return repo
+
+
 @pytest.mark.tmux_only
-def test_remote_add_list_status_rm_against_a_loopback_remote(
+def test_remote_list_and_status_against_a_loopback_remote(
     mux_server: MuxEnvironment,
     workmux_exe_path: Path,
     repo_path: Path,
     short_tmp: dict,
 ):
-    """A loopback remote is reachable through the workstation daemon's control
-    channel; an unreachable one shows the transport's error."""
+    """A repository whose config puts it on a loopback remote makes that
+    remote known; it is reachable through the workstation daemon's control
+    channel, and an unreachable one shows the transport's error."""
     env = mux_server
     root = env.tmp_path / "remote-root"
     root.mkdir()
     missing = env.tmp_path / "no-such-root"
+    origin = env.tmp_path / "origin"
     version = env.run_command([str(workmux_exe_path), "--version"]).stdout.split()[-1]
 
-    remote(
+    nothing = remote(env, workmux_exe_path, repo_path, "list", short_tmp).stdout
+    assert "No remotes." in nothing
+    assert "sandbox.backend: openshell" in nothing
+    project_in_sandbox(env, workmux_exe_path, "api", origin, short_tmp, root=root)
+    project_in_sandbox(
         env,
         workmux_exe_path,
-        repo_path,
-        f"add lb --transport loopback --target {root}",
+        "web",
+        origin,
         short_tmp,
-    )
-    remote(
-        env,
-        workmux_exe_path,
-        repo_path,
-        f"add gone --transport loopback --target {missing}",
-        short_tmp,
+        root=missing,
+        remote="gone",
     )
     daemon_pid = None
     try:
@@ -133,310 +171,42 @@ def test_remote_add_list_status_rm_against_a_loopback_remote(
         assert "status:   unreachable" in failed.stdout
         assert f"Loopback root {missing} does not exist" in failed.stdout
 
-        remote(env, workmux_exe_path, repo_path, "rm gone", short_tmp)
-        listing = remote(env, workmux_exe_path, repo_path, "list", short_tmp).stdout
-        assert "gone" not in listing
-        assert "lb" in listing
-        config = (env.home_path / ".config" / "workmux" / "config.yaml").read_text()
-        assert "gone" not in config
+        refused = remote(
+            env, workmux_exe_path, repo_path, "rm gone", short_tmp, expect_fail=True
+        )
+        assert "workmux deletes only those" in refused.stderr
     finally:
         if daemon_pid is not None:
             os.kill(daemon_pid, signal.SIGTERM)
 
 
-@pytest.fixture
-def local_sshd(workmux_exe_path: Path):
-    """A user-mode sshd on a free localhost port, configured entirely from a
-    temp dir like the Rust SSH harness (never ~/.ssh or the system sshd).
-
-    Host `wmx-test` reaches a remote whose shell startup echoes noise and puts
-    workmux on PATH; `wmx-nowm` reaches the same server without workmux.
-    """
-    yield from start_local_sshd(workmux_exe_path)
-
-
-@pytest.fixture
-def fish_sshd(workmux_exe_path: Path):
-    """`local_sshd` whose remote login shell is fish (nix `fish` on PATH)."""
-    fish = shutil.which("fish")
-    if fish is None:
-        pytest.skip("put fish on PATH to run fish login shell tests")
-    yield from start_local_sshd(workmux_exe_path, fish=fish)
-
-
-def start_local_sshd(workmux_exe_path: Path, fish: str | None = None):
-    """Runs the sshd behind `local_sshd` and yields its `ssh_config`. With
-    `fish`, remote commands run in that fish as a fish login shell would run
-    them: the user's own login shell runs ForceCommand, which hands fish
-    $SSH_ORIGINAL_COMMAND unparsed."""
-    if os.environ.get("WORKMUX_TEST_SSH") != "1":
-        pytest.skip("set WORKMUX_TEST_SSH=1 to run SSH tests")
-    d = Path(tempfile.mkdtemp(prefix="wmx", dir="/tmp"))
-    for key in ["host_key", "client_key"]:
-        subprocess.run(
-            ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(d / key)],
-            check=True,
-        )
-    shutil.copy(d / "client_key.pub", d / "authorized_keys")
-    remote_home = d / "remote-home"
-    remote_home.mkdir()
-    rc = d / "rc"
-    rc.mkdir()
-    dtach_dir = Path(shutil.which("dtach") or "/usr/bin/dtach").parent
-    # A chatty shell startup must not break the control channel.
-    startup = (
-        "echo 'Welcome to the remote'; printf partial\n"
-        f"export HOME={remote_home} XDG_CONFIG_HOME={remote_home}/.config\n"
-        f"export XDG_STATE_HOME={remote_home}/.local/state\n"
-        f"export PATH={dtach_dir}:/usr/bin:/bin\n"
-        '[ -n "$WMX_NO_WORKMUX" ] || '
-        f"export PATH={workmux_exe_path.parent}:$PATH\n"
-    )
-    force_command = ""
-    if fish is None:
-        (rc / ".zshenv").write_text(startup)
-        (rc / ".bashrc").write_text(startup)
-    else:
-        (rc / ".zshenv").write_text("")
-        (rc / ".bashrc").write_text("")
-        (rc / "fish").mkdir()
-        (rc / "fish" / "config.fish").write_text(
-            "echo 'Welcome to the remote'; printf partial\n"
-            f"set -gx HOME {remote_home}; set -gx XDG_CONFIG_HOME {remote_home}/.config\n"
-            f"set -gx XDG_STATE_HOME {remote_home}/.local/state\n"
-            f"set -gx PATH {dtach_dir} /usr/bin /bin\n"
-            f"set -q WMX_NO_WORKMUX; or set -gx PATH {workmux_exe_path.parent} $PATH\n"
-        )
-        force_command = (
-            f"ForceCommand exec env XDG_CONFIG_HOME={rc} {fish}"
-            ' -c "$SSH_ORIGINAL_COMMAND"\n'
-        )
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        port = s.getsockname()[1]
-    (d / "sshd_config").write_text(
-        f"Port {port}\n"
-        "ListenAddress 127.0.0.1\n"
-        f"HostKey {d}/host_key\n"
-        f"AuthorizedKeysFile {d}/authorized_keys\n"
-        f"PidFile {d}/sshd.pid\n"
-        "PasswordAuthentication no\n"
-        "KbdInteractiveAuthentication no\n"
-        "UsePAM no\n"
-        "StrictModes no\n"
-        "AcceptEnv WMX_*\n"
-        f"SetEnv ZDOTDIR={rc} BASH_ENV={rc}/.bashrc\n" + force_command
-    )
-    user = os.environ["USER"]
-
-    def host(alias, extra=""):
-        return (
-            f"Host {alias}\n  HostName 127.0.0.1\n  Port {port}\n  User {user}\n"
-            f"  IdentityFile {d}/client_key\n  IdentitiesOnly yes\n"
-            "  IdentityAgent none\n  UserKnownHostsFile /dev/null\n"
-            "  StrictHostKeyChecking no\n  LogLevel ERROR\n" + extra
-        )
-
-    ssh_config = d / "ssh_config"
-    ssh_config.write_text(
-        host("wmx-test") + host("wmx-nowm", "  SetEnv WMX_NO_WORKMUX=1\n")
-    )
-    sshd = subprocess.Popen(
-        ["/usr/sbin/sshd", "-D", "-f", str(d / "sshd_config"), "-E", str(d / "log")]
-    )
-    deadline = time.monotonic() + 5
-    while True:
-        try:
-            socket.create_connection(("127.0.0.1", port), timeout=1).close()
-            break
-        except OSError:
-            assert time.monotonic() < deadline, (d / "log").read_text()
-            time.sleep(0.02)
-    yield ssh_config
-    sshd.kill()
-    # End the remote panes left running on the "remote".
-    subprocess.run(["pkill", "-f", f"dtach -n {d}/"], check=False)
-    sshd.wait()
-    shutil.rmtree(d, ignore_errors=True)
-
-
 @pytest.mark.tmux_only
-def test_remote_add_status_rm_against_ssh_to_localhost(
+def test_a_global_projects_registry_is_refused_naming_what_replaced_it(
     mux_server: MuxEnvironment,
     workmux_exe_path: Path,
     repo_path: Path,
     short_tmp: dict,
-    local_sshd: Path,
 ):
-    """An SSH remote is reachable through the workstation daemon; one without
-    workmux names the version to install."""
+    """A config still holding the withdrawn `projects:` registry fails with a
+    message naming the repository config that replaced it (ADR 0004)."""
     env = mux_server
-    version = env.run_command([str(workmux_exe_path), "--version"]).stdout.split()[-1]
-    # The daemon runs the system ssh from PATH; point it at the test config.
-    env.install_script(
-        env.fake_bin_dir / "ssh", f'#!/bin/sh\nexec /usr/bin/ssh -F {local_sshd} "$@"\n'
+    config = env.home_path / ".config" / "workmux" / "config.yaml"
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text(
+        "projects:\n  api:\n    git_url: https://example.com/api.git\n    openshell: {}\n"
     )
 
-    remote(
+    failed = run_workmux_command(
         env,
         workmux_exe_path,
         repo_path,
-        "add box --transport ssh --target wmx-test",
-        short_tmp,
+        "list",
+        pre_run_env=short_tmp,
+        expect_fail=True,
     )
-    remote(
-        env,
-        workmux_exe_path,
-        repo_path,
-        "add nowm --transport ssh --target wmx-nowm",
-        short_tmp,
-    )
-    daemon_pid = None
-    try:
-        status = remote(
-            env, workmux_exe_path, repo_path, "status box", short_tmp
-        ).stdout
-        assert "status:   reachable" in status
-        assert f"workmux:  {version}" in status
-        assert "protocol: 1" in status
 
-        # The workstation daemon holds the channel through ssh.
-        daemon_pid = remote_daemon_ping(env, workmux_exe_path, repo_path, short_tmp)[
-            "pid"
-        ]
-        children = subprocess.run(
-            ["pgrep", "-P", str(daemon_pid), "-f", "wmx-test"],
-            capture_output=True,
-            text=True,
-        ).stdout.split()
-        assert len(children) == 1
-
-        # End of input declines the offer to install workmux there.
-        failed = run_workmux_command(
-            env,
-            workmux_exe_path,
-            repo_path,
-            "remote status nowm",
-            pre_run_env=short_tmp,
-            stdin_input="",
-            expect_fail=True,
-            timeout=30.0,
-        )
-        assert "status:   unreachable" in failed.stdout
-        assert (
-            f"workmux is not installed on nowm: install workmux {version}"
-            in failed.stdout
-        )
-
-        remote(env, workmux_exe_path, repo_path, "rm nowm", short_tmp)
-        remote(env, workmux_exe_path, repo_path, "rm box", short_tmp)
-        listing = remote(env, workmux_exe_path, repo_path, "list", short_tmp).stdout
-        assert "box" not in listing
-        assert "nowm" not in listing
-    finally:
-        if daemon_pid is not None:
-            os.kill(daemon_pid, signal.SIGTERM)
-
-
-@pytest.mark.tmux_only
-def test_a_remote_without_workmux_gets_one_installed_on_yes_and_remembers(
-    mux_server: MuxEnvironment,
-    workmux_exe_path: Path,
-    repo_path: Path,
-    short_tmp: dict,
-    local_sshd: Path,
-):
-    """Checking an SSH remote without workmux offers to install this build
-    in the remote's cache directory; on yes the remote serves from there,
-    and the answer is kept so the next check asks nothing."""
-    env = mux_server
-    version = env.run_command([str(workmux_exe_path), "--version"]).stdout.split()[-1]
-    env.install_script(
-        env.fake_bin_dir / "ssh", f'#!/bin/sh\nexec /usr/bin/ssh -F {local_sshd} "$@"\n'
-    )
-    remote_home = local_sshd.parent / "remote-home"
-
-    def wm(command, stdin_input=None, expect_fail=False):
-        return run_workmux_command(
-            env,
-            workmux_exe_path,
-            repo_path,
-            command,
-            pre_run_env=short_tmp,
-            stdin_input=stdin_input,
-            expect_fail=expect_fail,
-            timeout=60.0,
-        )
-
-    wm("remote add nowm --transport ssh --target wmx-nowm")
-    daemon_pid = None
-    try:
-        # End of input answers nothing, and nothing is remembered.
-        unanswered = wm("remote status nowm", stdin_input="", expect_fail=True)
-        assert f"Install workmux {version} on nowm" in unanswered.stderr
-        assert "workmux remote upload nowm" in unanswered.stderr
-        assert "status:   unreachable" in unanswered.stdout
-
-        installed = wm("remote status nowm", stdin_input="y\n")
-        assert f"Install workmux {version} on nowm" in installed.stderr
-        assert "status:   reachable" in installed.stdout
-        assert f"workmux:  {version}" in installed.stdout
-        uploaded = remote_home / ".cache" / "workmux" / "bin" / version / "workmux"
-        assert uploaded.is_file()
-        config = (env.home_path / ".config" / "workmux" / "config.yaml").read_text()
-        assert "upload_workmux: true" in config
-
-        again = wm("remote status nowm")
-        assert "Install workmux" not in again.stderr
-        assert "status:   reachable" in again.stdout
-        daemon_pid = remote_daemon_ping(env, workmux_exe_path, repo_path, short_tmp)[
-            "pid"
-        ]
-    finally:
-        if daemon_pid is not None:
-            os.kill(daemon_pid, signal.SIGTERM)
-
-
-@pytest.mark.tmux_only
-def test_a_project_command_on_a_remote_without_workmux_runs_once_it_is_installed(
-    mux_server: MuxEnvironment,
-    workmux_exe_path: Path,
-    repo_path: Path,
-    short_tmp: dict,
-    local_sshd: Path,
-):
-    """A command for a project on an SSH remote without workmux offers the
-    install and, on yes, runs there."""
-    env = mux_server
-    env.install_script(
-        env.fake_bin_dir / "ssh", f'#!/bin/sh\nexec /usr/bin/ssh -F {local_sshd} "$@"\n'
-    )
-    origin = make_origin(env, env.tmp_path / "origin", "")
-
-    def wm(command, stdin_input=None):
-        return run_workmux_command(
-            env,
-            workmux_exe_path,
-            repo_path,
-            command,
-            pre_run_env=short_tmp,
-            stdin_input=stdin_input,
-            timeout=60.0,
-        )
-
-    wm("remote add nowm --transport ssh --target wmx-nowm")
-    wm(f"project add remote api --remote nowm --repo {origin} --path code/api")
-    daemon_pid = None
-    try:
-        listing = wm("list --project api", stdin_input="y\n")
-        assert "Install workmux" in listing.stderr
-        assert listing.stdout.splitlines()[1].split()[:2] == ["api@nowm", "main"]
-        daemon_pid = remote_daemon_ping(env, workmux_exe_path, repo_path, short_tmp)[
-            "pid"
-        ]
-    finally:
-        if daemon_pid is not None:
-            os.kill(daemon_pid, signal.SIGTERM)
+    assert "projects: is no longer read" in failed.stderr
+    assert "backend: openshell" in failed.stderr
 
 
 def remote_daemon_ping(env, exe, repo, tmp_env):
@@ -453,8 +223,9 @@ def test_remote_project_is_cloned_on_first_use_and_answers_list_and_path(
     repo_path: Path,
     short_tmp: dict,
 ):
-    """A project registered on a loopback remote is cloned on first use;
-    list and path run on the remote and keep their output and exit codes."""
+    """A repository whose config puts it on a loopback remote is cloned
+    there by the first command run in it, with no registration; list and
+    path run on the remote and keep their output and exit codes."""
     env = mux_server
     root = env.tmp_path / "remote-root"
     root.mkdir()
@@ -467,29 +238,30 @@ def test_remote_project_is_cloned_on_first_use_and_answers_list_and_path(
         cwd=origin,
     )
 
-    def wm(command, expect_fail=False):
+    def wm(command, expect_fail=False, cwd=None):
         return run_workmux_command(
             env,
             workmux_exe_path,
-            repo_path,
+            cwd or repo_path,
             command,
             pre_run_env=short_tmp,
             expect_fail=expect_fail,
             timeout=30.0,
         )
 
-    wm(f"remote add lb --transport loopback --target {root}")
-    added = wm(f"project add remote api --remote lb --repo {origin} --path code/api")
-    assert "Added project api on remote lb" in added.stdout
-    duplicate = wm(
-        f"project add remote api --remote lb --repo {origin}", expect_fail=True
+    workstation = env.tmp_path / "workstation" / "api"
+    workstation.mkdir(parents=True)
+    env.run_command(["git", "init", "-q", "-b", "main"], cwd=workstation)
+    env.run_command(["git", "remote", "add", "origin", str(origin)], cwd=workstation)
+    (workstation / ".workmux.yaml").write_text(
+        "nerdfont: false\nsandbox:\n  enabled: true\n  backend: loopback\n  loopback:\n"
+        f"    root: {root}\n    remote: lb\n    path: code/api\n"
     )
-    assert "project api already exists" in duplicate.stderr
 
     clone = root / "home" / "code" / "api"
     daemon_pid = None
     try:
-        listing = wm("list --project api")
+        listing = wm("list", cwd=workstation)
         assert clone.joinpath(".git").is_dir()
         assert "Cloning" in listing.stderr
         header, main_row = listing.stdout.splitlines()[:2]
@@ -645,14 +417,24 @@ def test_remote_add_places_windows_in_the_project_session(
             timeout=60.0,
         )
 
-    wm(f"remote add lb --transport loopback --target {root}")
-    wm(f"project add remote api --remote lb --repo {origin} --path code/api")
-    wm(
-        f"project add remote web --remote lb --repo {origin} --path code/web --session frontend"
+    project_in_sandbox(env, workmux_exe_path, "api", origin, short_tmp, root=root)
+    project_in_sandbox(
+        env,
+        workmux_exe_path,
+        "web",
+        origin,
+        short_tmp,
+        root=root,
+        config="project_session: frontend\n",
     )
-    wm(
-        f"project add remote docs --remote lb --repo {origin} --path code/docs"
-        " --placement current-session"
+    project_in_sandbox(
+        env,
+        workmux_exe_path,
+        "docs",
+        origin,
+        short_tmp,
+        root=root,
+        config="project_placement: current-session\n",
     )
     daemon_pid = None
     try:
@@ -756,8 +538,7 @@ def test_remote_git_commands_act_on_the_remote_repository(
         assert "not supported on a remote" not in result.stderr, result.stderr
         return result
 
-    wm(f"remote add lb --transport loopback --target {root}")
-    wm(f"project add remote api --remote lb --repo {origin} --path code/api")
+    project_in_sandbox(env, workmux_exe_path, "api", origin, short_tmp, root=root)
     clone = root / "home" / "code" / "api"
     worktrees = root / "home" / "code" / "api__worktrees"
     daemon_pid = None
@@ -827,145 +608,6 @@ def test_remote_git_commands_act_on_the_remote_repository(
 
 @requires_dtach
 @pytest.mark.tmux_only
-def test_remote_add_and_remove_over_ssh_to_localhost(
-    mux_server: MuxEnvironment,
-    workmux_exe_path: Path,
-    repo_path: Path,
-    short_tmp: dict,
-    local_sshd: Path,
-):
-    """`add` over the SSH transport creates the worktree on the remote and a
-    window in the project's session whose pane runs there; `remove` takes
-    the worktree, its branch and the window away again, after the
-    unmerged-branch confirmation is answered in the invoking terminal."""
-    env = mux_server
-    assert isinstance(env, TmuxEnvironment)
-    env.install_script(
-        env.fake_bin_dir / "ssh", f'#!/bin/sh\nexec /usr/bin/ssh -F {local_sshd} "$@"\n'
-    )
-    remote_home = local_sshd.parent / "remote-home"
-    origin = make_origin(
-        env,
-        env.tmp_path / "origin",
-        'post_create:\n  - echo "post-create ran in $PWD"\n'
-        "panes:\n  - command: pwd -P > pane-ran.txt\n",
-    )
-
-    def wm(command, stdin_input=None):
-        return run_workmux_command(
-            env,
-            workmux_exe_path,
-            repo_path,
-            command,
-            pre_run_env=short_tmp,
-            stdin_input=stdin_input,
-            timeout=60.0,
-        )
-
-    wm("remote add box --transport ssh --target wmx-test")
-    wm(f"project add remote api --remote box --repo {origin} --path code/api")
-    daemon_pid = None
-    try:
-        added = wm("add feature --project api")
-        daemon_pid = remote_daemon_ping(env, workmux_exe_path, repo_path, short_tmp)[
-            "pid"
-        ]
-        assert "post-create ran in" in added.stdout + added.stderr
-        worktree = remote_home / "code" / "api__worktrees" / "feature"
-        assert worktree.is_dir()
-        assert tmux_value(env, "=api:wm-feature", "#{session_name}") == "api"
-        assert session_tag(env, "api") == "box:api"
-        assert wait_for(worktree / "pane-ran.txt", timeout=30).strip() == str(
-            worktree.resolve()
-        )
-
-        env.tmux(["select-window", "-t", env.runner_pane_id or "test:0"])
-        env.run_command(["git", "add", "pane-ran.txt"], cwd=worktree)
-        env.run_command(
-            ["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q"]
-            + ["-m", "unmerged work"],
-            cwd=worktree,
-        )
-        removed = wm("remove feature --project api", stdin_input="y\n")
-        assert "Are you sure you want to continue? [y/N]" in removed.stdout
-        assert not worktree.exists()
-        branches = env.run_command(
-            ["git", "branch", "--list", "feature"], cwd=remote_home / "code" / "api"
-        ).stdout
-        assert branches.strip() == ""
-        windows = env.tmux(["list-windows", "-a", "-F", "#{window_name}"]).stdout
-        assert "wm-feature" not in windows.split()
-    finally:
-        if daemon_pid is not None:
-            os.kill(daemon_pid, signal.SIGTERM)
-
-
-@requires_dtach
-@pytest.mark.tmux_only
-def test_add_and_a_relayed_command_on_a_fish_login_shell_remote(
-    mux_server: MuxEnvironment,
-    workmux_exe_path: Path,
-    repo_path: Path,
-    short_tmp: dict,
-    fish_sshd: Path,
-):
-    """An SSH remote whose login shell is fish gets workmux installed, takes
-    `add`, and a relayed command's backslashes, quotes and spaces reach the
-    remote intact."""
-    env = mux_server
-    assert isinstance(env, TmuxEnvironment)
-    env.install_script(
-        env.fake_bin_dir / "ssh", f'#!/bin/sh\nexec /usr/bin/ssh -F {fish_sshd} "$@"\n'
-    )
-    remote_home = fish_sshd.parent / "remote-home"
-    origin = make_origin(
-        env, env.tmp_path / "origin", "panes:\n  - command: pwd -P > pane-ran.txt\n"
-    )
-
-    def wm(command, stdin_input=None):
-        return run_workmux_command(
-            env,
-            workmux_exe_path,
-            repo_path,
-            command,
-            pre_run_env=short_tmp,
-            stdin_input=stdin_input,
-            timeout=60.0,
-        )
-
-    # Without workmux on its PATH, the remote runs the one installed in its
-    # cache directory.
-    wm("remote add box --transport ssh --target wmx-nowm")
-    wm(f"project add remote api --remote box --repo {origin} --path code/api")
-    daemon_pid = None
-    try:
-        installed = wm("remote status box", stdin_input="y\n")
-        assert "status:   reachable" in installed.stdout
-        wm("add feature --project api")
-        daemon_pid = remote_daemon_ping(env, workmux_exe_path, repo_path, short_tmp)[
-            "pid"
-        ]
-        worktree = remote_home / "code" / "api__worktrees" / "feature"
-        assert wait_for(worktree / "pane-ran.txt", timeout=30).strip() == str(
-            worktree.resolve()
-        )
-
-        # The Rust fish tests' AWKWARD_ARGS, through the relay.
-        awkward = ["back\\slash", "two\\\\backslashes", "trailing\\", "it's"]
-        awkward += ["\\'", 'say "hi"', "two words", "$HOME (x) *", "~", ""]
-        awkward += ["line\nbreak"]
-        ran = wm(
-            "run feature --project api -- "
-            + shlex.join(["printf", "%s|", *awkward, "end"])
-        )
-        assert "".join(f"{arg}|" for arg in awkward) + "end|" in ran.stdout
-    finally:
-        if daemon_pid is not None:
-            os.kill(daemon_pid, signal.SIGTERM)
-
-
-@requires_dtach
-@pytest.mark.tmux_only
 def test_remote_remove_cleans_up_the_remote_worktree_branch_and_window(
     mux_server: MuxEnvironment,
     workmux_exe_path: Path,
@@ -1005,8 +647,7 @@ def test_remote_remove_cleans_up_the_remote_worktree_branch_and_window(
     def windows():
         return env.tmux(["list-windows", "-a", "-F", "#{window_name}"]).stdout.split()
 
-    wm(f"remote add lb --transport loopback --target {root}")
-    wm(f"project add remote api --remote lb --repo {origin} --path code/api")
+    project_in_sandbox(env, workmux_exe_path, "api", origin, short_tmp, root=root)
     daemon_pid = None
     try:
         wm("add feature --project api")
@@ -1090,8 +731,7 @@ def test_remote_merge_merges_in_the_remotes_clone_without_pushing(
     def head(repo: Path) -> str:
         return env.run_command(["git", "rev-parse", "main"], cwd=repo).stdout.strip()
 
-    wm(f"remote add lb --transport loopback --target {root}")
-    wm(f"project add remote api --remote lb --repo {origin} --path code/api")
+    project_in_sandbox(env, workmux_exe_path, "api", origin, short_tmp, root=root)
     workstation_head = head(repo_path)
     daemon_pid = None
     try:
@@ -1162,8 +802,7 @@ def test_commands_that_would_open_an_editor_refuse_for_a_remote_project(
             timeout=60.0,
         )
 
-    wm(f"remote add lb --transport loopback --target {root}")
-    wm(f"project add remote api --remote lb --repo {origin} --path code/api")
+    project_in_sandbox(env, workmux_exe_path, "api", origin, short_tmp, root=root)
     daemon_pid = None
     try:
         # Refused on the workstation: the remote is never even cloned.
@@ -1237,8 +876,9 @@ def test_a_prompt_file_is_read_on_the_workstation_for_a_remote_project(
     def prompt_of(branch):
         return (worktrees / branch / ".workmux" / f"PROMPT-{branch}.md").read_text()
 
-    wm(f"remote add lb --transport loopback --target {remote_root}")
-    wm(f"project add remote api --remote lb --repo {origin} --path code/api")
+    project_in_sandbox(
+        env, workmux_exe_path, "api", origin, short_tmp, root=remote_root
+    )
     daemon_pid = None
     try:
         missing = wm("add feature -P missing.md --project api", expect_fail=True)
@@ -1295,9 +935,11 @@ def test_a_workstation_agent_alias_runs_its_agent_type_on_a_remote_project(
             timeout=60.0,
         )
 
-    wm(f"remote add lb --transport loopback --target {remote_root}")
-    wm(f"project add remote api --remote lb --repo {origin} --path code/api")
+    project_in_sandbox(
+        env, workmux_exe_path, "api", origin, short_tmp, root=remote_root
+    )
     config_path = env.home_path / ".config" / "workmux" / "config.yaml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
     with config_path.open("a") as config:
         config.write(
             "agents:\n"
@@ -1361,8 +1003,7 @@ def test_ctrl_c_cancels_a_remote_command_during_a_long_hook(
             timeout=60.0,
         )
 
-    wm(f"remote add lb --transport loopback --target {root}")
-    wm(f"project add remote api --remote lb --repo {origin} --path code/api")
+    project_in_sandbox(env, workmux_exe_path, "api", origin, short_tmp, root=root)
     daemon_pid = None
     try:
         daemon_pid = remote_daemon_ping(env, workmux_exe_path, repo_path, short_tmp)[
@@ -1497,8 +1138,9 @@ def test_remote_panes_survive_drops_and_reattach(
             timeout=60.0,
         )
 
-    wm(f"remote add lb --transport loopback --target {remote_root}")
-    wm(f"project add remote api --remote lb --repo {origin} --path code/api")
+    project_in_sandbox(
+        env, workmux_exe_path, "api", origin, short_tmp, root=remote_root
+    )
     daemon_pid = None
     try:
         wm("add feature --project api")
@@ -1649,8 +1291,7 @@ def test_remote_agents_start_in_the_devshell_and_resume_conversations(
             timeout=60.0,
         )
 
-    wm(f"remote add lb --transport loopback --target {root}")
-    wm(f"project add remote api --remote lb --repo {origin} --path code/api")
+    project_in_sandbox(env, workmux_exe_path, "api", origin, short_tmp, root=root)
     worktrees = home / "code" / "api__worktrees"
     daemon_pid = None
     try:
@@ -1718,9 +1359,13 @@ def test_provisioning_installs_agent_hooks_and_status_warns_without_them(
             timeout=60.0,
         )
 
-    wm(f"remote add lb --transport loopback --target {provisioned}")
-    wm(f"remote add bare --transport loopback --target {bare}")
-    wm(f"project add remote api --remote lb --repo {origin} --path code/api")
+    project_in_sandbox(
+        env, workmux_exe_path, "api", origin, short_tmp, root=provisioned
+    )
+    # A second project on a remote never provisioned for it.
+    project_in_sandbox(
+        env, workmux_exe_path, "other", origin, short_tmp, root=bare, remote="bare"
+    )
     daemon_pid = None
     try:
         listing = wm("list --project api")
@@ -1853,8 +1498,9 @@ def test_remote_agent_status_shows_live_turns_stale_and_catches_up_on_reconnect(
             f"the {status} hook",
         )
 
-    wm(f"remote add lb --transport loopback --target {remote_root}")
-    wm(f"project add remote api --remote lb --repo {origin} --path code/api")
+    project_in_sandbox(
+        env, workmux_exe_path, "api", origin, short_tmp, root=remote_root
+    )
     daemon_pid = None
     feed = None
     try:
@@ -1979,8 +1625,9 @@ def test_open_and_resurrect_reattach_to_surviving_remote_panes(
     def window_gone(window: str) -> bool:
         return env.tmux(["list-panes", "-t", window], check=False).returncode != 0
 
-    wm(f"remote add lb --transport loopback --target {remote_root}")
-    wm(f"project add remote api --remote lb --repo {origin} --path code/api")
+    project_in_sandbox(
+        env, workmux_exe_path, "api", origin, short_tmp, root=remote_root
+    )
     daemons = []
     try:
         wm("add feature --project api")
@@ -2062,8 +1709,9 @@ def test_remote_run_executes_in_the_remote_worktree(
             timeout=60.0,
         )
 
-    wm(f"remote add lb --transport loopback --target {remote_root}")
-    wm(f"project add remote api --remote lb --repo {origin} --path code/api")
+    project_in_sandbox(
+        env, workmux_exe_path, "api", origin, short_tmp, root=remote_root
+    )
     daemon_pid = None
     try:
         wm("add feature --project api")
@@ -2157,8 +1805,9 @@ def test_reap_agents_reaps_aged_agents_on_the_remote(
             )
         )
 
-    wm(f"remote add lb --transport loopback --target {remote_root}")
-    wm(f"project add remote api --remote lb --repo {origin} --path code/api")
+    project_in_sandbox(
+        env, workmux_exe_path, "api", origin, short_tmp, root=remote_root
+    )
     daemon_pid = None
     try:
         busy = add_agent("busy")
@@ -2241,8 +1890,9 @@ def test_close_and_remove_end_the_worktrees_unshown_remote_panes_too(
     def running() -> int:
         return len(pids(holders))
 
-    wm(f"remote add lb --transport loopback --target {remote_root}")
-    wm(f"project add remote api --remote lb --repo {origin} --path code/api")
+    project_in_sandbox(
+        env, workmux_exe_path, "api", origin, short_tmp, root=remote_root
+    )
     daemon_pid = None
     try:
         wm("add feature --project api")
@@ -2374,8 +2024,11 @@ def test_commands_typed_in_a_remote_pane_reach_the_workstation(
             ["list-windows", "-a", "-F", "#{session_name}:#{window_name}"]
         ).stdout.split()
 
-    wm(f"remote add lb --transport loopback --target {root} --host-command pwd")
-    wm(f"project add remote api --remote lb --repo {origin} --path code/api")
+    # Global config allows the remote to run `pwd` on the workstation.
+    global_config = env.home_path / ".config" / "workmux" / "config.yaml"
+    global_config.parent.mkdir(parents=True, exist_ok=True)
+    global_config.write_text("sandbox:\n  host_commands: [pwd]\n")
+    project_in_sandbox(env, workmux_exe_path, "api", origin, short_tmp, root=root)
     daemon_pid = None
     try:
         wm("add feature --project api")
@@ -2550,8 +2203,9 @@ def test_agent_commands_reach_remote_agents_from_the_workstation(
             ["display-message", "-p", "-c", client, "#{pane_id}"]
         ).stdout.strip()
 
-    wm(f"remote add lb --transport loopback --target {remote_root}")
-    wm(f"project add remote api --remote lb --repo {origin} --path code/api")
+    project_in_sandbox(
+        env, workmux_exe_path, "api", origin, short_tmp, root=remote_root
+    )
     daemon_pid = None
     feed = None
     try:
@@ -2731,8 +2385,9 @@ def test_dashboard_reviews_stages_and_closes_a_remote_worktree(
             timeout=60.0,
         )
 
-    wm(f"remote add lb --transport loopback --target {remote_root}")
-    wm(f"project add remote api --remote lb --repo {origin} --path code/api")
+    project_in_sandbox(
+        env, workmux_exe_path, "api", origin, short_tmp, root=remote_root
+    )
     daemon_pid = None
     feed = None
     try:
@@ -2903,8 +2558,9 @@ def test_dashboard_worktrees_tab_lists_adds_closes_and_removes_remote_worktrees(
             timeout=60.0,
         )
 
-    wm(f"remote add lb --transport loopback --target {remote_root}")
-    wm(f"project add remote api --remote lb --repo {origin} --path code/api")
+    project_in_sandbox(
+        env, workmux_exe_path, "api", origin, short_tmp, root=remote_root
+    )
     clone = remote_root / "home" / "code" / "api"
     worktrees = remote_root / "home" / "code" / "api__worktrees"
     daemon_pid = None
@@ -3035,8 +2691,9 @@ def test_dashboard_shows_pr_status_for_a_remote_projects_branches_while_unreacha
             timeout=60.0,
         )
 
-    wm(f"remote add lb --transport loopback --target {remote_root}")
-    wm(f"project add remote api --remote lb --repo {origin} --path code/api")
+    project_in_sandbox(
+        env, workmux_exe_path, "api", origin, short_tmp, root=remote_root
+    )
     daemon_pid = None
     try:
         wm("add feature --project api")
@@ -3160,7 +2817,9 @@ esac
             timeout=30.0,
         )
 
-    wm("project add openshell api --repo https://example.com/api.git")
+    project_in_sandbox(
+        env, workmux_exe_path, "api", "https://example.com/api.git", short_tmp
+    )
     env.tmux(["new-session", "-d", "-s", "api", "-n", "wm-feature"])
     env.tmux(["set-option", "-t", "=api:", "@workmux_project", "api:api"])
     env.tmux(
@@ -3196,67 +2855,6 @@ esac
     assert "mine" in windows
     sessions = env.tmux(["list-sessions", "-F", "#{session_name}"]).stdout.split()
     assert "api" not in sessions
-
-
-@pytest.mark.tmux_only
-def test_removing_a_project_closes_its_workstation_windows_and_keeps_its_remote(
-    mux_server: MuxEnvironment,
-    workmux_exe_path: Path,
-    repo_path: Path,
-    short_tmp: dict,
-):
-    """`project rm` asks first, then unregisters the project and closes every
-    workstation window tagged with it, untagging its adopted session. Its
-    remote stays registered; nothing is run on the remote."""
-    env = mux_server
-    assert isinstance(env, TmuxEnvironment)
-
-    def wm(command, stdin_input=None):
-        return run_workmux_command(
-            env,
-            workmux_exe_path,
-            repo_path,
-            command,
-            stdin_input=stdin_input,
-            pre_run_env=short_tmp,
-            timeout=30.0,
-        )
-
-    wm("remote add devbox --transport ssh --target devbox")
-    wm("project add remote api --remote devbox --repo git@example.com:me/api.git")
-    env.tmux(["new-window", "-d", "-t", "test:", "-n", "wm-feature"])
-    env.tmux(
-        [
-            "set-option",
-            "-w",
-            "-t",
-            "=test:wm-feature",
-            "@workmux_project_window",
-            "devbox:api",
-        ]
-    )
-    env.tmux(["set-option", "-t", "=test:", "@workmux_project", "devbox:api"])
-    env.tmux(["new-window", "-d", "-t", "test:", "-n", "mine"])
-    config_path = env.home_path / ".config" / "workmux" / "config.yaml"
-
-    kept = wm("project rm api", stdin_input="n\n")
-
-    assert "Kept project api" in kept.stdout
-    assert "api:" in config_path.read_text()
-    windows = env.tmux(["list-windows", "-a", "-F", "#{window_name}"]).stdout.split()
-    assert "wm-feature" in windows
-
-    removed = wm("project rm api --yes")
-
-    assert "Closed 1 workstation window(s) of project api" in removed.stderr
-    config = config_path.read_text()
-    assert "api:" not in config
-    assert "devbox:" in config
-    windows = env.tmux(["list-windows", "-a", "-F", "#{window_name}"]).stdout.split()
-    assert "wm-feature" not in windows
-    assert "mine" in windows
-    tag = env.tmux(["show-options", "-qv", "-t", "=test:", "@workmux_project"])
-    assert tag.stdout.strip() == ""
 
 
 FAKE_OPENSHELL = """#!/usr/bin/env python3
@@ -3351,10 +2949,21 @@ def test_a_command_for_every_project_checks_each_remotes_state_once(
     daemon_pid = None
     try:
         for name in ("api", "web"):
-            wm(
-                f"project add openshell {name} --repo {origin} "
-                f"--path {state}/{name}/{name}"
+            project_in_sandbox(
+                env,
+                workmux_exe_path,
+                name,
+                origin,
+                short_tmp,
+                config=f"  openshell:\n    path: {state}/{name}/{name}\n",
             )
+        # Making the projects known opened channels; start cold.
+        setup_daemon = remote_daemon_ping(env, workmux_exe_path, repo_path, short_tmp)
+        os.kill(setup_daemon["pid"], signal.SIGTERM)
+        wait_until(
+            lambda: not pid_alive(setup_daemon["pid"]), "the setup daemon to exit"
+        )
+        log.unlink(missing_ok=True)
         cold = wm("reap-agents")
         daemon_pid = remote_daemon_ping(env, workmux_exe_path, repo_path, short_tmp)[
             "pid"

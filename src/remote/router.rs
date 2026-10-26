@@ -98,7 +98,7 @@ pub fn resolve(explicit: Option<&str>) -> Result<Option<RemoteProject>> {
 /// Whether this process runs on a remote (for a command session, in a
 /// remote pane's shell, or in an OpenShell sandbox), where the project's
 /// config describes the sandbox it is already in.
-fn on_a_remote() -> bool {
+pub fn on_a_remote() -> bool {
     ServedProject::current().is_some()
         || super::shell::Shell::current().is_some()
         || std::env::var_os(super::openshell::SANDBOX_ENV).is_some()

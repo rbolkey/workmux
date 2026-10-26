@@ -142,7 +142,7 @@ fn project_in(
                 anyhow!("sandbox.loopback.root is required for the loopback backend")
             })?,
             builtin_shims: None,
-            host_commands: Vec::new(),
+            host_commands: config.sandbox.host_commands().to_vec(),
             openshell: None,
         },
         _ => {
@@ -163,7 +163,7 @@ fn project_in(
                     .clone()
                     .unwrap_or_else(|| openshell_sandbox_name(&name)),
                 builtin_shims: None,
-                host_commands: Vec::new(),
+                host_commands: config.sandbox.host_commands().to_vec(),
                 openshell: Some(OpenshellRemote {
                     project: name.clone(),
                     git_url: Some(git_url.clone()),
@@ -571,6 +571,22 @@ mod tests {
         assert_eq!(project.remote.transport, TransportKind::Loopback);
         assert_eq!(project.remote.target, "/tmp/lb");
         assert_eq!(project.remote.openshell, None);
+    }
+
+    #[test]
+    fn a_remote_may_run_the_host_commands_global_config_allows() {
+        let global = config("sandbox:\n  host_commands: [just]\n");
+        let project = config(&format!("{OPENSHELL}  host_commands: [curl]\n"));
+
+        let project = project_in(
+            &global.merge_for_test(project),
+            Path::new("/src/api"),
+            Some("https://github.com/me/api.git"),
+            &none,
+        )
+        .unwrap();
+
+        assert_eq!(project.remote.host_commands, ["just"]);
     }
 
     #[test]
