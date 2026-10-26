@@ -234,6 +234,8 @@ The step that builds the devshell has no secret, so the flake's builders and `sh
 
 The image is fixed when the sandbox is created. When the clone's `flake.lock` no longer matches the baked one, `remote status` warns, and `workmux remote recreate` rebuilds the image.
 
+The image's tag follows what the bake reads: `flake.nix`, `flake.lock`, and the files and directories the flake names by path (`./nix/shell.nix`, `"${self}/nix"`), followed through the `.nix` files among them. Change any of them and `workmux remote recreate` gives the sandbox a new image. Changes to the rest of the repository don't. Neither does a file the flake reads through a path it builds from a string at evaluation time.
+
 A devbox project gets no devshell in a sandbox. Put its toolchain in your `image`. `remote status` says so.
 
 ## Policy
