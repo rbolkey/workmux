@@ -42,9 +42,9 @@ sandbox:
 
 Settings merge as any other setting does: the repository's value overrides your global config's, key by key. `providers` is the exception. It is read only from global config, and a repository's `.workmux.yaml` setting it is ignored with a warning, so a repository can't commit `providers: [gh-login]` and receive your GitHub login. Every OpenShell sandbox gets the same providers; tokens scoped to what your projects need bound what each one can reach.
 
-The project is named after the repository: the directory name of your clone. The sandbox clones the repository from your clone's `origin`. The sandbox is named after your clone, as Lima VMs are: up to 10 characters of the directory name and a hash of the clone's full path, such as `api-1a2b3c4d`, within OpenShell's rules (lowercase letters, digits and hyphens, up to 19 characters). Config can't name a sandbox, so no repository can reach another's. Two clones get two sandboxes, even of the same repository, and a clone moved to another path gets a new one.
+The project is named after the repository: the directory name of your clone. The sandbox clones the repository from your clone's `origin`. The sandbox is named after your clone in the format of a project's Lima VM name: `wm-`, up to 7 characters of the directory name and the first 8 hex digits of the sha256 of the clone's full path, such as `wm-api-79949073`, within OpenShell's rules (lowercase letters, digits and hyphens, up to 19 characters). Config can't name a sandbox, so no repository can reach another's. Two clones get two sandboxes, even of the same repository, and a clone moved to another path gets a new one.
 
-The sandbox is the project's remote, so there is nothing to register. Run in the repository, `workmux remote status` shows the sandbox before any other command has created it.
+The sandbox is the project's remote, so there is nothing to register. Run in the repository, `workmux sandbox status` shows the sandbox before any other command has created it.
 
 Git credentials and agent API keys should come from OpenShell providers, so that secrets never sit in the sandbox environment. See [Git and GitHub](#git-and-github) for git.
 
@@ -140,42 +140,44 @@ The proxy substitutes credentials only in HTTPS, and no profile allows SSH. work
   The sandbox's identity is the provider's, which may not be your SSH key's: a work-account key and a personal `gh` login reach different repositories. With no GitHub provider attached, the note adds that public repositories will clone, but private ones and push need `gh-login` or another GitHub provider. workmux can't tell whether a repository is private, so it doesn't fail.
 
 - An SSH origin on any other host fails: set `origin` to an `https://` URL.
-- `remote status` and the first-use clone show the URL as `https://github.com/me/api.git (rewritten from SSH: git@github.com:me/api.git)`.
+- `sandbox status` and the first-use clone show the URL as `https://github.com/me/api.git (rewritten from SSH: git@github.com:me/api.git)`.
 - Inside the sandbox, the image rewrites `git@github.com:` and `ssh://git@github.com/` to `https://github.com/` with git's `url.<base>.insteadOf`, so submodules and URLs an agent types go over HTTPS too. On your workstation, workmux still clones the original URL to look for a flake devshell.
 
 Not covered: SSH hosts other than github.com. For private nix flake inputs, in the devshell bake and in the sandbox, see [Nix devshells](#nix-devshells).
 
 ## Lifecycle
 
-workmux creates and starts the sandbox for you, and stops or deletes it only when you ask.
+workmux creates and starts the sandbox for you, and stops, rebuilds or deletes it only when you ask, with the [`workmux sandbox`](/reference/commands/sandbox/#openshell-commands) commands Lima VMs use.
 
 - **Create.** The first command that acts in the project, such as `workmux add`, builds the image, creates the sandbox and clones the repository, with the notice `Creating remote api on first use; …`.
 - **Start.** A command that acts in a stopped sandbox starts it first (`Starting remote api…`).
-- **Never just to look.** Commands that only report never create or start a sandbox: `list`, `path`, `status`, `wait`, `remote status`, `remote list`, the sidebar and the dashboard. With no sandbox yet, they say `workmux add <branch>` creates it; with a stopped one, they say `workmux remote start` starts it. `resurrect` and `reap-agents` don't create or start one either; they skip it with a notice and don't count it as a failure.
+- **Never just to look.** Commands that only report never create or start a sandbox: `list`, `path`, `status`, `wait`, `sandbox status`, the sidebar and the dashboard. With no sandbox yet, they say `workmux add <branch>` creates it; with a stopped one, that the next command that needs it starts it. `resurrect` and `reap-agents` don't create or start one either; they skip it with a notice and don't count it as a failure.
 
 ```bash
 # run in your clone of the repository
-workmux remote stop      # stop the sandbox; the workspace survives
-workmux remote start     # start it again (creating it if missing)
-workmux remote recreate  # delete and recreate, carrying committed work across
-workmux remote rm        # delete the sandbox
+workmux sandbox status   # the sandbox's state, versions, policy and agents
+workmux sandbox shell    # a shell in the sandbox, in the current worktree
+workmux sandbox stop     # stop sandboxes; their workspaces survive
+workmux sandbox rebuild  # delete and recreate, carrying committed work across
+workmux sandbox prune    # delete workmux's sandboxes, after naming the work they hold
 ```
 
-**Stopping ends every process in the sandbox**, agents included. The worktrees and status files survive, but agents do not: after `remote start`, workstation panes find their remote panes ended and close. Reopen the worktree with `workmux open`.
+**Stopping ends every process in the sandbox**, agents included. The worktrees and status files survive, but agents do not: once the sandbox starts again, workstation panes find their remote panes ended and close. There is no start command; the next command that needs the sandbox, such as `workmux open`, starts it. Reopen the worktree with `workmux open`.
 
-### Deleting a sandbox
+`stop` and `prune` act on every sandbox whose name has workmux's `wm-` prefix, and on no other: a sandbox named by an older workmux, without the prefix, is no longer found, and the next command in its repository creates a `wm-` one. Delete the old one with `openshell sandbox delete <name>` once its work is pushed.
 
-`workmux remote rm` deletes the sandbox and everything in it, because nothing is mounted from your workstation. Before it asks for confirmation, it lists the work at risk, worktree by worktree and branch by branch:
+### Deleting sandboxes
 
-- uncommitted changes
-- commits that are on no remote-tracking branch, so exist only in the sandbox
-- branches not merged into the project's base branch
+`workmux sandbox prune` deletes workmux's sandboxes and everything in them, because nothing is mounted from your workstation. Before it asks for confirmation, it checks each one, worktree by worktree and branch by branch, as `workmux remove` checks a worktree:
 
-It starts a stopped sandbox to check, and stops it again if you decline. Once the sandbox is deleted, it closes the project's workstation windows. The next workmux command in the repository creates a new sandbox. `-y` skips the confirmation.
+- **Uncommitted changes** refuse, naming each sandbox, as does a sandbox that could not be checked.
+- **Commits on no remote-tracking branch**, which exist only in the sandbox and are lost with it, and **branches not merged into their base** (the base `workmux add` recorded, else the default branch) are named in the confirmation.
 
-### Recreating a sandbox
+It starts a stopped sandbox to check, and stops it again if nothing is deleted. Once a sandbox is deleted, it closes its project's workstation windows. The next command in the repository that needs a sandbox creates a new one. `--force` skips the check and the confirmation and deletes them all, uncommitted changes included.
 
-Some changes need a new sandbox: a narrowed policy, a changed image, or a new devshell. workmux never recreates on its own; it warns and points at `workmux remote recreate`. A recreate:
+### Rebuilding a sandbox
+
+Some changes need a new sandbox: a narrowed policy, a changed image, or a new devshell. workmux never rebuilds on its own; it warns and points at `workmux sandbox rebuild`. A rebuild:
 
 1. refuses while any worktree has uncommitted changes, and names them
 2. confirms, naming unmerged work, because agents' remote panes are lost (`-y` skips this)
@@ -184,7 +186,7 @@ Some changes need a new sandbox: a narrowed policy, a changed image, or a new de
 5. restores the clone: branches, tags, remotes, upstreams and every worktree at its path
 6. reinstalls agent hooks
 
-If the restore fails, run `workmux remote recreate` again. It resumes from the kept bundle without deleting the sandbox again.
+If the restore fails, run `workmux sandbox rebuild` again. It resumes from the kept bundle without deleting the sandbox again.
 
 ## Image
 
@@ -220,7 +222,7 @@ These are the paths OpenShell's example provider profiles allow, so a provider m
 
 The sandbox runs the agent's plain CLI, not your workstation's agent command. The image records the default agent in `/etc/workmux/default-agent`. Remote workmux uses it when no config in the sandbox names an agent, and counts it as a configured agent, so a project without panes of its own gets an agent pane. A `--agent` given to `add` is passed to remote workmux as it is, so give it the agent's plain CLI (`-a codex`) rather than a workstation alias.
 
-`remote status` lists each agent and the attached providers whose profile allows its binary, whatever the provider's type. It warns when none does, and so does creating the sandbox:
+`sandbox status` lists each agent and the attached providers whose profile allows its binary, whatever the provider's type. It warns when none does, and so does creating the sandbox:
 
 ```text
 agent:    claude: installed at /usr/local/bin/claude; its credentials come from a provider whose profile allows it, such as one of type claude-code
@@ -243,7 +245,7 @@ An OpenShell sandbox follows `sandbox.toolchain` as a Lima sandbox does. When it
 
 nix in the sandbox is for working on the flake itself: `nix flake check`, `nix develop` while you change the flake, or `nix profile install` to test that it installs. It builds without nix's own build sandbox (`sandbox = false`), which needs kernel namespaces OpenShell sandboxes don't have. The devshell and the flake's inputs are in its store already, and are garbage collection roots, so `nix develop` doesn't fetch them again. `nix profile install` puts commands in `~/.nix-profile/bin`, which isn't on `PATH`.
 
-`nix develop` sees your edits to the flake at once. Panes and agents keep the baked devshell until `workmux remote recreate` builds a new image, so changing the environment for agents still means committing the flake change, pushing it and recreating the sandbox.
+`nix develop` sees your edits to the flake at once. Panes and agents keep the baked devshell until `workmux sandbox rebuild` builds a new image, so changing the environment for agents still means committing the flake change, pushing it and rebuilding the sandbox.
 
 nix reaches the binary cache (`cache.nixos.org`), the flake registry (`channels.nixos.org`, `releases.nixos.org`) and GitHub (`github.com`, `api.github.com`, `codeload.github.com`, read-only), through the `workmux-nix` rule in the sandbox's [policy](#policy). For private `github:` inputs, the sandbox's `nix` command gives nix the placeholder token of the provider that gives GitHub credentials (`GH_TOKEN` or `GITHUB_TOKEN`) as its access token for github.com, and OpenShell's proxy swaps in the real token. `git+https://github.com/…` inputs use git's credential helper, as git does. The sandbox has no network interface besides loopback, so nix warns `you don't have Internet access` and fetches anyway. Other hosts, such as another binary cache, need a rule in your policy file for the nix binary (`/nix/store/*/bin/nix`). The token and a fix for garbage collection come from the image's `nix` command (`/usr/local/bin/nix` and the `nix-*` commands beside it); a nix your devshell puts first on `PATH` reads the same configuration but goes without them.
 
@@ -255,9 +257,9 @@ nix reaches the binary cache (`cache.nixos.org`), the flake registry (`channels.
 
 The step that builds the devshell has no secret, so the flake's builders and `shellHook` can't read the token. Any other project's bake gets no token: a private input fails it with nix's `HTTP error 404` or `Cannot find Git revision`, and workmux says private GitHub flake inputs need `gh-login` in `sandbox.openshell.providers`. Private inputs on other git servers aren't covered.
 
-The image is fixed when the sandbox is created. It follows what the bake reads: `flake.nix`, `flake.lock`, and the files and directories the flake names by path (`./nix/shell.nix`, `"${self}/nix"`), followed through the `.nix` files among them. When any of them in the clone no longer match the baked ones, `remote status` warns, and `workmux remote recreate` gives the sandbox a new image. Changes to the rest of the repository don't. Neither does a file the flake reads through a path it builds from a string at evaluation time.
+The image is fixed when the sandbox is created. It follows what the bake reads: `flake.nix`, `flake.lock`, and the files and directories the flake names by path (`./nix/shell.nix`, `"${self}/nix"`), followed through the `.nix` files among them. When any of them in the clone no longer match the baked ones, `sandbox status` warns, and `workmux sandbox rebuild` gives the sandbox a new image. Changes to the rest of the repository don't. Neither does a file the flake reads through a path it builds from a string at evaluation time.
 
-A devbox project gets no devshell and no nix in a sandbox. Put its toolchain in your `image`. `remote status` says so.
+A devbox project gets no devshell and no nix in a sandbox. Put its toolchain in your `image`. `sandbox status` says so.
 
 ## Policy
 
@@ -281,9 +283,9 @@ Your `policy` file is merged on top:
 - `network_policies`: the rules of both. A rule name in both files is refused.
 - Any other section: yours.
 
-`workmux remote status` shows the sandbox's effective policy (read-only and read-write paths, workdir, network rules) and warns when it differs from the project's.
+`workmux sandbox status` shows the sandbox's effective policy (read-only and read-write paths, workdir, network rules) and warns when it differs from the project's.
 
-When you edit the policy file, the next command brings a running sandbox in line. Network rules apply at once. Filesystem grants that are added take effect after `remote stop` and `remote start`. A grant that is removed needs `workmux remote recreate`, because OpenShell can't narrow a live sandbox's filesystem policy; workmux warns instead.
+When you edit the policy file, the next command brings a running sandbox in line. Network rules apply at once. Filesystem grants that are added take effect once `workmux sandbox stop` has stopped the sandbox and the next command has started it. A grant that is removed needs `workmux sandbox rebuild`, because OpenShell can't narrow a live sandbox's filesystem policy; workmux warns instead.
 
 ## Troubleshooting
 

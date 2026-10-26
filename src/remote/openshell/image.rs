@@ -428,7 +428,7 @@ pub fn devshell_digest(dir: &Path) -> String {
 /// directory (`./.`), which is the whole repository: the image follows the
 /// devshell, not the project's source. Nix can read files in ways this
 /// does not see (paths built from strings at evaluation time); those
-/// changes need `workmux remote recreate` after a change to the flake.
+/// changes need `workmux sandbox rebuild` after a change to the flake.
 pub fn devshell_inputs(dir: &Path) -> BTreeMap<String, String> {
     let mut inputs = BTreeMap::new();
     let mut pending = vec!["flake.nix".to_string(), "flake.lock".to_string()];

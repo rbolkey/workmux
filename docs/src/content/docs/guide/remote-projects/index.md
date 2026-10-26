@@ -12,8 +12,8 @@ You use workmux commands on a remote project the same way you use them on one on
 ## How it works
 
 - **Remote workmux.** The same `workmux` binary runs in the sandbox. It does all the git, worktree, config and hook work there. It reads the project's `.workmux.yaml` from the sandbox's clone.
-- **Control channel.** The workstation daemon opens one control channel per remote by running `workmux remote serve` through `openshell sandbox exec`. It speaks over that process's stdin and stdout. The sandbox never connects back to your workstation, so it needs no network route to it.
-- **Remote panes.** Agents and shells run in the sandbox inside a **session holder** ([dtach](https://github.com/crigler/dtach)), so they keep running through a dropped connection or a laptop sleep. A workstation pane is only a view onto its remote pane. It runs `workmux remote attach` and reattaches on its own.
+- **Control channel.** The workstation daemon opens one control channel per remote by running workmux's internal `remote serve` command through `openshell sandbox exec`. It speaks over that process's stdin and stdout. The sandbox never connects back to your workstation, so it needs no network route to it.
+- **Remote panes.** Agents and shells run in the sandbox inside a **session holder** ([dtach](https://github.com/crigler/dtach)), so they keep running through a dropped connection or a laptop sleep. A workstation pane is only a view onto its remote pane. It runs workmux's internal `remote attach` command and reattaches on its own.
 - **Status.** Agent hooks in the sandbox write each agent's status to a file. Remote workmux sends those files over the control channel, so the sidebar updates live. Changes made while you were disconnected arrive on reconnect, with their original times.
 
 ## Set up a project
@@ -53,7 +53,7 @@ Outside any repository and any project window, they fail and tell you to run the
 
 Run from a remote worktree's window, commands with no worktree name act on that worktree, as they do on the workstation.
 
-A remote project is named after its repository: the directory name of your clone. Its sandbox is named after the clone's path (see [OpenShell projects](/guide/remote-projects/openshell/)), so two clones get two sandboxes, even of the same repository. workmux stores nothing about a project. In the sidebar, dashboard and `workmux status` a remote project shows as `name@remote`, for example `api@api-1a2b3c4d`, so it never merges with a project of the same name on the workstation. Agent selectors accept `feature`, `api:feature` and `api@api-1a2b3c4d:feature`.
+A remote project is named after its repository: the directory name of your clone. Its sandbox is named after the clone's path (see [OpenShell projects](/guide/remote-projects/openshell/)), so two clones get two sandboxes, even of the same repository. workmux stores nothing about a project. In the sidebar, dashboard and `workmux status` a remote project shows as `name@remote`, for example `api@wm-api-79949073`, so it never merges with a project of the same name on the workstation. Agent selectors accept `feature`, `api:feature` and `api@wm-api-79949073:feature`.
 
 `resurrect` and `reap-agents` run on the workstation and then on every remote project with an open window on the workstation, and on the project of the clone you run them in (after the tmux server restarts no window is left, so run `resurrect` in the clone). Each project's output appears under a `<project> (on <remote>):` heading.
 
@@ -97,11 +97,10 @@ The control channel stays open while any workstation pane shows one of that remo
 ## Checking a remote
 
 ```bash
-workmux remote list      # each remote and whether it is reachable
-workmux remote status    # versions, warnings, and the error when unreachable
+workmux sandbox status   # state, versions, warnings, and the error when unreachable
 ```
 
-Run in a repository whose config puts it in a sandbox, they include that sandbox even before any other command has run there. An unreachable remote is reported in the transport's own words. `remote status` warns when:
+Run in a repository whose config puts it in a sandbox, it shows that sandbox even before any other command has created it, and never creates or starts it. An unreachable remote is reported in the transport's own words. It warns when:
 
 - dtach is missing in the sandbox
 - an agent in the sandbox has no status hooks (its agents show no status in the sidebar; run `workmux setup --hooks` there)

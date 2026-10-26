@@ -88,7 +88,7 @@ impl RemoteProject {
                     .map(|c| c.to_uppercase().chain(first).collect::<String>())
                     .unwrap_or_default();
                 Some(format!(
-                    "{target} is stopped; `workmux remote start` starts it"
+                    "{target} is stopped; the next command that needs it, such as `workmux open`, starts it"
                 ))
             }
         }
@@ -982,7 +982,7 @@ agents:
         assert_eq!(
             api.not_running(RemoteState::Stopped).as_deref(),
             Some(
-                "OpenShell sandbox wm-api (project api) is stopped; `workmux remote start` starts it"
+                "OpenShell sandbox wm-api (project api) is stopped; the next command that needs it, such as `workmux open`, starts it"
             )
         );
     }

@@ -72,12 +72,12 @@ requires_dtach = pytest.mark.skipif(
 )
 
 
-def remote(env, exe, repo, command, tmp_env, expect_fail=False):
+def sandbox(env, exe, repo, command, tmp_env, expect_fail=False):
     return run_workmux_command(
         env,
         exe,
         repo,
-        f"remote {command}",
+        f"sandbox {command}",
         pre_run_env=tmp_env,
         expect_fail=expect_fail,
         timeout=30.0,
@@ -130,47 +130,36 @@ def project_tag(env, remote: str, name: str) -> str:
 
 
 def openshell_sandbox_name(clone: Path) -> str:
-    """The OpenShell sandbox name workmux derives from a clone's path."""
+    """The OpenShell sandbox name workmux derives from a clone's path, in
+    the format of a project's Lima VM name: `wm-<project>-<hash8>`, the
+    project cut to fit OpenShell's 19 characters, the hash from sha256."""
     root = os.path.realpath(clone)
     digest = hashlib.sha256(root.encode()).hexdigest()[:8]
-    prefix = ""
-    for c in os.path.basename(root):
-        if c.isascii() and c.isalnum():
-            prefix += c.lower()
-        elif prefix and not prefix.endswith("-"):
-            prefix += "-"
-    prefix = prefix[:10].strip("-")
-    return f"{prefix}-{digest}" if prefix else f"wm-{digest}"
+    project = re.sub(r"[^a-z0-9]+", "-", os.path.basename(root).lower()).strip("-")
+    project = project[:7].rstrip("-")
+    return f"wm-{project}-{digest}" if project else f"wm-{digest}"
 
 
 @pytest.mark.tmux_only
-def test_remote_list_and_status_against_a_loopback_remote(
+def test_sandbox_status_against_a_loopback_remote(
     mux_server: MuxEnvironment,
     workmux_exe_path: Path,
     repo_path: Path,
     short_tmp: dict,
 ):
-    """A repository whose config puts it on a loopback remote lists that
-    remote when run in it; it is reachable through the workstation daemon's
-    control channel, and an unreachable one shows the transport's error."""
+    """`sandbox status` in a repository whose config puts it on a loopback
+    remote shows that remote reachable through the workstation daemon's
+    control channel, and an unreachable one with the transport's error. A
+    repository with no sandbox runs on the workstation."""
     env = mux_server
     root = env.tmp_path / "remote-root"
     root.mkdir()
     missing = env.tmp_path / "no-such-root"
-    origin = env.tmp_path / "origin"
+    origin = make_origin(env, env.tmp_path / "origin", "panes: []\n")
     version = env.run_command([str(workmux_exe_path), "--version"]).stdout.split()[-1]
-    # A gateway with no sandboxes, whatever OpenShell this machine has.
-    stub = env.tmp_path / "stub-bin"
-    stub.mkdir()
-    (stub / "openshell").write_text(
-        '#!/bin/sh\necho \'{"next_page_token":"","sandboxes":[]}\'\n'
-    )
-    (stub / "openshell").chmod(0o755)
-    short_tmp = {**short_tmp, "PATH": f"{stub}:{env.env['PATH']}"}
 
-    nothing = remote(env, workmux_exe_path, repo_path, "list", short_tmp).stdout
-    assert "No remotes." in nothing
-    assert "sandbox.backend: openshell" in nothing
+    here = sandbox(env, workmux_exe_path, repo_path, "status", short_tmp).stdout
+    assert "This repository runs on the workstation" in here
     project_in_sandbox(env, workmux_exe_path, "api", origin, short_tmp, root=root)
     project_in_sandbox(
         env,
@@ -183,27 +172,22 @@ def test_remote_list_and_status_against_a_loopback_remote(
     )
     daemon_pid = None
     try:
-
-        def rows(clone):
-            listing = remote(env, workmux_exe_path, clone, "list", short_tmp).stdout
-            return {
-                line.split()[0]: line
-                for line in listing.splitlines()[1:]
-                if line.strip()
-            }
-
-        assert rows(clone_of(env, "api"))["lb"].rstrip().endswith("reachable")
-        assert (
-            f"unreachable: Loopback root {missing} does not exist"
-            in rows(clone_of(env, "web"))["gone"]
-        )
-
-        status = remote(
+        status = sandbox(
             env, workmux_exe_path, clone_of(env, "api"), "status", short_tmp
         ).stdout
+        assert status.startswith("lb (loopback ")
         assert "status:   reachable" in status
         assert f"workmux:  {version}" in status
         assert "protocol: 1" in status
+
+        # A shell opens in the sandbox's clone (here, under the loopback
+        # root), creating the clone on first use.
+        shell = sandbox(
+            env, workmux_exe_path, clone_of(env, "api"), "shell -- pwd", short_tmp
+        )
+        assert shell.stdout.strip().splitlines()[-1] == os.path.realpath(
+            root / "home" / "code" / "api"
+        )
 
         # The workstation daemon holds the channel: remote workmux runs as
         # its child, rooted in the loopback root.
@@ -217,14 +201,16 @@ def test_remote_list_and_status_against_a_loopback_remote(
         assert len(children) == 1
 
         web = clone_of(env, "web")
-        failed = remote(
+        failed = sandbox(
             env, workmux_exe_path, web, "status", short_tmp, expect_fail=True
         )
         assert "status:   unreachable" in failed.stdout
         assert f"Loopback root {missing} does not exist" in failed.stdout
 
-        refused = remote(env, workmux_exe_path, web, "rm", short_tmp, expect_fail=True)
-        assert "only those are deleted" in refused.stderr
+        refused = sandbox(
+            env, workmux_exe_path, web, "rebuild", short_tmp, expect_fail=True
+        )
+        assert "only those are rebuilt" in refused.stderr
     finally:
         if daemon_pid is not None:
             os.kill(daemon_pid, signal.SIGTERM)
@@ -1465,7 +1451,7 @@ def test_provisioning_installs_agent_hooks_and_status_warns_without_them(
     short_tmp: dict,
 ):
     """The first use of a remote project installs agent hooks on the remote
-    without asking. `remote status` warns about a remote whose agents have
+    without asking. `sandbox status` warns about a remote whose agents have
     no hooks."""
     env = mux_server
     provisioned = env.tmp_path / "provisioned"
@@ -1504,14 +1490,14 @@ def test_provisioning_installs_agent_hooks_and_status_warns_without_them(
         )
         assert "hooks" in settings
 
-        status = wm("remote status", cwd=clone_of(env, "api")).stdout
+        status = wm("sandbox status", cwd=clone_of(env, "api")).stdout
         assert "status:   reachable" in status
         # Agents found on the workstation's PATH (the loopback shares it)
         # may warn too; Claude Code's hooks were installed.
         assert "Claude Code has no status hooks" not in status, status
         assert "dtach" not in status, status
 
-        status = wm("remote status", cwd=clone_of(env, "other")).stdout
+        status = wm("sandbox status", cwd=clone_of(env, "other")).stdout
         assert "status:   reachable" in status
         assert (
             "warning:  Claude Code has no status hooks on this remote,"
@@ -2909,48 +2895,64 @@ def test_dashboard_shows_pr_status_for_a_remote_projects_branches_while_unreacha
 
 
 @pytest.mark.tmux_only
-def test_removing_an_openshell_project_closes_its_workstation_windows(
+def test_pruning_openshell_sandboxes_closes_their_workstation_windows(
     mux_server: MuxEnvironment,
     workmux_exe_path: Path,
     repo_path: Path,
     short_tmp: dict,
 ):
-    """`remote rm` on an OpenShell project deletes its sandbox and closes
-    every workstation window tagged with the project, leaving the user's
-    other windows alone. `openshell` is a fake on PATH."""
+    """`sandbox prune` deletes workmux's (`wm-`) sandboxes after one
+    confirmation, which names the commits that exist only in them, and
+    closes every workstation window tagged with their projects, leaving the
+    user's other windows and other sandboxes alone. `openshell` is a fake on
+    PATH."""
     env = mux_server
     assert isinstance(env, TmuxEnvironment)
     state = env.tmp_path / "openshell"
     state.mkdir()
-    (state / "phase").write_text("Ready")
+    clone = project_in_sandbox(
+        env, workmux_exe_path, "api", "https://example.com/api.git", short_tmp
+    )
+    sandbox = openshell_sandbox_name(clone)
+    (state / f"phase-{sandbox}").write_text("Ready")
+    (state / "phase-trellis-7fba5166").write_text("Ready")
     env.install_script(
         env.fake_bin_dir / "openshell",
         f"""#!/bin/sh
 printf '%s\\n' "$*" >> {state}/log
 case "$1 $2" in
+'sandbox list')
+  printf '{{"next_page_token":"","sandboxes":['
+  sep=
+  for entry in {sandbox}:api trellis-7fba5166:trellis; do
+    name=${{entry%:*}}
+    [ -e {state}/phase-$name ] || continue
+    printf '%s{{"name":"%s","phase":"%s","annotations":{{"workmux.project":"%s"}}}}' \\
+      "$sep" $name "$(cat {state}/phase-$name)" "${{entry#*:}}"
+    sep=,
+  done
+  printf ']}}' ;;
 'sandbox get')
-  [ -e {state}/phase ] || {{ echo "sandbox not found" >&2; exit 1; }}
-  printf '{{"phase":"%s","policy":{{}}}}' "$(cat {state}/phase)" ;;
-'sandbox delete') rm -f {state}/phase ;;
-'sandbox exec') echo '[]' ;;
+  [ -e {state}/phase-$3 ] || {{ echo "sandbox not found" >&2; exit 1; }}
+  printf '{{"phase":"%s","policy":{{}}}}' "$(cat {state}/phase-$3)" ;;
+'sandbox delete') rm -f {state}/phase-$3 ;;
+'sandbox exec') echo '[{{"path":null,"branch":"spike","uncommitted":false,"unpushed":1,"unmerged_into":null}}]' ;;
 esac
 """,
     )
 
-    def wm(command, cwd=None):
+    def wm(command, cwd=None, stdin_input=None):
         return run_workmux_command(
             env,
             workmux_exe_path,
             cwd or repo_path,
             command,
             pre_run_env=short_tmp,
+            stdin_input=stdin_input,
             timeout=30.0,
         )
 
-    clone = project_in_sandbox(
-        env, workmux_exe_path, "api", "https://example.com/api.git", short_tmp
-    )
-    tag = project_tag(env, openshell_sandbox_name(clone), "api")
+    tag = project_tag(env, sandbox, "api")
     env.tmux(["new-session", "-d", "-s", "api", "-n", "wm-feature"])
     env.tmux(["set-option", "-t", "=api:", "@workmux_project", tag])
     env.tmux(
@@ -2976,10 +2978,16 @@ esac
     )
     env.tmux(["new-window", "-d", "-t", "test:", "-n", "mine"])
 
-    removed = wm("remote rm --yes", cwd=clone_of(env, "api"))
+    pruned = wm("sandbox prune", cwd=clone_of(env, "api"), stdin_input="y\n")
 
-    assert "sandbox delete" in (state / "log").read_text()
-    assert "Closed 2 workstation window(s) of project api" in removed.stderr
+    assert sandbox in pruned.stdout
+    assert f"{sandbox}: branch spike: 1 commit not on any remote" in pruned.stdout
+    assert "trellis-7fba5166" not in pruned.stdout
+    log = (state / "log").read_text()
+    assert f"sandbox delete {sandbox}" in log
+    assert "trellis-7fba5166" not in log
+    assert (state / "phase-trellis-7fba5166").exists()
+    assert "Closed 2 workstation window(s) of project api" in pruned.stderr
     windows = env.tmux(["list-windows", "-a", "-F", "#{window_name}"]).stdout.split()
     assert "wm-feature" not in windows
     assert "wm-other" not in windows
@@ -3139,7 +3147,8 @@ def test_read_only_commands_never_create_or_start_an_openshell_sandbox(
     short_tmp: dict,
 ):
     """In a repository whose config puts it in an OpenShell sandbox,
-    commands that only report say the sandbox doesn't exist yet, or is
+    commands that only report (`sandbox status` among them) say the
+    sandbox doesn't exist yet, or is
     stopped, and never create, start or build it. `openshell` and `docker`
     are fakes on PATH that log every call."""
     env = mux_server
@@ -3194,8 +3203,9 @@ esac
     missing = wm("path feature", expect_fail=True)
     assert "No OpenShell sandbox for trellis yet" in missing.stderr
     wm("status")
-    assert "not created yet" in wm("remote status").stdout
-    assert "not created yet" in wm("remote list").stdout
+    status = wm("sandbox status").stdout
+    assert status.startswith(f"{sandbox} (openshell {sandbox})"), status
+    assert "not created yet" in status
     assert calls() <= {"sandbox get", "sandbox list"}
 
     # A stopped sandbox.
@@ -3205,8 +3215,7 @@ esac
     assert wm("list --json").stdout.strip() == "[]"
     assert stopped in wm("path feature", expect_fail=True).stderr
     wm("status")
-    assert "stopped" in wm("remote status").stdout
-    assert "stopped" in wm("remote list").stdout
+    assert "stopped" in wm("sandbox status").stdout
     assert calls() <= {"sandbox get", "sandbox list"}
     assert (state / "phase").read_text() == "Stopped"
     assert not (state / "docker-log").exists()

@@ -1268,39 +1268,21 @@ impl LoopbackConfig {
 /// OpenShell's limit on sandbox name length.
 const SANDBOX_NAME_MAX: usize = 19;
 
-/// The sandbox name for the OpenShell project whose clone is `root`, as
-/// Lima's VM names are derived: its directory's name and a hash of its
-/// canonical path, within OpenShell's rules (lowercase letters, digits and
-/// hyphens, at most 19 characters). Config cannot name a sandbox, so no
-/// repository can reach another's.
+/// The sandbox name for the OpenShell project whose clone is `root`, in the
+/// format of a project's Lima VM name (`wm-<project>-<hash8>`), with the
+/// project cut to fit OpenShell's limit. The hash is the first 8 hex digits
+/// of the canonical path's sha256, not Lima's `DefaultHasher`, which Rust
+/// may change between releases: a renamed sandbox would strand its work.
+/// Config cannot name a sandbox, so no repository can reach another's.
 pub fn openshell_sandbox_name(root: &Path) -> String {
     use sha2::Digest;
-    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    let hash = sha2::Sha256::digest(root.to_string_lossy().as_bytes());
-    let suffix: String = hash[..4].iter().map(|b| format!("{b:02x}")).collect();
-    let mut prefix = String::new();
-    for c in root
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default()
-        .chars()
-    {
-        if c.is_ascii_alphanumeric() {
-            prefix.push(c.to_ascii_lowercase());
-        } else if !prefix.is_empty() && !prefix.ends_with('-') {
-            prefix.push('-');
-        }
-    }
-    let prefix: String = prefix
-        .chars()
-        .take(SANDBOX_NAME_MAX - suffix.len() - 1)
-        .collect();
-    let prefix = prefix.trim_matches('-');
-    if prefix.is_empty() {
-        format!("wm-{suffix}")
-    } else {
-        format!("{prefix}-{suffix}")
-    }
+    // "wm-" + project + "-" + hash8 within the limit.
+    crate::sandbox::lima::project_name(root, SANDBOX_NAME_MAX - "wm-".len() - 1 - 8, |key| {
+        sha2::Sha256::digest(key.as_bytes())[..4]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    })
 }
 
 impl RemoteConfig {
@@ -4752,7 +4734,8 @@ sandbox:
     }
 
     #[test]
-    fn an_openshell_sandbox_is_named_after_its_clones_directory_and_path() {
+    fn an_openshell_sandbox_is_named_in_limas_format_with_a_stable_hash() {
+        // Paths that don't exist are taken as they are.
         let name = |path: &str| super::openshell_sandbox_name(std::path::Path::new(path));
         let fits = |name: &str| {
             name.len() <= 19
@@ -4761,23 +4744,18 @@ sandbox:
                     .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
         };
 
-        let api = name("/src/api");
-        assert!(api.starts_with("api-"), "{api}");
-        assert_eq!(api.len(), "api-".len() + 8, "{api}");
-        assert_eq!(name("/src/api"), api);
+        // `wm-<project>-<hash8>`, as Lima names a project's VM, with the
+        // first 8 hex digits of the path's sha256 (stable across Rust
+        // releases, unlike Lima's hash).
+        assert_eq!(name("/src/api"), "wm-api-79949073");
         // Two repositories with the same directory name get two sandboxes.
-        assert_ne!(name("/work/api"), api);
-        for odd in [
-            "/src/a-very-long-project-name",
-            "/src/My_App.v2",
-            "/src/___",
-            "/",
-        ] {
+        assert_eq!(name("/work/api"), "wm-api-c24c3b62");
+        assert_eq!(name("/src/My_App.v2"), "wm-my-app-faac9882");
+        for odd in ["/src/a-very-long-project-name", "/src/___", "/"] {
             assert!(fits(&name(odd)), "{}", name(odd));
         }
-        assert!(name("/src/a-very-long-project-name").starts_with("a-very-lon-"));
-        assert!(name("/src/My_App.v2").starts_with("my-app-v2-"));
-        assert!(name("/src/___").starts_with("wm-"));
+        assert!(name("/src/a-very-long-project-name").starts_with("wm-a-very-"));
+        assert_eq!(name("/src/___").len(), "wm-".len() + 8);
     }
 
     #[test]

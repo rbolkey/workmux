@@ -783,7 +783,8 @@ enum Commands {
     /// Manage sandbox settings
     Sandbox(command::sandbox::SandboxArgs),
 
-    /// Manage remotes: project hosts reached through a transport
+    /// Internal commands for remote panes and transports
+    #[command(hide = true)]
     Remote(command::remote::RemoteArgs),
 
     /// Set agent status for the current tmux window (used by hooks)
@@ -1544,16 +1545,48 @@ mod tests {
     }
 
     #[test]
-    fn remote_lifecycle_commands_take_no_name() {
-        // They act on the current repository's sandbox.
-        for sub in ["status", "start", "stop", "recreate", "rm"] {
+    fn openshell_sandboxes_are_managed_under_sandbox_not_remote() {
+        for sub in ["list", "status", "start", "stop", "recreate", "rm"] {
             assert!(
-                Cli::try_parse_from(["workmux", "remote", sub]).is_ok(),
+                Cli::try_parse_from(["workmux", "remote", sub]).is_err(),
                 "remote {sub}"
             );
+        }
+        // They act on the current repository's sandbox.
+        for sub in ["status", "rebuild"] {
             assert!(
-                Cli::try_parse_from(["workmux", "remote", sub, "api"]).is_err(),
-                "remote {sub} api"
+                Cli::try_parse_from(["workmux", "sandbox", sub]).is_ok(),
+                "sandbox {sub}"
+            );
+            assert!(
+                Cli::try_parse_from(["workmux", "sandbox", sub, "api"]).is_err(),
+                "sandbox {sub} api"
+            );
+        }
+        assert!(Cli::try_parse_from(["workmux", "sandbox", "rebuild", "--yes"]).is_ok());
+        assert!(Cli::try_parse_from(["workmux", "sandbox", "prune", "--force"]).is_ok());
+        assert!(Cli::try_parse_from(["workmux", "sandbox", "stop", "wm-api-1a2b3c4d"]).is_ok());
+
+        let help = Cli::command().render_help().to_string();
+        assert!(!help.contains("remote"), "{help}");
+        let mut sandbox = Cli::command().find_subcommand("sandbox").unwrap().clone();
+        let help = sandbox.render_help().to_string();
+        let openshell = help
+            .split_once("OpenShell commands:")
+            .map(|(_, rest)| rest.split("\n\n").next().unwrap_or_default())
+            .unwrap_or_else(|| panic!("{help}"));
+        for sub in ["stop", "prune", "rebuild"] {
+            assert!(
+                openshell
+                    .lines()
+                    .any(|line| line.trim_start().starts_with(sub)),
+                "{sub} in {openshell}"
+            );
+        }
+        for sub in ["status", "shell"] {
+            assert!(
+                help.lines().any(|line| line.trim_start().starts_with(sub)),
+                "{sub} in {help}"
             );
         }
     }

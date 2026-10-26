@@ -32,8 +32,9 @@ pub struct AtRisk {
     /// Commits on no remote-tracking branch: unpushed, and unmerged into
     /// anything pushed.
     pub unpushed: usize,
-    /// The project's base branch, when the branch has commits not merged
-    /// into it (pushed or not).
+    /// The branch's base (the one `workmux add` stored for it, else the
+    /// default branch), when the branch has commits not merged into it
+    /// (pushed or not), as `workmux remove` decides.
     #[serde(default)]
     pub unmerged_into: Option<String>,
 }
@@ -162,46 +163,12 @@ fn unpushed(clone: &Path, rev: &str) -> Result<usize> {
         .with_context(|| format!("Unreadable commit count {count:?}"))
 }
 
-/// The project's base branch: its configured `main_branch`, else the
-/// clone's default branch. `None` when neither can be told.
-fn base_branch(clone: &Path) -> Option<String> {
-    crate::config::Config::load_with_location_from(clone, None)
-        .ok()
-        .and_then(|(config, _)| config.main_branch)
-        .or_else(|| crate::git::get_default_branch_in(Some(clone)).ok())
-}
-
-/// Whether `branch` has commits merged into neither the local `base` nor
-/// origin's.
-fn unmerged(clone: &Path, branch: &str, base: &str) -> Result<bool> {
-    let mut args = vec!["rev-list".to_string(), "--count".to_string()];
-    args.push(format!("refs/heads/{branch}"));
-    args.push("--not".to_string());
-    for base in [
-        format!("refs/heads/{base}"),
-        format!("refs/remotes/origin/{base}"),
-    ] {
-        if git(clone, &["rev-parse", "--verify", "--quiet", &base]).is_ok() {
-            args.push(base);
-        }
-    }
-    let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    Ok(git(clone, &args)?.trim() != "0")
-}
-
 /// Every worktree and branch of the clone at `clone` whose work exists
-/// only here, or is not merged into the project's base branch.
+/// only here, or is not merged into its base.
 pub fn at_risk(clone: &Path) -> Result<Vec<AtRisk>> {
     let worktrees = worktrees(clone)?;
-    let base = base_branch(clone);
-    let unmerged_into = |branch: &str| -> Result<Option<String>> {
-        match &base {
-            Some(base) if base != branch && unmerged(clone, branch, base)? => {
-                Ok(Some(base.clone()))
-            }
-            _ => Ok(None),
-        }
-    };
+    // As `workmux remove` decides, so remove, rebuild and prune agree.
+    let unmerged_into = |branch: &str| crate::git::branch_unmerged_base_in(branch, Some(clone));
     let mut risks = Vec::new();
     let mut checked_out = Vec::new();
     for worktree in &worktrees {
@@ -210,7 +177,7 @@ pub fn at_risk(clone: &Path) -> Result<Vec<AtRisk>> {
             Head::Detached(commit) => (None, commit.clone()),
         };
         checked_out.extend(branch.clone());
-        let uncommitted = !git(&worktree.path, &["status", "--porcelain"])?.is_empty();
+        let uncommitted = crate::git::has_uncommitted_changes(&worktree.path)?;
         let unpushed = unpushed(clone, &rev)?;
         let unmerged_into = match &branch {
             Some(branch) => unmerged_into(branch)?,
@@ -543,7 +510,7 @@ pub fn recreate(
         )
     };
     let (bundle, manifest) = if let Some(kept_work) = kept_work(keep)? {
-        notice("Restoring the work an earlier recreate kept…");
+        notice("Restoring the work an earlier rebuild kept…");
         kept_work
     } else {
         let uncommitted: Vec<String> = remote_at_risk(transport, path)?
@@ -553,7 +520,7 @@ pub fn recreate(
             .collect();
         if !uncommitted.is_empty() {
             bail!(
-                "These worktrees have uncommitted changes, which a recreate would lose; commit or discard them first:\n  {}",
+                "These worktrees have uncommitted changes, which a rebuild would lose; commit or discard them first:\n  {}",
                 uncommitted.join("\n  ")
             );
         }
@@ -702,6 +669,40 @@ mod tests {
                 "branch spike: 2 commits not on any remote, not merged into main".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn a_branch_merged_into_the_base_it_was_added_from_is_merged() {
+        // As `workmux remove` decides: against the base `add` stored for the
+        // branch, else the default branch.
+        let project = Project::new();
+        run_git(&project.clone, &["branch", "--quiet", "develop"]);
+        run_git(&project.clone, &["push", "--quiet", "origin", "develop"]);
+        let feature = project.worktree("feature");
+        run_git(&feature, &["reset", "--quiet", "--hard", "develop"]);
+        project.commit(&feature, "a.txt");
+        run_git(&feature, &["push", "--quiet", "-u", "origin", "feature"]);
+        run_git(
+            &project.clone,
+            &[
+                "config",
+                "--local",
+                "branch.feature.workmux-base",
+                "develop",
+            ],
+        );
+        run_git(
+            &project.clone,
+            &["branch", "--quiet", "-f", "develop", "feature"],
+        );
+
+        let risks: Vec<String> = at_risk(&project.clone)
+            .unwrap()
+            .iter()
+            .map(AtRisk::describe)
+            .collect();
+
+        assert_eq!(risks, ["branch develop: not merged into main"]);
     }
 
     #[test]

@@ -3,8 +3,8 @@
 Env-gated: `WORKMUX_TEST_OPENSHELL=1`. The workmux under test is a dev
 build, so workmux builds a Linux workmux from this checkout into the sandbox
 image; `WORKMUX_OPENSHELL_WORKMUX`, when set, points at a Linux build to use
-instead. Each test owns one `wm-e20-…` project and sandbox, and deletes the
-sandbox and the images built for it.
+instead. Each test owns one `wm-e20-…` project and its sandbox
+(`wm-wm-e20-…`), and deletes the sandbox and the images built for it.
 """
 
 import json
@@ -65,7 +65,7 @@ done
 
 class Project:
     """An OpenShell project named `wm-e20-…`, in the sandbox workmux names
-    after its workstation clone (`wm-e20-…-<hash>`)."""
+    after its workstation clone (`wm-wm-e20-<hash8>`)."""
 
     def __init__(self, env: MuxEnvironment, exe: Path, repo: Path, tmp: dict):
         self.name = f"wm-e20-{uuid.uuid4().hex[:4]}"
@@ -135,6 +135,13 @@ class Project:
             return None
         return json.loads(result.stdout)["phase"]
 
+    def stop(self):
+        """Stop the sandbox as `sandbox stop` does, through `openshell`:
+        workmux's own stop lists every `wm-` sandbox on the gateway, so it
+        is tested against a fake one only."""
+        openshell(["sandbox", "stop", self.sandbox], timeout=300)
+        wait_until(lambda: self.phase() == "Stopped", "the sandbox to stop", 300.0)
+
     def make_origin(self):
         """A repository in the sandbox that the project clones on first use."""
         self.sh(
@@ -190,9 +197,15 @@ def project(mux_server, workmux_exe_path, repo_path, short_tmp):
     project.clean_up()
 
 
+def create_sandbox(project: Project, timeout: float):
+    """Create the project's sandbox before anything is cloned in it: a
+    rebuild of a sandbox that doesn't exist yet only creates it."""
+    return project.wm("sandbox rebuild --yes", timeout=timeout)
+
+
 def add_project(project: Project):
     project.configure("/sandbox/origin", LEARNING_IMAGE)
-    started = project.wm("remote start", timeout=600.0)
+    started = create_sandbox(project, timeout=600.0)
     assert f"Creating remote {project.sandbox} on first use" in started.stderr
     assert project.phase() == "Ready"
     project.make_origin()
@@ -220,15 +233,15 @@ def test_listing_a_new_openshell_project_creates_nothing(project: Project):
     assert images == []
 
 
-def test_an_openshell_project_lives_stops_resumes_and_is_removed_with_its_sandbox(
+def test_an_openshell_project_lives_stops_and_resumes_with_its_sandbox(
     project: Project,
 ):
     """add → agent status in the sidebar → stop → stale → start → reconnect
-    → remove, with the sandbox created on first use and deleted on request."""
+    → remove, with the sandbox created on first use."""
     env = project.env
     assert isinstance(env, TmuxEnvironment)
     add_project(project)
-    status = project.wm("remote status").stdout
+    status = project.wm("sandbox status").stdout
     assert "status:   reachable" in status, status
     assert "read-write: /tmp, /dev/null, /dev/pts, /dev/ptmx" in status, status
 
@@ -259,8 +272,7 @@ def test_an_openshell_project_lives_stops_resumes_and_is_removed_with_its_sandbo
 
         # Stopped only on request; the agent turns stale, and status never
         # starts the sandbox.
-        stopped = project.wm("remote stop", timeout=300.0)
-        assert "Stopped remote" in stopped.stdout
+        project.stop()
         feed.wait(
             lambda s: (
                 agent_in(s, pane).get("remote", {}).get("stale")
@@ -269,15 +281,16 @@ def test_an_openshell_project_lives_stops_resumes_and_is_removed_with_its_sandbo
             "the entry to turn stale",
             timeout=60.0,
         )
-        status = project.wm("remote status").stdout
+        status = project.wm("sandbox status").stdout
         assert "status:   stopped" in status, status
         project.wm("resurrect")
         assert project.phase() == "Stopped"
 
-        # Started on request: the channel reconnects and the workspace is
-        # intact.
-        project.wm("remote start", timeout=300.0)
-        status = project.wm("remote status").stdout
+        # Started by a command that needs it, here a shell in the sandbox:
+        # the channel reconnects and the workspace is intact.
+        shell = project.wm("sandbox shell -- true", timeout=300.0)
+        assert "Starting remote" in shell.stderr, shell.stderr
+        status = project.wm("sandbox status").stdout
         assert "status:   reachable" in status, status
         listing = project.wm("list").stdout
         assert "feature" in listing, listing
@@ -288,7 +301,7 @@ def test_an_openshell_project_lives_stops_resumes_and_is_removed_with_its_sandbo
         # A command that acts on a stopped sandbox starts it itself (a
         # read-only one, such as path, never does); path then finds the
         # worktree in it.
-        project.wm("remote stop", timeout=300.0)
+        project.stop()
         added = project.wm("add second", timeout=300.0)
         assert "Starting remote" in added.stderr
         path = project.wm("path feature", timeout=60.0)
@@ -303,22 +316,9 @@ def test_an_openshell_project_lives_stops_resumes_and_is_removed_with_its_sandbo
         if daemon_pid is not None:
             os.kill(daemon_pid, 15)
 
-    # Delete names work that exists only in the sandbox, and asks first.
-    project.sh(
-        f"cd /sandbox/{project.name} && git checkout -q -b spike && "
-        "git -c user.name=t -c user.email=t@t commit -q --allow-empty -m wip && "
-        "git checkout -q main"
-    )
-    kept = project.wm("remote rm", stdin="n\n")
-    assert "branch spike: 1 commit not on any remote" in kept.stdout, kept.stdout
-    assert project.phase() == "Ready"
-    removed = project.wm("remote rm --yes", timeout=300.0)
-    assert "Deleted sandbox" in removed.stdout
-    assert project.phase() is None
 
-
-def test_a_recreate_carries_a_worktree_and_its_commit_across(project: Project):
-    """Commit on a worktree branch, recreate: the branch and the worktree are
+def test_a_rebuild_carries_a_worktree_and_its_commit_across(project: Project):
+    """Commit on a worktree branch, rebuild: the branch and the worktree are
     back with the commit, in a new sandbox."""
     add_project(project)
     project.wm("add feature", timeout=120.0)
@@ -333,12 +333,12 @@ def test_a_recreate_carries_a_worktree_and_its_commit_across(project: Project):
         openshell(["sandbox", "get", project.sandbox, "-o", "json"]).stdout
     )["id"]
 
-    refused = project.wm("remote recreate --yes", expect_fail=True, timeout=120.0)
+    refused = project.wm("sandbox rebuild --yes", expect_fail=True, timeout=120.0)
     assert "uncommitted changes" in refused.stderr, refused.stderr
     assert f"{worktree} (branch feature)" in refused.stderr, refused.stderr
 
     project.sh(f"rm {worktree}/draft.txt")
-    project.wm("remote recreate --yes", timeout=900.0)
+    project.wm("sandbox rebuild --yes", timeout=900.0)
 
     after = json.loads(
         openshell(["sandbox", "get", project.sandbox, "-o", "json"]).stdout
@@ -400,7 +400,7 @@ def test_an_openshell_sandbox_follows_the_sandbox_settings_of_every_backend(
     project.tmp["WM_E20_PASSED"] = "from the workstation"
     note = f"Note: extra_mounts is ignored for OpenShell sandbox {project.sandbox}"
 
-    started = project.wm("remote start", timeout=600.0)
+    started = create_sandbox(project, timeout=600.0)
 
     assert note in started.stderr, started.stderr
     project.make_origin()
@@ -433,7 +433,7 @@ def test_an_openshell_projects_sandbox_runs_claude_code(project: Project):
     sandbox with no credentials attached."""
     env = project.env
     project.configure("/sandbox/origin", LEARNING_IMAGE)
-    started = project.wm("remote start", timeout=900.0)
+    started = create_sandbox(project, timeout=900.0)
     assert (
         "no provider attached to the sandbox has a profile that allows /usr/local/bin/claude"
         in started.stderr
@@ -444,7 +444,7 @@ def test_an_openshell_projects_sandbox_runs_claude_code(project: Project):
         "echo api > /sandbox/origin/README; git -C /sandbox/origin add README; "
         "git -C /sandbox/origin -c user.name=t -c user.email=t@t commit -q -m initial"
     )
-    status = project.wm("remote status").stdout
+    status = project.wm("sandbox status").stdout
     assert "agent:    claude: installed at /usr/local/bin/claude" in status, status
 
     daemon_pid = None
@@ -533,7 +533,7 @@ def test_a_private_ssh_github_repo_clones_over_https_with_the_providers_credenti
     ssh = f"git@github.com:{PRIVATE_REPO}.git"
     https = f"https://github.com/{PRIVATE_REPO}.git"
     project.configure(ssh, LEARNING_IMAGE, providers=[github_provider])
-    started = project.wm("remote start", timeout=900.0)
+    started = create_sandbox(project, timeout=900.0)
     assert (
         "The repository's origin uses SSH, which OpenShell sandboxes don't support; the sandbox "
         f"reaches github.com over HTTPS with `{github_provider}` credentials instead."
@@ -546,7 +546,7 @@ def test_a_private_ssh_github_repo_clones_over_https_with_the_providers_credenti
     assert project.sh(f"git -C /sandbox/{project.name} config remote.origin.url") == (
         f"{https}\n"
     )
-    status = project.wm("remote status").stdout
+    status = project.wm("sandbox status").stdout
     assert f"repo:     {https} (rewritten from SSH: {ssh})" in status, status
     for url in [ssh, f"ssh://git@github.com/{PRIVATE_REPO}.git"]:
         assert "HEAD" in project.sh(f"git ls-remote {shlex.quote(url)} HEAD")
@@ -617,7 +617,7 @@ def test_a_projects_sandbox_gets_the_workstations_gh_login(
     authorised."""
     https = f"https://github.com/{PRIVATE_REPO}.git"
     project.configure(https, LEARNING_IMAGE, providers=["gh-login"])
-    started = project.wm("remote start", timeout=900.0)
+    started = create_sandbox(project, timeout=900.0)
     assert "provider gh-login gives the sandbox your gh login's GitHub access" in (
         started.stderr
     ), started.stderr
@@ -641,7 +641,7 @@ def add_gh_login_project(project: Project):
     project.configure(
         f"https://github.com/{PRIVATE_REPO}.git", GH_IMAGE, providers=["gh-login"]
     )
-    project.wm("remote start", timeout=900.0)
+    create_sandbox(project, timeout=900.0)
     project.wm("list", timeout=300.0)
 
 

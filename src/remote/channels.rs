@@ -75,7 +75,7 @@ fn still_tagged(tag: &ProjectTag) -> bool {
 /// How long a remote may take to install its shims.
 const SHIMS_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// A remote's reachability as `workmux remote status` shows it.
+/// A remote's reachability as `workmux sandbox status` shows it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteStatus {
     pub name: String,

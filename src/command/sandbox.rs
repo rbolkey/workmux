@@ -27,7 +27,13 @@ Lima commands:
   stop             Stop Lima VMs to free resources
   prune            Delete unused Lima VMs to reclaim disk space
 
+OpenShell commands:
+  stop             Stop OpenShell sandboxes to free resources
+  prune            Delete OpenShell sandboxes, refusing while one holds work
+  rebuild          Delete and recreate this repository's sandbox, keeping its committed work
+
 General commands:
+  status           Show this repository's sandbox
   agent            Run an agent inside a sandbox with RPC support
   shell            Start an interactive shell in a sandbox
   install-dev      Cross-compile and install workmux into sandboxes
@@ -52,12 +58,24 @@ pub enum SandboxCommand {
         #[arg(long)]
         force: bool,
     },
-    /// Delete unused Lima VMs to reclaim disk space.
+    /// Delete unused Lima VMs, or OpenShell sandboxes, to reclaim disk space.
+    /// An OpenShell sandbox holds its project's clone: prune refuses while one
+    /// has uncommitted or unpushed work.
     Prune {
-        /// Skip confirmation and delete all workmux VMs
+        /// Skip confirmation and delete all workmux VMs or sandboxes (OpenShell: even those holding work)
         #[arg(short, long)]
         force: bool,
     },
+    /// Delete and recreate this repository's OpenShell sandbox from the current
+    /// image and config, carrying committed work on every branch across.
+    Rebuild {
+        /// Don't ask for confirmation
+        #[arg(short, long)]
+        yes: bool,
+    },
+    /// Show this repository's sandbox: its state and what workmux gives it.
+    /// Never starts or creates one.
+    Status,
     /// Run a command inside a sandbox (internal, used by pane setup).
     #[command(hide = true)]
     Run {
@@ -79,12 +97,12 @@ pub enum SandboxCommand {
         #[arg(long)]
         release: bool,
     },
-    /// Stop Lima VMs to free resources.
+    /// Stop Lima VMs, or OpenShell sandboxes, to free resources.
     Stop {
-        /// VM name to stop (if not provided, show interactive list)
+        /// VM or sandbox name to stop (if not provided, show interactive list)
         #[arg(conflicts_with = "all")]
         name: Option<String>,
-        /// Stop all workmux VMs (wm-* prefix)
+        /// Stop all workmux VMs or sandboxes (wm-* prefix)
         #[arg(long)]
         all: bool,
         /// Skip confirmation prompt
@@ -166,10 +184,145 @@ pub fn run(args: SandboxArgs) -> Result<()> {
             release,
         } => run_install_dev(skip_build, release),
         SandboxCommand::Agent { command } => run_agent(command),
-        SandboxCommand::Prune { force } => run_prune(force),
-        SandboxCommand::Stop { name, all, yes } => run_stop(name, all, yes),
+        SandboxCommand::Prune { force } => match openshell_here()? {
+            true => super::sandbox_openshell::prune(force),
+            false => run_prune(force),
+        },
+        SandboxCommand::Stop { name, all, yes } => match openshell_here()? {
+            true => super::sandbox_openshell::stop(name, all, yes),
+            false => run_stop(name, all, yes),
+        },
+        SandboxCommand::Rebuild { yes } => {
+            super::sandbox_openshell::rebuild(&super::sandbox_openshell::current_project()?, yes)
+        }
+        SandboxCommand::Status => run_status(),
         SandboxCommand::Shell { exec, command } => run_shell(exec, command),
     }
+}
+
+/// Whether this repository's config puts it in an OpenShell sandbox, so
+/// `stop` and `prune` act on OpenShell's sandboxes rather than Lima's VMs.
+fn openshell_here() -> Result<bool> {
+    Ok(Config::load(None)?.sandbox.remote_backend()
+        == Some(crate::config::SandboxBackend::Openshell))
+}
+
+/// `sandbox status`: the repository's sandbox, as its backend has it.
+fn run_status() -> Result<()> {
+    use crate::config::SandboxBackend;
+
+    if let Some(sandbox) = std::env::var_os(crate::remote::openshell::SANDBOX_ENV) {
+        println!(
+            "This is OpenShell sandbox {}; run `workmux sandbox status` in the repository on your workstation to see it",
+            sandbox.to_string_lossy()
+        );
+        return Ok(());
+    }
+    let config = Config::load(None)?;
+    if config.sandbox.remote_backend().is_some() {
+        let project = super::sandbox_openshell::current_project()?;
+        if !super::sandbox_openshell::status(&project)? {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+    let lines = if !config.sandbox.is_enabled() {
+        vec!["This repository runs on the workstation: its config enables no sandbox".to_string()]
+    } else {
+        match config.sandbox.backend() {
+            SandboxBackend::Lima => {
+                let cwd = std::env::current_dir().context("Failed to get current directory")?;
+                lima_status(&config, &cwd)?
+            }
+            _ => container_status(&config),
+        }
+    };
+    for line in lines {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+/// The Lima VM `config` gives the repository at `cwd`: its name and state,
+/// its toolchain, and the mounts workmux gives it. Only lists VMs: never
+/// starts or creates one.
+fn lima_status(config: &Config, cwd: &Path) -> Result<Vec<String>> {
+    let isolation = config.sandbox.lima.isolation();
+    let name = lima::instance_name(cwd, isolation.clone(), config)?;
+    let state = if LimaInstance::is_lima_available() {
+        LimaInstance::list()?
+            .into_iter()
+            .find(|vm| vm.name == name)
+            .map(|vm| vm.status.to_lowercase())
+            .unwrap_or_else(|| {
+                "not created yet; the first command that needs it creates it".to_string()
+            })
+    } else {
+        "unknown: limactl is not installed".to_string()
+    };
+    let exists = !state.starts_with("not created") && !state.starts_with("unknown");
+    let project_root = lima::mounts::determine_project_root(cwd)?;
+    let toolchain = match crate::sandbox::toolchain::resolve_toolchain(
+        &config.sandbox.toolchain(),
+        &project_root,
+    ) {
+        crate::sandbox::toolchain::DetectedToolchain::Flake => "nix flake",
+        crate::sandbox::toolchain::DetectedToolchain::Devbox => "devbox",
+        crate::sandbox::toolchain::DetectedToolchain::None => "none",
+    };
+    let mut lines = vec![
+        format!("{name} (lima)"),
+        format!("  status:    {state}"),
+        format!(
+            "  isolation: {}",
+            match isolation {
+                crate::config::IsolationLevel::Project => "project",
+                crate::config::IsolationLevel::Shared => "shared",
+            }
+        ),
+        format!("  toolchain: {toolchain}"),
+    ];
+    // The mounts are made when the VM is created; their directories exist
+    // only then.
+    if exists {
+        let agent = resolve_agent(config);
+        let mounts = lima::mounts::generate_mounts(cwd, isolation, config, &name, agent)?;
+        for (i, mount) in mounts.iter().enumerate() {
+            let label = if i == 0 {
+                "  mounts:    "
+            } else {
+                "             "
+            };
+            let access = if mount.read_only { "ro" } else { "rw" };
+            if mount.guest_path == mount.host_path {
+                lines.push(format!("{label}{} ({access})", mount.host_path.display()));
+            } else {
+                lines.push(format!(
+                    "{label}{} -> {} ({access})",
+                    mount.host_path.display(),
+                    mount.guest_path.display()
+                ));
+            }
+        }
+    }
+    Ok(lines)
+}
+
+/// What `config` gives the repository's containers: the image and whether
+/// it is present locally. Containers are per worktree and short-lived.
+fn container_status(config: &Config) -> Vec<String> {
+    let image = config.sandbox.resolved_image(resolve_agent(config));
+    let runtime = config.sandbox.runtime();
+    let present = if sandbox::image_exists(runtime, &image) {
+        "present locally"
+    } else {
+        "not present locally; the first sandboxed pane pulls or builds it"
+    };
+    vec![
+        format!("container ({})", runtime.display_name()),
+        format!("  image:     {image} ({present})"),
+        "  Each worktree's panes run in containers of their own, started with them: there is no long-lived sandbox".to_string(),
+    ]
 }
 
 fn run_build() -> Result<()> {
@@ -931,9 +1084,11 @@ fn run_shell(exec: bool, command: Vec<String>) -> Result<()> {
         SandboxBackend::Container => run_shell_container(exec, command, &config),
         SandboxBackend::Lima => run_shell_lima(exec, command, &config),
         // A remote backend: the project lives in a sandbox of its own.
-        _ => {
-            anyhow::bail!("This project lives in a sandbox of its own, not a container or Lima VM")
-        }
+        _ => super::sandbox_openshell::shell(
+            &super::sandbox_openshell::current_project()?,
+            exec,
+            command,
+        ),
     }
 }
 
@@ -1150,4 +1305,144 @@ fn select_vms_interactive<'a>(
     }
 
     Ok(vec![vms[idx - 1]])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `body` as an executable `name` in `bin`.
+    fn script(bin: &Path, name: &str, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(bin).unwrap();
+        let path = bin.join(name);
+        std::fs::write(&path, body).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// Run test `name` in a child, in a repository at `<temp>/api` whose
+    /// `.workmux.yaml` is `config`, with `bin` first on PATH.
+    fn run_in_repo(name: &str, temp: &Path, config: &str) {
+        let repo = temp.join("api");
+        std::fs::create_dir_all(&repo).unwrap();
+        crate::test_support::run_git(&repo, &["init", "-q"]);
+        std::fs::write(repo.join(".workmux.yaml"), config).unwrap();
+        std::fs::write(repo.join("flake.nix"), "{ outputs = _: { }; }\n").unwrap();
+        let path = std::env::join_paths(
+            std::iter::once(temp.join("bin"))
+                .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+        )
+        .unwrap();
+        crate::test_support::run_isolated_test(
+            name,
+            &repo,
+            &[
+                ("XDG_CONFIG_HOME", &temp.join("config")),
+                ("XDG_STATE_HOME", &temp.join("state")),
+                ("HOME", temp),
+                ("PATH", Path::new(&path)),
+            ],
+        );
+    }
+
+    #[test]
+    fn lima_status_reports_the_repositorys_vm_without_starting_it() {
+        const NAME: &str =
+            "command::sandbox::tests::lima_status_reports_the_repositorys_vm_without_starting_it";
+        if !crate::test_support::is_isolated_child(NAME) {
+            let temp = tempfile::tempdir().unwrap();
+            let log = temp.path().join("log");
+            script(
+                &temp.path().join("bin"),
+                "limactl",
+                &format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n\
+                     [ \"$1\" = list ] && [ -f '{dir}/vm' ] && cat '{dir}/vm'\nexit 0\n",
+                    log.display(),
+                    dir = temp.path().display()
+                ),
+            );
+            run_in_repo(
+                NAME,
+                temp.path(),
+                "sandbox:\n  enabled: true\n  backend: lima\n",
+            );
+            let log = std::fs::read_to_string(&log).unwrap();
+            assert!(
+                log.lines()
+                    .all(|line| line.starts_with("list") || line == "--version"),
+                "{log}"
+            );
+            return;
+        }
+        println!("{}", crate::test_support::ISOLATED_TEST_CANARY);
+        let config = Config::load(None).unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        let vm = lima::instance_name(&cwd, config.sandbox.lima.isolation(), &config).unwrap();
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+
+        let missing = lima_status(&config, &cwd).unwrap();
+        assert_eq!(missing[0], format!("{vm} (lima)"));
+        assert!(missing[1].contains("not created yet"), "{missing:?}");
+        assert!(
+            missing.iter().any(|l| l == "  toolchain: nix flake"),
+            "{missing:?}"
+        );
+        assert!(
+            !missing.iter().any(|l| l.contains("mounts:")),
+            "{missing:?}"
+        );
+
+        std::fs::write(
+            home.join("vm"),
+            format!("{{\"name\":\"{vm}\",\"status\":\"Stopped\"}}\n"),
+        )
+        .unwrap();
+        let stopped = lima_status(&config, &cwd).unwrap();
+        assert_eq!(stopped[1], "  status:    stopped");
+        let root = cwd.canonicalize().unwrap();
+        assert!(
+            stopped
+                .iter()
+                .any(|l| l == &format!("  mounts:    {} (rw)", root.display())),
+            "{stopped:?}"
+        );
+    }
+
+    #[test]
+    fn container_status_reports_the_image_and_no_long_lived_sandbox() {
+        const NAME: &str =
+            "command::sandbox::tests::container_status_reports_the_image_and_no_long_lived_sandbox";
+        if !crate::test_support::is_isolated_child(NAME) {
+            let temp = tempfile::tempdir().unwrap();
+            let log = temp.path().join("log");
+            script(
+                &temp.path().join("bin"),
+                "docker",
+                &format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n[ \"$3\" = present:1 ]\n",
+                    log.display()
+                ),
+            );
+            run_in_repo(NAME, temp.path(), "sandbox:\n  enabled: true\n");
+            let log = std::fs::read_to_string(&log).unwrap();
+            assert!(
+                log.lines().all(|line| line.starts_with("image inspect")),
+                "{log}"
+            );
+            return;
+        }
+        println!("{}", crate::test_support::ISOLATED_TEST_CANARY);
+        let mut config = Config::load(None).unwrap();
+        config.sandbox.container.runtime = Some(crate::config::SandboxRuntime::Docker);
+
+        config.sandbox.image = Some("present:1".to_string());
+        let present = container_status(&config);
+        assert_eq!(present[0], "container (docker)");
+        assert_eq!(present[1], "  image:     present:1 (present locally)");
+        assert!(present[2].contains("no long-lived sandbox"), "{present:?}");
+
+        config.sandbox.image = Some("absent:1".to_string());
+        assert!(container_status(&config)[1].contains("not present locally"));
+    }
 }
