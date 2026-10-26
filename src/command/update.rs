@@ -473,8 +473,7 @@ pub fn run_background_check() -> Result<()> {
     let mut cache = load_cache(&cache_path);
 
     // Reset notification counter when a new version is discovered
-    if cache.latest_version.as_deref() != Some(&latest)
-        || cache.source.as_deref() != Some(&source)
+    if cache.latest_version.as_deref() != Some(&latest) || cache.source.as_deref() != Some(&source)
     {
         cache.notify_count = Some(0);
     }
