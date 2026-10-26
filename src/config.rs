@@ -1134,17 +1134,9 @@ pub struct RemoteConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub host_commands: Vec<String>,
 
-    /// Workstation environment variables passed through to remote workmux
-    /// and the panes it starts, as `sandbox.env_passthrough` passes them to
-    /// a container or Lima sandbox.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub env_passthrough: Vec<String>,
-
-    /// Environment variables set in remote workmux's environment and the
-    /// panes it starts, as `sandbox.env` sets them in a container or Lima
-    /// sandbox.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub env: BTreeMap<String, String>,
+    /// The environment remote workmux and the panes it starts get.
+    #[serde(flatten)]
+    pub env: RemoteEnv,
 
     /// For an OpenShell project's remote: what its sandbox is created from.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1288,6 +1280,42 @@ pub fn openshell_sandbox_name(root: &Path) -> String {
 impl RemoteConfig {
     pub fn builtin_shims(&self) -> bool {
         self.builtin_shims.unwrap_or(true)
+    }
+}
+
+/// The environment a project's sandbox settings give remote workmux and the
+/// panes it starts, as they give a container or Lima sandbox.
+#[derive(Debug, Default, Deserialize, Serialize, Clone, PartialEq, Eq)]
+pub struct RemoteEnv {
+    /// Workstation environment variables passed through, as
+    /// `sandbox.env_passthrough` passes them.
+    #[serde(
+        rename = "env_passthrough",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub passthrough: Vec<String>,
+
+    /// Environment variables set, as `sandbox.env` sets them.
+    #[serde(rename = "env", default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub vars: BTreeMap<String, String>,
+}
+
+impl RemoteEnv {
+    /// The environment `sandbox` gives.
+    pub fn of(sandbox: &SandboxConfig) -> Self {
+        Self {
+            passthrough: sandbox
+                .env_passthrough()
+                .into_iter()
+                .map(String::from)
+                .collect(),
+            vars: sandbox
+                .env_vars()
+                .into_iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect(),
+        }
     }
 }
 
@@ -4445,7 +4473,7 @@ fn note_once(note: &[u8]) {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
 
     use super::{
         AgentColumn, AgentEnvValue, AgentIconConfig, AgentIconDetails, AllowedDomainDetails,
@@ -4457,9 +4485,29 @@ mod tests {
         ToolchainMode, WindowPlacement, WorktreeColumn, is_agent_command, validate_domain,
         validate_group_add_entry, validate_layouts_config,
     };
-    use super::{DashboardConfig, InputExitKey};
+    use super::{DashboardConfig, InputExitKey, RemoteConfig};
     use crate::test_support;
     use tempfile::TempDir;
+
+    #[test]
+    fn a_remote_config_keeps_its_environment_under_the_sandbox_settings_names() {
+        let remote: RemoteConfig = serde_json::from_value(serde_json::json!({
+            "transport": "openshell",
+            "target": "wm-api-12345678",
+            "env_passthrough": ["GITHUB_TOKEN"],
+            "env": {"API_URL": "https://api.test"},
+        }))
+        .unwrap();
+
+        assert_eq!(remote.env.passthrough, ["GITHUB_TOKEN"]);
+        assert_eq!(
+            remote.env.vars,
+            BTreeMap::from([("API_URL".to_string(), "https://api.test".to_string())])
+        );
+        let json = serde_json::to_value(&remote).unwrap();
+        assert_eq!(json["env_passthrough"], serde_json::json!(["GITHUB_TOKEN"]));
+        assert_eq!(json["env"]["API_URL"], "https://api.test");
+    }
 
     #[test]
     fn an_openshell_sandbox_ignores_the_projects_sandbox_setting() {

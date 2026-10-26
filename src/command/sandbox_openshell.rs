@@ -486,9 +486,14 @@ pub fn rebuild(project: &RemoteProject, yes: bool) -> Result<()> {
     // work; this one creates the sandbox if need be and restores it.
     let resuming = crate::remote::carry::has_kept_work(&keep);
     if provisioning.status()? == RemoteState::Missing && !resuming {
-        return ensure_running(name, transport.as_ref(), true, &mut |notice| eprintln!("{notice}")).map(|_| ());
+        return ensure_running(name, transport.as_ref(), true, &mut |notice| {
+            eprintln!("{notice}")
+        })
+        .map(|_| ());
     }
-    ensure_running(name, transport.as_ref(), true, &mut |notice| eprintln!("{notice}"))?;
+    ensure_running(name, transport.as_ref(), true, &mut |notice| {
+        eprintln!("{notice}")
+    })?;
     if !resuming && !yes {
         let risks = match crate::remote::carry::remote_at_risk(
             transport.as_ref(),

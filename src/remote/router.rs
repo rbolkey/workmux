@@ -356,10 +356,11 @@ fn sandbox_env(
 ) -> BTreeMap<String, String> {
     let config = &project.remote_config;
     config
-        .env_passthrough
+        .env
+        .passthrough
         .iter()
         .filter_map(|name| Some((name.clone(), workstation(name)?)))
-        .chain(config.env.clone())
+        .chain(config.env.vars.clone())
         .collect()
 }
 
@@ -810,7 +811,7 @@ mod tests {
     #[test]
     fn a_command_carries_the_workstation_values_of_the_variables_sandbox_env() {
         let mut project = api();
-        project.remote_config.env_passthrough =
+        project.remote_config.env.passthrough =
             ["GITHUB_TOKEN", "UNSET"].map(String::from).to_vec();
         let workstation = |name: &str| (name == "GITHUB_TOKEN").then(|| "ghp_x".to_string());
 
@@ -825,9 +826,9 @@ mod tests {
     #[test]
     fn a_command_carries_the_variables_config_sets_over_those_sandbox_env() {
         let mut project = api();
-        project.remote_config.env_passthrough =
+        project.remote_config.env.passthrough =
             ["API_URL", "GITHUB_TOKEN"].map(String::from).to_vec();
-        project.remote_config.env =
+        project.remote_config.env.vars =
             BTreeMap::from([("API_URL".to_string(), "https://api.test".to_string())]);
         let workstation = |name: &str| Some(format!("workstation {name}"));
 

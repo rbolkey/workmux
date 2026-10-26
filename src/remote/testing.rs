@@ -224,7 +224,6 @@ pub fn devbox_api() -> super::router::RemoteProject {
             target: "/tmp/devbox".to_string(),
             builtin_shims: None,
             host_commands: Vec::new(),
-            env_passthrough: Vec::new(),
             env: Default::default(),
             openshell: None,
         },
