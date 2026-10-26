@@ -1,10 +1,11 @@
 //! Command router: resolves the project a command targets and relays the
 //! command to remote workmux when the project lives on a remote.
 //!
-//! Target resolution: an explicit `--project`, then the project tag on the
-//! current tmux session, then the config resolved in the working
+//! Target resolution: the project tag on the window (or session) the
+//! command was run from, then the config resolved in the working
 //! directory's repository (ADR 0004), which puts the project on the
-//! workstation or in a sandbox such as OpenShell's.
+//! workstation or in a sandbox such as OpenShell's. There is no flag naming
+//! another project: a command targets the project it runs in.
 
 use anyhow::{Context, Result, anyhow};
 use std::io::Write;
@@ -39,6 +40,17 @@ impl RemoteProject {
     pub fn host(&self) -> super::Remote<'_> {
         super::Remote::new(&self.site.remote, &self.remote)
     }
+
+    /// Where the project runs, as a command targeting it says once.
+    pub fn target(&self) -> String {
+        match self.remote.transport {
+            crate::config::TransportKind::Openshell => format!(
+                "OpenShell sandbox {} (project {})",
+                self.remote.target, self.site.name
+            ),
+            _ => format!("remote {} (project {})", self.site.remote, self.site.name),
+        }
+    }
 }
 
 /// Refuse `what`, which would open an editor, for `project`: the command
@@ -69,30 +81,23 @@ pub fn remote_projects() -> Result<Vec<RemoteProject>> {
 }
 
 /// The remote project a command targets, or `None` for a local project:
-/// an explicit `--project`, else the project the invoking tmux session is
-/// tagged with, else the one the working directory's repository config
-/// puts in a sandbox. Commands remote workmux runs are never routed again.
-pub fn resolve(explicit: Option<&str>) -> Result<Option<RemoteProject>> {
+/// the project the invoking tmux window (or its session) is tagged with,
+/// else the one the working directory's repository config puts in a
+/// sandbox. Commands remote workmux runs are never routed again.
+pub fn resolve() -> Result<Option<RemoteProject>> {
     if on_a_remote() {
         return Ok(None);
     }
-    let here = std::env::current_dir()
-        .ok()
-        .map(|dir| super::registry::resolve_at(&dir))
-        .transpose()?
-        .flatten();
-    if let Some(name) = explicit {
-        return match here {
-            Some(project) if project.site.name == name => Ok(Some(project)),
-            _ => Ok(Some(remote_project(name)?)),
-        };
-    }
-    if let Some(tag) = invoking_session_tag()
+    if let Some(tag) = invoking_project_tag()
         && let Some(project) = project_tagged(&tag)
     {
         return Ok(Some(project));
     }
-    Ok(here)
+    std::env::current_dir()
+        .ok()
+        .map(|dir| super::registry::resolve_at(&dir))
+        .transpose()
+        .map(Option::flatten)
 }
 
 /// Whether this process runs on a remote (for a command session, in a
@@ -104,19 +109,41 @@ pub fn on_a_remote() -> bool {
         || std::env::var_os(super::openshell::SANDBOX_ENV).is_some()
 }
 
-/// The project tag of the tmux session this command was run from. Commands
+/// The project tag of the tmux window this command was run from, else of
+/// its session: a window or session workmux opened for a project. Commands
 /// remote workmux runs are never routed again.
-fn invoking_session_tag() -> Option<String> {
+fn invoking_project_tag() -> Option<String> {
     if ServedProject::current().is_some() {
         return None;
     }
     let invocation = InvocationContext::current();
     let pane = invocation.pane_id.as_deref()?;
     let tmux = TmuxBackend::for_socket(invocation.tmux_socket_path()?);
-    let tag = tmux
-        .query(&["show-options", "-qv", "-t", pane, forwarded::SESSION_TAG])
+    let tags = tmux
+        .query(&[
+            "display-message",
+            "-p",
+            "-t",
+            pane,
+            &format!(
+                "#{{{}}}\t#{{{}}}",
+                forwarded::WINDOW_TAG,
+                forwarded::SESSION_TAG
+            ),
+        ])
         .ok()?;
-    Some(tag.trim().to_string()).filter(|tag| !tag.is_empty())
+    project_tag_of(&tags)
+}
+
+/// The project tag in a `<window tag>\t<session tag>` line: the window's,
+/// else the session's.
+fn project_tag_of(tags: &str) -> Option<String> {
+    let (window, session) = tags.trim_end_matches('\n').split_once('\t')?;
+    [window, session]
+        .into_iter()
+        .map(str::trim)
+        .find(|tag| !tag.is_empty())
+        .map(str::to_string)
 }
 
 /// The ownership token of the window this command was typed in, when that
@@ -430,27 +457,11 @@ pub fn captured(project: &RemoteProject, argv: &[&str]) -> Result<Captured> {
 }
 
 /// This command's own arguments, for relaying to remote workmux: `workmux`
-/// and the arguments it was run with, less `--project`.
+/// and the arguments it was run with.
 pub fn relayed_argv() -> Vec<String> {
-    without_project(std::env::args().skip(1))
-}
-
-fn without_project(args: impl IntoIterator<Item = String>) -> Vec<String> {
-    let mut argv = vec!["workmux".to_string()];
-    let mut args = args.into_iter();
-    while let Some(arg) = args.next() {
-        if arg == "--" {
-            argv.push(arg);
-            argv.extend(args.by_ref());
-            break;
-        }
-        if arg == "--project" {
-            args.next();
-        } else if !arg.starts_with("--project=") {
-            argv.push(arg);
-        }
-    }
-    argv
+    std::iter::once("workmux".to_string())
+        .chain(std::env::args().skip(1))
+        .collect()
 }
 
 /// `argv`, a relayed `workmux <subcommand> ...` defined by `command`, less
@@ -596,7 +607,14 @@ fn typed_value(
 /// Relay this command, as it was typed, to `project`'s remote and exit
 /// with the remote command's exit code.
 pub fn relay(project: &RemoteProject) -> Result<()> {
+    announce(project);
     relay_argv(project, &relayed_argv())
+}
+
+/// Say once which remote a relayed command runs on, so the target is
+/// always visible.
+fn announce(project: &RemoteProject) {
+    eprintln!("Running in {}", project.target());
 }
 
 /// Run `argv` on `project`'s remote and exit with its exit code.
@@ -619,6 +637,7 @@ pub fn relay_with_workstation_args(
     prompt_file: Option<&Path>,
     command: &clap::Command,
 ) -> Result<()> {
+    announce(project);
     let mut argv = relayed_argv();
     if command.get_arguments().any(|a| a.get_id() == "agent") {
         argv = with_agent_types(argv, command, &Config::load_global_only()?)?;
@@ -664,7 +683,7 @@ pub fn relay_to_every_project() -> Result<usize> {
             Ok(true) => {}
             Ok(false) => {
                 eprintln!(
-                    "Skipping remote project '{name}': remote {remote} is stopped (start it with: workmux remote start {remote})"
+                    "Skipping remote project '{name}': remote {remote} is stopped (start it with `workmux remote start` in a clone of its repository)"
                 );
                 continue;
             }
@@ -726,26 +745,6 @@ mod tests {
                 openshell: None,
             },
         }
-    }
-
-    #[test]
-    fn a_relayed_command_keeps_its_arguments_but_not_its_project() {
-        let args = |list: &[&str]| list.iter().map(|a| a.to_string()).collect::<Vec<_>>();
-
-        assert_eq!(
-            without_project(args(&["add", "--project", "api", "feature", "-p", "x"])),
-            args(&["workmux", "add", "feature", "-p", "x"])
-        );
-        assert_eq!(
-            without_project(args(&[
-                "add",
-                "--project=api",
-                "feature",
-                "--",
-                "--project"
-            ])),
-            args(&["workmux", "add", "feature", "--", "--project"])
-        );
     }
 
     #[test]
@@ -860,6 +859,28 @@ agents:
         std::fs::write(&path, "x".repeat(MAX_PROMPT_FILE_BYTES as usize + 1)).unwrap();
         let refused = read_prompt_file(&path).unwrap_err().to_string();
         assert!(refused.contains("more than the 1048576 bytes"), "{refused}");
+    }
+
+    #[test]
+    fn a_command_names_the_sandbox_it_targets() {
+        let mut api = api();
+        assert_eq!(api.target(), "remote devbox (project api)");
+        api.remote.transport = crate::config::TransportKind::Openshell;
+        api.remote.target = "wm-api".to_string();
+        assert_eq!(api.target(), "OpenShell sandbox wm-api (project api)");
+    }
+
+    #[test]
+    fn a_project_window_targets_its_project_before_its_session() {
+        assert_eq!(
+            project_tag_of("devbox:api\tdevbox:web\n").as_deref(),
+            Some("devbox:api")
+        );
+        assert_eq!(
+            project_tag_of("\tdevbox:web\n").as_deref(),
+            Some("devbox:web")
+        );
+        assert_eq!(project_tag_of("\t\n"), None);
     }
 
     #[test]

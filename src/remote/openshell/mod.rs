@@ -465,12 +465,9 @@ impl OpenShell {
         let narrowed = policy::narrowed(&current_yaml, &desired);
         if !narrowed.is_empty() {
             return Ok(vec![format!(
-                "the policy of sandbox {} no longer grants {}, which OpenShell cannot take away from a sandbox; run `workmux remote recreate {}` to apply it",
+                "the policy of sandbox {} no longer grants {}, which OpenShell cannot take away from a sandbox; run `workmux remote recreate` in the repository to apply it",
                 self.sandbox,
                 narrowed.join(", "),
-                self.origin
-                    .as_ref()
-                    .map_or(self.sandbox.as_str(), |o| o.project.as_str())
             )]);
         }
         let dir = tempfile::tempdir()?;

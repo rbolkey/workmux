@@ -273,7 +273,7 @@ pub fn run(worktrees: &[String], json: bool, all: bool, show_git: bool) -> Resul
 
     // A remote project's tagged session scopes like a local repository.
     let session_project = if worktrees.is_empty() && !all {
-        crate::remote::router::resolve(None)?
+        crate::remote::router::resolve()?
     } else {
         None
     };

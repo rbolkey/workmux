@@ -12,6 +12,11 @@ pub struct ForkBranchSpec {
     pub branch: String,
 }
 
+/// What a command that needs a project says when run outside any
+/// repository and any window workmux opened for a project.
+pub const NOT_IN_A_REPOSITORY: &str =
+    "Not in a git repository; run this command inside a clone of the repository";
+
 /// Custom error type for worktree not found
 #[derive(Debug, thiserror::Error)]
 #[error("Worktree not found: {0}")]
