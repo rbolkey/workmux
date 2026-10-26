@@ -228,14 +228,16 @@ pub fn current_warnings() -> Vec<String> {
 }
 
 /// A warning when the devshell baked into this sandbox was built from
-/// another `flake.lock` than the project's clone has now.
+/// other flake files than the project's clone has now: those
+/// [`devshell_inputs`](crate::remote::openshell::image::devshell_inputs)
+/// lists, which the image tag follows too.
 fn baked_devshell_warning(source: &Path) -> Option<String> {
-    use crate::remote::openshell::image::{DevshellSource, flake_lock_digest};
+    use crate::remote::openshell::image::{DevshellSource, devshell_digest};
     let source: DevshellSource = serde_json::from_slice(&std::fs::read(source).ok()?).ok()?;
     let clone = Path::new(&source.clone);
-    (clone.is_dir() && flake_lock_digest(clone) != source.flake_lock_sha256).then(|| {
+    (clone.is_dir() && devshell_digest(clone) != source.devshell_sha256).then(|| {
         format!(
-            "the devshell baked into this sandbox was built from another flake.lock than {}'s; \
+            "the devshell baked into this sandbox was built from other flake files than {} has now; \
              run `workmux remote recreate` for the project to rebuild it",
             source.clone
         )
@@ -384,27 +386,43 @@ mod tests {
     }
 
     #[test]
-    fn a_baked_devshell_older_than_the_clones_flake_lock_is_warned_about() {
+    fn a_baked_devshell_older_than_the_clones_flake_is_warned_about() {
+        use crate::remote::openshell::image::{DevshellSource, devshell_digest};
         let dir = tempfile::tempdir().unwrap();
         let clone = dir.path().join("api");
-        std::fs::create_dir(&clone).unwrap();
-        std::fs::write(clone.join("flake.lock"), "v1").unwrap();
+        std::fs::create_dir_all(clone.join("nix")).unwrap();
+        let write =
+            |file: &str, contents: &str| std::fs::write(clone.join(file), contents).unwrap();
+        write("flake.nix", "{ outputs = _: import ./nix/shell.nix; }");
+        write("flake.lock", "v1");
+        write("nix/shell.nix", "{ }");
+        write("README.md", "v1");
         let source = dir.path().join("devshell-source.json");
-        std::fs::write(
-            &source,
-            format!(
-                r#"{{"clone":"{}","flake_lock_sha256":"{}"}}"#,
-                clone.display(),
-                crate::remote::openshell::image::sha256_hex(b"v1")
-            ),
-        )
-        .unwrap();
+        let bake = || {
+            let baked = DevshellSource {
+                clone: clone.display().to_string(),
+                devshell_sha256: devshell_digest(&clone),
+            };
+            std::fs::write(&source, serde_json::to_vec(&baked).unwrap()).unwrap();
+        };
+        bake();
+        assert_eq!(baked_devshell_warning(&source), None);
+        write("README.md", "v2");
         assert_eq!(baked_devshell_warning(&source), None);
 
-        std::fs::write(clone.join("flake.lock"), "v2").unwrap();
-
-        let warning = baked_devshell_warning(&source).expect("a warning");
-        assert!(warning.contains("workmux remote recreate"), "{warning}");
+        for (file, contents) in [
+            ("flake.lock", "v2"),
+            (
+                "flake.nix",
+                "{ outputs = _: import ./nix/shell.nix // { }; }",
+            ),
+            ("nix/shell.nix", "{ x = 1; }"),
+        ] {
+            write(file, contents);
+            let warning = baked_devshell_warning(&source).expect(file);
+            assert!(warning.contains("workmux remote recreate"), "{warning}");
+            bake();
+        }
     }
 
     #[test]

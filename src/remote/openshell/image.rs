@@ -31,7 +31,7 @@ const DEFAULT_BASE: &str = "docker.io/library/ubuntu:24.04";
 pub const DEFAULT_AGENT: &str = "/etc/workmux/default-agent";
 
 /// Where the baked devshell records what it was built from, so remote
-/// workmux can tell when the project's `flake.lock` has moved on.
+/// workmux can tell when the project's flake has moved on.
 pub const DEVSHELL_SOURCE: &str = "/nix/devshell-source.json";
 
 /// The build secret holding the workstation's GitHub token, for the
@@ -283,8 +283,8 @@ fn installed(recipe: &Recipe) -> impl Iterator<Item = &'static SandboxAgent> + '
 pub struct DevshellSource {
     /// The project's clone in the sandbox.
     pub clone: String,
-    /// SHA-256 of the project's `flake.lock` (empty when it has none).
-    pub flake_lock_sha256: String,
+    /// [`devshell_digest`] of the project checkout the bake read.
+    pub devshell_sha256: String,
 }
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
@@ -295,11 +295,15 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
-/// The `flake.lock` digest of the project checkout at `dir`.
-pub fn flake_lock_digest(dir: &Path) -> String {
-    std::fs::read(dir.join("flake.lock"))
-        .map(|lock| sha256_hex(&lock))
-        .unwrap_or_default()
+/// The digest of [`devshell_inputs`] of the project checkout at `dir`: it
+/// changes whenever the devshell bake would read something else.
+pub fn devshell_digest(dir: &Path) -> String {
+    let mut digest = Vec::new();
+    for (file, sha256) in devshell_inputs(dir) {
+        digest.extend(file.into_bytes());
+        digest.extend(sha256.into_bytes());
+    }
+    sha256_hex(&digest)
 }
 
 /// The files of the project checkout at `dir` that the devshell bake
@@ -449,14 +453,11 @@ pub fn prepare(recipe: &Recipe, sandbox: &str, clone: &str, context: &Path) -> R
         if checkout != &context.join("project") {
             bail!("The devshell checkout must be the build context's project directory");
         }
-        for (file, sha256) in devshell_inputs(checkout) {
-            digest.extend(file.into_bytes());
-            digest.extend(sha256.into_bytes());
-        }
         let source = DevshellSource {
             clone: clone.to_string(),
-            flake_lock_sha256: flake_lock_digest(checkout),
+            devshell_sha256: devshell_digest(checkout),
         };
+        digest.extend(source.devshell_sha256.as_bytes());
         std::fs::write(
             context.join("devshell-source.json"),
             serde_json::to_vec(&source)?,
@@ -938,7 +939,7 @@ mod tests {
             &std::fs::read(context.path().join("devshell-source.json")).unwrap(),
         )
         .unwrap();
-        assert_eq!(source.flake_lock_sha256, sha256_hex(b"v2"));
+        assert_eq!(source.devshell_sha256, devshell_digest(&project));
         assert_eq!(source.clone, "/sandbox/api");
     }
 
