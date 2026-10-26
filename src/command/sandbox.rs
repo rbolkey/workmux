@@ -88,7 +88,7 @@ pub enum SandboxCommand {
         #[arg(last = true, required = true)]
         command: Vec<String>,
     },
-    /// Cross-compile and install workmux into containers and running Lima VMs for development.
+    /// Cross-compile and install workmux into containers, running Lima VMs and OpenShell sandbox images for development.
     InstallDev {
         /// Skip cross-compilation and use existing binary
         #[arg(long)]
@@ -681,6 +681,13 @@ fn run_install_dev(skip_build: bool, release: bool) -> Result<()> {
         }
     }
 
+    // --- OpenShell image ---
+    let installed = crate::remote::openshell::image::installed_workmux();
+    let openshell = which::which("openshell").is_ok();
+    if install_dev_openshell(&binary_path, installed.as_deref(), openshell)? {
+        did_something = true;
+    }
+
     // --- Lima VM installation ---
     if LimaInstance::is_lima_available() {
         let instances = LimaInstance::list()?;
@@ -723,13 +730,37 @@ fn run_install_dev(skip_build: bool, release: bool) -> Result<()> {
 
     if !did_something {
         bail!(
-            "Nothing to do: no container image '{}' found and no running Lima VMs.",
+            "Nothing to do: no container image '{}' found, no running Lima VMs, and no OpenShell.",
             image_name
         );
     }
 
     println!("\nDone.");
     Ok(())
+}
+
+/// Install `binary` as the Linux workmux OpenShell sandbox images get, at
+/// `installed`: when OpenShell is installed, or to replace one installed
+/// before. Returns whether it did.
+fn install_dev_openshell(
+    binary_path: &Path,
+    installed: Option<&Path>,
+    openshell_available: bool,
+) -> Result<bool> {
+    let Some(installed) = installed else {
+        bail!("Could not determine where to keep the Linux workmux for OpenShell sandboxes");
+    };
+    if !openshell_available && !installed.exists() {
+        return Ok(false);
+    }
+    println!("Installing workmux for OpenShell sandboxes...");
+    crate::remote::openshell::image::install_workmux(binary_path, installed)?;
+    println!("  {} ... ok", installed.display());
+    // The image's workmux is root's and the sandbox can't replace it.
+    println!(
+        "  The next sandbox created or rebuilt gets it; a running sandbox keeps its workmux until `workmux sandbox rebuild`"
+    );
+    Ok(true)
 }
 
 /// Build a thin overlay image to replace workmux in the container image.
@@ -1343,6 +1374,37 @@ fn select_vms_interactive<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn install_dev_installs_the_linux_workmux_when_openshell_is_installed() {
+        let dir = tempfile::tempdir().unwrap();
+        let built = dir.path().join("built");
+        std::fs::write(&built, "linux workmux").unwrap();
+        let installed = dir.path().join("state/openshell/workmux");
+
+        assert!(install_dev_openshell(&built, Some(&installed), true).unwrap());
+
+        assert_eq!(
+            std::fs::read_to_string(&installed).unwrap(),
+            "linux workmux"
+        );
+    }
+
+    #[test]
+    fn without_openshell_install_dev_replaces_only_a_linux_workmux_installed_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let built = dir.path().join("built");
+        std::fs::write(&built, "second build").unwrap();
+        let installed = dir.path().join("state/openshell/workmux");
+
+        assert!(!install_dev_openshell(&built, Some(&installed), false).unwrap());
+        assert!(!installed.exists());
+
+        std::fs::create_dir_all(installed.parent().unwrap()).unwrap();
+        std::fs::write(&installed, "first build").unwrap();
+        assert!(install_dev_openshell(&built, Some(&installed), false).unwrap());
+        assert_eq!(std::fs::read_to_string(&installed).unwrap(), "second build");
+    }
 
     /// `body` as an executable `name` in `bin`.
     fn script(bin: &Path, name: &str, body: &str) {

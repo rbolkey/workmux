@@ -131,7 +131,11 @@ pub fn open_project(remote: &str, name: &str) -> Result<RemoteProject> {
 
 /// The remote project `config` puts the repository at `root` in, given its
 /// `origin` URL.
-fn project_in(config: &Config, root: &Path, origin: Option<&str>) -> Result<RemoteProject> {
+pub(crate) fn project_in(
+    config: &Config,
+    root: &Path,
+    origin: Option<&str>,
+) -> Result<RemoteProject> {
     let backend = config
         .sandbox
         .remote_backend()

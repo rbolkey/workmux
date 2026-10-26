@@ -132,6 +132,9 @@ pub struct OpenShell {
     openshell: PathBuf,
     docker: PathBuf,
     gh: PathBuf,
+    /// Where `workmux sandbox install-dev` put the Linux workmux the
+    /// sandbox's image gets.
+    linux_workmux: Option<PathBuf>,
     phase_poll: Duration,
     /// The sandbox as the last state check described it, kept for the one
     /// policy read that follows, so a command asks OpenShell about the
@@ -154,6 +157,7 @@ impl OpenShell {
             openshell: PathBuf::from("openshell"),
             docker: PathBuf::from("docker"),
             gh: PathBuf::from("gh"),
+            linux_workmux: image::installed_workmux(),
             phase_poll: Duration::from_secs(1),
             last_get: Mutex::new(None),
         }
@@ -442,7 +446,12 @@ impl OpenShell {
     }
 
     /// Build the sandbox's image, returning its tag.
-    fn build_image(&self, origin: &OpenshellRemote, context: &std::path::Path) -> Result<String> {
+    fn build_image(
+        &self,
+        origin: &OpenshellRemote,
+        workmux: &std::path::Path,
+        context: &std::path::Path,
+    ) -> Result<String> {
         let checkout = context.join("project");
         // A devshell is baked when the toolchain is a flake, as nix is, and
         // the clone has one. The workstation has SSH: clone the way the
@@ -453,16 +462,9 @@ impl OpenShell {
                 .as_ref()
                 .is_some_and(|url| self.fetch_flake(url.original(), &checkout)))
         .then_some(checkout);
-        let workmux = image::Workmux::current();
-        if let image::Workmux::Source(source) = &workmux {
-            eprintln!(
-                "This workmux is a dev build: building a Linux workmux from {} into the sandbox image",
-                source.display()
-            );
-        }
         let recipe = image::Recipe {
             base: origin.settings.image.clone(),
-            workmux,
+            workmux: workmux.to_path_buf(),
             agents: origin.agents.clone(),
             devshell,
             git_credential_helper: self.needs_git_credential_helper(),
@@ -760,6 +762,7 @@ impl Provisioning for OpenShell {
 
     fn create(&self) -> Result<()> {
         let origin = self.origin()?;
+        let workmux = image::linux_workmux(self.linux_workmux.as_deref())?;
         for note in provider_notes(&origin.settings) {
             eprintln!("{note}");
         }
@@ -783,7 +786,7 @@ impl Provisioning for OpenShell {
         }
         self.refresh_gh_login(true)?;
         let context = tempfile::tempdir()?;
-        let image = self.build_image(origin, context.path())?;
+        let image = self.build_image(origin, workmux, context.path())?;
         for warning in self.agent_report().map(|r| r.warnings).unwrap_or_default() {
             eprintln!("warning: {warning}");
         }
@@ -983,6 +986,8 @@ pub(super) mod tests {
                 std::fs::write(&path, body).unwrap();
                 std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
             }
+            // The Linux workmux `sandbox install-dev` would have installed.
+            std::fs::write(dir.path().join("linux-workmux"), "linux workmux").unwrap();
             let fake = Self { dir };
             fake.providers("[]");
             fake.profiles("[]");
@@ -997,6 +1002,7 @@ pub(super) mod tests {
                 openshell: self.dir.path().join("openshell"),
                 docker: self.dir.path().join("docker"),
                 gh: self.dir.path().join("gh"),
+                linux_workmux: Some(self.dir.path().join("linux-workmux")),
                 phase_poll: Duration::from_millis(10),
                 ..OpenShell::new("api", origin)
             }
@@ -1420,6 +1426,26 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn without_a_linux_workmux_create_fails_before_any_docker_build() {
+        let fake = FakeOpenShell::new();
+        std::fs::remove_file(fake.path("linux-workmux")).unwrap();
+
+        let error = fake.transport(Some(origin())).create().unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "No workmux release for this build can serve OpenShell sandboxes yet; \
+             run `workmux sandbox install-dev`"
+        );
+        assert!(!fake.path("docker-log").exists());
+        assert!(
+            fake.log()
+                .iter()
+                .all(|line| !line.starts_with("sandbox create"))
+        );
+    }
+
+    #[test]
     fn stop_start_and_delete_follow_the_sandboxs_phase() {
         let fake = FakeOpenShell::new();
         let transport = fake.transport(Some(origin()));
@@ -1561,8 +1587,8 @@ mod contract {
     }
 
     /// The image the contract tests run: the learning tests' fixture image
-    /// (git, dtach, python3), to which workmux adds a Linux workmux built
-    /// from this checkout, or the one `WORKMUX_OPENSHELL_WORKMUX` names.
+    /// (git, dtach, python3), to which workmux adds the Linux workmux
+    /// `workmux sandbox install-dev` installed.
     fn fixture_image() -> String {
         let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/openshell");
         let status = Command::new("docker")

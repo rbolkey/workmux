@@ -232,10 +232,10 @@ workmux sandbox shell --exec
 
 ### sandbox install-dev
 
-Cross-compile and install workmux into container images and running Lima VMs for local development.
+Cross-compile and install workmux into container images, running Lima VMs and OpenShell sandbox images for local development.
 
 ```bash
-# Cross-compile and install into containers and running VMs
+# Cross-compile and install into containers, running VMs and OpenShell images
 workmux sandbox install-dev
 
 # Use release profile (slower build, faster binary)
@@ -253,6 +253,8 @@ workmux sandbox install-dev --skip-build
 This is a developer-only command for getting local workmux builds into sandbox environments. The host macOS binary cannot run inside Linux containers or VMs, so this command cross-compiles for the correct Linux architecture.
 
 For container sandboxes, it builds a thin overlay image (`FROM <image>` + `COPY workmux`) on top of the configured sandbox image, replacing it in-place. For Lima VMs, it copies the binary into each running VM.
+
+For OpenShell, when `openshell` is on your PATH or a Linux workmux was installed before, it copies the binary to `~/.local/state/workmux/openshell/workmux`, one for every project. The next sandbox created or rebuilt gets it in its image; a running sandbox keeps its workmux until `workmux sandbox rebuild`. Workmux releases can't serve OpenShell sandboxes yet, so creating or rebuilding one fails until this has run.
 
 **Prerequisites:**
 

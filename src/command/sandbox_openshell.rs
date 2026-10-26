@@ -475,6 +475,9 @@ fn rebuild_prompt(name: &str, sandbox: &str, risks: Option<&[AtRisk]>) -> String
 /// current image and config, carrying its committed work across.
 pub fn rebuild(project: &RemoteProject, yes: bool) -> Result<()> {
     openshell_only(project, "rebuilt")?;
+    // Refused before the sandbox is deleted, not by the create after it.
+    let installed = crate::remote::openshell::image::installed_workmux();
+    crate::remote::openshell::image::linux_workmux(installed.as_deref())?;
     let name = &project.site.remote;
     let transport = crate::remote::transport::build(&project.remote_config)?;
     let provisioning = lifecycle(transport.as_ref());
@@ -1010,6 +1013,34 @@ mod tests {
         println!("{}", crate::test_support::ISOLATED_TEST_CANARY);
 
         prune(true).unwrap();
+    }
+
+    #[test]
+    fn without_a_linux_workmux_rebuild_refuses_before_touching_the_sandbox() {
+        const NAME: &str = "command::sandbox_openshell::tests::without_a_linux_workmux_rebuild_refuses_before_touching_the_sandbox";
+        if !crate::test_support::is_isolated_child(NAME) {
+            let gateway = Gateway::new(Work::None);
+            gateway.run(NAME);
+            assert_eq!(gateway.log("log"), "");
+            return;
+        }
+        println!("{}", crate::test_support::ISOLATED_TEST_CANARY);
+        let config: crate::config::Config =
+            serde_yaml::from_str("sandbox:\n  enabled: true\n  backend: openshell\n").unwrap();
+        let project = crate::remote::resolve::project_in(
+            &config,
+            &gateway_dir(),
+            Some("https://github.com/me/api.git"),
+        )
+        .unwrap();
+
+        let error = rebuild(&project, true).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "No workmux release for this build can serve OpenShell sandboxes yet; \
+             run `workmux sandbox install-dev`"
+        );
     }
 
     #[test]
