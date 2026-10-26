@@ -1412,7 +1412,14 @@ mod tests {
     /// remote pane `pane`.
     fn viewing_pane(server: &PrivateTmuxServer, session: &str, dir: &Path, pane: &str) -> String {
         let viewing = server.new_session(session, dir);
-        server.query(&["set-option", "-w", "-t", &viewing, WINDOW_TAG, "devbox:api:/src/api"]);
+        server.query(&[
+            "set-option",
+            "-w",
+            "-t",
+            &viewing,
+            WINDOW_TAG,
+            "devbox:api:/src/api",
+        ]);
         server.query(&["set-option", "-p", "-t", &viewing, REMOTE_PANE_TAG, pane]);
         viewing
     }

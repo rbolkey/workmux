@@ -398,6 +398,21 @@ pub fn set_branch_base_in(branch: &str, base: &str, workdir: Option<&Path>) -> R
     Ok(())
 }
 
+/// Forget the base stored for `branch`, if any.
+pub fn unset_branch_base_in(branch: &str, workdir: Option<&Path>) -> Result<()> {
+    let config_key = format!("branch.{}.workmux-base", branch);
+    let cmd = Cmd::new("git").args(&["config", "--local", "--unset", &config_key]);
+    let cmd = match workdir {
+        Some(path) => cmd.workdir(path),
+        None => cmd,
+    };
+    if get_branch_base_in(branch, workdir).is_err() {
+        return Ok(());
+    }
+    cmd.run().context("Failed to unset workmux-base config")?;
+    Ok(())
+}
+
 /// Retrieve the base branch/commit that a branch was created from
 pub fn get_branch_base(branch: &str) -> Result<String> {
     get_branch_base_in(branch, None)
