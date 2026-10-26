@@ -452,7 +452,7 @@ mod tests {
 
     fn attaching(providers: &[&str]) -> OpenshellRemote {
         let mut origin = origin();
-        origin.settings.providers = providers.iter().map(|p| p.to_string()).collect();
+        origin.settings.providers = Some(providers.iter().map(|p| p.to_string()).collect());
         origin
     }
 

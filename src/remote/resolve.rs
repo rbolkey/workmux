@@ -353,7 +353,7 @@ mod tests {
             openshell.settings.policy.as_deref(),
             Some("/src/api/policy.yaml")
         );
-        assert_eq!(openshell.settings.providers, ["github"]);
+        assert_eq!(openshell.settings.attached_providers(), ["github"]);
         assert_eq!(openshell.agents, ["claude"]);
     }
 

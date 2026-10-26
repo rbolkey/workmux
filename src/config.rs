@@ -1042,8 +1042,9 @@ pub(crate) struct ProjectsWithdrawn;
 impl WithdrawnKey for ProjectsWithdrawn {
     const MESSAGE: &'static str = "projects: is no longer read. Where a project runs comes from \
 its repository's config: put `sandbox: {enabled: true, backend: openshell, openshell: {image, \
-policy, agents, path}}` in the repository's .workmux.yaml, list OpenShell providers under \
-sandbox.openshell.providers in your global config, and run workmux in a clone of the repository";
+policy, agents, providers}}` in the repository's .workmux.yaml, list the OpenShell providers \
+repositories may use under sandbox.openshell.providers in your global config, and run workmux in \
+a clone of the repository";
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1188,9 +1189,16 @@ pub struct OpenshellProject {
 
     /// OpenShell providers attached to the sandbox, for credentials;
     /// `gh-login` is the one workmux keeps from the workstation's `gh`
-    /// login. Global-only.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub providers: Vec<String>,
+    /// login. Global config lists the providers repositories may use; a
+    /// repository's list picks from it. Merged, the repository's picks, or
+    /// `None` when the repository lists none (it gets none).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub providers: Option<Vec<String>>,
+
+    /// Providers the repository's list names that global config doesn't:
+    /// never attached. Set by the merge.
+    #[serde(skip)]
+    pub unlisted_providers: Vec<String>,
 
     /// Agents the sandbox's image installs, by type such as `claude` or
     /// `codex`; the first is remote workmux's default agent (default: the
@@ -1200,16 +1208,25 @@ pub struct OpenshellProject {
 }
 
 impl OpenshellProject {
-    /// Merge: project overrides global, per field; `providers` is
-    /// global-only.
+    /// Merge: project overrides global, per field; `providers` narrows the
+    /// global list.
     fn merge(global: Self, project: Self) -> Self {
-        // Security: providers is global-only. Project config cannot set it
-        // -- otherwise a repository could commit `providers: [gh-login]`
-        // and receive the user's GitHub login.
-        if !project.providers.is_empty() {
+        // Security: global config lists the providers repositories may use,
+        // as named agents are global-only. A repository picks from that
+        // list and never adds to it -- otherwise it could commit
+        // `providers: [gh-login]` and receive the user's GitHub login.
+        let allowed = global.providers.unwrap_or_default();
+        let (providers, unlisted_providers): (Vec<String>, Vec<String>) = project
+            .providers
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .partition(|name| allowed.contains(name));
+        for name in &unlisted_providers {
             tracing::warn!(
-                "sandbox.openshell.providers in project config (.workmux.yaml) is ignored -- \
-                move it to your global config (~/.config/workmux/config.yaml)"
+                provider = name,
+                "sandbox.openshell.providers in project config (.workmux.yaml) names a provider \
+                your global config does not list; it is not attached"
             );
         }
         Self {
@@ -1217,13 +1234,19 @@ impl OpenshellProject {
             image: project.image.or(global.image),
             policy: project.policy.or(global.policy),
             path: project.path.or(global.path),
-            providers: global.providers,
+            providers: project.providers.map(|_| providers),
+            unlisted_providers,
             agents: if project.agents.is_empty() {
                 global.agents
             } else {
                 project.agents
             },
         }
+    }
+
+    /// The providers attached to the sandbox.
+    pub fn attached_providers(&self) -> &[String] {
+        self.providers.as_deref().unwrap_or_default()
     }
 }
 
@@ -4567,39 +4590,14 @@ mod tests {
         assert!(note.is_empty());
     }
 
-    /// Run `f`, returning its result and the log lines it emitted.
-    fn capture_logs<T>(f: impl FnOnce() -> T) -> (T, String) {
-        #[derive(Clone, Default)]
-        struct Sink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-        impl std::io::Write for Sink {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        let sink = Sink::default();
-        let writer = sink.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(move || writer.clone())
-            .with_ansi(false)
-            .finish();
-        let result = tracing::subscriber::with_default(subscriber, f);
-        let logs = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
-        (result, logs)
-    }
-
     #[test]
-    fn sandbox_openshell_merges_per_field_and_providers_are_global_only() {
+    fn sandbox_openshell_merges_per_field() {
         let global: Config = serde_yaml::from_str(
             "\
 sandbox:
   openshell:
     image: ghcr.io/me/base:1
     policy: global-policy.yaml
-    providers: [github, anthropic]
     agents: [claude]
 ",
         )
@@ -4612,25 +4610,92 @@ sandbox:
   openshell:
     image: ghcr.io/me/api-dev:1
     path: ~/src/api
-    providers: [gh-login]
 ",
         )
         .unwrap();
 
-        let (merged, logs) = capture_logs(|| global.merge(project));
+        let merged = global.merge(project);
 
         let openshell = &merged.sandbox.openshell;
         assert_eq!(openshell.image.as_deref(), Some("ghcr.io/me/api-dev:1"));
         assert_eq!(openshell.policy.as_deref(), Some("global-policy.yaml"));
         assert_eq!(openshell.path.as_deref(), Some("~/src/api"));
         assert_eq!(openshell.agents, ["claude"]);
-        assert_eq!(openshell.providers, ["github", "anthropic"]);
-        assert!(
-            logs.contains(
-                "sandbox.openshell.providers in project config (.workmux.yaml) is ignored"
-            ),
-            "logs: {logs}"
+    }
+
+    /// The OpenShell settings `global` and `project` merge to.
+    fn merged_openshell(global: &str, project: &str) -> super::OpenshellProject {
+        let global: Config = serde_yaml::from_str(global).unwrap();
+        let project: Config = serde_yaml::from_str(project).unwrap();
+        global.merge(project).sandbox.openshell
+    }
+
+    const GLOBAL_PROVIDERS: &str =
+        "sandbox:\n  openshell:\n    providers: [github-trellis, gh-login, claude]\n";
+
+    #[test]
+    fn a_repository_picks_its_providers_from_the_global_list_in_its_own_order() {
+        let openshell = merged_openshell(
+            GLOBAL_PROVIDERS,
+            "sandbox:\n  openshell:\n    providers: [claude, github-trellis]\n",
         );
+
+        assert_eq!(
+            openshell.providers.as_deref(),
+            Some(&["claude".to_string(), "github-trellis".to_string()][..])
+        );
+        assert!(openshell.unlisted_providers.is_empty());
+    }
+
+    #[test]
+    fn a_provider_the_global_list_does_not_name_is_never_attached() {
+        // A repository can't commit `providers: [gh-login]` and receive the
+        // user's GitHub login unless the user allows it globally.
+        let openshell = merged_openshell(
+            "sandbox:\n  openshell:\n    providers: [claude]\n",
+            "sandbox:\n  openshell:\n    providers: [gh-login, claude, github-api]\n",
+        );
+
+        assert_eq!(
+            openshell.providers.as_deref(),
+            Some(&["claude".to_string()][..])
+        );
+        assert_eq!(openshell.unlisted_providers, ["gh-login", "github-api"]);
+    }
+
+    #[test]
+    fn gh_login_is_attached_only_to_a_repository_that_names_it() {
+        let asks = merged_openshell(
+            GLOBAL_PROVIDERS,
+            "sandbox:\n  openshell:\n    providers: [gh-login]\n",
+        );
+        assert_eq!(
+            asks.providers.as_deref(),
+            Some(&["gh-login".to_string()][..])
+        );
+
+        let asks_for_another = merged_openshell(
+            GLOBAL_PROVIDERS,
+            "sandbox:\n  openshell:\n    providers: [claude]\n",
+        );
+        assert_eq!(
+            asks_for_another.providers.as_deref(),
+            Some(&["claude".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn a_repository_with_no_provider_list_gets_no_providers() {
+        let silent = merged_openshell(GLOBAL_PROVIDERS, "sandbox:\n  enabled: true\n");
+        assert_eq!(silent.providers, None);
+        assert!(silent.attached_providers().is_empty());
+
+        let empty = merged_openshell(
+            GLOBAL_PROVIDERS,
+            "sandbox:\n  openshell:\n    providers: []\n",
+        );
+        assert_eq!(empty.providers.as_deref(), Some(&[][..]));
+        assert!(empty.attached_providers().is_empty());
     }
 
     #[test]
