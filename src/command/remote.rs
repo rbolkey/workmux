@@ -527,6 +527,7 @@ fn summary(reach: &Reach) -> String {
     match reach {
         Reach::Reachable { .. } => "reachable".to_string(),
         Reach::Stopped => "stopped".to_string(),
+        Reach::Missing => "not created yet".to_string(),
         Reach::Unreachable { error } => {
             format!("unreachable: {}", error.lines().next().unwrap_or_default())
         }
@@ -639,6 +640,7 @@ fn status(remotes: &BTreeMap<String, RemoteConfig>, listed: &[Listed]) -> Result
                 }
             }
             Reach::Stopped => println!("  status:   stopped"),
+            Reach::Missing => println!("  status:   not created yet"),
             Reach::Unreachable { error } => {
                 all_reachable = false;
                 println!("  status:   unreachable");
