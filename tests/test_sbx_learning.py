@@ -23,7 +23,7 @@ import termios
 import threading
 import time
 from pathlib import Path
-from typing import Generator, Iterator
+from typing import Generator, Iterator, Optional
 
 import pytest
 
@@ -1036,6 +1036,176 @@ def test_guest_sees_placeholder_environment(sandbox: Sandbox):
     assert out == ["[gho_sbxproxy]", "[]", "[]"]
 
 
+SERVICES = [
+    "anthropic",
+    "copilot",
+    "cursor",
+    "devin",
+    "droid",
+    "github",
+    "google",
+    "groq",
+    "mistral",
+    "nebius",
+    "openai",
+    "openrouter",
+    "xai",
+]
+
+
+def test_shell_sandbox_gets_only_the_github_placeholder_whatever_secrets_it_holds(
+    sandbox: Sandbox,
+):
+    # Dummy values, scoped to the sandbox and removed again.
+    for service in SERVICES:
+        stored = sbx(
+            ["secret", "set", service, "--sandbox", sandbox.name],
+            input=f"wm-learn-dummy-{service}\n",
+        )
+        assert stored.returncode == 0, stored.stderr
+    try:
+        sandbox.stop()
+        names = sandbox.sh_ok("env | cut -d= -f1").split()
+        credentials = sorted(
+            name
+            for name in names
+            if name.endswith(("_API_KEY", "_TOKEN")) or name.startswith("SBX_CRED_")
+        )
+        assert credentials == ["GH_TOKEN"]
+    finally:
+        for service in SERVICES:
+            sbx(["secret", "rm", service, "--sandbox", sandbox.name, "-f"])
+    assert sbx_json(["secret", "ls", "--sandbox", sandbox.name])["secrets"] == []
+
+
+# Every variable `sbx secret import` knows, with dummy values, and some it
+# doesn't.
+CREDENTIAL_VARIABLES = [
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "COPILOT_GITHUB_TOKEN",
+    "CURSOR_API_KEY",
+    "DEVIN_API_KEY",
+    "FACTORY_API_KEY",
+    "GEMINI_API_KEY",
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GOOGLE_API_KEY",
+    "GOOGLE_GENERATIVE_AI_API_KEY",
+    "GROQ_API_KEY",
+    "MISTRAL_API_KEY",
+    "NEBIUS_API_KEY",
+    "OPENAI_API_KEY",
+    "OPENAI_KEY",
+    "OPENROUTER_API_KEY",
+    "XAI_API_KEY",
+]
+
+
+def detected_credentials(variables: list[str]) -> dict[str, str]:
+    """Service -> variable `sbx secret import --dry-run` would read; writes nothing."""
+    env = {key: os.environ[key] for key in ("HOME", "PATH", "USER", "TMPDIR")}
+    env.update({var: f"wm-learn-dummy-{var}" for var in variables})
+    result = subprocess.run(
+        ["sbx", "secret", "import", "--dry-run"],
+        capture_output=True,
+        text=True,
+        env={**env, "NO_COLOR": "1"},
+        stdin=subprocess.DEVNULL,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stderr
+    detected = {}
+    for line in result.stdout.splitlines():
+        # "Would import openai from OPENAI_API_KEY (last 4: ...)", or for a
+        # service logged in with OAuth "Would skip anthropic: ... so
+        # ANTHROPIC_API_KEY would never be used ..."
+        words = line.split()
+        if line.startswith("Would import"):
+            detected[words[2]] = words[4]
+        elif line.startswith("Would skip"):
+            service = words[2].rstrip(":")
+            detected[service] = next(w for w in words if w.isupper() and "_" in w)
+    return detected
+
+
+def test_secret_import_names_the_variables_that_hold_each_services_credential():
+    assert detected_credentials(CREDENTIAL_VARIABLES) == {
+        "anthropic": "ANTHROPIC_API_KEY",
+        "copilot": "COPILOT_GITHUB_TOKEN",
+        "cursor": "CURSOR_API_KEY",
+        "droid": "FACTORY_API_KEY",
+        "github": "GH_TOKEN",
+        "google": "GEMINI_API_KEY",
+        "groq": "GROQ_API_KEY",
+        "mistral": "MISTRAL_API_KEY",
+        "nebius": "NEBIUS_API_KEY",
+        "openai": "OPENAI_API_KEY",
+        "openrouter": "OPENROUTER_API_KEY",
+        "xai": "XAI_API_KEY",
+    }
+    # Each service takes its first variable; the fallbacks:
+    assert detected_credentials(["GITHUB_TOKEN", "GOOGLE_API_KEY"]) == {
+        "github": "GITHUB_TOKEN",
+        "google": "GOOGLE_API_KEY",
+    }
+    assert detected_credentials(["GOOGLE_GENERATIVE_AI_API_KEY"]) == {
+        "google": "GOOGLE_GENERATIVE_AI_API_KEY"
+    }
+    # devin has no variable, and these are none of the services'.
+    assert (
+        detected_credentials(
+            [
+                "DEVIN_API_KEY",
+                "OPENAI_KEY",
+                "ANTHROPIC_AUTH_TOKEN",
+                "CLAUDE_CODE_OAUTH_TOKEN",
+            ]
+        )
+        == {}
+    )
+
+
+def test_sbx_git_config_only_keeps_sbx_dirs_ignored(mounted: Sandbox):
+    out = mounted.sh_ok(
+        'echo "$GIT_CONFIG_COUNT $GIT_CONFIG_KEY_0 $GIT_CONFIG_VALUE_0"; '
+        "git config --file ~/.gitconfig_ignore_scope --list; "
+        "git config --file ~/.gitconfig_workspace_ignore --list; "
+        "cat ~/.gitignore_global"
+    ).splitlines()
+    assert out[0] == "1 include.path /home/agent/.gitconfig_ignore_scope"
+    settings = [line.split("=")[0] for line in out[1:] if "=" in line]
+    # An includeIf per git workspace, setting nothing but the excludes file:
+    # no credential helper.
+    assert settings and all(
+        key.startswith("includeif.") or key == "core.excludesfile" for key in settings
+    ), settings
+    assert ".sbx" in out
+
+
+def private_github_repo() -> Optional[str]:
+    """A private repository the gh login can read, by name only."""
+    listed = subprocess.run(
+        [
+            "gh",
+            "repo",
+            "list",
+            "--visibility",
+            "private",
+            "--limit",
+            "1",
+            "--json",
+            "nameWithOwner",
+            "-q",
+            ".[].nameWithOwner",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    return listed.stdout.strip() or None
+
+
 def gh_logged_in() -> bool:
     try:
         return (
@@ -1083,6 +1253,56 @@ def test_github_secret_from_command_reaches_the_api_as_placeholder(sandbox: Sand
     finally:
         sbx(["secret", "rm", "github", "--sandbox", sandbox.name, "-f"])
     assert wait_for(lambda: status() == "401")
+
+
+@pytest.mark.skipif(not gh_logged_in(), reason="needs gh logged in on the workstation")
+def test_git_over_https_and_an_overridden_gh_token_use_the_github_secret(
+    sandbox: Sandbox,
+):
+    repo = private_github_repo()
+    if repo is None:
+        pytest.skip("gh can't list a private repository")
+    # workmux's git identity replaces sbx's GIT_CONFIG_* entries.
+    identity = {
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "user.name",
+        "GIT_CONFIG_VALUE_0": "wm",
+        "GIT_TERMINAL_PROMPT": "0",
+    }
+
+    def ls_remote() -> int:
+        return sandbox.sh(
+            f"git ls-remote https://github.com/{repo} HEAD >/dev/null", env=identity
+        ).returncode
+
+    def status_with(token: str) -> str:
+        return sandbox.sh_ok(
+            'curl -s -o /dev/null -w "%{http_code}" '
+            '-H "Authorization: Bearer $GH_TOKEN" https://api.github.com/user',
+            env={"GH_TOKEN": token},
+        )
+
+    assert ls_remote() != 0
+    stored = sbx(
+        [
+            "secret",
+            "set",
+            "github",
+            "--sandbox",
+            sandbox.name,
+            "--command",
+            "gh auth token",
+        ]
+    )
+    assert stored.returncode == 0, stored.stderr
+    try:
+        # git needs no credential helper: the proxy authenticates github.com.
+        assert wait_for(lambda: ls_remote() == 0)
+        # The proxy replaces whatever the guest sends, so a variable passed
+        # over the placeholder only puts its own value in the agent's hands.
+        assert status_with("not-a-token") == "200"
+    finally:
+        sbx(["secret", "rm", "github", "--sandbox", sandbox.name, "-f"])
 
 
 # --- workmux image as template (Q10, Q16) ------------------------------------
