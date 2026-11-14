@@ -8,8 +8,9 @@ use std::process::Command;
 use std::time::SystemTime;
 use tracing::debug;
 
-use crate::config::Config;
+use crate::config::{Config, SandboxBackend};
 use crate::sandbox;
+use crate::sandbox::docker_sbx::{self, SbxInstance, SbxSandboxInfo};
 use crate::sandbox::lima;
 use crate::sandbox::lima::{LimaInstance, parse_lima_instances};
 
@@ -23,9 +24,9 @@ Container commands:
   pull             Pull the latest sandbox image from the container registry
   init-dockerfile  Export customizable Dockerfile templates
 
-Lima commands:
-  stop             Stop Lima VMs to free resources
-  prune            Delete unused Lima VMs to reclaim disk space
+Lima and Docker Sandboxes commands:
+  stop             Stop Lima VMs or sbx sandboxes to free resources
+  prune            Delete unused Lima VMs or sbx sandboxes to reclaim disk space
 
 General commands:
   agent            Run an agent inside a sandbox with RPC support
@@ -52,9 +53,10 @@ pub enum SandboxCommand {
         #[arg(long)]
         force: bool,
     },
-    /// Delete unused Lima VMs to reclaim disk space.
+    /// Delete unused Lima VMs (or sbx sandboxes with the docker_sbx backend)
+    /// to reclaim disk space.
     Prune {
-        /// Skip confirmation and delete all workmux VMs
+        /// Skip confirmation and delete all workmux VMs or sandboxes
         #[arg(short, long)]
         force: bool,
     },
@@ -85,12 +87,13 @@ pub enum SandboxCommand {
         #[arg(long)]
         release: bool,
     },
-    /// Stop Lima VMs to free resources.
+    /// Stop Lima VMs (or sbx sandboxes with the docker_sbx backend) to free
+    /// resources.
     Stop {
-        /// VM name to stop (if not provided, show interactive list)
+        /// VM or sandbox name to stop (if not provided, show interactive list)
         #[arg(conflicts_with = "all")]
         name: Option<String>,
-        /// Stop all workmux VMs (wm-* prefix)
+        /// Stop all workmux VMs or sandboxes (wm-* prefix)
         #[arg(long)]
         all: bool,
         /// Skip confirmation prompt
@@ -109,7 +112,7 @@ pub enum SandboxCommand {
     /// Uses the same mounts and environment as a normal worktree sandbox.
     Shell {
         /// Exec into an existing container for this worktree instead of starting a new one
-        /// (container backend only)
+        /// (container backend; Lima and docker_sbx always use the worktree's VM or sandbox)
         #[arg(long, short)]
         exec: bool,
         /// Command to run instead of bash
@@ -618,6 +621,9 @@ struct VmInfo {
 }
 
 fn run_prune(force: bool) -> Result<()> {
+    if Config::load(None)?.sandbox.backend() == SandboxBackend::DockerSbx {
+        return run_prune_docker_sbx(force);
+    }
     if !LimaInstance::is_lima_available() {
         bail!("limactl is not installed or not in PATH");
     }
@@ -762,6 +768,94 @@ fn run_prune(force: bool) -> Result<()> {
     Ok(())
 }
 
+fn run_prune_docker_sbx(force: bool) -> Result<()> {
+    if !SbxInstance::is_sbx_available() {
+        bail!("sbx is not installed or not in PATH");
+    }
+
+    let sandboxes: Vec<SbxSandboxInfo> = SbxInstance::list()?
+        .into_iter()
+        .filter(|sandbox| sandbox.name.starts_with(docker_sbx::SANDBOX_PREFIX))
+        .collect();
+
+    if sandboxes.is_empty() {
+        println!("No workmux sbx sandboxes found.");
+        return Ok(());
+    }
+
+    println!("Found {} workmux sbx sandbox(es):\n", sandboxes.len());
+
+    for (i, sandbox) in sandboxes.iter().enumerate() {
+        println!("{}. {} ({})", i + 1, sandbox.name, sandbox.status);
+        if let Some(created) = sandbox.created() {
+            println!("   Age: {}", format_duration_since(created));
+        }
+        if let Some(last_used) = sandbox.last_used() {
+            println!("   Last used: {}", format_duration_since(last_used));
+        }
+        println!();
+    }
+
+    // Confirm deletion unless --force
+    if !force {
+        print!("Delete all these sandboxes? [y/N] ");
+        io::stdout().flush().context("Failed to flush stdout")?;
+
+        let mut input = String::new();
+        io::stdin()
+            .read_line(&mut input)
+            .context("Failed to read input")?;
+
+        if input.trim().to_lowercase() != "y" {
+            println!("Aborted.");
+            return Ok(());
+        }
+    }
+
+    println!("\nDeleting sandboxes...");
+    let mut deleted_count: u64 = 0;
+    let mut failed: Vec<(String, String)> = Vec::new();
+
+    for sandbox in sandboxes {
+        print!("  Deleting {}... ", sandbox.name);
+        io::stdout().flush().ok();
+
+        match SbxInstance::remove_by_name(&sandbox.name) {
+            Ok(()) => {
+                println!("done");
+                deleted_count += 1;
+
+                // Clean up per-sandbox state directory
+                if let Ok(state_dir) = docker_sbx::sbx_state_dir_path(&sandbox.name)
+                    && state_dir.exists()
+                    && let Err(e) = std::fs::remove_dir_all(&state_dir)
+                {
+                    tracing::warn!(sandbox = %sandbox.name, error = %e, "failed to clean up state dir");
+                }
+            }
+            Err(e) => {
+                println!("failed");
+                failed.push((sandbox.name, e.to_string()));
+            }
+        }
+    }
+
+    println!();
+    if deleted_count > 0 {
+        println!("Deleted {} sandbox(es).", deleted_count);
+    }
+
+    if !failed.is_empty() {
+        eprintln!("\nFailed to delete {} sandbox(es):", failed.len());
+        for (name, error) in &failed {
+            eprintln!("  - {}: {}", name, error);
+        }
+        bail!("Some sandboxes could not be deleted");
+    }
+
+    Ok(())
+}
+
 /// Format duration since a timestamp as human-readable string.
 fn format_duration_since(time: SystemTime) -> String {
     let now = SystemTime::now();
@@ -808,6 +902,10 @@ fn format_duration_since(time: SystemTime) -> String {
 fn run_stop(name: Option<String>, all: bool, skip_confirm: bool) -> Result<()> {
     use crate::sandbox::lima::{LimaInstance, LimaInstanceInfo, VM_PREFIX};
     use std::io::{self, IsTerminal, Write};
+
+    if Config::load(None)?.sandbox.backend() == SandboxBackend::DockerSbx {
+        return run_stop_docker_sbx(name, all, skip_confirm);
+    }
 
     // Check if limactl is available
     if !LimaInstance::is_lima_available() {
@@ -930,19 +1028,134 @@ fn run_stop(name: Option<String>, all: bool, skip_confirm: bool) -> Result<()> {
     Ok(())
 }
 
-fn run_shell(exec: bool, command: Vec<String>) -> Result<()> {
-    use crate::config::SandboxBackend;
+fn run_stop_docker_sbx(name: Option<String>, all: bool, skip_confirm: bool) -> Result<()> {
+    use std::io::IsTerminal;
 
+    if !SbxInstance::is_sbx_available() {
+        bail!("sbx not found. Please install Docker Sandboxes first.");
+    }
+
+    // Get list of all workmux sandboxes
+    let workmux_sandboxes: Vec<SbxSandboxInfo> = SbxInstance::list()?
+        .into_iter()
+        .filter(|sandbox| sandbox.name.starts_with(docker_sbx::SANDBOX_PREFIX))
+        .collect();
+
+    // Filter to running sandboxes for display/selection
+    let running: Vec<&SbxSandboxInfo> = workmux_sandboxes
+        .iter()
+        .filter(|sandbox| sandbox.is_running())
+        .collect();
+
+    let to_stop: Vec<&SbxSandboxInfo> = if all {
+        if running.is_empty() {
+            println!("No running workmux sandboxes found.");
+            return Ok(());
+        }
+        running
+    } else if let Some(ref sandbox_name) = name {
+        // Check all sandboxes (not just running) for better error messages
+        match workmux_sandboxes.iter().find(|s| s.name == *sandbox_name) {
+            Some(s) if s.is_running() => vec![s],
+            Some(s) => {
+                println!(
+                    "Sandbox '{}' is already stopped (status: {}).",
+                    sandbox_name, s.status
+                );
+                return Ok(());
+            }
+            None => {
+                bail!(
+                    "Sandbox '{}' not found. Use 'workmux sandbox stop' to see available sandboxes.",
+                    sandbox_name
+                );
+            }
+        }
+    } else {
+        // Interactive mode: require TTY
+        if !io::stdin().is_terminal() {
+            bail!("Non-interactive stdin detected. Use --all or specify a sandbox name.");
+        }
+
+        if running.is_empty() {
+            println!("No running workmux sandboxes found.");
+            return Ok(());
+        }
+
+        select_sandboxes_interactive(&running)?
+    };
+
+    if to_stop.is_empty() {
+        println!("No sandboxes selected.");
+        return Ok(());
+    }
+
+    // Show what will be stopped
+    println!("The following sandboxes will be stopped:");
+    for sandbox in &to_stop {
+        println!("  - {} ({})", sandbox.name, sandbox.status);
+    }
+
+    // Confirm unless --yes flag is provided
+    if !skip_confirm {
+        print!(
+            "\nAre you sure you want to stop {} sandbox(es)? [y/N] ",
+            to_stop.len()
+        );
+        io::stdout().flush()?;
+
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+
+        let answer = input.trim().to_ascii_lowercase();
+        if !matches!(answer.as_str(), "y" | "yes") {
+            println!("Aborted.");
+            return Ok(());
+        }
+    }
+
+    let mut success_count = 0;
+    let mut failed: Vec<(String, String)> = Vec::new();
+
+    for sandbox in to_stop {
+        print!("Stopping {}... ", sandbox.name);
+        io::stdout().flush()?;
+
+        match SbxInstance::stop_by_name(&sandbox.name) {
+            Ok(()) => {
+                println!("✓");
+                success_count += 1;
+            }
+            Err(e) => {
+                println!("✗");
+                failed.push((sandbox.name.clone(), e.to_string()));
+            }
+        }
+    }
+
+    if success_count > 0 {
+        println!("\n✓ Successfully stopped {} sandbox(es)", success_count);
+    }
+
+    if !failed.is_empty() {
+        eprintln!("\nFailed to stop {} sandbox(es):", failed.len());
+        for (name, error) in &failed {
+            eprintln!("  - {}: {}", name, error);
+        }
+        bail!("Some sandboxes could not be stopped");
+    }
+
+    Ok(())
+}
+
+fn run_shell(exec: bool, command: Vec<String>) -> Result<()> {
     let config = Config::load(None)?;
     sandbox::notice::show_once();
 
     match config.sandbox.backend() {
         SandboxBackend::Container => run_shell_container(exec, command, &config),
         SandboxBackend::Lima => run_shell_lima(exec, command, &config),
-        SandboxBackend::DockerSbx => bail!(
-            "'workmux sandbox shell' is not supported with the docker_sbx backend yet.\n\
-             Use 'sbx exec -it <sandbox> bash' (find the sandbox with 'sbx ls')."
-        ),
+        SandboxBackend::DockerSbx => run_shell_docker_sbx(command, &config),
     }
 }
 
@@ -1122,6 +1335,75 @@ fn run_shell_lima(exec: bool, command: Vec<String>, config: &Config) -> Result<(
         .context("Failed to execute limactl shell")?;
 
     std::process::exit(status.code().unwrap_or(1));
+}
+
+/// Exec a shell into the current worktree's sbx sandbox (creating it if
+/// needed). sbx sandboxes persist, so `--exec` means the same.
+fn run_shell_docker_sbx(command: Vec<String>, config: &Config) -> Result<()> {
+    let cwd = std::env::current_dir().context("Failed to get current directory")?;
+    let cwd = cwd.canonicalize().unwrap_or(cwd);
+    let worktree_root = crate::git::get_repo_root()
+        .context("Not inside a git repository. The docker_sbx sandbox is per worktree.")?;
+
+    // Build shell command
+    let shell_cmd = if command.is_empty() {
+        "bash".to_string()
+    } else {
+        command.join(" ")
+    };
+
+    let mut env = Vec::new();
+    for term_var in ["TERM", "COLORTERM"] {
+        if let Ok(val) = std::env::var(term_var) {
+            env.push((term_var.to_string(), val));
+        }
+    }
+    env.extend(super::sandbox_run::git_user_config_envs(&cwd));
+    let exec = docker_sbx::ExecRequest {
+        command: shell_cmd,
+        env,
+        session: docker_sbx::new_session()?,
+    };
+    let plan =
+        docker_sbx::prepare_launch(config, &worktree_root, &cwd, resolve_agent(config), &exec)?;
+
+    debug!(sandbox = %plan.sandbox_name, cmd = %exec.command, "starting sbx shell");
+    std::process::exit(docker_sbx::run_exec(&plan)?);
+}
+
+fn select_sandboxes_interactive<'a>(
+    sandboxes: &'a [&'a SbxSandboxInfo],
+) -> Result<Vec<&'a SbxSandboxInfo>> {
+    println!("Running workmux sandboxes:");
+    println!();
+    for (idx, sandbox) in sandboxes.iter().enumerate() {
+        println!("  {}. {} ({})", idx + 1, sandbox.name, sandbox.status);
+    }
+    println!();
+    println!("Enter sandbox number to stop (or 'all' for all sandboxes):");
+    print!("> ");
+    io::stdout().flush()?;
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    let input = input.trim();
+
+    if input.eq_ignore_ascii_case("all") {
+        return Ok(sandboxes.to_vec());
+    }
+
+    let idx: usize = input
+        .parse()
+        .context("Invalid input. Please enter a number or 'all'.")?;
+
+    if idx < 1 || idx > sandboxes.len() {
+        bail!(
+            "Invalid selection. Please choose a number between 1 and {}",
+            sandboxes.len()
+        );
+    }
+
+    Ok(vec![sandboxes[idx - 1]])
 }
 
 fn select_vms_interactive<'a>(

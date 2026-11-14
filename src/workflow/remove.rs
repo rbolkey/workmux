@@ -139,6 +139,8 @@ fn remove_with_hook_output(
     // the supervisor's Drop handler to run. We try unconditionally since sandbox
     // may have been enabled via --sandbox flag even if disabled in config.
     sandbox::stop_containers_for_handle(actual_handle);
+    // An sbx sandbox outlives its panes; delete it with the worktree.
+    sandbox::remove_docker_sbx_sandbox(&worktree_path);
 
     info!(branch = %branch_name, keep_branch, "remove:cleanup start");
     let cleanup_result = cleanup::cleanup(
