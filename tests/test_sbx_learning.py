@@ -1003,6 +1003,38 @@ def test_a_device_cant_be_mounted_over_a_file(remap_dirs: Path):
             Sandbox(name).remove()
 
 
+def test_mask_kept_in_a_read_only_workspace_holds_across_a_restart(
+    tmp_path: Path,
+):
+    """A mask's source can sit inside another read-only workspace, as
+    workmux keeps masks in the sandbox's state dir. A masked file deleted on
+    the host comes back there, empty, when sbx next starts the sandbox."""
+    ws = tmp_path.resolve() / "ws"
+    state = tmp_path.resolve() / "state"
+    (state / "masks").mkdir(parents=True)
+    (state / "masks" / "env").write_text("")
+    ws.mkdir()
+    env = ws / ".env"
+    env.write_text("SECRET=1\n")
+    masked, created = create_sandbox(
+        "mask",
+        [str(ws), f"{state}/masks/env:{env}:ro", f"{state}:ro"],
+    )
+    try:
+        assert created.returncode == 0, created.stderr
+        out = masked.sh(f"cat {env}; echo x >> {env}")
+        assert out.stdout == ""
+        assert "Read-only file system" in out.stderr
+        assert env.read_text() == "SECRET=1\n", "the host file is untouched"
+
+        env.unlink()
+        masked.stop()
+        assert masked.sh_ok(f"cat {env}") == ""
+        assert env.read_text() == "", "sbx made the mount point again"
+    finally:
+        masked.remove()
+
+
 # --- Resources (Q13) ---------------------------------------------------------
 
 
