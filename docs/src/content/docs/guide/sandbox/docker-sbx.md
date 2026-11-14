@@ -40,6 +40,8 @@ workmux checks these before creating a sandbox and fails closed, never running t
 | Global network policy chosen | Error naming `sbx policy init`                                                               |
 | Supported host               | Error naming sbx's platforms: macOS 14+ on Apple silicon, Windows 11, Ubuntu 24.04+ with KVM |
 
+workmux reads the sign-in and policy checks from `sbx diagnose`. Any other check it fails, such as disk space, is printed as a warning with sbx's hint, and the launch goes ahead: sbx reports its own error if it can't create or run the sandbox.
+
 ## Configuration
 
 The generic `sandbox` settings keep their meaning:
