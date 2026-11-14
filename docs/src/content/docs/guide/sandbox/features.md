@@ -1,9 +1,9 @@
 ---
 title: "Shared features"
-description: Features shared across container and Lima sandbox backends
+description: Features shared across the container, Lima and Docker Sandboxes backends
 ---
 
-These features work with both the container and Lima sandbox backends.
+These features work with the container, Lima and Docker Sandboxes (`docker_sbx`) sandbox backends.
 
 ## Extra mounts
 
@@ -54,6 +54,8 @@ sandbox:
 
 When configured, workmux creates shim scripts inside the sandbox that transparently forward these commands to the host via RPC. The host runs them in the project's toolchain environment (Devbox/Nix if available), streams stdout/stderr back to the sandbox in real-time, and returns the exit code.
 
+Under `docker_sbx`, host commands run on your workstation, outside sbx's network policy and its placeholder credentials: they reach whatever your workstation can reach, and see the credentials it holds (within the filesystem sandbox described below), not sbx's placeholders. Weigh each command you add with that in mind.
+
 Some commands are built-in and always available as host-exec shims without configuration (e.g., `afplay` for sound notifications). Only commands listed in `host_commands` or built-in are allowed; there is no wildcard or auto-discovery.
 
 For Lima VMs: This is complementary to the toolchain integration (`toolchain: auto`). The toolchain wraps the _agent command_ itself (e.g., `claude`), while `host_commands` lets the agent invoke _other_ tools that exist on the host. For example, an agent running inside the VM could run `just check` and the command would execute on the host with full access to the project's Devbox environment.
@@ -80,7 +82,7 @@ Host-exec applies several layers of defense to limit what a compromised agent in
 
 ## Sound notifications
 
-Claude Code hooks often use `afplay` to play notification sounds (e.g., when an agent finishes). Since `afplay` is a macOS-only binary, it doesn't exist inside the Linux guest. workmux includes `afplay` as a built-in host-exec shim that forwards sound playback to the host. This works with both Lima and container backends.
+Claude Code hooks often use `afplay` to play notification sounds (e.g., when an agent finishes). Since `afplay` is a macOS-only binary, it doesn't exist inside the Linux guest. workmux includes `afplay` as a built-in host-exec shim that forwards sound playback to the host. This works with every sandbox backend.
 
 This is transparent: when a hook runs `afplay /System/Library/Sounds/Glass.aiff` inside the sandbox, the shim runs `afplay` on the host via the host-exec RPC mechanism. No configuration is needed.
 

@@ -119,7 +119,7 @@ workmux sandbox agent -- claude -p "coordinate these tasks"
 
 - `<command...>` - Command to run instead of the configured agent
 
-This command runs a sandboxed agent in the current directory. It delegates to the same supervisor process used by `workmux sandbox run`, which handles RPC server setup, sandbox dispatch (Lima or container), environment variables, and cleanup.
+This command runs a sandboxed agent in the current directory. It delegates to the same supervisor process used by `workmux sandbox run`, which handles RPC server setup, sandbox dispatch (Lima, container or Docker Sandboxes), environment variables, and cleanup.
 
 The key difference from `sandbox shell` is that this starts an RPC server, enabling the guest to call `workmux add` from inside the sandbox. Guest-side `workmux add` detects the sandbox environment and routes through SpawnAgent RPC to the host, where sub-agents are created normally (and sandboxed if the project config says so).
 
@@ -154,7 +154,7 @@ workmux sandbox shell --exec
 
 - **Container:** Starts a fresh container with the same mounts and environment as a normal worktree sandbox. With `--exec`, attaches to an existing container instead.
 - **Lima:** Connects to the Lima VM for the current worktree (creating it if needed). The `--exec` flag is not supported since Lima VMs are persistent and `shell` always connects to the existing VM.
-- **Docker Sandboxes:** Runs the shell with `sbx exec` in the current worktree's sbx sandbox, creating it if needed and starting it if sbx stopped it. `--exec` means the same.
+- **Docker Sandboxes:** Runs the shell with `sbx exec` in the current worktree's sbx sandbox, creating it if needed and starting it if sbx stopped it. `--exec` means the same. A single argument after `--` runs as a shell command line (`-- 'git log | head'`); several are passed on as separate words, keeping their quoting (`-- bash -c 'set -x; make'`). It gets a terminal only when stdin is one, so it also works from scripts and pipes.
 
 ### sandbox install-dev
 
