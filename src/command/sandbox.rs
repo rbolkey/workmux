@@ -626,8 +626,14 @@ fn run_install_dev(skip_build: bool, release: bool) -> Result<()> {
     }
 
     // --- sbx sandbox installation ---
+    // Best effort, whatever the backend: skipped unless sbx can list its
+    // sandboxes.
     if SbxInstance::is_sbx_available() {
-        let sandboxes = SbxInstance::list()?;
+        let sandboxes = SbxInstance::list().unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "failed to list sbx sandboxes");
+            eprintln!("Warning: skipping sbx sandboxes: {}", e);
+            Vec::new()
+        });
         let running: Vec<_> = sandboxes
             .iter()
             .filter(|s| s.name.starts_with(docker_sbx::SANDBOX_PREFIX) && s.is_running())
