@@ -42,7 +42,7 @@ pub fn git_metadata(worktree: &Path) -> Result<GitMetadata> {
         }
     }
 
-    let config_paths = config_paths(&common.join("config"))?
+    let config_paths = config_paths(&common.join("config"), &identity.worktree)?
         .into_iter()
         .filter(|path| path.starts_with(&identity.worktree) || path.starts_with(common))
         .collect();
@@ -195,9 +195,27 @@ fn config_entries(config: &Path, pattern: &str) -> Result<Vec<(String, String)>>
 
 /// Files the repository config includes, and the programs it runs, that
 /// exist: an agent able to change them could change what git does on the host.
-fn config_paths(config: &Path) -> Result<Vec<PathBuf>> {
+///
+/// Paths resolve as git resolves them: an include relative to the config
+/// file that names it; `core.hooksPath` and the programs (`core.fsmonitor`,
+/// diff, filter and merge drivers) relative to the top of `worktree`, where
+/// git runs hooks and commands, a program without a slash being looked up
+/// on `PATH`; `~/` in the home directory.
+fn config_paths(config: &Path, worktree: &Path) -> Result<Vec<PathBuf>> {
+    fn expand_home(path: &str) -> Result<Option<PathBuf>> {
+        Ok(match path.strip_prefix("~/") {
+            Some(rest) => Some(
+                home::home_dir()
+                    .context("Could not resolve home directory for Git config path")?
+                    .join(rest),
+            ),
+            None => None,
+        })
+    }
+
     fn visit(
         config: &Path,
+        worktree: &Path,
         visited: &mut std::collections::HashSet<PathBuf>,
         paths: &mut Vec<PathBuf>,
     ) -> Result<()> {
@@ -210,10 +228,8 @@ fn config_paths(config: &Path) -> Result<Vec<PathBuf>> {
             if value.contains(['*', '?', '[', '%']) {
                 bail!("Git config include path cannot be protected safely: {value}");
             }
-            let include = match value.strip_prefix("~/") {
-                Some(rest) => home::home_dir()
-                    .context("Could not resolve home directory for Git config include")?
-                    .join(rest),
+            let include = match expand_home(&value)? {
+                Some(path) => path,
                 None => dir.join(&value),
             };
             if !include.is_file() {
@@ -223,28 +239,41 @@ fn config_paths(config: &Path) -> Result<Vec<PathBuf>> {
                 );
             }
             paths.push(include.clone());
-            visit(&include, visited, paths)?;
+            visit(&include, worktree, visited, paths)?;
         }
 
+        // git matches the pattern against lowercased keys.
         for (key, value) in config_entries(
             &config,
-            "^(core\\.(hooksPath|fsmonitor)|diff\\..*\\.(command|textconv)|filter\\..*\\.(clean|smudge|process)|merge\\..*\\.driver)$",
+            "^(core\\.(hookspath|fsmonitor)|diff\\..*\\.(command|textconv)|filter\\..*\\.(clean|smudge|process)|merge\\..*\\.driver)$",
         )? {
+            let hooks_path = key.eq_ignore_ascii_case("core.hooksPath");
             if key.eq_ignore_ascii_case("core.fsmonitor")
                 && matches!(value.as_str(), "true" | "false")
             {
                 continue;
             }
-            let token = value
-                .trim_start_matches('!')
-                .split_whitespace()
-                .next()
-                .unwrap_or("")
-                .trim_matches(['\'', '"']);
+            let token = if hooks_path {
+                value.as_str()
+            } else {
+                value
+                    .trim_start_matches('!')
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .trim_matches(['\'', '"'])
+            };
             if token.is_empty() || token.contains(['$', '`', '%']) {
                 continue;
             }
-            let candidate = dir.join(token);
+            // A program named without a slash comes from PATH.
+            if !hooks_path && !token.contains('/') {
+                continue;
+            }
+            let candidate = match expand_home(token)? {
+                Some(path) => path,
+                None => worktree.join(token),
+            };
             if candidate.exists() {
                 paths.push(candidate);
             }
@@ -253,7 +282,12 @@ fn config_paths(config: &Path) -> Result<Vec<PathBuf>> {
     }
 
     let mut paths = Vec::new();
-    visit(config, &mut std::collections::HashSet::new(), &mut paths)?;
+    visit(
+        config,
+        worktree,
+        &mut std::collections::HashSet::new(),
+        &mut paths,
+    )?;
     Ok(paths)
 }
 
@@ -339,6 +373,32 @@ mod tests {
                 worktree.join("extra.gitconfig"),
                 worktree.join("fsmonitor.sh")
             ]
+        );
+    }
+
+    #[test]
+    fn relative_hooks_and_programs_resolve_against_the_worktree_as_git_does() {
+        // Husky sets `core.hooksPath .husky/_`; git runs hooks, filters and
+        // diff drivers from the top of the working tree, not the config's
+        // directory, and looks programs without a slash up on PATH.
+        let (_temp, main, worktree) = linked_worktree();
+        std::fs::create_dir_all(worktree.join(".husky/_")).unwrap();
+        std::fs::create_dir_all(worktree.join("scripts")).unwrap();
+        std::fs::write(worktree.join("scripts/clean.sh"), "").unwrap();
+        std::fs::write(worktree.join("git-lfs"), "").unwrap();
+        std::fs::create_dir_all(main.join(".git/.husky/_")).unwrap();
+        for (key, value) in [
+            ("core.hooksPath", ".husky/_"),
+            ("filter.x.clean", "./scripts/clean.sh %f"),
+            ("filter.lfs.process", "git-lfs filter-process"),
+        ] {
+            git(&["config", key, value], &main);
+        }
+
+        let git = git_metadata(&worktree).unwrap();
+        assert_eq!(
+            git.config_paths,
+            vec![worktree.join(".husky/_"), worktree.join("scripts/clean.sh")]
         );
     }
 
