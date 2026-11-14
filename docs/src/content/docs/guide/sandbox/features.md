@@ -108,18 +108,20 @@ Codex also gets `--dangerously-bypass-hook-trust`. Codex otherwise asks you to r
 
 ## Credentials
 
-Both sandbox backends mount agent-specific credential directories from the host. The mounted directory depends on the configured `agent`:
+Every sandbox backend mounts agent-specific credential directories from the host. The mounted directory depends on the configured `agent`:
 
-| Agent      | Host directory               | Container mount                 | Lima mount                       |
-| ---------- | ---------------------------- | ------------------------------- | -------------------------------- |
-| `claude`   | `~/.claude/`                 | `/tmp/.claude/`                 | `$HOME/.claude/`                 |
-| `copilot`  | `~/.copilot/`                | `/tmp/.copilot/`                | `$HOME/.copilot/`                |
-| `gemini`   | `~/.gemini/`                 | `/tmp/.gemini/`                 | `$HOME/.gemini/`                 |
-| `agy`      | `~/.gemini/antigravity-cli/` | `/tmp/.gemini/antigravity-cli/` | `$HOME/.gemini/antigravity-cli/` |
-| `codex`    | `~/.codex/`                  | `/home/user/.codex/`            | `$HOME/.codex/`                  |
-| `opencode` | `~/.local/share/opencode/`   | `/tmp/.local/share/opencode/`   | `$HOME/.local/share/opencode/`   |
-| `pi`       | `~/.pi/agent/`               | `/tmp/.pi/agent/`               | `$HOME/.pi/agent/`               |
-| `omp`      | `~/.omp/agent/`              | `/tmp/.omp/agent/`              | `$HOME/.omp/agent/`              |
+| Agent      | Host directory               | Container mount                 | Lima mount                       | `docker_sbx` link                      |
+| ---------- | ---------------------------- | ------------------------------- | -------------------------------- | -------------------------------------- |
+| `claude`   | `~/.claude/`                 | `/tmp/.claude/`                 | `$HOME/.claude/`                 | `/home/agent/.claude/`                 |
+| `copilot`  | `~/.copilot/`                | `/tmp/.copilot/`                | `$HOME/.copilot/`                | `/home/agent/.copilot/`                |
+| `gemini`   | `~/.gemini/`                 | `/tmp/.gemini/`                 | `$HOME/.gemini/`                 | `/home/agent/.gemini/`                 |
+| `agy`      | `~/.gemini/antigravity-cli/` | `/tmp/.gemini/antigravity-cli/` | `$HOME/.gemini/antigravity-cli/` | `/home/agent/.gemini/antigravity-cli/` |
+| `codex`    | `~/.codex/`                  | `/home/user/.codex/`            | `$HOME/.codex/`                  | `/home/agent/.codex/`                  |
+| `opencode` | `~/.local/share/opencode/`   | `/tmp/.local/share/opencode/`   | `$HOME/.local/share/opencode/`   | `/home/agent/.local/share/opencode/`   |
+| `pi`       | `~/.pi/agent/`               | `/tmp/.pi/agent/`               | `$HOME/.pi/agent/`               | `/home/agent/.pi/agent/`               |
+| `omp`      | `~/.omp/agent/`              | `/tmp/.omp/agent/`              | `$HOME/.omp/agent/`              | `/home/agent/.omp/agent/`              |
+
+Docker Sandboxes can mount a directory only at its own host path, so under `docker_sbx` the host directory is mounted at its host path and linked to the path in the table when the sandbox is created.
 
 Other agents get no config directory mount.
 
@@ -130,11 +132,11 @@ Key behaviors:
 - Gemini, Codex, OpenCode, and OMP store credentials in files. If you've authenticated on the host, the sandbox automatically has access.
 - Claude stores auth in macOS Keychain, which isn't accessible from containers or Linux VMs. You need to authenticate Claude separately inside the sandbox.
 - Authentication done inside the sandbox writes back to the host directory. Credentials persist across sandbox recreations.
-- The credential mount is determined by the `agent` setting. Switching agents requires recreating the sandbox (Lima) or starting a new container.
-- For `pi`, the entire `~/.pi/agent/` is shared except `bin/`. Pi auto-downloads platform-specific `fd` and `rg` binaries into `bin/`, so a Linux sandbox would otherwise overwrite a macOS host's Mach-O binaries through the bind mount. Workmux overlays a per-sandbox, arch-keyed directory on `bin/` to keep host and guest binaries separate.
+- The credential mount is determined by the `agent` setting. Switching agents requires recreating the sandbox (Lima and `docker_sbx`, with `workmux sandbox prune`) or starting a new container.
+- For `pi`, the entire `~/.pi/agent/` is shared except `bin/`. Pi auto-downloads platform-specific `fd` and `rg` binaries into `bin/`, so a Linux sandbox would otherwise overwrite a macOS host's Mach-O binaries through the bind mount. Workmux overlays a per-sandbox, arch-keyed directory on `bin/` to keep host and guest binaries separate. Under `docker_sbx`, the overlay is a directory inside the sandbox, bound over `bin/` each time a pane starts; OMP's `~/.omp/agent/tools/`, where OMP downloads the same binaries, gets the same treatment.
 - OMP uses file-backed state and credentials mounted from `~/.omp/agent/`.
 
-The container backend also uses a separate config file for Claude, mounted to `/tmp/.claude.json` inside the container. Docker/Podman use `~/.claude-sandbox.json` (file mount); Apple Container uses `~/.claude-sandbox-config/claude.json` (directory mount, since Apple Container only supports directory mounts).
+The container backend also uses a separate config file for Claude, mounted to `/tmp/.claude.json` inside the container. Docker/Podman use `~/.claude-sandbox.json` (file mount); Apple Container uses `~/.claude-sandbox-config/claude.json` (directory mount, since Apple Container only supports directory mounts). Lima and `docker_sbx` instead give each VM or sandbox its own `~/.claude.json`, seeded with Claude's onboarding marked complete.
 
 ### Custom config directory
 
