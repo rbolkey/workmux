@@ -270,17 +270,9 @@ fn current_platform() -> Platform {
     }
 }
 
-/// Gather what sbx reports about the sandbox `name`.
-pub fn gather_state(name: &str) -> Result<SbxState> {
-    if !SbxInstance::is_sbx_available() {
-        bail!(
-            "docker_sbx backend is enabled but sbx is not installed.\n\
-             Install Docker Sandboxes: https://docs.docker.com/ai/sandboxes/\n\
-             Or disable sandbox: set 'sandbox.enabled: false' in config."
-        );
-    }
-    let checks = sbx_diagnose()?;
-    let platform = current_platform();
+/// The sandbox `name` from `sbx ls`, and its rules (the global ones while
+/// it doesn't exist).
+fn list_sandbox_and_rules(name: &str) -> Result<(Option<SbxSandboxInfo>, Vec<SbxRule>)> {
     let sandbox = SbxInstance::list()?
         .into_iter()
         .find(|sandbox| sandbox.name == name);
@@ -306,15 +298,46 @@ pub fn gather_state(name: &str) -> Result<SbxState> {
         }
         Err(e) => return Err(e.context("Failed to list sbx network rules")),
     };
-    // Secret names and scopes, never values. Advisory only: a listing
-    // failure leaves the credential warnings out.
-    let secrets = match sbx_json(&["secret", "ls"]) {
-        Ok(stdout) => parse_sbx_secrets(&stdout)?,
+    Ok((sandbox, rules))
+}
+
+/// Secret names and scopes from `sbx secret ls`, never values. Advisory
+/// only: a listing failure leaves the credential warnings out.
+fn list_secrets() -> Result<Vec<SbxSecret>> {
+    match sbx_json(&["secret", "ls"]) {
+        Ok(stdout) => parse_sbx_secrets(&stdout),
         Err(e) => {
             debug!(error = %e, "failed to list sbx secrets");
-            Vec::new()
+            Ok(Vec::new())
         }
-    };
+    }
+}
+
+/// Gather what sbx reports about the sandbox `name`.
+pub fn gather_state(name: &str) -> Result<SbxState> {
+    if !SbxInstance::is_sbx_available() {
+        bail!(
+            "docker_sbx backend is enabled but sbx is not installed.\n\
+             Install Docker Sandboxes: https://docs.docker.com/ai/sandboxes/\n\
+             Or disable sandbox: set 'sandbox.enabled: false' in config."
+        );
+    }
+    let platform = current_platform();
+    // The listings are independent but for the rules, which depend on
+    // whether the sandbox exists; run them side by side.
+    let (checks, sandbox_and_rules, secrets) = std::thread::scope(|scope| {
+        let checks = scope.spawn(sbx_diagnose);
+        let secrets = scope.spawn(list_secrets);
+        let sandbox_and_rules = list_sandbox_and_rules(name);
+        (
+            checks.join().expect("sbx diagnose thread panicked"),
+            sandbox_and_rules,
+            secrets.join().expect("sbx secret ls thread panicked"),
+        )
+    });
+    let checks = checks?;
+    let (sandbox, rules) = sandbox_and_rules?;
+    let secrets = secrets?;
     Ok(SbxState {
         platform,
         checks,
@@ -462,7 +485,6 @@ pub fn prepare_launch(
     let state_dir = sbx_state_dir_path(&name)?;
     std::fs::create_dir_all(&state_dir)
         .with_context(|| format!("Failed to create {}", state_dir.display()))?;
-    let git = super::git::git_metadata(&worktree_root)?;
     // sbx mounts only directories that exist.
     if let Some(config_dir) = config.sandbox.resolved_agent_config_dir(agent) {
         let _ = std::fs::create_dir_all(&config_dir);
@@ -478,11 +500,18 @@ pub fn prepare_launch(
     let state = gather_state(&name)?;
     let network_record = read_network_record(&state_dir);
     let created_with = read_created_record(&state_dir);
+    // Only creating the sandbox mounts the git metadata; finding it walks
+    // the worktree.
+    let git = if super::plan::creates_sandbox(&state, created_with.as_ref()) {
+        Some(super::git::git_metadata(&worktree_root)?)
+    } else {
+        None
+    };
     let target = LaunchTarget {
         sandbox_name: &name,
         worktree_root: &worktree_root,
         pane_cwd: &pane_cwd,
-        git: &git,
+        git: git.as_ref(),
         opencode_config_dir: opencode_config_dir.as_deref(),
         state_dir: &state_dir,
         network_record: &network_record,

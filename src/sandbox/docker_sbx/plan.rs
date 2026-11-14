@@ -49,8 +49,10 @@ pub struct LaunchTarget<'a> {
     pub worktree_root: &'a Path,
     /// The pane's working directory, under `worktree_root`.
     pub pane_cwd: &'a Path,
-    /// The git metadata the worktree uses.
-    pub git: &'a GitMetadata,
+    /// The git metadata the worktree uses. Finding it walks the worktree,
+    /// so it's gathered only when the launch creates the sandbox (see
+    /// [`creates_sandbox`]), which is all that mounts it.
+    pub git: Option<&'a GitMetadata>,
     /// OpenCode's global config directory (`~/.config/opencode/`), when it
     /// exists; mounted read-only for the opencode agent.
     pub opencode_config_dir: Option<&'a Path>,
@@ -493,24 +495,50 @@ fn git_workspaces(git: &GitMetadata) -> Vec<String> {
     workspaces
 }
 
+/// An `extra_mounts` entry as a workspace: `HOST[:GUEST][:ro]`.
+fn extra_mount_workspace(host: &Path, guest: &Path, read_only: bool) -> String {
+    let workspace = if guest == host {
+        host.to_string_lossy().into_owned()
+    } else {
+        format!("{}:{}", host.display(), guest.display())
+    };
+    if read_only {
+        format!("{workspace}:ro")
+    } else {
+        workspace
+    }
+}
+
+/// `sandbox.extra_mounts` as the workspaces they become, unchecked: what a
+/// sandbox's create-time settings record.
+fn extra_mount_settings(config: &SandboxConfig) -> Result<Vec<String>> {
+    config
+        .extra_mounts()
+        .iter()
+        .map(|mount| {
+            let (host, guest, read_only) = mount.resolve()?;
+            Ok(extra_mount_workspace(&host, &guest, read_only))
+        })
+        .collect()
+}
+
 /// `sandbox.extra_mounts` as workspaces (`HOST[:GUEST]`), read-only unless
 /// writable. sbx mounts a file only read-only.
-fn extra_mount_workspaces(config: &SandboxConfig, target: &LaunchTarget) -> Result<Vec<String>> {
+fn extra_mount_workspaces(
+    config: &SandboxConfig,
+    target: &LaunchTarget,
+    git: &GitMetadata,
+) -> Result<Vec<String>> {
     let protected = [
         target.worktree_root.join(".git"),
-        target.git.admin_dir.clone(),
-        target.git.common_dir.clone(),
+        git.admin_dir.clone(),
+        git.common_dir.clone(),
     ];
     let mut workspaces = Vec::new();
     for mount in config.extra_mounts() {
         let (host, guest, read_only) = mount.resolve()?;
-        let workspace = if guest == host {
-            host.to_string_lossy().into_owned()
-        } else {
-            format!("{}:{}", host.display(), guest.display())
-        };
         if read_only {
-            workspaces.push(format!("{workspace}:ro"));
+            workspaces.push(extra_mount_workspace(&host, &guest, read_only));
             continue;
         }
         // Checking the host is the plan's only look at the filesystem.
@@ -531,7 +559,7 @@ fn extra_mount_workspaces(config: &SandboxConfig, target: &LaunchTarget) -> Resu
                 guest.display()
             );
         }
-        workspaces.push(workspace);
+        workspaces.push(extra_mount_workspace(&host, &guest, read_only));
     }
     Ok(workspaces)
 }
@@ -941,7 +969,6 @@ pub fn launch_plan(
         .network
         .validate()
         .context("Invalid sandbox network config")?;
-    let extra_mounts = extra_mount_workspaces(config, target)?;
 
     let name = target.sandbox_name;
     let mut setup = Vec::new();
@@ -954,7 +981,7 @@ pub fn launch_plan(
         agent: agent.to_string(),
         agent_config_dir: config_dir.as_ref().map(|(dir, _)| dir.clone()),
         opencode_config_dir: opencode_config_dir.map(Path::to_path_buf),
-        extra_mounts: extra_mounts.clone(),
+        extra_mounts: extra_mount_settings(config)?,
         cpus: sbx.cpus(),
         memory: sbx.memory().map(str::to_string),
         kits: sbx.kits().to_vec(),
@@ -975,6 +1002,10 @@ pub fn launch_plan(
     });
 
     if !exists {
+        let git = target
+            .git
+            .context("git metadata missing for a sandbox the plan creates")?;
+        let extra_mounts = extra_mount_workspaces(config, target, git)?;
         let mut args = words(&[
             "create",
             "--name",
@@ -996,7 +1027,7 @@ pub fn launch_plan(
         }
         args.push("shell".to_string());
         args.push(target.worktree_root.to_string_lossy().into_owned());
-        args.extend(git_workspaces(target.git));
+        args.extend(git_workspaces(git));
         // The agent's config directory where the agent looks for it, as on
         // the other backends.
         if let Some((config_dir, subpath)) = &config_dir {
@@ -1009,7 +1040,7 @@ pub fn launch_plan(
             ));
         }
         args.push(format!("{}:ro", target.state_dir.display()));
-        args.extend(extra_mounts.iter().cloned());
+        args.extend(extra_mounts);
         setup.push(SbxCommand {
             args,
             env: Vec::new(),
@@ -1254,7 +1285,7 @@ mod tests {
             sandbox_name: "wm-proj-12345678",
             worktree_root: &p.worktree,
             pane_cwd: &p.cwd,
-            git: &p.git,
+            git: Some(&p.git),
             opencode_config_dir: None,
             state_dir: &p.state,
             network_record: &p.record,
@@ -1437,6 +1468,28 @@ mod tests {
             let plan = launch_plan(&config(), &target(&p), "claude", &state, &exec()).unwrap();
             assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
         }
+    }
+
+    #[test]
+    fn existing_sandbox_launches_without_its_git_metadata() {
+        // Finding the git metadata walks the worktree; only creating the
+        // sandbox mounts it.
+        let p = paths();
+        let target = LaunchTarget {
+            git: None,
+            ..target(&p)
+        };
+        let plan = launch_plan(
+            &config(),
+            &target,
+            "claude",
+            &running_with(Vec::new()),
+            &exec(),
+        );
+        assert!(plan.is_ok(), "{:?}", plan.err());
+
+        let err = launch_plan(&config(), &target, "claude", &missing(), &exec()).unwrap_err();
+        assert!(format!("{err:#}").contains("git metadata"), "{err:#}");
     }
 
     fn rule(scope: &str, resource: &str) -> SbxRule {
