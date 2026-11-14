@@ -143,6 +143,23 @@ sbx creates sandboxes from templates kept in its own image store. workmux builds
 
 Agents use the login in their mounted config directory, as on the container backend: Codex, Gemini, OpenCode, pi and OMP start logged in if you've logged in on the workstation. Claude stores its login in the macOS Keychain, which the sandbox can't reach. Sign in to Claude once inside a sandbox; the login is written to the mounted config directory and persists across sandboxes. See [Credentials](/guide/sandbox/features/#credentials).
 
+### Tool credentials
+
+Give tools such as `gh` and `git` their credentials with sbx's own secrets, not with `env` or `env_passthrough`:
+
+```bash
+# For every sandbox
+sbx secret set github --command 'gh auth token'
+# For one sandbox
+sbx secret set github --sandbox wm-myproject-a1b2c3d4 --command 'gh auth token'
+```
+
+sbx keeps the secret on the workstation and its proxy adds it to requests for the service's domains, so the agent only ever holds a placeholder (such as `GH_TOKEN=gho_sbxproxy…`). `git` over HTTPS to GitHub needs no credential helper: the proxy authenticates it too. Services are `anthropic`, `copilot`, `cursor`, `devin`, `droid`, `github`, `google`, `groq`, `mistral`, `nebius`, `openai`, `openrouter` and `xai`; `sbx secret ls` lists the ones you've set. workmux never sets, reads or passes a secret: it reads only their names, with `sbx secret ls`.
+
+A variable in `env` or `env_passthrough` that holds one of these credentials (`GH_TOKEN`, `GITHUB_TOKEN`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY` and the like, as `sbx secret import` recognises them) replaces sbx's placeholder with the real value, which the agent can then read and send anywhere it can reach. When sbx holds a secret for that service, globally or for the sandbox, workmux warns at launch, naming the variable and `sbx secret set`; remove the variable from your config. When sbx holds no such secret, workmux says nothing.
+
+sbx also sets git config of its own in the sandbox (keeping its `.sbx` directories out of `git status`); workmux keeps it alongside your [git identity](/guide/sandbox/features/#git-identity).
+
 ## Provisioning
 
 The `provision` script runs once, after workmux creates the sandbox and sets it up (config directory links, Claude's onboarding state, network rules), never on later launches. It runs as root with `bash -c`, in the worktree; the template has no `sudo`, so don't use it. Its downloads go through sbx's proxy and network policy like any other request in the sandbox. sbx's `balanced` policy reaches package mirrors over HTTPS only, while the template's Debian sources use plain HTTP (refused with `403 Forbidden`), so switch them to HTTPS first, as below. A changed script applies the next time the sandbox is created (`workmux sandbox prune`, or `workmux remove`). If the script fails, workmux deletes the sandbox and stops with its error, so the next launch creates and provisions it again.
