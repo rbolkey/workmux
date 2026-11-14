@@ -136,6 +136,9 @@ pub struct LaunchPlan {
     pub create_template: Option<String>,
     /// Commands to run, in order, before `exec`.
     pub setup: Vec<SbxCommand>,
+    /// The custom provision script, run as root after `setup` when the plan
+    /// creates the sandbox, so the sandbox's network rules apply to it.
+    pub provision: Option<SbxCommand>,
     /// The interactive exec that runs the command.
     pub exec: SbxCommand,
     /// Hangs up the exec's processes in the guest. sbx leaves them running
@@ -514,14 +517,15 @@ fn check_prerequisites(state: &SbxState) -> Result<()> {
 ///
 /// When the sandbox is missing: create it from the template with sbx's
 /// generic `shell` agent (agent kits would write into the mounted config
-/// directory), mounting the worktree, the main repository's git dir
-/// (read-only but for what commits write), the agent's config directory,
-/// the shims and `extra_mounts`, all at their host paths; then,
-/// as root, link the config directory to where the agent looks for it and
-/// seed Claude's onboarding state. On every launch: bind pi's and OMP's
-/// binaries directory to a guest-local one, reconcile the sandbox's rules
-/// with `sandbox.network`, and allow the supervisor's RPC port until the
-/// exec ends.
+/// directory), the configured resources and mixin kits, mounting the
+/// worktree, the main repository's git dir (read-only but for what commits
+/// write), the agent's config directory, the shims and `extra_mounts`, all
+/// at their host paths; then, as root, link the config directory to where
+/// the agent looks for it and seed Claude's onboarding state. On every
+/// launch: bind pi's and OMP's binaries directory to a guest-local one,
+/// reconcile the sandbox's rules with `sandbox.network`, and allow the
+/// supervisor's RPC port until the exec ends. Last, when the sandbox was
+/// just created, the `provision` script.
 pub fn launch_plan(
     config: &SandboxConfig,
     target: &LaunchTarget,
@@ -560,8 +564,18 @@ pub fn launch_plan(
             &template,
             "--pull",
             "never",
-            "shell",
         ]);
+        let sbx = &config.docker_sbx;
+        if let Some(cpus) = sbx.cpus() {
+            args.extend(["--cpus".to_string(), cpus.to_string()]);
+        }
+        if let Some(memory) = sbx.memory() {
+            args.extend(["--memory".to_string(), memory.to_string()]);
+        }
+        for kit in sbx.kits() {
+            args.extend(["--kit".to_string(), kit.clone()]);
+        }
+        args.push("shell".to_string());
         args.push(target.worktree_root.to_string_lossy().into_owned());
         args.extend(git_workspaces(target.git));
         let config_dir = config_dir_and_home_subpath(config, agent);
@@ -656,6 +670,16 @@ pub fn launch_plan(
         }
     }
 
+    // The custom provision script runs once, as root, when the sandbox is
+    // created. The template already holds what Lima's built-in provisioning
+    // installs, so there is no built-in step for skip_default_provision to
+    // skip.
+    let provision = config
+        .docker_sbx
+        .provision_script()
+        .filter(|_| state.sandbox.is_none())
+        .map(|script| root_exec(name, words(&["bash", "-c", script])));
+
     // A rule scoped to the sandbox lets the guest reach the supervisor's RPC
     // server through host.docker.internal; sbx names the workstation
     // `localhost`. Only its port, and only while the supervisor runs: the
@@ -676,6 +700,7 @@ pub fn launch_plan(
         sandbox_name: name.to_string(),
         create_template,
         setup,
+        provision,
         exec: exec_command(target, exec),
         hangup: hangup_command(target, exec),
         teardown,
@@ -688,7 +713,8 @@ pub fn launch_plan(
 mod tests {
     use super::*;
     use crate::config::{
-        AllowedDomainDetails, AllowedDomainEntry, ExtraMount, NetworkConfig, NetworkPolicy,
+        AllowedDomainDetails, AllowedDomainEntry, DockerSbxConfig, ExtraMount, NetworkConfig,
+        NetworkPolicy,
     };
     use std::path::PathBuf;
 
@@ -1863,5 +1889,163 @@ mod tests {
         let config = with_extra_mounts(vec![ExtraMount::Path("/code".to_string())]);
         let p = paths();
         assert!(launch_plan(&config, &target(&p), "claude", &missing(), &exec()).is_ok());
+    }
+
+    fn with_docker_sbx(edit: impl FnOnce(&mut DockerSbxConfig)) -> SandboxConfig {
+        let mut config = config();
+        edit(&mut config.docker_sbx);
+        config
+    }
+
+    /// The flags `sbx create` gets before the agent.
+    fn create_flags(plan: &LaunchPlan) -> Vec<String> {
+        plan.setup[0]
+            .args
+            .iter()
+            .take_while(|a| *a != "shell")
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn created_sandbox_gets_the_configured_cpus_memory_and_kits() {
+        let config = with_docker_sbx(|sbx| {
+            sbx.cpus = Some(8);
+            sbx.memory = Some("8g".to_string());
+            sbx.kits = Some(vec![
+                "docker.io/sbx/task:latest".to_string(),
+                "./my-mixin/".to_string(),
+            ]);
+        });
+        let p = paths();
+        let plan = launch_plan(&config, &target(&p), "claude", &missing(), &exec()).unwrap();
+
+        let flags = create_flags(&plan);
+        let tag = super::super::template::template_tag("test-image:latest");
+        assert_eq!(
+            flags,
+            args(&[
+                "create",
+                "--name",
+                "wm-proj-12345678",
+                "--no-progress",
+                "--template",
+                &tag,
+                "--pull",
+                "never",
+                "--cpus",
+                "8",
+                "--memory",
+                "8g",
+                "--kit",
+                "docker.io/sbx/task:latest",
+                "--kit",
+                "./my-mixin/",
+            ])
+        );
+    }
+
+    #[test]
+    fn unset_resources_leave_sbx_its_defaults() {
+        let p = paths();
+        let plan = launch_plan(&config(), &target(&p), "claude", &missing(), &exec()).unwrap();
+
+        let flags = create_flags(&plan);
+        for flag in ["--cpus", "--memory", "--kit"] {
+            assert!(!flags.contains(&flag.to_string()), "{flags:?}");
+        }
+    }
+
+    fn provision_command() -> Vec<String> {
+        args(&[
+            "exec",
+            "-u",
+            "root",
+            "wm-proj-12345678",
+            "bash",
+            "-c",
+            "apt-get install -y ripgrep",
+        ])
+    }
+
+    #[test]
+    fn provision_runs_as_root_after_the_sandbox_is_set_up_and_its_rules_added() {
+        let config = SandboxConfig {
+            docker_sbx: DockerSbxConfig {
+                provision: Some("apt-get install -y ripgrep".to_string()),
+                ..Default::default()
+            },
+            ..with_network(NetworkPolicy::Deny, domains(&["deb.debian.org"]))
+        };
+        let p = paths();
+        let plan = launch_plan(&config, &target(&p), "claude", &missing(), &exec()).unwrap();
+
+        // Provisioning runs after every setup command: the seed, the links
+        // and the domain rules its downloads may need.
+        let setup = setup_args(&plan);
+        assert!(
+            setup
+                .iter()
+                .any(|a| a.iter().any(|w| w.contains(".claude.json"))),
+            "{setup:?}"
+        );
+        assert!(
+            setup.contains(&policy("allow", "deb.debian.org:443")),
+            "{setup:?}"
+        );
+        assert!(!setup.contains(&provision_command()), "{setup:?}");
+        assert_eq!(plan.provision.map(|c| c.args), Some(provision_command()));
+    }
+
+    #[test]
+    fn provision_never_runs_on_an_existing_sandbox() {
+        let config = with_docker_sbx(|sbx| {
+            sbx.provision = Some("apt-get install -y ripgrep".to_string());
+            sbx.kits = Some(vec!["docker.io/sbx/task:latest".to_string()]);
+            sbx.cpus = Some(8);
+        });
+        let p = paths();
+        let state = SbxState {
+            sandbox: Some(sandbox("stopped")),
+            ..missing()
+        };
+        let plan = launch_plan(&config, &target(&p), "claude", &state, &exec()).unwrap();
+
+        assert_eq!(plan.provision, None);
+        assert!(
+            plan.setup.iter().all(|c| c.args[0] != "create"),
+            "{:?}",
+            plan.setup
+        );
+    }
+
+    #[test]
+    fn skip_default_provision_still_runs_provision_and_workmux_setup() {
+        let config = with_docker_sbx(|sbx| {
+            sbx.provision = Some("apt-get install -y ripgrep".to_string());
+            sbx.skip_default_provision = Some(true);
+        });
+        let p = paths();
+        let skipped = launch_plan(&config, &target(&p), "claude", &missing(), &exec()).unwrap();
+
+        let config = with_docker_sbx(|sbx| {
+            sbx.provision = Some("apt-get install -y ripgrep".to_string());
+        });
+        let plan = launch_plan(&config, &target(&p), "claude", &missing(), &exec()).unwrap();
+
+        assert_eq!(
+            skipped.provision.as_ref().map(|c| c.args.clone()),
+            Some(provision_command())
+        );
+        assert_eq!(setup_args(&skipped), setup_args(&plan));
+    }
+
+    #[test]
+    fn blank_provision_script_runs_nothing() {
+        let config = with_docker_sbx(|sbx| sbx.provision = Some("  \n".to_string()));
+        let p = paths();
+        let plan = launch_plan(&config, &target(&p), "claude", &missing(), &exec()).unwrap();
+
+        assert_eq!(plan.provision, None);
     }
 }
