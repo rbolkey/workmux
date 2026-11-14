@@ -14,7 +14,9 @@ import fcntl
 import json
 import os
 import pty
+import re
 import select
+import shlex
 import signal
 import socket
 import struct
@@ -23,7 +25,7 @@ import termios
 import threading
 import time
 from pathlib import Path
-from typing import Generator, Iterator, Optional
+from typing import Generator, Iterator, Optional, Sequence
 
 import pytest
 
@@ -1497,6 +1499,324 @@ def test_git_over_https_and_an_overridden_gh_token_use_the_github_secret(
         assert status_with("not-a-token") == "200"
     finally:
         sbx(["secret", "rm", "github", "--sandbox", sandbox.name, "-f"])
+
+
+# --- Placeholder agent credentials (ticket 07) -------------------------------
+
+
+@contextlib.contextmanager
+def dummy_secrets(sandbox: Sandbox, services: list[str]) -> Iterator[None]:
+    """Dummy service secrets scoped to the sandbox, removed afterwards."""
+    for service in services:
+        stored = sbx(
+            ["secret", "set", service, "--sandbox", sandbox.name],
+            input=f"wm-learn-dummy-{service}\n",
+        )
+        assert stored.returncode == 0, stored.stderr
+    try:
+        yield
+    finally:
+        for service in services:
+            sbx(["secret", "rm", service, "--sandbox", sandbox.name, "-f"])
+
+
+def test_proxy_injects_model_provider_api_keys_in_a_shell_sandbox(sandbox: Sandbox):
+    """No agent kit needed: in a `shell` sandbox the proxy injects the
+    anthropic, openai and google secrets by domain, replacing the
+    placeholder the agent sends. The providers' errors tell a missing key
+    from a wrong one, and OpenAI's names the start of the key it got."""
+    probe = (
+        "curl -s -m 30 https://api.anthropic.com/v1/models "
+        "-H 'anthropic-version: 2023-06-01'; echo; "
+        "curl -s -m 30 https://api.openai.com/v1/models "
+        "-H 'Authorization: Bearer proxy-managed'; echo; "
+        "curl -s -m 30 https://generativelanguage.googleapis.com/v1beta/models; echo"
+    )
+    before = sandbox.sh_ok(probe)
+    assert "x-api-key header is required" in before
+    assert "Incorrect API key provided: proxy-ma" in before
+    assert "PERMISSION_DENIED" in before
+
+    with dummy_secrets(sandbox, ["anthropic", "openai", "google"]):
+        assert wait_for(lambda: "invalid x-api-key" in sandbox.sh_ok(probe))
+        after = sandbox.sh_ok(probe)
+        assert "Incorrect API key provided: wm-learn" in after, "header replaced"
+        assert "API_KEY_INVALID" in after
+
+
+def copilot_token_works_on_the_host() -> bool:
+    if not gh_logged_in():
+        return False
+    token = subprocess.run(
+        ["gh", "auth", "token"], capture_output=True, text=True
+    ).stdout.strip()
+    status = subprocess.run(
+        [
+            "curl",
+            "-s",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{http_code}",
+            "-H",
+            f"Authorization: Bearer {token}",
+            "-H",
+            "Copilot-Integration-Id: copilot-developer-cli",
+            "https://api.githubcopilot.com/models",
+        ],
+        capture_output=True,
+        text=True,
+    ).stdout
+    return status == "200"
+
+
+@pytest.mark.skipif(
+    not copilot_token_works_on_the_host(),
+    reason="needs gh logged in with a token Copilot's API accepts",
+)
+def test_proxy_doesnt_serve_the_copilot_secret_in_a_shell_sandbox(sandbox: Sandbox):
+    """sbx declares Copilot's injection in its copilot kit only: a shell
+    sandbox's requests to api.githubcopilot.com go out unchanged, with a
+    token that works from the workstation stored for copilot or github."""
+
+    def status() -> str:
+        return sandbox.sh_ok(
+            'curl -s -o /dev/null -w "%{http_code}" '
+            '-H "Authorization: Bearer $GH_TOKEN" '
+            "-H 'Copilot-Integration-Id: copilot-developer-cli' "
+            "https://api.githubcopilot.com/models"
+        )
+
+    for service in ["copilot", "github"]:
+        stored = sbx(
+            [
+                "secret",
+                "set",
+                service,
+                "--sandbox",
+                sandbox.name,
+                "--command",
+                "gh auth token",
+            ]
+        )
+        assert stored.returncode == 0, stored.stderr
+        try:
+            time.sleep(5)
+            assert status() == "401"
+        finally:
+            sbx(["secret", "rm", service, "--sandbox", sandbox.name, "-f"])
+
+
+@pytest.fixture(scope="module")
+def agent_templates() -> Generator[list[str], None, None]:
+    """Templates the placeholder tests loaded, removed after the module."""
+    loaded: list[str] = []
+    try:
+        yield loaded
+    finally:
+        for tag in loaded:
+            sbx(["template", "rm", "-f", tag])
+
+
+def agent_sandbox(
+    agent: str,
+    workspace: Path,
+    templates: list[str],
+    extra: Sequence[str] = (),
+) -> tuple[Sandbox, subprocess.CompletedProcess[str]]:
+    template = load_learning_template(agent)
+    templates.append(template)
+    return create_sandbox(
+        f"ph-{agent}",
+        [str(workspace), *extra],
+        extra=["-t", template, "--pull", "never"],
+    )
+
+
+def intercepted(sandbox: Sandbox, host: str) -> bool:
+    """Whether sbx's proxy opened the sandbox's TLS to `host`, as it does to
+    inject a credential, rather than passing it through."""
+    log = sbx_json(["policy", "log", sandbox.name])
+    return any(
+        entry["host"] == f"{host}:443" and entry["proxy_type"] == "forward"
+        for entry in log["allowed"]
+    )
+
+
+@requires_docker
+def test_codex_reads_a_masked_auth_json_and_sends_the_openai_secret(
+    workspace: Path,
+    tmp_path_factory: pytest.TempPathFactory,
+    agent_templates: list[str],
+):
+    """sbx's codex kit writes `{"OPENAI_API_KEY": "proxy-managed"}` to
+    ~/.codex/auth.json for an API key. Mounted read-only over the config
+    dir's own auth.json, it hides that file, and the proxy replaces the
+    placeholder with the openai secret."""
+    config = tmp_path_factory.mktemp("codex-config").resolve()
+    (config / "auth.json").write_text('{"OPENAI_API_KEY": "wm-learn-real"}\n')
+    masks = tmp_path_factory.mktemp("masks").resolve()
+    (masks / "auth.json").write_text('{\n  "OPENAI_API_KEY": "proxy-managed"\n}\n')
+    sandbox, created = agent_sandbox(
+        "codex",
+        workspace,
+        agent_templates,
+        [
+            f"{config}:/home/agent/.codex",
+            f"{masks / 'auth.json'}:/home/agent/.codex/auth.json:ro",
+        ],
+    )
+    try:
+        assert created.returncode == 0, created.stderr
+        assert "proxy-managed" in sandbox.sh_ok("cat ~/.codex/auth.json")
+        with dummy_secrets(sandbox, ["openai"]):
+            out = sandbox.sh(
+                "cd /tmp && timeout 180 codex exec --skip-git-repo-check 'say hi' 2>&1",
+                timeout=240,
+            ).stdout
+            assert "Incorrect API key provided: wm-learn" in out
+            assert "wm-learn-real" not in out
+        assert "wm-learn-real" in (config / "auth.json").read_text()
+    finally:
+        sandbox.remove()
+
+
+@requires_docker
+def test_opencode_takes_placeholder_api_keys_from_the_environment(
+    workspace: Path, agent_templates: list[str]
+):
+    """sbx's opencode kit marks each provider's key variable proxy-managed;
+    set to the placeholder, OpenCode sends it and the proxy swaps in the
+    secret, with an empty auth.json in place of the stored logins."""
+    sandbox, created = agent_sandbox("opencode", workspace, agent_templates)
+    try:
+        assert created.returncode == 0, created.stderr
+        sandbox.sh_ok(
+            "mkdir -p ~/.local/share/opencode && echo '{}' > ~/.local/share/opencode/auth.json"
+        )
+        env = {"OPENAI_API_KEY": "proxy-managed", "ANTHROPIC_API_KEY": "proxy-managed"}
+        with dummy_secrets(sandbox, ["openai", "anthropic"]):
+            out = sandbox.sh(
+                "cd /tmp && timeout 120 opencode run -m openai/gpt-4o-mini 'say hi' 2>&1; "
+                "timeout 120 opencode run -m anthropic/claude-haiku-4-5 'say hi' 2>&1",
+                env=env,
+                timeout=300,
+            ).stdout
+            assert "Incorrect API key provided: wm-learn" in out
+            assert "invalid x-api-key" in out
+    finally:
+        sandbox.remove()
+
+
+@requires_docker
+def test_gemini_sends_a_placeholder_api_key_the_proxy_intercepts(
+    workspace: Path, agent_templates: list[str]
+):
+    """Gemini with an API key: `GEMINI_API_KEY=proxy-managed` and no Google
+    login. With a google secret the proxy opens the request to inject it;
+    without one it passes it through."""
+    sandbox, created = agent_sandbox("gemini", workspace, agent_templates)
+    try:
+        assert created.returncode == 0, created.stderr
+        run = (
+            "cd /tmp && timeout 180 gemini --skip-trust -p 'say hi' 2>&1 | "
+            "grep -c API_KEY_INVALID"
+        )
+        env = {"GEMINI_API_KEY": "proxy-managed"}
+        with dummy_secrets(sandbox, ["google"]):
+            assert int(sandbox.sh(run, env=env, timeout=240).stdout or 0) > 0
+            assert intercepted(sandbox, "generativelanguage.googleapis.com")
+    finally:
+        sandbox.remove()
+
+
+@requires_docker
+def test_claude_uses_a_placeholder_api_key_once_approved(
+    workspace: Path, agent_templates: list[str]
+):
+    """For an anthropic API key, sbx's claude kit sets an `apiKeyHelper`
+    printing `proxy-managed`; in workmux's mounted config the same comes
+    from `ANTHROPIC_API_KEY=proxy-managed`, which Claude uses without asking
+    once ~/.claude.json approves it."""
+    sandbox, created = agent_sandbox("claude", workspace, agent_templates)
+    try:
+        assert created.returncode == 0, created.stderr
+        env = {"ANTHROPIC_API_KEY": "proxy-managed"}
+        with dummy_secrets(sandbox, ["anthropic"]):
+            out = sandbox.sh(
+                "cd /tmp && timeout 120 claude -p 'say hi' 2>&1", env=env, timeout=180
+            ).stdout
+            assert "Invalid API key" in out
+            assert intercepted(sandbox, "api.anthropic.com")
+
+        def startup_screen(seed: dict[str, object]) -> str:
+            sandbox.sh_ok(f"printf %s {shlex.quote(json.dumps(seed))} > ~/.claude.json")
+            screen = sandbox.sh(
+                "cd /tmp && (sleep 12; printf '\\003\\003') | timeout 15 "
+                "script -q -c 'claude --dangerously-skip-permissions' /dev/null",
+                env=env,
+                timeout=60,
+            ).stdout
+            return re.sub(r"\x1b\[[0-9;?<>]*[a-zA-Z]|\s", "", screen)
+
+        seed: dict[str, object] = {
+            "hasCompletedOnboarding": True,
+            "bypassPermissionsModeAccepted": True,
+            "projects": {"/tmp": {"hasTrustDialogAccepted": True}},
+        }
+        assert "DetectedacustomAPIkey" in startup_screen(seed)
+        seed["customApiKeyResponses"] = {"approved": ["proxy-managed"], "rejected": []}
+        assert "DetectedacustomAPIkey" not in startup_screen(seed)
+    finally:
+        sandbox.remove()
+
+
+@requires_docker
+def test_claude_reads_sbx_kits_oauth_sentinels_from_a_masked_credentials_file(
+    workspace: Path,
+    tmp_path_factory: pytest.TempPathFactory,
+    agent_templates: list[str],
+):
+    """sbx's claude kit writes its OAuth sentinels into
+    ~/.claude/.credentials.json. Masked over the config dir's own file,
+    Claude reads them and logs in with the sentinel token. Whether the proxy
+    swaps in a real OAuth login needs one (`sbx secret ls` shows
+    `(oauth configured)`) and is checked by hand: ticket 07."""
+    config = tmp_path_factory.mktemp("claude-config").resolve()
+    (config / ".credentials.json").write_text('{"claudeAiOauth": {}}\n')
+    masks = tmp_path_factory.mktemp("masks").resolve()
+    sentinels = {
+        "claudeAiOauth": {
+            "accessToken": "sk-ant-oat01-proxy-managed",
+            "refreshToken": "sk-ant-ort01-proxy-managed",
+            "expiresAt": 4102444800000,
+            "scopes": ["user:inference", "user:profile"],
+        }
+    }
+    (masks / "credentials.json").write_text(json.dumps(sentinels))
+    sandbox, created = agent_sandbox(
+        "claude",
+        workspace,
+        agent_templates,
+        [
+            f"{config}:/home/agent/.claude",
+            f"{masks / 'credentials.json'}:/home/agent/.claude/.credentials.json:ro",
+        ],
+    )
+    try:
+        assert created.returncode == 0, created.stderr
+        out = sandbox.sh(
+            "cd /tmp && timeout 120 claude -p 'say hi' 2>&1", timeout=180
+        ).stdout
+        # Not "Not logged in": Claude took the sentinel as its OAuth login,
+        # which Anthropic refuses without the proxy's swap.
+        assert "OAuth" in out
+        assert "Not logged in" not in out
+        assert config.joinpath(".credentials.json").read_text() == (
+            '{"claudeAiOauth": {}}\n'
+        )
+    finally:
+        sandbox.remove()
 
 
 # --- workmux image as template (Q10, Q16) ------------------------------------
