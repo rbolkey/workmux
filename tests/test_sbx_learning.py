@@ -820,6 +820,37 @@ def test_workmux_image_with_thin_agent_layer_is_a_template(
 
 
 @requires_docker
+def test_root_bind_mount_keeps_guest_writes_off_the_host_until_stop(
+    template: str, tmp_path_factory: pytest.TempPathFactory
+):
+    """A guest-local dir bound over a workspace subdir takes the guest's writes
+    (pi's bin/); the bind ends when the sandbox stops, its contents stay.
+    The stock shell image has no `mount`; workmux's image does."""
+    config = tmp_path_factory.mktemp("sbx-bind").resolve()
+    host_bin = config / "bin"
+    sandbox, created = create_sandbox(
+        "bind", [str(config)], extra=["-t", template, "--pull", "never"]
+    )
+    try:
+        assert created.returncode == 0, created.stderr
+        bind = (
+            f"install -d -o agent -g agent /var/lib/wm-learn && mkdir -p {host_bin} "
+            f"&& mount --bind /var/lib/wm-learn {host_bin}"
+        )
+        sandbox.sh_ok(bind, user="root")
+        sandbox.sh_ok(f"echo linux > {host_bin}/fd")
+        assert list(host_bin.iterdir()) == []
+
+        sandbox.stop()
+        out = sandbox.sh_ok(
+            f"mountpoint -q {host_bin} && echo bound || echo unbound; ls /var/lib/wm-learn"
+        )
+        assert out.split() == ["unbound", "fd"]
+    finally:
+        sandbox.remove()
+
+
+@requires_docker
 def test_claude_kit_no_longer_needs_an_agent_owned_claude_dir(workspace: Path):
     """v0.50.1 failed to create a claude sandbox from an image without an
     agent-owned ~/.claude (500, "failed to apply kit to sandbox"). Since
