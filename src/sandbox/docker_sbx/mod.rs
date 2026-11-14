@@ -7,6 +7,7 @@
 
 mod git;
 mod instance;
+mod mask;
 mod plan;
 mod template;
 

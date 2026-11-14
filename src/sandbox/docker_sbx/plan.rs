@@ -1,19 +1,20 @@
 //! The launch plan: what a pane launch asks of sbx.
 //!
 //! [`launch_plan`] is pure, but for checking whether a writable extra mount
-//! is a file. Callers gather sbx's state (see
+//! is a file and which excluded files exist. Callers gather sbx's state (see
 //! [`super::instance::gather_state`]), compute the plan, run its setup
 //! commands, then run its exec in the foreground.
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use crate::config::SandboxConfig;
 use crate::sandbox::toolchain::{self, DetectedToolchain};
 use crate::shell::shell_quote;
 
 use super::instance::{SbxCheck, SbxRule, SbxSandboxInfo, SbxSecret};
+use super::mask::Mask;
 
 /// The host sbx runs on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,6 +85,8 @@ pub struct CreateSettings {
     pub opencode_config_dir: Option<PathBuf>,
     /// `sandbox.extra_mounts`, as workspaces.
     pub extra_mounts: Vec<String>,
+    /// The files `sandbox.container.excluded_files` masked.
+    pub excluded_files: Vec<PathBuf>,
     pub cpus: Option<u32>,
     pub memory: Option<String>,
     pub kits: Vec<String>,
@@ -177,6 +180,10 @@ pub struct LaunchPlan {
     pub remove: Option<SbxCommand>,
     /// Template the sandbox is created from, when the plan creates it.
     pub create_template: Option<String>,
+    /// Files mounted over others when the plan creates the sandbox, whose
+    /// sources must be written (see [`super::mask::write_masks`]) before
+    /// `setup` runs.
+    pub masks: Vec<Mask>,
     /// Commands to run, in order, before `exec`.
     pub setup: Vec<SbxCommand>,
     /// workmux's built-in provisioning, run after `setup` when the plan
@@ -493,6 +500,55 @@ fn git_workspaces(git: &GitMetadata) -> Vec<String> {
     workspaces.extend(git.pointer_files.iter().cloned().map(ro));
     workspaces.extend(git.config_paths.iter().cloned().map(ro));
     workspaces
+}
+
+/// Masks hiding `sandbox.container.excluded_files` from the agent, by the
+/// container backend's rules: only existing regular files inside the
+/// worktree are masked; missing paths, directories and paths outside the
+/// worktree are skipped with a warning. A mask over a missing path would
+/// make sbx create it in the worktree on the workstation.
+fn excluded_file_masks(config: &SandboxConfig, worktree_root: &Path) -> Vec<Mask> {
+    let mut masks = Vec::new();
+    for rel in config.container.excluded_files() {
+        let rel_path = Path::new(rel);
+        if rel_path.is_absolute()
+            || rel_path
+                .components()
+                .any(|c| matches!(c, Component::ParentDir))
+        {
+            tracing::warn!(
+                path = %rel,
+                "sandbox.container.excluded_files entry must be a relative path inside the worktree; skipping"
+            );
+            continue;
+        }
+        let host_path = worktree_root.join(rel_path);
+        if host_path.is_file() {
+            // The guest follows a link itself, so mask the file it reads.
+            // The main worktree, which the container backend also masks,
+            // isn't mounted: a link into it doesn't resolve in the sandbox.
+            let file = host_path.canonicalize().unwrap_or(host_path);
+            if !file.starts_with(worktree_root) {
+                tracing::warn!(
+                    path = %rel,
+                    "sandbox.container.excluded_files entry resolves outside the worktree; skipping"
+                );
+            } else if !masks.iter().any(|mask: &Mask| mask.target == file) {
+                masks.push(Mask::empty(file));
+            }
+        } else if host_path.is_dir() {
+            tracing::warn!(
+                path = %rel,
+                "sandbox.container.excluded_files entry is a directory; only regular files can be masked. Skipping."
+            );
+        } else {
+            tracing::warn!(
+                path = %rel,
+                "sandbox.container.excluded_files entry does not exist on disk; skipping"
+            );
+        }
+    }
+    masks
 }
 
 /// An `extra_mounts` entry as a workspace: `HOST[:GUEST][:ro]`.
@@ -904,6 +960,10 @@ fn create_settings_warnings(
             current.opencode_config_dir != created.opencode_config_dir,
         ),
         ("extra_mounts", current.extra_mounts != created.extra_mounts),
+        (
+            "container.excluded_files",
+            current.excluded_files != created.excluded_files,
+        ),
         ("docker_sbx.cpus", current.cpus != created.cpus),
         ("docker_sbx.memory", current.memory != created.memory),
         ("docker_sbx.kits", current.kits != created.kits),
@@ -938,9 +998,10 @@ pub fn creates_sandbox(state: &SbxState, created_with: Option<&CreateSettings>) 
 /// generic `shell` agent (agent kits would write into the mounted config
 /// directory), the configured resources and mixin kits, mounting the
 /// worktree, the main repository's git dir (read-only but for what commits
-/// write) and the shims at their host paths, the agent's config directory
-/// where the agent looks for it, and `extra_mounts`; then, as root, give the
-/// agent the config directory's parents and seed Claude's onboarding state.
+/// write) and the shims at their host paths, an empty file over each of
+/// `excluded_files`, the agent's config directory where the agent looks for
+/// it, and `extra_mounts`; then, as root, give the agent the config
+/// directory's parents and seed Claude's onboarding state.
 /// On every launch: bind pi's and OMP's binaries directory to a guest-local
 /// one, reconcile the sandbox's rules with `sandbox.network` and the
 /// toolchain's endpoints, and allow the supervisor's RPC port until the exec
@@ -957,14 +1018,6 @@ pub fn launch_plan(
 ) -> Result<LaunchPlan> {
     check_prerequisites(state)?;
     check_backend_choice(config, state)?;
-    if !config.container.excluded_files().is_empty() {
-        bail!(
-            "sandbox.container.excluded_files is set but the docker_sbx backend \
-             doesn't mask files. Secrets would remain readable inside the sandbox. Use the container \
-             backend with docker or podman, or remove sandbox.container.excluded_files."
-        );
-    }
-
     config
         .network
         .validate()
@@ -973,6 +1026,8 @@ pub fn launch_plan(
     let name = target.sandbox_name;
     let mut setup = Vec::new();
     let mut create_template = None;
+    let excluded = excluded_file_masks(config, target.worktree_root);
+    let mut masks = Vec::new();
     let template = super::template::template_tag(&config.resolved_image(agent));
     let config_dir = config_dir_and_home_subpath(config, agent);
     let opencode_config_dir = target.opencode_config_dir.filter(|_| agent == "opencode");
@@ -982,6 +1037,7 @@ pub fn launch_plan(
         agent_config_dir: config_dir.as_ref().map(|(dir, _)| dir.clone()),
         opencode_config_dir: opencode_config_dir.map(Path::to_path_buf),
         extra_mounts: extra_mount_settings(config)?,
+        excluded_files: excluded.iter().map(|mask| mask.target.clone()).collect(),
         cpus: sbx.cpus(),
         memory: sbx.memory().map(str::to_string),
         kits: sbx.kits().to_vec(),
@@ -1028,6 +1084,8 @@ pub fn launch_plan(
         args.push("shell".to_string());
         args.push(target.worktree_root.to_string_lossy().into_owned());
         args.extend(git_workspaces(git));
+        args.extend(excluded.iter().map(|mask| mask.workspace(target.state_dir)));
+        masks.extend(excluded);
         // The agent's config directory where the agent looks for it, as on
         // the other backends.
         if let Some((config_dir, subpath)) = &config_dir {
@@ -1155,6 +1213,7 @@ pub fn launch_plan(
         sandbox_name: name.to_string(),
         remove,
         create_template,
+        masks,
         setup,
         default_provision,
         provision,
@@ -1417,6 +1476,7 @@ mod tests {
                 agent_config_dir: Some(PathBuf::from("/home/me/.claude")),
                 opencode_config_dir: None,
                 extra_mounts: Vec::new(),
+                excluded_files: Vec::new(),
                 cpus: Some(4),
                 memory: Some("8g".to_string()),
                 kits: vec!["docker.io/sbx/task:latest".to_string()],
@@ -2748,14 +2808,141 @@ mod tests {
             .to_string()
     }
 
-    #[test]
-    fn excluded_files_is_an_error_since_sbx_cant_hide_a_file() {
-        let mut config = config();
-        config.container.excluded_files = Some(vec![".env".to_string()]);
+    /// `paths()` with a real worktree holding `files`, as excluded files
+    /// are looked for on the host.
+    fn worktree_with(files: &[&str]) -> (tempfile::TempDir, Paths) {
+        let dir = tempfile::tempdir().unwrap();
+        let worktree = dir.path().canonicalize().unwrap();
+        for file in files {
+            let path = worktree.join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "SECRET=1\n").unwrap();
+        }
+        let p = Paths {
+            cwd: worktree.clone(),
+            worktree,
+            ..paths()
+        };
+        (dir, p)
+    }
 
-        let message = config_error(&config);
-        assert!(message.contains("excluded_files"), "{message}");
-        assert!(message.contains("readable"), "{message}");
+    fn excluding(files: &[&str]) -> SandboxConfig {
+        let mut config = config();
+        config.container.excluded_files = Some(files.iter().map(|f| f.to_string()).collect());
+        config
+    }
+
+    #[test]
+    fn excluded_files_are_masked_read_only_with_an_empty_file_from_the_state_dir() {
+        let (_dir, p) = worktree_with(&[".env", "config/.env.local"]);
+        let config = excluding(&[".env", "config/.env.local"]);
+        let plan = launch_plan(&config, &target(&p), "claude", &missing(), &exec()).unwrap();
+
+        let env = p.worktree.join(".env");
+        let local = p.worktree.join("config/.env.local");
+        assert_eq!(
+            plan.masks,
+            vec![Mask::empty(env.clone()), Mask::empty(local.clone())]
+        );
+        let workspaces = workspaces(&plan);
+        for target in [&env, &local] {
+            let source = Mask::empty(target.clone()).source(&p.state);
+            assert!(source.starts_with(&p.state), "{}", source.display());
+            let expected = format!("{}:{}:ro", source.display(), target.display());
+            assert!(workspaces.contains(&expected), "{expected}: {workspaces:?}");
+        }
+    }
+
+    #[test]
+    fn only_existing_files_inside_the_worktree_are_masked_as_on_the_container_backend() {
+        // A mask over a missing path would make sbx create it in the
+        // worktree on the workstation; directories can't be masked; paths
+        // outside the worktree are refused.
+        let (_dir, p) = worktree_with(&[".env", "secrets/key"]);
+        let config = excluding(&[
+            ".env.missing",
+            "secrets",
+            "/etc/hosts",
+            "../outside/.env",
+            "sub/../.env",
+            ".env",
+        ]);
+        let plan = launch_plan(&config, &target(&p), "claude", &missing(), &exec()).unwrap();
+
+        assert_eq!(plan.masks, vec![Mask::empty(p.worktree.join(".env"))]);
+        assert!(!p.worktree.join(".env.missing").exists());
+    }
+
+    #[test]
+    fn a_symlinked_excluded_file_masks_the_file_it_resolves_to_in_the_worktree() {
+        // The guest resolves the link itself, so the mask goes over the
+        // file it reads. The main worktree, where the container backend
+        // also masks the path, isn't mounted under docker_sbx: a link into
+        // it doesn't resolve in the sandbox.
+        let (_dir, p) = worktree_with(&["config/real.env"]);
+        let main = tempfile::tempdir().unwrap();
+        std::fs::write(main.path().join(".env.main"), "SECRET=1\n").unwrap();
+        std::os::unix::fs::symlink("config/real.env", p.worktree.join(".env")).unwrap();
+        std::os::unix::fs::symlink(main.path().join(".env.main"), p.worktree.join(".env.main"))
+            .unwrap();
+        let config = excluding(&[".env", "config/real.env", ".env.main"]);
+        let plan = launch_plan(&config, &target(&p), "claude", &missing(), &exec()).unwrap();
+
+        assert_eq!(
+            plan.masks,
+            vec![Mask::empty(p.worktree.join("config/real.env"))]
+        );
+    }
+
+    #[test]
+    fn excluded_files_masked_differently_than_at_create_warn_how_to_recreate() {
+        // A changed list, or a listed file created since, isn't masked
+        // until the sandbox is created again.
+        let (_dir, mut p) = worktree_with(&[".env", ".env.local"]);
+        let env = p.worktree.join(".env");
+        p.created = Some(CreateSettings {
+            excluded_files: vec![env.clone()],
+            ..created_settings()
+        });
+        let state = running_with(Vec::new());
+
+        let plan = launch_plan(
+            &excluding(&[".env"]),
+            &target(&p),
+            "claude",
+            &state,
+            &exec(),
+        )
+        .unwrap();
+        assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
+
+        let config = excluding(&[".env", ".env.local"]);
+        let plan = launch_plan(&config, &target(&p), "claude", &state, &exec()).unwrap();
+        assert_eq!(plan.warnings.len(), 1, "{:?}", plan.warnings);
+        let warning = &plan.warnings[0];
+        assert!(warning.contains("(container.excluded_files)"), "{warning}");
+        assert!(warning.contains("workmux sandbox prune"), "{warning}");
+
+        let plan = launch_plan(&config, &target(&p), "claude", &missing(), &exec()).unwrap();
+        assert_eq!(
+            plan.create_settings.excluded_files,
+            vec![env, p.worktree.join(".env.local")]
+        );
+    }
+
+    #[test]
+    fn excluded_files_are_masked_only_when_the_sandbox_is_created() {
+        let (_dir, p) = worktree_with(&[".env"]);
+        let plan = launch_plan(
+            &excluding(&[".env"]),
+            &target(&p),
+            "claude",
+            &running_with(Vec::new()),
+            &exec(),
+        )
+        .unwrap();
+
+        assert!(plan.masks.is_empty(), "{:?}", plan.masks);
     }
 
     fn with_extra_mounts(mounts: Vec<ExtraMount>) -> SandboxConfig {

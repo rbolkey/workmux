@@ -463,7 +463,8 @@ fn run_sbx(command: &SbxCommand) -> Result<()> {
 }
 
 /// Gather sbx's state, compute the launch plan and run its setup commands:
-/// load the template and create the sandbox if it's missing, reconcile its
+/// load the template, write its masks' sources and create the sandbox if
+/// it's missing, reconcile its
 /// policy rules, recording the ones workmux writes for `sandbox.network`
 /// and the toolchain, and provision a sandbox it created (built-in
 /// provisioning, then the `provision` script), removing it again if
@@ -541,6 +542,7 @@ pub fn prepare_launch(
             run_sbx(remove)?;
         }
         remove_created_record(&state_dir)?;
+        super::mask::write_masks(&state_dir, &plan.masks)?;
         info!(sandbox = %name, "creating sbx sandbox");
         eprintln!("  Workspaces:");
         if let Some(create) = plan.setup.first() {
