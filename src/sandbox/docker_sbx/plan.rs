@@ -1,6 +1,7 @@
 //! The launch plan: what a pane launch asks of sbx.
 //!
-//! [`launch_plan`] is pure. Callers gather sbx's state (see
+//! [`launch_plan`] is pure, but for checking whether a writable extra mount
+//! is a file. Callers gather sbx's state (see
 //! [`super::instance::gather_state`]), compute the plan, run its setup
 //! commands, then run its exec in the foreground.
 
@@ -42,13 +43,32 @@ pub struct LaunchTarget<'a> {
     pub worktree_root: &'a Path,
     /// The pane's working directory, under `worktree_root`.
     pub pane_cwd: &'a Path,
-    /// The main repository's git dir, when it lies outside `worktree_root`.
-    pub git_common_dir: Option<&'a Path>,
+    /// The git metadata the worktree uses.
+    pub git: &'a GitMetadata,
     /// OpenCode's global config directory (`~/.config/opencode/`), when it
     /// exists; mounted read-only for the opencode agent.
     pub opencode_config_dir: Option<&'a Path>,
     /// Host-side state directory for the sandbox (shims live under it).
     pub state_dir: &'a Path,
+}
+
+/// A linked worktree's git metadata, as found on the host (see
+/// [`super::git::git_metadata`]).
+#[derive(Debug, Clone, Default)]
+pub struct GitMetadata {
+    /// The main repository's git dir.
+    pub common_dir: PathBuf,
+    /// The worktree's own admin dir, `<common_dir>/worktrees/<name>`.
+    pub admin_dir: PathBuf,
+    /// `.git` pointer files under the worktree: its own and its submodules'.
+    pub pointer_files: Vec<PathBuf>,
+    /// Submodule git dirs under `<common_dir>/modules`.
+    pub module_roots: Vec<PathBuf>,
+    /// Files the repository config includes or runs, inside the worktree or
+    /// the git dir.
+    pub config_paths: Vec<PathBuf>,
+    /// Whether `<common_dir>/rr-cache` exists.
+    pub rr_cache: bool,
 }
 
 /// The command and environment to run in the sandbox.
@@ -210,6 +230,95 @@ fn hangup_command(target: &LaunchTarget, exec: &ExecRequest) -> SbxCommand {
     }
 }
 
+/// Workspaces that keep the main repository's git metadata read-only, as the
+/// container backend does: the git dir is read-only, the parts commits write
+/// (objects, refs, logs, the worktree's admin dir, submodule git dirs) are
+/// writable inside it, and their control files are read-only again. sbx
+/// mounts parents before children, and read-only mounts hold even for root.
+fn git_workspaces(git: &GitMetadata) -> Vec<String> {
+    let rw = |path: PathBuf| path.to_string_lossy().into_owned();
+    let ro = |path: PathBuf| format!("{}:ro", path.display());
+    let common = &git.common_dir;
+
+    let mut workspaces = vec![ro(common.clone())];
+    for dir in ["objects", "refs", "logs"] {
+        workspaces.push(rw(common.join(dir)));
+    }
+    if git.rr_cache {
+        workspaces.push(rw(common.join("rr-cache")));
+    }
+    workspaces.push(rw(git.admin_dir.clone()));
+    workspaces.extend(git.module_roots.iter().cloned().map(rw));
+
+    workspaces.push(ro(common.join("objects/info")));
+    for name in ["config.worktree", "gitdir", "commondir"] {
+        workspaces.push(ro(git.admin_dir.join(name)));
+    }
+    for root in &git.module_roots {
+        for name in [
+            "hooks",
+            "info",
+            "objects/info",
+            "modules",
+            "worktrees",
+            "config",
+            "config.worktree",
+        ] {
+            workspaces.push(ro(root.join(name)));
+        }
+    }
+    workspaces.extend(git.pointer_files.iter().cloned().map(ro));
+    workspaces.extend(git.config_paths.iter().cloned().map(ro));
+    workspaces
+}
+
+/// `sandbox.extra_mounts` as workspaces, read-only unless writable. sbx
+/// mounts a host path only at that same path, and a file only read-only.
+fn extra_mount_workspaces(config: &SandboxConfig, target: &LaunchTarget) -> Result<Vec<String>> {
+    let protected = [
+        target.worktree_root.join(".git"),
+        target.git.admin_dir.clone(),
+        target.git.common_dir.clone(),
+    ];
+    let mut workspaces = Vec::new();
+    for mount in config.extra_mounts() {
+        let (host, guest, read_only) = mount.resolve()?;
+        if guest != host {
+            bail!(
+                "sandbox.extra_mounts entry {} sets guest_path {} but the docker_sbx \
+                 backend mounts a host path only at that same path. Remove guest_path, \
+                 or use the container or lima backend.",
+                host.display(),
+                guest.display()
+            );
+        }
+        if read_only {
+            workspaces.push(format!("{}:ro", host.display()));
+            continue;
+        }
+        // Checking the host is the plan's only look at the filesystem.
+        if host.is_file() {
+            bail!(
+                "sandbox.extra_mounts entry {} is a writable file but the docker_sbx \
+                 backend mounts files only read-only. Remove writable: true, or mount \
+                 its directory instead.",
+                host.display()
+            );
+        }
+        if protected
+            .iter()
+            .any(|path| guest.starts_with(path) || path.starts_with(&guest))
+        {
+            bail!(
+                "Writable extra mount at {} overlaps protected Git metadata",
+                guest.display()
+            );
+        }
+        workspaces.push(host.to_string_lossy().into_owned());
+    }
+    Ok(workspaces)
+}
+
 /// Whether sbx's diagnostics report `name` as failed.
 fn check_failed(state: &SbxState, name: &str) -> bool {
     state
@@ -256,8 +365,9 @@ fn check_prerequisites(state: &SbxState) -> Result<()> {
 ///
 /// When the sandbox is missing: create it from the template with sbx's
 /// generic `shell` agent (agent kits would write into the mounted config
-/// directory), mounting the worktree, the main repository's git dir, the
-/// agent's config directory and the shims, all at their host paths; then,
+/// directory), mounting the worktree, the main repository's git dir
+/// (read-only but for what commits write), the agent's config directory,
+/// the shims and `extra_mounts`, all at their host paths; then,
 /// as root, link the config directory to where the agent looks for it and
 /// seed Claude's onboarding state. On every launch: bind pi's and OMP's
 /// binaries directory to a guest-local one, and add the RPC policy rule if
@@ -270,6 +380,16 @@ pub fn launch_plan(
     exec: &ExecRequest,
 ) -> Result<LaunchPlan> {
     check_prerequisites(state)?;
+    if !config.container.excluded_files().is_empty() {
+        bail!(
+            "sandbox.container.excluded_files is set but the docker_sbx backend \
+             can't mask files: sbx mounts a host path only at that same path. \
+             Secrets would remain readable inside the sandbox. Use the container \
+             backend with docker or podman, or remove sandbox.container.excluded_files."
+        );
+    }
+
+    let extra_mounts = extra_mount_workspaces(config, target)?;
 
     let name = target.sandbox_name;
     let mut setup = Vec::new();
@@ -289,9 +409,7 @@ pub fn launch_plan(
             "shell",
         ]);
         args.push(target.worktree_root.to_string_lossy().into_owned());
-        if let Some(git_dir) = target.git_common_dir {
-            args.push(git_dir.to_string_lossy().into_owned());
-        }
+        args.extend(git_workspaces(target.git));
         let config_dir = config_dir_and_home_subpath(config, agent);
         if let Some((config_dir, _)) = &config_dir {
             args.push(config_dir.to_string_lossy().into_owned());
@@ -301,6 +419,7 @@ pub fn launch_plan(
             args.push(format!("{}:ro", dir.display()));
         }
         args.push(format!("{}:ro", target.state_dir.display()));
+        args.extend(extra_mounts);
         setup.push(SbxCommand {
             args,
             env: Vec::new(),
@@ -388,6 +507,7 @@ pub fn launch_plan(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ExtraMount;
     use std::path::PathBuf;
 
     fn args(words: &[&str]) -> Vec<String> {
@@ -442,15 +562,24 @@ mod tests {
     struct Paths {
         worktree: PathBuf,
         cwd: PathBuf,
-        git: PathBuf,
+        git: GitMetadata,
         state: PathBuf,
+    }
+
+    fn git_metadata() -> GitMetadata {
+        GitMetadata {
+            common_dir: PathBuf::from("/code/proj/.git"),
+            admin_dir: PathBuf::from("/code/proj/.git/worktrees/feat"),
+            pointer_files: vec![PathBuf::from("/code/proj__worktrees/feat/.git")],
+            ..Default::default()
+        }
     }
 
     fn paths() -> Paths {
         Paths {
             worktree: PathBuf::from("/code/proj__worktrees/feat"),
             cwd: PathBuf::from("/code/proj__worktrees/feat/sub"),
-            git: PathBuf::from("/code/proj/.git"),
+            git: git_metadata(),
             state: PathBuf::from("/state/docker-sbx/wm-proj-12345678"),
         }
     }
@@ -460,7 +589,7 @@ mod tests {
             sandbox_name: "wm-proj-12345678",
             worktree_root: &p.worktree,
             pane_cwd: &p.cwd,
-            git_common_dir: Some(&p.git),
+            git: &p.git,
             opencode_config_dir: None,
             state_dir: &p.state,
         }
@@ -485,7 +614,7 @@ mod tests {
         let tag = super::super::template::template_tag("test-image:latest");
         assert_eq!(plan.create_template.as_deref(), Some(tag.as_str()));
         assert_eq!(
-            plan.setup[0].args,
+            plan.setup[0].args[..10],
             args(&[
                 "create",
                 "--name",
@@ -497,10 +626,11 @@ mod tests {
                 "never",
                 "shell",
                 "/code/proj__worktrees/feat",
-                "/code/proj/.git",
-                "/home/me/.claude",
-                "/state/docker-sbx/wm-proj-12345678:ro",
             ])
+        );
+        assert_eq!(
+            plan.setup[0].args.last().unwrap(),
+            "/state/docker-sbx/wm-proj-12345678:ro"
         );
     }
 
@@ -938,13 +1068,10 @@ mod tests {
         };
         let plan = launch_plan(&config, &target(&p), "default", &missing(), &exec()).unwrap();
 
-        assert_eq!(
-            plan.setup[0].args[9..],
-            args(&[
-                "/code/proj__worktrees/feat",
-                "/code/proj/.git",
-                "/state/docker-sbx/wm-proj-12345678:ro",
-            ])
+        assert!(
+            !workspaces(&plan).iter().any(|w| w.starts_with("/home/me")),
+            "{:?}",
+            plan.setup[0]
         );
         assert!(
             !plan
@@ -956,21 +1083,182 @@ mod tests {
         );
     }
 
+    fn workspaces(plan: &LaunchPlan) -> Vec<String> {
+        plan.setup[0]
+            .args
+            .iter()
+            .skip_while(|a| *a != "shell")
+            .skip(1)
+            .cloned()
+            .collect()
+    }
+
     #[test]
-    fn main_worktree_mounts_no_separate_git_dir() {
+    fn main_git_dir_is_read_only_but_for_what_commits_write() {
+        // As on the container backend: hooks, config and the rest of the git
+        // dir are read-only; objects, refs, logs and the worktree's own admin
+        // dir stay writable, with the admin dir's pointers read-only again.
         let p = paths();
-        let target = LaunchTarget {
-            git_common_dir: None,
-            ..target(&p)
-        };
-        let plan = launch_plan(&config(), &target, "claude", &missing(), &exec()).unwrap();
+        let plan = launch_plan(&config(), &target(&p), "claude", &missing(), &exec()).unwrap();
+
         assert_eq!(
-            plan.setup[0].args[9..],
+            workspaces(&plan),
             args(&[
                 "/code/proj__worktrees/feat",
+                "/code/proj/.git:ro",
+                "/code/proj/.git/objects",
+                "/code/proj/.git/refs",
+                "/code/proj/.git/logs",
+                "/code/proj/.git/worktrees/feat",
+                "/code/proj/.git/objects/info:ro",
+                "/code/proj/.git/worktrees/feat/config.worktree:ro",
+                "/code/proj/.git/worktrees/feat/gitdir:ro",
+                "/code/proj/.git/worktrees/feat/commondir:ro",
+                "/code/proj__worktrees/feat/.git:ro",
                 "/home/me/.claude",
                 "/state/docker-sbx/wm-proj-12345678:ro",
             ])
         );
+    }
+
+    #[test]
+    fn submodule_git_dirs_are_writable_with_their_control_files_read_only() {
+        let mut p = paths();
+        p.git.module_roots = vec![PathBuf::from("/code/proj/.git/modules/vendor")];
+        p.git
+            .pointer_files
+            .push(PathBuf::from("/code/proj__worktrees/feat/vendor/.git"));
+        p.git.config_paths = vec![PathBuf::from("/code/proj__worktrees/feat/extra.gitconfig")];
+        p.git.rr_cache = true;
+        let plan = launch_plan(&config(), &target(&p), "claude", &missing(), &exec()).unwrap();
+        let workspaces = workspaces(&plan);
+
+        for expected in [
+            "/code/proj/.git/rr-cache",
+            "/code/proj/.git/modules/vendor",
+            "/code/proj/.git/modules/vendor/hooks:ro",
+            "/code/proj/.git/modules/vendor/info:ro",
+            "/code/proj/.git/modules/vendor/objects/info:ro",
+            "/code/proj/.git/modules/vendor/modules:ro",
+            "/code/proj/.git/modules/vendor/worktrees:ro",
+            "/code/proj/.git/modules/vendor/config:ro",
+            "/code/proj/.git/modules/vendor/config.worktree:ro",
+            "/code/proj__worktrees/feat/vendor/.git:ro",
+            "/code/proj__worktrees/feat/extra.gitconfig:ro",
+        ] {
+            assert!(
+                workspaces.contains(&expected.to_string()),
+                "{expected}: {workspaces:?}"
+            );
+        }
+    }
+
+    fn config_error(config: &SandboxConfig) -> String {
+        let p = paths();
+        launch_plan(config, &target(&p), "claude", &missing(), &exec())
+            .unwrap_err()
+            .to_string()
+    }
+
+    #[test]
+    fn excluded_files_is_an_error_since_sbx_cant_hide_a_file() {
+        let mut config = config();
+        config.container.excluded_files = Some(vec![".env".to_string()]);
+
+        let message = config_error(&config);
+        assert!(message.contains("excluded_files"), "{message}");
+        assert!(message.contains("readable"), "{message}");
+    }
+
+    fn with_extra_mounts(mounts: Vec<ExtraMount>) -> SandboxConfig {
+        SandboxConfig {
+            extra_mounts: Some(mounts),
+            ..config()
+        }
+    }
+
+    #[test]
+    fn extra_mounts_are_workspaces_read_only_unless_writable() {
+        let config = with_extra_mounts(vec![
+            ExtraMount::Path("/data/notes".to_string()),
+            ExtraMount::Spec {
+                host_path: "/data/scratch".to_string(),
+                guest_path: Some("/data/scratch".to_string()),
+                writable: Some(true),
+            },
+            ExtraMount::Spec {
+                host_path: "/data/reference".to_string(),
+                guest_path: None,
+                writable: None,
+            },
+        ]);
+        let p = paths();
+        let plan = launch_plan(&config, &target(&p), "claude", &missing(), &exec()).unwrap();
+
+        let workspaces = workspaces(&plan);
+        assert_eq!(
+            workspaces[workspaces.len() - 3..],
+            args(&["/data/notes:ro", "/data/scratch", "/data/reference:ro"])
+        );
+    }
+
+    #[test]
+    fn extra_mount_at_a_different_guest_path_is_an_error() {
+        let config = with_extra_mounts(vec![ExtraMount::Spec {
+            host_path: "/data/notes".to_string(),
+            guest_path: Some("/mnt/notes".to_string()),
+            writable: None,
+        }]);
+
+        let message = config_error(&config);
+        assert!(message.contains("/mnt/notes"), "{message}");
+        assert!(message.contains("guest_path"), "{message}");
+    }
+
+    #[test]
+    fn writable_extra_mount_of_a_file_is_an_error() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let host_path = file.path().to_string_lossy().into_owned();
+        let config = with_extra_mounts(vec![ExtraMount::Spec {
+            host_path: host_path.clone(),
+            guest_path: None,
+            writable: Some(true),
+        }]);
+
+        let message = config_error(&config);
+        assert!(message.contains(&host_path), "{message}");
+        assert!(message.contains("read-only"), "{message}");
+
+        // Read-only, the file mounts.
+        let config = with_extra_mounts(vec![ExtraMount::Path(host_path.clone())]);
+        let p = paths();
+        let plan = launch_plan(&config, &target(&p), "claude", &missing(), &exec()).unwrap();
+        assert!(workspaces(&plan).contains(&format!("{host_path}:ro")));
+    }
+
+    #[test]
+    fn writable_extra_mount_cannot_overlap_git_metadata() {
+        for host_path in [
+            "/code/proj/.git/hooks",
+            "/code",
+            "/code/proj__worktrees/feat/.git",
+        ] {
+            let config = with_extra_mounts(vec![ExtraMount::Spec {
+                host_path: host_path.to_string(),
+                guest_path: None,
+                writable: Some(true),
+            }]);
+
+            let message = config_error(&config);
+            assert!(
+                message.contains("protected Git metadata"),
+                "{host_path}: {message}"
+            );
+        }
+
+        // Read-only, it can.
+        let config = with_extra_mounts(vec![ExtraMount::Path("/code".to_string())]);
+        let p = paths();
+        assert!(launch_plan(&config, &target(&p), "claude", &missing(), &exec()).is_ok());
     }
 }

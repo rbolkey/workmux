@@ -261,13 +261,6 @@ pub(crate) fn sbx_state_dir_path(name: &str) -> Result<PathBuf> {
     Ok(crate::xdg::state_dir()?.join("docker-sbx").join(name))
 }
 
-/// The main repository's git dir, when it lies outside the worktree.
-fn git_common_dir_outside(worktree_root: &Path) -> Result<Option<PathBuf>> {
-    let common = crate::sandbox::lima::mounts::determine_git_common_dir(worktree_root)?;
-    let common = common.canonicalize().unwrap_or(common);
-    Ok((!common.starts_with(worktree_root)).then_some(common))
-}
-
 /// Run one sbx command from a plan, failing with sbx's error.
 fn run_sbx(command: &SbxCommand) -> Result<()> {
     debug!(args = ?command.args, "running sbx");
@@ -306,7 +299,7 @@ pub fn prepare_launch(
     let state_dir = sbx_state_dir_path(&name)?;
     std::fs::create_dir_all(&state_dir)
         .with_context(|| format!("Failed to create {}", state_dir.display()))?;
-    let git_common_dir = git_common_dir_outside(&worktree_root)?;
+    let git = super::git::git_metadata(&worktree_root)?;
     // sbx mounts only directories that exist.
     if let Some(config_dir) = config.sandbox.resolved_agent_config_dir(agent) {
         let _ = std::fs::create_dir_all(&config_dir);
@@ -320,7 +313,7 @@ pub fn prepare_launch(
         sandbox_name: &name,
         worktree_root: &worktree_root,
         pane_cwd: &pane_cwd,
-        git_common_dir: git_common_dir.as_deref(),
+        git: &git,
         opencode_config_dir: opencode_config_dir.as_deref(),
         state_dir: &state_dir,
     };
