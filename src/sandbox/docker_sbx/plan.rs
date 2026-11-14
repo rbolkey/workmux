@@ -61,7 +61,8 @@ pub struct LaunchTarget<'a> {
     pub network_record: &'a [NetworkRule],
     /// The toolchain the worktree uses (see
     /// [`toolchain::resolve_toolchain`]): installed on create, its endpoints
-    /// allowed, and the agent command run in it.
+    /// allowed (under `deny`, only those `allowed_domains` lists), and the
+    /// agent command run in it.
     pub toolchain: &'a DetectedToolchain,
 }
 
@@ -501,9 +502,49 @@ fn extra_mount_workspaces(config: &SandboxConfig, target: &LaunchTarget) -> Resu
     Ok(workspaces)
 }
 
+/// Whether `host` matches one of `patterns`, workmux's allowed-domain
+/// forms (`host` or `*.suffix`).
+fn host_allowed(patterns: &[String], host: &str) -> bool {
+    patterns
+        .iter()
+        .any(|pattern| match pattern.strip_prefix('*') {
+            Some(suffix) => host.ends_with(suffix),
+            None => host == pattern,
+        })
+}
+
+/// `sandbox.allowed_domains` hosts, lowercased.
+fn allowed_hosts(config: &SandboxConfig) -> Vec<String> {
+    config
+        .network
+        .allowed_domains()
+        .iter()
+        .map(|entry| entry.host().to_ascii_lowercase())
+        .collect()
+}
+
+/// The toolchain's endpoints `sandbox.network.allowed_domains` doesn't
+/// allow under `deny`, which workmux leaves blocked.
+fn blocked_toolchain_hosts(
+    config: &SandboxConfig,
+    toolchain: &DetectedToolchain,
+) -> Vec<&'static str> {
+    if !config.network_policy_is_deny() || *toolchain == DetectedToolchain::None {
+        return Vec::new();
+    }
+    let allowed = allowed_hosts(config);
+    TOOLCHAIN_HOSTS
+        .iter()
+        .copied()
+        .filter(|host| !host_allowed(&allowed, host))
+        .collect()
+}
+
 /// `sandbox.network` as rules scoped to the sandbox. Under `deny`, port 443
 /// to each allowed domain, as workmux's CONNECT proxy allows on the
-/// container backend; under `allow`, none. Either way, port 443 to the
+/// container backend: the toolchain's endpoints only when
+/// `allowed_domains` lists them, since a repository can add a toolchain
+/// and `sandbox.network` is the user's own. Under `allow`, port 443 to the
 /// toolchain's endpoints when the worktree uses one: the global sbx policy
 /// may block them (`balanced` does).
 ///
@@ -511,26 +552,16 @@ fn extra_mount_workspaces(config: &SandboxConfig, target: &LaunchTarget) -> Resu
 /// matches one label and its `**.d` any depth and `d` too. So `*.d` becomes
 /// `**.d` with a deny for `d`, unless `d` is itself allowed.
 fn network_rules(config: &SandboxConfig, toolchain: &DetectedToolchain) -> Vec<NetworkRule> {
-    let mut hosts: Vec<String> = Vec::new();
-    if config.network_policy_is_deny() {
-        hosts.extend(
-            config
-                .network
-                .allowed_domains()
-                .iter()
-                .map(|entry| entry.host().to_ascii_lowercase()),
-        );
-    }
-    if *toolchain != DetectedToolchain::None {
-        hosts.extend(TOOLCHAIN_HOSTS.iter().map(|host| host.to_string()));
-    }
-    let allowed = |host: &str| {
-        hosts.iter().any(|pattern| match pattern.strip_prefix('*') {
-            Some(suffix) => host.ends_with(suffix),
-            None => host == pattern,
-        })
+    let hosts: Vec<String> = if config.network_policy_is_deny() {
+        allowed_hosts(config)
+    } else if *toolchain != DetectedToolchain::None {
+        TOOLCHAIN_HOSTS
+            .iter()
+            .map(|host| host.to_string())
+            .collect()
+    } else {
+        Vec::new()
     };
-
     let mut rules = Vec::new();
     let mut add = |decision, resource: String| {
         let rule = NetworkRule { decision, resource };
@@ -542,7 +573,7 @@ fn network_rules(config: &SandboxConfig, toolchain: &DetectedToolchain) -> Vec<N
         match host.strip_prefix("*.") {
             Some(base) => {
                 add(RuleDecision::Allow, format!("**.{base}:443"));
-                if !allowed(base) {
+                if !host_allowed(&hosts, base) {
                     add(RuleDecision::Deny, format!("{base}:443"));
                 }
             }
@@ -553,14 +584,29 @@ fn network_rules(config: &SandboxConfig, toolchain: &DetectedToolchain) -> Vec<N
 }
 
 /// What sbx enforces differently from `sandbox.network` without widening
-/// it: settings it has no equivalent for, and what the user's global sbx
-/// policy allows besides (workmux never writes it, and a sandbox's allow
-/// can't take a global one back).
-fn network_notes(config: &SandboxConfig, state: &SbxState, name: &str) -> Vec<String> {
+/// it: settings it has no equivalent for, the toolchain's endpoints
+/// `allowed_domains` leaves blocked, and what the user's global sbx policy
+/// allows besides (workmux never writes it, and a sandbox's allow can't
+/// take a global one back).
+fn network_notes(
+    config: &SandboxConfig,
+    state: &SbxState,
+    name: &str,
+    toolchain: &DetectedToolchain,
+) -> Vec<String> {
     if !config.network_policy_is_deny() {
         return Vec::new();
     }
     let mut notes = Vec::new();
+    let blocked = blocked_toolchain_hosts(config, toolchain);
+    if !blocked.is_empty() {
+        notes.push(format!(
+            "the worktree's toolchain reaches {}, which sandbox.network.allowed_domains \
+             doesn't list; under policy: deny workmux allows them only when you add them \
+             to allowed_domains in your global config.",
+            blocked.join(", ")
+        ));
+    }
     if config.network.max_connections.is_some() {
         notes.push(
             "sandbox.network.max_connections is ignored under the docker_sbx backend: \
@@ -932,7 +978,7 @@ pub fn launch_plan(
         exec: exec_command(target, exec),
         hangup: hangup_command(target, exec),
         teardown,
-        notes: network_notes(config, state, name),
+        notes: network_notes(config, state, name, target.toolchain),
         warnings: check_warnings(state)
             .into_iter()
             .chain(credential_warnings(config, state, name, exec))
@@ -2682,21 +2728,67 @@ mod tests {
     ];
 
     #[test]
-    fn toolchain_endpoints_are_reconciled_with_the_network_rules_under_deny() {
-        let config = with_network(NetworkPolicy::Deny, domains(&["api.anthropic.com"]));
+    fn under_deny_the_toolchain_gets_only_the_endpoints_allowed_domains_lists() {
+        // A repository can add a devbox.json or flake.nix; under deny it must
+        // not open more than the global allowed_domains do.
+        let config = with_network(
+            NetworkPolicy::Deny,
+            domains(&[
+                "api.anthropic.com",
+                "cache.nixos.org",
+                "*.jetify.com",
+                "*.github.com",
+            ]),
+        );
         let p = with_toolchain(DetectedToolchain::Flake);
         let plan = launch_plan(&config, &target(&p), "claude", &missing(), &exec()).unwrap();
 
-        let commands = policy_commands(&plan);
-        let mut expected = vec![recorded(RuleDecision::Allow, "api.anthropic.com:443")];
-        for resource in TOOLCHAIN_RESOURCES {
-            assert!(
-                commands.contains(&policy("allow", resource)),
-                "{commands:?}"
-            );
-            expected.push(recorded(RuleDecision::Allow, resource));
+        assert_eq!(
+            plan.network_rules,
+            vec![
+                recorded(RuleDecision::Allow, "api.anthropic.com:443"),
+                recorded(RuleDecision::Allow, "cache.nixos.org:443"),
+                recorded(RuleDecision::Allow, "**.jetify.com:443"),
+                recorded(RuleDecision::Deny, "jetify.com:443"),
+                recorded(RuleDecision::Allow, "**.github.com:443"),
+                recorded(RuleDecision::Deny, "github.com:443"),
+            ]
+        );
+        assert_eq!(plan.notes.len(), 1, "{:?}", plan.notes);
+        let note = &plan.notes[0];
+        for missing in [
+            "install.determinate.systems",
+            "get.jetpack.io",
+            "releases.jetpack.io",
+            "www.nixsearch.com",
+            "github.com,",
+            "release-assets.githubusercontent.com",
+        ] {
+            assert!(note.contains(missing), "{missing}: {note}");
         }
-        assert_eq!(plan.network_rules, expected);
+        for listed in ["cache.nixos.org", "get.jetify.com", "api.github.com"] {
+            assert!(!note.contains(listed), "{listed}: {note}");
+        }
+        assert!(note.contains("allowed_domains"), "{note}");
+    }
+
+    #[test]
+    fn under_deny_no_note_when_allowed_domains_cover_the_toolchain() {
+        let hosts: Vec<&str> = TOOLCHAIN_RESOURCES
+            .iter()
+            .map(|r| r.trim_end_matches(":443"))
+            .collect();
+        let config = with_network(NetworkPolicy::Deny, domains(&hosts));
+        let p = with_toolchain(DetectedToolchain::Devbox);
+        let plan = launch_plan(&config, &target(&p), "claude", &missing(), &exec()).unwrap();
+
+        let resources: Vec<&str> = plan
+            .network_rules
+            .iter()
+            .map(|r| r.resource.as_str())
+            .collect();
+        assert_eq!(resources, TOOLCHAIN_RESOURCES);
+        assert!(plan.notes.is_empty(), "{:?}", plan.notes);
     }
 
     #[test]
@@ -2713,27 +2805,7 @@ mod tests {
             .map(|r| r.resource.as_str())
             .collect();
         assert_eq!(resources, TOOLCHAIN_RESOURCES);
-    }
-
-    #[test]
-    fn a_wildcard_doesnt_deny_a_base_domain_the_toolchain_needs() {
-        let config = with_network(NetworkPolicy::Deny, domains(&["*.github.com"]));
-        let p = with_toolchain(DetectedToolchain::Flake);
-        let plan = launch_plan(&config, &target(&p), "claude", &missing(), &exec()).unwrap();
-
-        let commands = policy_commands(&plan);
-        assert!(
-            commands.contains(&policy("allow", "**.github.com:443")),
-            "{commands:?}"
-        );
-        assert!(
-            commands.contains(&policy("allow", "github.com:443")),
-            "{commands:?}"
-        );
-        assert!(
-            !commands.contains(&policy("deny", "github.com:443")),
-            "{commands:?}"
-        );
+        assert!(plan.notes.is_empty(), "{:?}", plan.notes);
     }
 
     #[test]
