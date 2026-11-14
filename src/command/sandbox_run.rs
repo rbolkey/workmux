@@ -5,6 +5,7 @@
 //! Sandboxes microVM).
 
 use anyhow::{Context, Result, anyhow, bail};
+use std::io::IsTerminal;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -457,10 +458,11 @@ fn run_docker_sbx(
     env.extend(git_user_config_envs(worktree_root));
 
     let exec = docker_sbx::ExecRequest {
-        command: command.join(" "),
+        command: command.to_vec(),
         env,
         session: docker_sbx::new_session()?,
         rpc_port: Some(rpc_port),
+        tty: std::io::stdin().is_terminal(),
     };
     let plan = docker_sbx::prepare_launch(config, worktree_root, pane_cwd, agent, &exec)?;
 
