@@ -275,6 +275,131 @@ def test_policy_ls_lists_sandbox_rules_as_json_and_removes_by_id(sandbox: Sandbo
     assert sandbox.local_rules() == []
 
 
+# --- Network policy rules (ticket 06) ----------------------------------------
+# Observed under the global `balanced` policy.
+
+
+def guest_https_status(sandbox: Sandbox, url: str) -> str:
+    """The HTTP status a guest curl gets through sbx's proxy (403 when blocked)."""
+    return sandbox.sh_ok(
+        f"curl -s -o /dev/null -w '%{{http_code}}' --max-time 15 {url}"
+    )
+
+
+def test_domain_rule_on_port_443_allows_only_that_port(sandbox: Sandbox):
+    # example.com is not in the balanced policy's allow list.
+    assert guest_https_status(sandbox, "https://example.com") == "403"
+    assert sandbox.allow("example.com:443").returncode == 0
+    try:
+        assert wait_for(
+            lambda: guest_https_status(sandbox, "https://example.com") == "200"
+        )
+        assert guest_https_status(sandbox, "http://example.com") == "403"
+    finally:
+        assert sandbox.remove_rule("example.com:443").returncode == 0
+
+
+def test_wildcard_forms_one_label_or_any_depth_with_the_base(sandbox: Sandbox):
+    base = "wm-learn.example.org"
+    assert sandbox.allow(f"*.one.{base}:443").returncode == 0
+    assert sandbox.allow(f"**.any.{base}:443").returncode == 0
+    try:
+        assert sandbox.allows(f"a.one.{base}")
+        assert not sandbox.allows(f"a.b.one.{base}"), "* matches one label"
+        assert not sandbox.allows(f"one.{base}"), "* does not match the base"
+        assert sandbox.allows(f"a.b.any.{base}"), "** matches any depth"
+        assert sandbox.allows(f"any.{base}"), "** also matches the base"
+        assert not sandbox.allows(f"a.any.{base}:80")
+
+        # A deny for the base takes it out again, leaving the subdomains.
+        assert sandbox.deny(f"any.{base}:443").returncode == 0
+        assert not sandbox.allows(f"any.{base}")
+        assert sandbox.allows(f"a.any.{base}")
+    finally:
+        for resource in [f"*.one.{base}:443", f"**.any.{base}:443", f"any.{base}:443"]:
+            sandbox.remove_rule(resource)
+
+
+def test_sandbox_deny_beats_a_global_allow(sandbox: Sandbox):
+    assert sandbox.allows("github.com"), "balanced allows github.com:443"
+    assert sandbox.deny("github.com:443").returncode == 0
+    try:
+        assert not sandbox.allows("github.com")
+        assert sandbox.allows("api.github.com")
+    finally:
+        assert sandbox.remove_rule("github.com:443").returncode == 0
+
+
+def test_sandbox_deny_everything_also_beats_sandbox_allows(sandbox: Sandbox):
+    assert sandbox.allow("wm-learn.example.com:443").returncode == 0
+    assert sandbox.deny("**").returncode == 0
+    try:
+        assert not sandbox.allows("wm-learn.example.com")
+    finally:
+        sandbox.remove_rule("**")
+        sandbox.remove_rule("wm-learn.example.com:443")
+
+
+def test_adding_an_existing_rule_is_a_no_op_and_removing_a_missing_one_fails(
+    sandbox: Sandbox,
+):
+    assert sandbox.allow("wm-learn.example.com:443").returncode == 0
+    try:
+        again = sandbox.allow("wm-learn.example.com:443")
+        assert again.returncode == 0, again.stderr
+        assert "Already covered" in again.stdout
+        assert len(sandbox.local_rules()) == 1
+
+        opposite = sandbox.deny("wm-learn.example.com:443")
+        assert opposite.returncode != 0
+        assert "conflicts with existing allow rule" in opposite.stderr
+    finally:
+        assert sandbox.remove_rule("wm-learn.example.com:443").returncode == 0
+    missing = sandbox.remove_rule("wm-learn.example.com:443")
+    assert missing.returncode == 1
+    assert "rule not found" in missing.stderr
+
+
+def nip_io_resolves() -> bool:
+    try:
+        return socket.gethostbyname("127.0.0.1.nip.io") == "127.0.0.1"
+    except OSError:
+        return False
+
+
+@pytest.mark.skipif(not nip_io_resolves(), reason="needs DNS for nip.io")
+def test_domain_rule_reaches_the_workstation_loopback_its_dns_points_at(
+    sandbox: Sandbox, host_listener: int
+):
+    # Unlike workmux's CONNECT proxy, sbx doesn't refuse private or loopback
+    # addresses an allowed domain resolves to.
+    host = "127.0.0.1.nip.io"
+    script = f"""import socket, time
+s = socket.create_connection(("gateway.docker.internal", 3128), 5)
+s.settimeout(5)
+s.sendall(b"CONNECT {host}:{host_listener} HTTP/1.1\\r\\nHost: {host}\\r\\n\\r\\n")
+data = b""
+try:
+    while True:
+        chunk = s.recv(256)
+        if not chunk:
+            break
+        data += chunk
+except OSError:
+    pass
+print(repr(data.decode(errors="replace")))
+"""
+    resource = f"{host}:{host_listener}"
+    assert sandbox.allow(resource).returncode == 0
+    try:
+        time.sleep(3)
+        result = sbx(sandbox.exec_args(["python3", "-c", script])[1:])
+        assert result.returncode == 0, result.stderr
+        assert f"HELLO-{host_listener}" in result.stdout
+    finally:
+        assert sandbox.remove_rule(resource).returncode == 0
+
+
 # --- Exec (Q4, Q7, Q15) ------------------------------------------------------
 
 

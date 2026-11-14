@@ -152,6 +152,20 @@ class Sandbox:
     def allow(self, resource: str) -> subprocess.CompletedProcess[str]:
         return sbx(["policy", "allow", "network", "--sandbox", self.name, resource])
 
+    def deny(self, resource: str) -> subprocess.CompletedProcess[str]:
+        return sbx(["policy", "deny", "network", "--sandbox", self.name, resource])
+
+    def allows(self, target: str) -> bool:
+        """Whether this sandbox's policy allows `target` (port 443 unless given).
+
+        `sbx policy check` exits non-zero when the target is denied.
+        """
+        result = sbx(
+            ["policy", "check", "network", "--sandbox", self.name, target, "--json"]
+        )
+        assert result.stdout, result.stderr
+        return json.loads(result.stdout)["allowed"]
+
     def remove_rule(self, resource: str) -> subprocess.CompletedProcess[str]:
         return sbx(
             [
