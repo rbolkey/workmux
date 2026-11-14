@@ -28,9 +28,11 @@ sandbox:
 
 Paths starting with `~` are expanded to the user's home directory. When `guest_path` is omitted, the expanded host path is used as the guest mount point.
 
-**Note:** For the Lima backend, mount changes only take effect when the VM is created. To apply changes to an existing VM, recreate it with `workmux sandbox prune`.
+**Note:** For the Lima and `docker_sbx` backends, mount changes only take effect when the VM or sandbox is created. To apply changes to an existing one, recreate it with `workmux sandbox prune`.
 
 **Note:** Apple Container only supports directory mounts. Individual file paths in `extra_mounts` will fail with Apple Container.
+
+**Note:** Docker Sandboxes (`docker_sbx`) mounts a host path only at that same path and a file only read-only. An entry with a different `guest_path`, or a writable file, is an error.
 
 ## Host command proxying
 

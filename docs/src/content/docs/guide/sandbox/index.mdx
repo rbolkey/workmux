@@ -40,7 +40,7 @@ When sandbox is enabled, agents have access to:
 - Git operational data needed for commits, branches, merges, and rebases
 - Agent settings and credentials (see [credentials](/guide/sandbox/features/#credentials))
 
-Container backends keep repository config and shared hooks read-only. Existing
+Container and Docker Sandboxes backends keep repository config and shared hooks read-only. Existing
 hooks can run inside the container, while hook setup stays in a regular host
 pane. Git operations on the host honor configured content filters, merge
 drivers, and credential helpers. Programs stored in the writable worktree remain
