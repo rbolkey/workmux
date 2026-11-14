@@ -2488,6 +2488,12 @@ pub struct SandboxConfig {
     #[serde(default)]
     pub backend: Option<SandboxBackend>,
 
+    /// Whether the project config (.workmux.yaml) chose `backend` over the
+    /// global config's. Set internally during config loading, not
+    /// deserialized.
+    #[serde(skip)]
+    pub backend_from_project: bool,
+
     /// Which panes to sandbox. Default: agent
     #[serde(default)]
     pub target: Option<SandboxTarget>,
@@ -3529,6 +3535,8 @@ impl Config {
                 .backend
                 .clone()
                 .or(self.sandbox.backend.clone()),
+            backend_from_project: project.sandbox.backend.is_some()
+                && project.sandbox.backend != self.sandbox.backend,
             target: project
                 .sandbox
                 .target
@@ -6787,6 +6795,34 @@ docker_sbx:
         assert_eq!(
             global.merge(Config::default()).sandbox.backend(),
             SandboxBackend::Container
+        );
+    }
+
+    #[test]
+    fn sandbox_backend_from_project_is_recorded_only_when_the_project_chose_it() {
+        let container = sandbox_cfg(|sandbox| sandbox.backend = Some(SandboxBackend::Container));
+        let sbx = sandbox_cfg(|sandbox| sandbox.backend = Some(SandboxBackend::DockerSbx));
+        assert!(
+            container
+                .clone()
+                .merge(sbx.clone())
+                .sandbox
+                .backend_from_project
+        );
+        assert!(
+            Config::default()
+                .merge(sbx.clone())
+                .sandbox
+                .backend_from_project
+        );
+        // The user's own choice, whatever the project says.
+        assert!(!sbx.clone().merge(sbx.clone()).sandbox.backend_from_project);
+        assert!(!sbx.merge(Config::default()).sandbox.backend_from_project);
+        assert!(
+            !container
+                .merge(Config::default())
+                .sandbox
+                .backend_from_project
         );
     }
 
