@@ -1904,12 +1904,129 @@ impl LimaConfig {
 /// `sandbox.image` with a thin layer for sbx's requirements. The generic
 /// `sandbox.*` keys keep their meaning under this backend.
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
-pub struct DockerSbxConfig {}
+pub struct DockerSbxConfig {
+    /// Number of CPUs for the sandbox (sbx `--cpus`; 0 means all host CPUs).
+    /// Only passed when explicitly set: sbx's default is all host CPUs.
+    #[serde(default)]
+    pub cpus: Option<u32>,
+
+    /// Memory for the sandbox in sbx's binary units (e.g. "512m", "8g").
+    /// Minimum 512 MiB. Only passed when explicitly set: sbx defaults to half
+    /// the host's memory, clamped to 512 MiB-32 GiB.
+    #[serde(default)]
+    pub memory: Option<String>,
+
+    /// Custom provision script run once when the sandbox is created, after
+    /// workmux's own setup steps. Runs as root in the template's bash, which
+    /// has no `sudo`.
+    #[serde(default)]
+    pub provision: Option<String>,
+
+    /// Skip built-in provisioning. The sbx template already holds what
+    /// Lima's built-in provisioning installs (system packages, the agent CLI,
+    /// workmux), so workmux runs no built-in provisioning under docker_sbx
+    /// today; the setting is accepted for parity with Lima. Custom
+    /// `provision` script still runs if specified.
+    #[serde(default)]
+    pub skip_default_provision: Option<bool>,
+
+    /// sbx mixin kits added to the sandbox at creation (sbx `--kit`): OCI
+    /// references, git URLs, directories or ZIP files. A kit can add network
+    /// rules, credentials and install steps to the sandbox, so this field is
+    /// global-only: ignored in project config.
+    #[serde(default)]
+    pub kits: Option<Vec<String>>,
+}
+
+/// sbx's smallest sandbox memory (`--memory`).
+const DOCKER_SBX_MIN_MEMORY: f64 = 512.0 * 1024.0 * 1024.0;
+
+/// Bytes in a memory size as sbx reads `--memory`: a number with an
+/// optional binary unit (`k`, `m`, `g`, `t`, `p`), optionally followed by
+/// `i` and/or `b`, any case (`512m`, `8G`, `1GiB`, `1gb`, `536870912`).
+fn parse_docker_sbx_memory(memory: &str) -> Option<f64> {
+    let digits = memory
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(memory.len());
+    let (number, unit) = memory.split_at(digits);
+    if number.is_empty() || number.starts_with('.') || number.ends_with('.') {
+        return None;
+    }
+    let number: f64 = number.parse().ok()?;
+    let unit = unit.strip_prefix(' ').unwrap_or(unit).to_ascii_lowercase();
+    let unit = unit.strip_suffix('b').unwrap_or(&unit);
+    let unit = unit.strip_suffix('i').unwrap_or(unit);
+    let power = match unit {
+        "" => 0,
+        "k" => 1,
+        "m" => 2,
+        "g" => 3,
+        "t" => 4,
+        "p" => 5,
+        _ => return None,
+    };
+    Some(number * 1024f64.powi(power))
+}
 
 impl DockerSbxConfig {
-    /// Merge: project overrides global, per-field.
-    fn merge(_global: Self, _project: Self) -> Self {
-        Self {}
+    /// CPUs to pass to `sbx create --cpus`, if configured.
+    pub fn cpus(&self) -> Option<u32> {
+        self.cpus
+    }
+
+    /// Memory to pass to `sbx create --memory`, if configured.
+    pub fn memory(&self) -> Option<&str> {
+        self.memory.as_deref()
+    }
+
+    pub fn provision_script(&self) -> Option<&str> {
+        self.provision.as_deref().filter(|s| !s.trim().is_empty())
+    }
+
+    /// Mixin kits to pass to `sbx create --kit`. Returns empty slice when unset.
+    pub fn kits(&self) -> &[String] {
+        self.kits.as_deref().unwrap_or(&[])
+    }
+
+    /// Check `memory` is a size sbx accepts. Called at config load.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if let Some(memory) = self.memory() {
+            match parse_docker_sbx_memory(memory) {
+                Some(bytes) if bytes >= DOCKER_SBX_MIN_MEMORY => {}
+                Some(_) => anyhow::bail!(
+                    "sandbox.docker_sbx.memory '{memory}' is below sbx's minimum of 512 MiB \
+                     (512m)"
+                ),
+                None => anyhow::bail!(
+                    "sandbox.docker_sbx.memory '{memory}' is not a size sbx accepts; \
+                     use binary units such as 512m or 8g"
+                ),
+            }
+        }
+        Ok(())
+    }
+
+    /// Merge: project overrides global, per-field, EXCEPT for `kits`, which
+    /// is global-only.
+    fn merge(global: Self, project: Self) -> Self {
+        // Security: kits is global-only. A kit can add network rules,
+        // credentials and install steps, so a repo's .workmux.yaml must not
+        // be able to widen its sandbox's access through one.
+        if project.kits.is_some() {
+            tracing::warn!(
+                "sandbox.docker_sbx.kits in project config (.workmux.yaml) is ignored -- \
+                move it to your global config (~/.config/workmux/config.yaml)"
+            );
+        }
+        Self {
+            cpus: project.cpus.or(global.cpus),
+            memory: project.memory.or(global.memory),
+            provision: project.provision.or(global.provision),
+            skip_default_provision: project
+                .skip_default_provision
+                .or(global.skip_default_provision),
+            kits: global.kits,
+        }
     }
 }
 
@@ -3116,6 +3233,11 @@ impl Config {
             .container
             .validate()
             .context("Invalid sandbox container config")?;
+        config
+            .sandbox
+            .docker_sbx
+            .validate()
+            .context("Invalid sandbox docker_sbx config")?;
 
         Ok(config)
     }
@@ -4000,7 +4122,17 @@ pub const EXAMPLE_PROJECT_CONFIG: &str = r#"# workmux project configuration
 #   #   # excluded_files:
 #   #   #   - .env
 #   #   #   - .env.local
-#   # docker_sbx: {}         # with backend: docker_sbx (Docker Sandboxes)
+#   # docker_sbx:            # with backend: docker_sbx (Docker Sandboxes)
+#   #   cpus: 4                # only passed when set (sbx default: all CPUs)
+#   #   memory: 8g             # sbx binary units, at least 512m
+#   #   # Custom provision script (runs once on sandbox creation, as root).
+#   #   # provision: |
+#   #   #   sed -i 's|http://|https://|' /etc/apt/sources.list.d/debian.sources
+#   #   #   apt-get update && apt-get install -y ripgrep jq
+#   #   # sbx mixin kits added at creation. GLOBAL-ONLY: ignored in a
+#   #   # project .workmux.yaml, since a kit can add network rules.
+#   #   # kits:
+#   #   #   - docker.io/sbx/task:latest
 #   # lima:
 #   #   isolation: project
 #   #   cpus: 4
@@ -4108,11 +4240,12 @@ mod tests {
         AgentColumn, AgentEnvValue, AgentIconConfig, AgentIconDetails, AllowedDomainDetails,
         AllowedDomainEntry, CLEANUP_NODE_MODULES_PLACEHOLDER, Config, ContainerConfig,
         ContainerDevice, DEFAULT_AGENT_COLUMNS, DEFAULT_WORKTREE_COLUMNS, DashboardLayout,
-        ExtraMount, FileConfig, LayoutConfig, LimaConfig, NODE_MODULES_CLEANUP_SCRIPT,
-        NetworkConfig, NetworkPolicy, PaneConfig, SandboxBackend, SandboxConfig, SandboxRuntime,
-        SandboxTarget, SidebarEnterAction, SidebarHeight, SidebarPosition, SidebarWidth,
-        SplitDirection, ToolchainMode, WindowPlacement, WorktreeColumn, is_agent_command,
-        validate_domain, validate_group_add_entry, validate_layouts_config,
+        DockerSbxConfig, ExtraMount, FileConfig, LayoutConfig, LimaConfig,
+        NODE_MODULES_CLEANUP_SCRIPT, NetworkConfig, NetworkPolicy, PaneConfig, SandboxBackend,
+        SandboxConfig, SandboxRuntime, SandboxTarget, SidebarEnterAction, SidebarHeight,
+        SidebarPosition, SidebarWidth, SplitDirection, ToolchainMode, WindowPlacement,
+        WorktreeColumn, is_agent_command, validate_domain, validate_group_add_entry,
+        validate_layouts_config,
     };
     use super::{DashboardConfig, InputExitKey, RemoteConfig, RemoteIsolation};
     use crate::test_support;
@@ -6519,6 +6652,122 @@ docker_sbx: {}
 
         assert!(config.is_enabled());
         assert_eq!(config.backend(), SandboxBackend::DockerSbx);
+    }
+
+    #[test]
+    fn sandbox_docker_sbx_settings_yaml_format() {
+        let yaml = r#"
+backend: docker_sbx
+docker_sbx:
+  cpus: 8
+  memory: 8g
+  provision: |
+    apt-get install -y ripgrep
+  skip_default_provision: true
+  kits:
+    - docker.io/sbx/task:latest
+"#;
+        let config: SandboxConfig = serde_yaml::from_str(yaml).unwrap();
+        let sbx = &config.docker_sbx;
+
+        assert_eq!(sbx.cpus(), Some(8));
+        assert_eq!(sbx.memory(), Some("8g"));
+        assert_eq!(sbx.provision_script(), Some("apt-get install -y ripgrep\n"));
+        assert_eq!(sbx.skip_default_provision, Some(true));
+        assert_eq!(sbx.kits(), &["docker.io/sbx/task:latest".to_string()]);
+    }
+
+    #[test]
+    fn docker_sbx_settings_default_to_sbx_own() {
+        let sbx = DockerSbxConfig::default();
+        assert_eq!(sbx.cpus(), None);
+        assert_eq!(sbx.memory(), None);
+        assert_eq!(sbx.provision_script(), None);
+        assert_eq!(sbx.skip_default_provision, None);
+        assert!(sbx.kits().is_empty());
+    }
+
+    fn docker_sbx_cfg(edit: impl FnOnce(&mut DockerSbxConfig)) -> Config {
+        sandbox_cfg(|sandbox| edit(&mut sandbox.docker_sbx))
+    }
+
+    #[test]
+    fn docker_sbx_resources_and_provision_project_overrides_global() {
+        let global = docker_sbx_cfg(|sbx| {
+            sbx.cpus = Some(4);
+            sbx.memory = Some("4g".into());
+            sbx.provision = Some("echo global".into());
+            sbx.skip_default_provision = Some(true);
+        });
+        let project = docker_sbx_cfg(|sbx| {
+            sbx.cpus = Some(8);
+            sbx.provision = Some("echo project".into());
+            sbx.skip_default_provision = Some(false);
+        });
+        let merged = global.clone().merge(project).sandbox.docker_sbx;
+        assert_eq!(merged.cpus(), Some(8));
+        assert_eq!(merged.memory(), Some("4g"));
+        assert_eq!(merged.provision_script(), Some("echo project"));
+        assert_eq!(merged.skip_default_provision, Some(false));
+
+        let merged = global.merge(Config::default()).sandbox.docker_sbx;
+        assert_eq!(merged.cpus(), Some(4));
+        assert_eq!(merged.provision_script(), Some("echo global"));
+        assert_eq!(merged.skip_default_provision, Some(true));
+    }
+
+    #[test]
+    fn docker_sbx_empty_project_provision_disables_global() {
+        let global = docker_sbx_cfg(|sbx| sbx.provision = Some("echo global".into()));
+        let project = docker_sbx_cfg(|sbx| sbx.provision = Some("".into()));
+        let merged = global.merge(project);
+        assert_eq!(merged.sandbox.docker_sbx.provision_script(), None);
+    }
+
+    #[test]
+    fn docker_sbx_kits_project_is_ignored() {
+        let global =
+            docker_sbx_cfg(|sbx| sbx.kits = Some(vec!["docker.io/sbx/task:latest".into()]));
+        let project = docker_sbx_cfg(|sbx| sbx.kits = Some(vec!["evil/kit:latest".into()]));
+        let merged = global.merge(project);
+        assert_eq!(
+            merged.sandbox.docker_sbx.kits(),
+            &["docker.io/sbx/task:latest".to_string()]
+        );
+    }
+
+    #[test]
+    fn docker_sbx_kits_project_ignored_when_no_global() {
+        let global = Config::default();
+        let project = docker_sbx_cfg(|sbx| sbx.kits = Some(vec!["evil/kit:latest".into()]));
+        let merged = global.merge(project);
+        assert!(merged.sandbox.docker_sbx.kits().is_empty());
+    }
+
+    #[test]
+    fn docker_sbx_memory_accepts_sbx_sizes_from_its_minimum() {
+        for memory in ["512m", "8g", "8G", "1GiB", "1gb", "1.5g", "536870912"] {
+            let sbx = DockerSbxConfig {
+                memory: Some(memory.to_string()),
+                ..Default::default()
+            };
+            assert!(sbx.validate().is_ok(), "{memory}: {:?}", sbx.validate());
+        }
+    }
+
+    #[test]
+    fn docker_sbx_memory_below_minimum_or_malformed_is_an_error() {
+        for memory in ["511m", "100m", "abc", "8 GB extra", ""] {
+            let sbx = DockerSbxConfig {
+                memory: Some(memory.to_string()),
+                ..Default::default()
+            };
+            let message = sbx.validate().unwrap_err().to_string();
+            assert!(
+                message.contains("sandbox.docker_sbx.memory") && message.contains("512m"),
+                "{memory}: {message}"
+            );
+        }
     }
 
     #[test]
