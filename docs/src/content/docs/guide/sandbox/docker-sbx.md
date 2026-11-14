@@ -218,7 +218,7 @@ Installing and using Nix and Devbox reaches these hosts, on port 443:
 | `www.nixsearch.com`                                                              | Devbox package versions                    |
 | `github.com`, `api.github.com`, `codeload.github.com`                            | nixpkgs, and flake inputs hosted on GitHub |
 
-sbx's `balanced` global policy blocks most of them, so whenever the worktree uses a toolchain workmux adds a rule scoped to the sandbox for each, under `policy: allow` as well as `deny`, and reconciles them like the [network rules](#network-restrictions): turning the toolchain off removes them at the next launch. Under `deny` they widen what the sandbox reaches, GitHub included. A flake's other inputs (hosts other than GitHub) aren't covered: add them to `allowed_domains`.
+sbx's `balanced` global policy blocks most of them. Under `policy: allow`, whenever the worktree uses a toolchain workmux adds a rule scoped to the sandbox for each, and reconciles them like the [network rules](#network-restrictions): turning the toolchain off removes them at the next launch. Under `policy: deny`, workmux adds none beyond `allowed_domains`: a repository can add a `devbox.json` or `flake.nix`, and that mustn't open more than your global config allows. Each launch prints a note naming the toolchain hosts `allowed_domains` doesn't list; add the ones you want to `allowed_domains` in your global config, or installing Nix and Devbox fails. A flake's inputs on other hosts aren't in the list: under `deny`, add them to `allowed_domains`; under `allow`, your global sbx policy decides.
 
 ## Kits
 
@@ -251,7 +251,7 @@ sandbox:
       - "*.github.com"
 ```
 
-Under `policy: deny`, workmux adds a rule scoped to the sandbox for port 443 of each allowed domain (`sbx policy ls <sandbox>` lists them), and for the [toolchain's hosts](#nix-and-devbox-toolchain) when the worktree uses one. A wildcard such as `*.github.com` becomes sbx's `**.github.com:443` (subdomains at any depth) with a deny for `github.com:443`, so the base domain stays out unless you list it too. IP literals are refused, as on the container backend. Under `policy: allow`, workmux adds none but the toolchain's.
+Under `policy: deny`, workmux adds a rule scoped to the sandbox for port 443 of each allowed domain (`sbx policy ls <sandbox>` lists them), and nothing else: the [toolchain's hosts](#nix-and-devbox-toolchain) are reachable only if `allowed_domains` lists them. A wildcard such as `*.github.com` becomes sbx's `**.github.com:443` (subdomains at any depth) with a deny for `github.com:443`, so the base domain stays out unless you list it too. IP literals are refused, as on the container backend. Under `policy: allow`, workmux adds none but the toolchain's.
 
 Every launch reconciles the rules: it adds missing ones and removes the ones workmux added earlier that your config no longer lists, so a removed domain stops working at the sandbox's next launch. workmux records the rules it added in the sandbox's state directory and never touches rules you added yourself, or your global sbx policy.
 
