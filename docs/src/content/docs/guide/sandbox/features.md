@@ -139,6 +139,7 @@ Key behaviors:
 - The credential mount is determined by the `agent` setting. Switching agents requires recreating the sandbox (Lima and `docker_sbx`, with `workmux sandbox prune`) or starting a new container.
 - For `pi`, the entire `~/.pi/agent/` is shared except `bin/`. Pi auto-downloads platform-specific `fd` and `rg` binaries into `bin/`, so a Linux sandbox would otherwise overwrite a macOS host's Mach-O binaries through the bind mount. Workmux overlays a per-sandbox, arch-keyed directory on `bin/` to keep host and guest binaries separate. Under `docker_sbx`, the overlay is a directory inside the sandbox, bound over `bin/` each time a pane starts; OMP's `~/.omp/agent/tools/`, where OMP downloads the same binaries, gets the same treatment.
 - OMP uses file-backed state and credentials mounted from `~/.omp/agent/`.
+- Under `docker_sbx`, give tools such as `gh` their credentials with `sbx secret set` (for example `sbx secret set github --command 'gh auth token'`) rather than `env` or `env_passthrough`: the agent then holds only a placeholder. See [Tool credentials](/guide/sandbox/docker-sbx/#tool-credentials).
 
 The container backend also uses a separate config file for Claude, mounted to `/tmp/.claude.json` inside the container. Docker/Podman use `~/.claude-sandbox.json` (file mount); Apple Container uses `~/.claude-sandbox-config/claude.json` (directory mount, since Apple Container only supports directory mounts). Lima and `docker_sbx` instead give each VM or sandbox its own `~/.claude.json`, seeded with Claude's onboarding marked complete.
 
