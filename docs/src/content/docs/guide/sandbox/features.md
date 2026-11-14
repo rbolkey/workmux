@@ -215,7 +215,7 @@ During development, the macOS host binary cannot run inside Linux containers or 
 rustup target add aarch64-unknown-linux-gnu
 brew install messense/macos-cross-toolchains/aarch64-unknown-linux-gnu
 
-# Cross-compile and install into containers and running VMs
+# Cross-compile and install into containers, running VMs and running sbx sandboxes
 workmux sandbox install-dev
 
 # After code changes, rebuild and reinstall
@@ -228,4 +228,4 @@ workmux sandbox install-dev --release
 workmux sandbox install-dev --skip-build
 ```
 
-For containers, this builds a thin overlay image (`FROM <image>` + `COPY workmux`) on top of the configured sandbox image, replacing it in-place. For Lima VMs, the binary is installed to `~/.local/bin/workmux` inside each running VM.
+For containers, this builds a thin overlay image (`FROM <image>` + `COPY workmux`) on top of the configured sandbox image, replacing it in-place. For Lima VMs, the binary is installed to `~/.local/bin/workmux` inside each running VM. For Docker Sandboxes, the binary replaces `/usr/local/bin/workmux` in each running `wm-*` sbx sandbox; with `backend: docker_sbx` the overlay is built on the image in Docker's store and the sbx template is loaded again from it, so new sandboxes get the build too. Run `workmux sandbox pull` to go back to the released image.

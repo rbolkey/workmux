@@ -17,6 +17,8 @@ workmux sandbox build
 
 Builds the image locally for the configured agent. This is an alternative to using the pre-built image from `ghcr.io/raine/workmux-sandbox`. Most users should use `workmux sandbox pull` instead.
 
+With `backend: docker_sbx`, the image is built with Docker and the [sbx template](/guide/sandbox/docker-sbx/#template) is built and loaded from it.
+
 ### sandbox pull
 
 Pull the latest sandbox image from the container registry.
@@ -26,6 +28,8 @@ workmux sandbox pull
 ```
 
 Pulls the pre-built image for the configured agent from `ghcr.io/raine/workmux-sandbox:{agent}`. This is the recommended way to get and update the sandbox image.
+
+With `backend: docker_sbx`, the image is pulled with Docker and the [sbx template](/guide/sandbox/docker-sbx/#template) is loaded again if the image changed.
 
 ### sandbox init-dockerfile
 
@@ -39,7 +43,7 @@ workmux sandbox init-dockerfile [--force]
 
 - `--force` - Overwrite existing Dockerfile
 
-Creates a `Dockerfile.sandbox` in the current directory with the base system setup (Debian, git, workmux) and agent-specific installation (e.g., Claude Code) combined into a single file.
+Creates a `Dockerfile.sandbox` in the current directory with the base system setup (Debian, git, workmux) and agent-specific installation (e.g., Claude Code) combined into a single file. With `backend: docker_sbx`, it ends with the sbx layer (`docker/Dockerfile.sbx`) that sbx templates need.
 
 ## Lima and Docker Sandboxes commands
 
@@ -158,10 +162,10 @@ workmux sandbox shell --exec
 
 ### sandbox install-dev
 
-Cross-compile and install workmux into container images and running Lima VMs for local development.
+Cross-compile and install workmux into container images, running Lima VMs and running sbx sandboxes for local development.
 
 ```bash
-# Cross-compile and install into containers and running VMs
+# Cross-compile and install into containers, running VMs and running sbx sandboxes
 workmux sandbox install-dev
 
 # Use release profile (slower build, faster binary)
@@ -178,7 +182,7 @@ workmux sandbox install-dev --skip-build
 
 This is a developer-only command for getting local workmux builds into sandbox environments. The host macOS binary cannot run inside Linux containers or VMs, so this command cross-compiles for the correct Linux architecture.
 
-For container sandboxes, it builds a thin overlay image (`FROM <image>` + `COPY workmux`) on top of the configured sandbox image, replacing it in-place. For Lima VMs, it copies the binary into each running VM.
+For container sandboxes, it builds a thin overlay image (`FROM <image>` + `COPY workmux`) on top of the configured sandbox image, replacing it in-place. For Lima VMs, it copies the binary into each running VM. For Docker Sandboxes, it copies the binary into each running `wm-*` sbx sandbox (`/usr/local/bin/workmux`, installed as root); with `backend: docker_sbx` it also patches the image in Docker's store and loads the sbx template again from it.
 
 **Prerequisites:**
 
