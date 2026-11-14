@@ -164,7 +164,8 @@ pub struct LaunchPlan {
     /// Notes for the user: settings sbx can't enforce that only limit access,
     /// and what sbx allows beyond them.
     pub notes: Vec<String>,
-    /// Warnings for the user: variables in `sandbox.env` or
+    /// Warnings for the user: checks `sbx diagnose` fails that don't stop
+    /// the launch, and variables in `sandbox.env` or
     /// `sandbox.env_passthrough` that hand the agent a credential sbx holds
     /// a secret for.
     pub warnings: Vec<String>,
@@ -666,6 +667,34 @@ fn check_failed(state: &SbxState, name: &str) -> bool {
         .any(|check| check.name == name && check.status == "fail")
 }
 
+/// Checks sbx's diagnostics fail that [`check_prerequisites`] doesn't stop
+/// for, such as disk space. sbx decides for itself whether it can still run
+/// the sandbox, and reports its own error if not.
+fn check_warnings(state: &SbxState) -> Vec<String> {
+    state
+        .checks
+        .iter()
+        .filter(|check| {
+            check.status == "fail"
+                && !matches!(
+                    check.name.as_str(),
+                    "Authentication" | "Global network policy"
+                )
+        })
+        .map(|check| {
+            let mut warning = format!("sbx diagnose: {} failed", check.name);
+            if !check.message.is_empty() {
+                warning.push_str(&format!(" ({})", check.message));
+            }
+            warning.push('.');
+            if !check.hint.is_empty() {
+                warning.push_str(&format!(" {}", check.hint));
+            }
+            warning
+        })
+        .collect()
+}
+
 /// Fail closed unless sbx can run sandboxes. workmux never runs `sbx login`
 /// or `sbx policy init` itself.
 fn check_prerequisites(state: &SbxState) -> Result<()> {
@@ -901,7 +930,10 @@ pub fn launch_plan(
         hangup: hangup_command(target, exec),
         teardown,
         notes: network_notes(config, state, name),
-        warnings: credential_warnings(config, state, name, exec),
+        warnings: check_warnings(state)
+            .into_iter()
+            .chain(credential_warnings(config, state, name, exec))
+            .collect(),
         network_rules,
     })
 }
@@ -938,6 +970,8 @@ mod tests {
         .map(|(name, status)| SbxCheck {
             name: name.to_string(),
             status: status.to_string(),
+            message: String::new(),
+            hint: String::new(),
         })
         .collect()
     }
@@ -1886,6 +1920,34 @@ mod tests {
     fn uninitialised_global_policy_fails_naming_sbx_policy_init() {
         let message = plan_error(&failing("Global network policy"), "claude");
         assert!(message.contains("sbx policy init"), "{message}");
+    }
+
+    #[test]
+    fn other_failing_sbx_checks_are_warnings_naming_the_check_and_its_hint() {
+        let mut state = missing();
+        state.checks.push(SbxCheck {
+            name: "Disk space".to_string(),
+            status: "fail".to_string(),
+            message: "1.3GiB free".to_string(),
+            hint: "Free up disk space on the state directory's volume".to_string(),
+        });
+        state.checks.push(SbxCheck {
+            name: "Binary version".to_string(),
+            status: "warn".to_string(),
+            message: "update available".to_string(),
+            hint: "Download the latest release".to_string(),
+        });
+        let p = paths();
+        let plan = launch_plan(&config(), &target(&p), "claude", &state, &exec()).unwrap();
+
+        assert_eq!(plan.warnings.len(), 1, "{:?}", plan.warnings);
+        let warning = &plan.warnings[0];
+        assert!(warning.contains("Disk space"), "{warning}");
+        assert!(warning.contains("1.3GiB free"), "{warning}");
+        assert!(
+            warning.contains("Free up disk space on the state directory's volume"),
+            "{warning}"
+        );
     }
 
     #[test]
