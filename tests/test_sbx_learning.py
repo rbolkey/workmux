@@ -413,6 +413,22 @@ def test_exec_propagates_exit_status(sandbox: Sandbox):
     assert missing.returncode == 127
 
 
+def test_exec_asks_for_a_tty_only_when_stdin_is_a_terminal(sandbox: Sandbox):
+    # `-it` with piped stdin fails after a timeout; `-i` alone passes piped
+    # stdin and the exit status.
+    no_terminal = sbx(
+        sandbox.exec_args(["cat"], tty=True, interactive=True)[1:], input="piped\n"
+    )
+    assert no_terminal.returncode == 125
+    assert "context deadline exceeded" in no_terminal.stderr
+    piped = sbx(
+        sandbox.exec_args(["bash", "-c", "cat; exit 3"], interactive=True)[1:],
+        input="piped\n",
+    )
+    assert piped.returncode == 3
+    assert piped.stdout.endswith("piped\n")
+
+
 def test_exec_env_and_workdir(sandbox: Sandbox, workspace: Path):
     out = sbx(
         sandbox.exec_args(
