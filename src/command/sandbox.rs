@@ -8,7 +8,7 @@ use std::process::Command;
 use std::time::SystemTime;
 use tracing::debug;
 
-use crate::config::{Config, SandboxBackend};
+use crate::config::{Config, SandboxBackend, SandboxRuntime};
 use crate::sandbox;
 use crate::sandbox::docker_sbx::{self, SbxInstance, SbxSandboxInfo};
 use crate::sandbox::lima;
@@ -42,12 +42,15 @@ pub struct SandboxArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum SandboxCommand {
-    /// Build the sandbox container image locally.
+    /// Build the sandbox container image locally (and the sbx template with
+    /// the docker_sbx backend).
     /// Note: a pre-built image is available via `workmux sandbox pull`.
     Build,
-    /// Pull the latest sandbox image from the container registry.
+    /// Pull the latest sandbox image from the container registry (and
+    /// refresh the sbx template with the docker_sbx backend).
     Pull,
-    /// Export customizable Dockerfile templates for building your own sandbox image.
+    /// Export customizable Dockerfile templates for building your own sandbox image
+    /// (with the sbx layer under the docker_sbx backend).
     InitDockerfile {
         /// Overwrite existing Dockerfiles
         #[arg(long)]
@@ -78,7 +81,8 @@ pub enum SandboxCommand {
         #[arg(last = true, required = true)]
         command: Vec<String>,
     },
-    /// Cross-compile and install workmux into containers and running Lima VMs for development.
+    /// Cross-compile and install workmux into containers, running Lima VMs and
+    /// running sbx sandboxes (and the sbx template) for development.
     InstallDev {
         /// Skip cross-compilation and use existing binary
         #[arg(long)]
@@ -184,8 +188,29 @@ pub fn run(args: SandboxArgs) -> Result<()> {
     }
 }
 
+/// Load config for the image commands. Under docker_sbx the agent image
+/// lives in Docker's store, whatever `sandbox.container.runtime` says,
+/// since workmux builds sbx templates from it with Docker.
+fn load_image_config() -> Result<Config> {
+    let mut config = Config::load(None)?;
+    if config.sandbox.backend() == SandboxBackend::DockerSbx {
+        config.sandbox.container.runtime = Some(SandboxRuntime::Docker);
+    }
+    Ok(config)
+}
+
+/// Under docker_sbx, build and load the sbx template for `image` if it
+/// isn't loaded from the image Docker has now.
+fn ensure_docker_sbx_template(config: &Config, image: &str) -> Result<()> {
+    if config.sandbox.backend() == SandboxBackend::DockerSbx {
+        let tag = docker_sbx::ensure_template(image)?;
+        println!("sbx template '{}' is up to date.", tag);
+    }
+    Ok(())
+}
+
 fn run_build() -> Result<()> {
-    let config = Config::load(None)?;
+    let config = load_image_config()?;
     let agent = resolve_agent(&config);
 
     println!(
@@ -195,6 +220,7 @@ fn run_build() -> Result<()> {
     );
     sandbox::build_image(&config.sandbox, agent)?;
     println!("\nSandbox image built successfully!");
+    ensure_docker_sbx_template(&config, &config.sandbox.resolved_image(agent))?;
     println!();
     println!(
         "Tip: a pre-built image is available at {}:{}",
@@ -207,7 +233,7 @@ fn run_build() -> Result<()> {
 }
 
 fn run_pull() -> Result<()> {
-    let config = Config::load(None)?;
+    let config = load_image_config()?;
     let agent = resolve_agent(&config);
     let image = config.sandbox.resolved_image(agent);
 
@@ -216,6 +242,7 @@ fn run_pull() -> Result<()> {
     sandbox::freshness::mark_fresh(&image, config.sandbox.runtime());
 
     println!("Image '{}' is up to date.", image);
+    ensure_docker_sbx_template(&config, &image)?;
     Ok(())
 }
 
@@ -250,12 +277,19 @@ fn run_init_dockerfile(force: bool) -> Result<()> {
         .collect::<Vec<_>>()
         .join("\n");
 
-    let combined = format!(
+    let mut combined = format!(
         "{}\n\n# --- {} agent ---{}",
         sandbox::DOCKERFILE_BASE.trim_end(),
         agent_name,
         agent_body.trim_end(),
     );
+    let docker_sbx = config.sandbox.backend() == SandboxBackend::DockerSbx;
+    if docker_sbx {
+        combined.push_str(&format!(
+            "\n\n# --- Docker Sandboxes (sbx) layer ---\n{}\n",
+            docker_sbx::dockerfile_layer().trim_end(),
+        ));
+    }
 
     std::fs::write(&dockerfile_path, combined.as_bytes())?;
 
@@ -270,6 +304,9 @@ fn run_init_dockerfile(force: bool) -> Result<()> {
     println!("  3. Configure {}:", style(".workmux.yaml").bold());
     println!("       {}", style("sandbox:").dim());
     println!("         {}", style("enabled: true").dim());
+    if docker_sbx {
+        println!("         {}", style("backend: docker_sbx").dim());
+    }
     println!("         {}", style("image: my-sandbox").dim());
     Ok(())
 }
@@ -457,10 +494,43 @@ fn install_to_vm(binary_path: &Path, vm_name: &str) -> Result<()> {
     Ok(())
 }
 
+fn install_to_sbx_sandbox(binary_path: &Path, name: &str) -> Result<()> {
+    // Copy to temp location to avoid "text file busy"
+    let tmp_dest = format!("{}:/tmp/workmux.new", name);
+    let cp = Command::new("sbx")
+        .args(["cp", &binary_path.to_string_lossy(), &tmp_dest])
+        .output()
+        .context("Failed to run sbx cp")?;
+    if !cp.status.success() {
+        let stderr = String::from_utf8_lossy(&cp.stderr);
+        bail!("Failed to copy binary: {}", stderr.trim());
+    }
+
+    // Replace the template's binary, as root: the template has no sudo
+    let install = Command::new("sbx")
+        .args([
+            "exec",
+            "-u",
+            "root",
+            name,
+            "sh",
+            "-c",
+            "install -m 755 /tmp/workmux.new /usr/local/bin/workmux && rm -f /tmp/workmux.new",
+        ])
+        .output()
+        .context("Failed to run sbx exec for install")?;
+    if !install.status.success() {
+        let stderr = String::from_utf8_lossy(&install.stderr);
+        bail!("Failed to install binary: {}", stderr.trim());
+    }
+
+    Ok(())
+}
+
 fn run_install_dev(skip_build: bool, release: bool) -> Result<()> {
     use crate::sandbox::lima::VM_PREFIX;
 
-    let config = Config::load(None)?;
+    let config = load_image_config()?;
     let native = is_native_linux();
 
     // Build (or locate existing binary)
@@ -498,6 +568,14 @@ fn run_install_dev(skip_build: bool, release: bool) -> Result<()> {
     match install_dev_container(&binary_path, &image_name, &config) {
         Ok(true) => {
             did_something = true;
+            // The sbx template follows the patched image
+            if config.sandbox.backend() == SandboxBackend::DockerSbx
+                && docker_sbx::template_loaded_for(&image_name)?
+            {
+                println!("Reloading sbx template for '{}'...", image_name);
+                let tag = docker_sbx::ensure_template(&image_name)?;
+                println!("  {} ... ok", tag);
+            }
         }
         Ok(false) => {
             // Image doesn't exist, skip silently
@@ -547,9 +625,49 @@ fn run_install_dev(skip_build: bool, release: bool) -> Result<()> {
         }
     }
 
+    // --- sbx sandbox installation ---
+    if SbxInstance::is_sbx_available() {
+        let sandboxes = SbxInstance::list()?;
+        let running: Vec<_> = sandboxes
+            .iter()
+            .filter(|s| s.name.starts_with(docker_sbx::SANDBOX_PREFIX) && s.is_running())
+            .collect();
+
+        if !running.is_empty() {
+            println!(
+                "Installing workmux into {} running sbx sandbox(es)...\n",
+                running.len()
+            );
+            let mut failed: Vec<(String, String)> = Vec::new();
+
+            for sandbox in &running {
+                print!("  {} ... ", sandbox.name);
+                io::stdout().flush().ok();
+
+                match install_to_sbx_sandbox(&binary_path, &sandbox.name) {
+                    Ok(()) => println!("ok"),
+                    Err(e) => {
+                        println!("failed");
+                        failed.push((sandbox.name.clone(), e.to_string()));
+                    }
+                }
+            }
+
+            if !failed.is_empty() {
+                eprintln!("\nFailed to install to {} sbx sandbox(es):", failed.len());
+                for (name, error) in &failed {
+                    eprintln!("  - {}: {}", name, error);
+                }
+                bail!("Some installations failed");
+            }
+
+            did_something = true;
+        }
+    }
+
     if !did_something {
         bail!(
-            "Nothing to do: no container image '{}' found and no running Lima VMs.",
+            "Nothing to do: no container image '{}' found and no running Lima VMs or sbx sandboxes.",
             image_name
         );
     }

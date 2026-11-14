@@ -17,6 +17,7 @@ pub use instance::{
     remove_sandbox_for_worktree, run_exec,
 };
 pub use plan::{ExecRequest, launch_plan};
+pub use template::{dockerfile_layer, ensure_template, template_loaded_for};
 pub use wrap::wrap_for_docker_sbx;
 
 /// Prefix for all workmux-managed sbx sandbox names.

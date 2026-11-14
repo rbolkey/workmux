@@ -2,12 +2,19 @@
 # need a non-root `agent` user (UID 1000, home /home/agent), a directory for
 # the proxy's CA certificate, and BASH_ENV pointing at
 # /etc/sandbox-persistent.sh, which sbx writes the sandbox's environment into.
+# The layer can be applied twice (an image exported with `workmux sandbox
+# init-dockerfile` already has it).
 ARG BASE=ghcr.io/raine/workmux-sandbox:claude
 FROM ${BASE}
 USER root
-RUN useradd -m -u 1000 -s /bin/bash agent \
+RUN { id -u agent >/dev/null 2>&1 || useradd -m -u 1000 -s /bin/bash agent; } \
     && mkdir -p /usr/local/share/ca-certificates \
     && touch /etc/sandbox-persistent.sh
+# sbx's balanced network policy refuses plain HTTP, so fetch Debian packages
+# over HTTPS (through the proxy, whose CA sbx installs).
+RUN if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
+        sed -i 's|http://|https://|' /etc/apt/sources.list.d/debian.sources; \
+    fi
 ENV BASH_ENV=/etc/sandbox-persistent.sh
 USER agent
 WORKDIR /home/agent
