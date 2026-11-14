@@ -1,0 +1,13 @@
+# Thin Docker Sandboxes (sbx) layer over a workmux agent image. sbx templates
+# need a non-root `agent` user (UID 1000, home /home/agent), a directory for
+# the proxy's CA certificate, and BASH_ENV pointing at
+# /etc/sandbox-persistent.sh, which sbx writes the sandbox's environment into.
+ARG BASE=ghcr.io/raine/workmux-sandbox:claude
+FROM ${BASE}
+USER root
+RUN useradd -m -u 1000 -s /bin/bash agent \
+    && mkdir -p /usr/local/share/ca-certificates \
+    && touch /etc/sandbox-persistent.sh
+ENV BASH_ENV=/etc/sandbox-persistent.sh
+USER agent
+WORKDIR /home/agent

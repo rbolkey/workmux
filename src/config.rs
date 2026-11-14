@@ -1566,6 +1566,9 @@ pub enum SandboxBackend {
     Container,
     /// Lima VM backend
     Lima,
+    /// Docker Sandboxes (`sbx`) microVM backend
+    #[serde(rename = "docker_sbx")]
+    DockerSbx,
 }
 
 /// Container runtime for sandbox
@@ -1891,6 +1894,22 @@ impl LimaConfig {
                 .accept_reduced_git_metadata_isolation
                 .or(global.accept_reduced_git_metadata_isolation),
         }
+    }
+}
+
+/// Docker Sandboxes (`sbx`) specific sandbox configuration.
+/// Nested under `sandbox.docker_sbx` in YAML.
+///
+/// Each worktree gets its own sbx sandbox, created from a template built on
+/// `sandbox.image` with a thin layer for sbx's requirements. The generic
+/// `sandbox.*` keys keep their meaning under this backend.
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
+pub struct DockerSbxConfig {}
+
+impl DockerSbxConfig {
+    /// Merge: project overrides global, per-field.
+    fn merge(_global: Self, _project: Self) -> Self {
+        Self {}
     }
 }
 
@@ -2335,7 +2354,7 @@ fn validate_domain(domain: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Configuration for sandboxing (Container or Lima)
+/// Configuration for sandboxing (Container, Lima or Docker Sandboxes)
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub struct SandboxConfig {
     /// Enable sandboxing. Default: false
@@ -2352,6 +2371,7 @@ pub struct SandboxConfig {
 
     /// Container/VM image. For containers: Docker image name.
     /// For Lima: qcow2 image URL or file:// path.
+    /// For docker_sbx: the agent image the sbx template is built from.
     #[serde(default)]
     pub image: Option<String>,
 
@@ -2368,7 +2388,8 @@ pub struct SandboxConfig {
     pub env: Option<HashMap<String, String>>,
 
     /// Override the hostname used by containers to reach the host RPC server.
-    /// Defaults to `host.docker.internal` (Docker) or `host.containers.internal` (Podman).
+    /// Defaults to `host.docker.internal` (Docker and docker_sbx) or
+    /// `host.containers.internal` (Podman).
     /// Useful for non-standard Podman or custom networking setups.
     #[serde(default)]
     pub rpc_host: Option<String>,
@@ -2405,6 +2426,10 @@ pub struct SandboxConfig {
     /// Container-specific configuration
     #[serde(default)]
     pub container: ContainerConfig,
+
+    /// Docker Sandboxes (`sbx`) specific configuration
+    #[serde(default)]
+    pub docker_sbx: DockerSbxConfig,
 
     /// Network restriction configuration (container backend only).
     #[serde(default)]
@@ -2464,7 +2489,10 @@ impl SandboxConfig {
     pub fn resolved_rpc_host(&self) -> String {
         self.rpc_host
             .clone()
-            .unwrap_or_else(|| self.runtime().rpc_host_address().to_string())
+            .unwrap_or_else(|| match self.backend() {
+                SandboxBackend::DockerSbx => "host.docker.internal".to_string(),
+                _ => self.runtime().rpc_host_address().to_string(),
+            })
     }
 
     pub fn toolchain(&self) -> ToolchainMode {
@@ -3494,6 +3522,7 @@ impl Config {
                 }
                 ContainerConfig::merge(self.sandbox.container, project.sandbox.container)
             },
+            docker_sbx: DockerSbxConfig::merge(self.sandbox.docker_sbx, project.sandbox.docker_sbx),
             // Security: network is global-only. Project config cannot
             // set it -- this prevents a malicious repo from weakening
             // network restrictions via .workmux.yaml.
@@ -3968,6 +3997,7 @@ pub const EXAMPLE_PROJECT_CONFIG: &str = r#"# workmux project configuration
 #   #   # excluded_files:
 #   #   #   - .env
 #   #   #   - .env.local
+#   # docker_sbx: {}         # with backend: docker_sbx (Docker Sandboxes)
 #   # lima:
 #   #   isolation: project
 #   #   cpus: 4
@@ -4076,10 +4106,10 @@ mod tests {
         AllowedDomainEntry, CLEANUP_NODE_MODULES_PLACEHOLDER, Config, ContainerConfig,
         ContainerDevice, DEFAULT_AGENT_COLUMNS, DEFAULT_WORKTREE_COLUMNS, DashboardLayout,
         ExtraMount, FileConfig, LayoutConfig, LimaConfig, NODE_MODULES_CLEANUP_SCRIPT,
-        NetworkConfig, NetworkPolicy, PaneConfig, SandboxConfig, SandboxRuntime, SandboxTarget,
-        SidebarEnterAction, SidebarHeight, SidebarPosition, SidebarWidth, SplitDirection,
-        ToolchainMode, WindowPlacement, WorktreeColumn, is_agent_command, validate_domain,
-        validate_group_add_entry, validate_layouts_config,
+        NetworkConfig, NetworkPolicy, PaneConfig, SandboxBackend, SandboxConfig, SandboxRuntime,
+        SandboxTarget, SidebarEnterAction, SidebarHeight, SidebarPosition, SidebarWidth,
+        SplitDirection, ToolchainMode, WindowPlacement, WorktreeColumn, is_agent_command,
+        validate_domain, validate_group_add_entry, validate_layouts_config,
     };
     use super::{DashboardConfig, InputExitKey, RemoteConfig, RemoteIsolation};
     use crate::test_support;
@@ -6473,6 +6503,44 @@ container:
         assert_eq!(merged.isolation(), super::IsolationLevel::Shared);
         assert_eq!(merged.memory(), "4GiB");
         assert!(merged.accepts_reduced_git_metadata_isolation());
+    }
+
+    #[test]
+    fn sandbox_docker_sbx_yaml_format() {
+        let yaml = r#"
+enabled: true
+backend: docker_sbx
+docker_sbx: {}
+"#;
+        let config: SandboxConfig = serde_yaml::from_str(yaml).unwrap();
+
+        assert!(config.is_enabled());
+        assert_eq!(config.backend(), SandboxBackend::DockerSbx);
+    }
+
+    #[test]
+    fn sandbox_backend_project_overrides_global() {
+        let global = sandbox_cfg(|sandbox| sandbox.backend = Some(SandboxBackend::Container));
+        let project = sandbox_cfg(|sandbox| sandbox.backend = Some(SandboxBackend::DockerSbx));
+        assert_eq!(
+            global.clone().merge(project).sandbox.backend(),
+            SandboxBackend::DockerSbx
+        );
+        assert_eq!(
+            global.merge(Config::default()).sandbox.backend(),
+            SandboxBackend::Container
+        );
+    }
+
+    #[test]
+    fn docker_sbx_rpc_host_defaults_to_host_docker_internal() {
+        let config: SandboxConfig =
+            serde_yaml::from_str("backend: docker_sbx\ncontainer:\n  runtime: podman\n").unwrap();
+        assert_eq!(config.resolved_rpc_host(), "host.docker.internal");
+
+        let config: SandboxConfig =
+            serde_yaml::from_str("backend: docker_sbx\nrpc_host: example.internal\n").unwrap();
+        assert_eq!(config.resolved_rpc_host(), "example.internal");
     }
 
     #[test]

@@ -25,7 +25,7 @@ use tracing::debug;
 ///
 /// Lowercases, replaces non-alphanumeric characters with hyphens,
 /// collapses consecutive hyphens, and strips leading/trailing hyphens.
-fn sanitize_name(name: &str, max_len: usize) -> String {
+pub(crate) fn sanitize_name(name: &str, max_len: usize) -> String {
     let mut result = String::with_capacity(name.len());
     let mut prev_hyphen = false;
 
@@ -48,7 +48,7 @@ fn sanitize_name(name: &str, max_len: usize) -> String {
 }
 
 /// Hash a key and return the first `len` hex characters (zero-padded).
-fn hash_key(key: &str, len: usize) -> String {
+pub(crate) fn hash_key(key: &str, len: usize) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
