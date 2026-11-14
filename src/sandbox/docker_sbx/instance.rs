@@ -76,7 +76,13 @@ pub struct SbxSecret {
 #[derive(Debug, Clone, Deserialize)]
 pub struct SbxCheck {
     pub name: String,
+    /// `pass`, `warn`, `fail` or `skip`.
     pub status: String,
+    #[serde(default)]
+    pub message: String,
+    /// What sbx suggests doing about a failed check.
+    #[serde(default)]
+    pub hint: String,
 }
 
 #[derive(Deserialize)]
@@ -144,6 +150,25 @@ fn sbx_json(args: &[&str]) -> Result<Vec<u8>> {
         );
     }
     Ok(output.stdout)
+}
+
+/// Run `sbx diagnose --json`. It exits 1 when any check fails, disk space
+/// included, but still prints every check: read them whatever the exit
+/// status, so the plan can name the failing one.
+fn sbx_diagnose() -> Result<Vec<SbxCheck>> {
+    let output = Command::new("sbx")
+        .args(["diagnose", "--json"])
+        .output()
+        .context("Failed to run sbx diagnose")?;
+    match parse_sbx_checks(&output.stdout) {
+        Ok(checks) => Ok(checks),
+        Err(e) if output.status.success() => Err(e),
+        Err(_) => bail!(
+            "sbx diagnose failed ({}): {}",
+            output.status,
+            sbx_error(&String::from_utf8_lossy(&output.stderr))
+        ),
+    }
 }
 
 /// Turn sbx's stderr into an error message, naming the fix for errors the
@@ -256,7 +281,7 @@ pub fn gather_state(name: &str) -> Result<SbxState> {
              Or disable sandbox: set 'sandbox.enabled: false' in config."
         );
     }
-    let checks = parse_sbx_checks(&sbx_json(&["diagnose"])?)?;
+    let checks = sbx_diagnose()?;
     let platform = current_platform();
     let sandbox = SbxInstance::list()?
         .into_iter()
@@ -416,7 +441,7 @@ pub fn prepare_launch(
         eprintln!("note: {note}");
     }
     for warning in &plan.warnings {
-        warn!(sandbox = %name, warning, "sbx credential override");
+        warn!(sandbox = %name, warning, "sbx launch warning");
         eprintln!("warning: {warning}");
     }
 
@@ -659,11 +684,13 @@ mod tests {
     #[test]
     fn parses_sbx_diagnose_json() {
         let checks = parse_sbx_checks(
-            br#"{"version":"1.0","checks":[{"name":"Authentication","status":"pass","message":"authenticated","detail":"","hint":""}],"summary":{"pass":1}}"#,
+            br#"{"version":"1.0","checks":[{"name":"Authentication","status":"pass","message":"authenticated","detail":"","hint":""},{"name":"Disk space","status":"fail","message":"1.3GiB free","detail":"","hint":"Free some space"}],"summary":{"pass":1,"fail":1}}"#,
         )
         .unwrap();
         assert_eq!(checks[0].name, "Authentication");
         assert_eq!(checks[0].status, "pass");
+        assert_eq!(checks[1].message, "1.3GiB free");
+        assert_eq!(checks[1].hint, "Free some space");
     }
 
     #[test]
