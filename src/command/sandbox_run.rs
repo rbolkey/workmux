@@ -419,8 +419,8 @@ fn run_docker_sbx(
     shims::create_shim_directory(&state_dir, &host_commands)?;
     info!(commands = ?host_commands, "created host-exec shims");
 
-    // sbx's `localhost` rule reaches listeners on the workstation's loopback,
-    // so the RPC server needn't listen anywhere else.
+    // sbx's `localhost:<port>` rule reaches listeners on the workstation's
+    // loopback, so the RPC server needn't listen anywhere else.
     let (rpc_server, rpc_port, rpc_token, ctx) = start_rpc(
         config,
         frozen_config_path,
@@ -460,6 +460,7 @@ fn run_docker_sbx(
         command: command.join(" "),
         env,
         session: docker_sbx::new_session()?,
+        rpc_port: Some(rpc_port),
     };
     let plan = docker_sbx::prepare_launch(config, worktree_root, pane_cwd, agent, &exec)?;
 

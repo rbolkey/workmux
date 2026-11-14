@@ -2255,12 +2255,14 @@ pub struct AllowedDomainRule {
 pub const DEFAULT_NETWORK_MAX_CONNECTIONS: usize = 128;
 pub const MAX_NETWORK_MAX_CONNECTIONS: usize = 1024;
 
-/// Network restriction configuration for the container sandbox.
+/// Network restriction configuration for the container and docker_sbx sandboxes.
 ///
 /// When `policy` is `deny`, all outbound connections are blocked except those
 /// to whitelisted domains via an HTTP CONNECT proxy. An iptables firewall
 /// inside the container enforces that only the proxy and RPC ports are
-/// reachable, preventing bypass via direct connections.
+/// reachable, preventing bypass via direct connections. Under docker_sbx,
+/// sbx enforces the same allow list as rules scoped to the sandbox, on top
+/// of the user's global sbx policy.
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub struct NetworkConfig {
     /// Network restriction policy. Default: allow (no restrictions).
@@ -2275,6 +2277,7 @@ pub struct NetworkConfig {
     pub allowed_domains: Option<Vec<AllowedDomainEntry>>,
 
     /// Maximum number of concurrent CONNECT proxy connections.
+    /// Ignored under docker_sbx, which has no such cap.
     #[serde(default)]
     pub max_connections: Option<usize>,
 }
@@ -2431,7 +2434,7 @@ pub struct SandboxConfig {
     #[serde(default)]
     pub docker_sbx: DockerSbxConfig,
 
-    /// Network restriction configuration (container backend only).
+    /// Network restriction configuration (container and docker_sbx backends).
     #[serde(default)]
     pub network: NetworkConfig,
 
