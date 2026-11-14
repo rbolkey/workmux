@@ -1,7 +1,7 @@
 //! sbx sandbox state and commands.
 
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -11,7 +11,9 @@ use tracing::{debug, info, warn};
 
 use crate::config::Config;
 
-use super::plan::{ExecRequest, LaunchPlan, LaunchTarget, Platform, SbxCommand, SbxState};
+use super::plan::{
+    ExecRequest, LaunchPlan, LaunchTarget, NetworkRule, Platform, SbxCommand, SbxState,
+};
 
 /// A sandbox from `sbx ls --json`.
 #[derive(Debug, Clone, Deserialize)]
@@ -53,6 +55,9 @@ pub struct SbxRule {
     pub scope: String,
     #[serde(default)]
     pub decision: String,
+    /// `network`, `filesystem:read`, ...
+    #[serde(default)]
+    pub resource_type: String,
     #[serde(default)]
     pub resources: Vec<String>,
 }
@@ -94,6 +99,9 @@ pub fn parse_sbx_checks(stdout: &[u8]) -> Result<Vec<SbxCheck>> {
         .context("Failed to parse sbx diagnose output")?
         .checks)
 }
+
+/// What `sbx policy rm` prints for a rule that doesn't exist.
+const RULE_NOT_FOUND: &str = "rule not found";
 
 /// The error sbx prints for every sandbox verb before `sbx policy init`.
 const POLICY_NOT_INITIALIZED: &str = "global network policy has not been initialized";
@@ -236,17 +244,19 @@ pub fn gather_state(name: &str) -> Result<SbxState> {
         running = sandbox.as_ref().is_some_and(SbxSandboxInfo::is_running),
         "sbx sandbox state"
     );
-    // Rules are only listed for an existing sandbox; listing them also fails
-    // before the global policy is initialised, which the plan reports.
-    let rules = match &sandbox {
-        Some(_) => match sbx_json(&["policy", "ls", name]) {
-            Ok(stdout) => parse_sbx_rules(&stdout)?,
-            Err(e) => {
-                debug!(error = %e, "failed to list sbx rules");
-                Vec::new()
-            }
-        },
-        None => Vec::new(),
+    // An existing sandbox's rules include the global ones; before it exists,
+    // the global ones are what it will get. Listing fails before the global
+    // policy is initialised, which the plan reports.
+    let policy_ls = match &sandbox {
+        Some(_) => vec!["policy", "ls", name],
+        None => vec!["policy", "ls"],
+    };
+    let rules = match sbx_json(&policy_ls) {
+        Ok(stdout) => parse_sbx_rules(&stdout)?,
+        Err(e) => {
+            debug!(error = %e, "failed to list sbx rules");
+            Vec::new()
+        }
     };
     Ok(SbxState {
         platform,
@@ -261,6 +271,41 @@ pub(crate) fn sbx_state_dir_path(name: &str) -> Result<PathBuf> {
     Ok(crate::xdg::state_dir()?.join("docker-sbx").join(name))
 }
 
+/// File in a sandbox's state directory holding the network rules workmux
+/// last wrote for it. Removed with the state directory when the sandbox is.
+const NETWORK_RECORD_FILE: &str = "network-rules.json";
+
+#[derive(Default, Deserialize, Serialize)]
+struct NetworkRecord {
+    #[serde(default)]
+    rules: Vec<NetworkRule>,
+}
+
+/// The network rules workmux last wrote for a sandbox. Empty if missing or
+/// corrupted.
+fn read_network_record(state_dir: &Path) -> Vec<NetworkRule> {
+    let path = state_dir.join(NETWORK_RECORD_FILE);
+    match std::fs::read_to_string(&path) {
+        Ok(content) => match serde_json::from_str::<NetworkRecord>(&content) {
+            Ok(record) => record.rules,
+            Err(e) => {
+                warn!(?path, error = %e, "corrupted sbx network record, ignoring");
+                Vec::new()
+            }
+        },
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Record the network rules workmux wrote for a sandbox.
+fn write_network_record(state_dir: &Path, rules: &[NetworkRule]) -> Result<()> {
+    let record = NetworkRecord {
+        rules: rules.to_vec(),
+    };
+    let content = serde_json::to_string_pretty(&record)?;
+    crate::util::write_atomic(&state_dir.join(NETWORK_RECORD_FILE), content.as_bytes())
+}
+
 /// Run one sbx command from a plan, failing with sbx's error.
 fn run_sbx(command: &SbxCommand) -> Result<()> {
     debug!(args = ?command.args, "running sbx");
@@ -270,18 +315,25 @@ fn run_sbx(command: &SbxCommand) -> Result<()> {
         .output()
         .with_context(|| format!("Failed to run sbx {}", command.args[0]))?;
     if !output.status.success() {
-        bail!(
-            "sbx {} failed: {}",
-            command.args[0],
-            sbx_error(&String::from_utf8_lossy(&output.stderr))
-        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // Another launch into the same sandbox may have removed the rule.
+        if command
+            .args
+            .starts_with(&["policy".to_string(), "rm".to_string()])
+            && stderr.contains(RULE_NOT_FOUND)
+        {
+            debug!(args = ?command.args, "sbx rule already removed");
+            return Ok(());
+        }
+        bail!("sbx {} failed: {}", command.args[0], sbx_error(&stderr));
     }
     Ok(())
 }
 
 /// Gather sbx's state, compute the launch plan and run its setup commands:
-/// load the template and create the sandbox if it's missing, and add the
-/// policy rules it lacks. Returns the plan, whose `exec` the caller runs.
+/// load the template and create the sandbox if it's missing, and reconcile
+/// its policy rules, recording the ones workmux writes for
+/// `sandbox.network`. Returns the plan, whose `exec` the caller runs.
 pub fn prepare_launch(
     config: &Config,
     worktree_root: &Path,
@@ -309,6 +361,7 @@ pub fn prepare_launch(
         .map(|dir| dir.canonicalize().unwrap_or(dir));
 
     let state = gather_state(&name)?;
+    let network_record = read_network_record(&state_dir);
     let target = LaunchTarget {
         sandbox_name: &name,
         worktree_root: &worktree_root,
@@ -316,8 +369,13 @@ pub fn prepare_launch(
         git: &git,
         opencode_config_dir: opencode_config_dir.as_deref(),
         state_dir: &state_dir,
+        network_record: &network_record,
     };
     let plan = super::launch_plan(&config.sandbox, &target, agent, &state, exec)?;
+    for note in &plan.notes {
+        info!(sandbox = %name, note, "sbx network note");
+        eprintln!("note: {note}");
+    }
 
     if plan.create_template.is_some() {
         super::template::ensure_template(&config.sandbox.resolved_image(agent))?;
@@ -329,6 +387,18 @@ pub fn prepare_launch(
             }
         }
     }
+    // Record the rules about to be written before writing them, so a
+    // failed launch still knows which rules are workmux's.
+    let mut pending = network_record.clone();
+    pending.extend(
+        plan.network_rules
+            .iter()
+            .filter(|rule| !network_record.contains(rule))
+            .cloned(),
+    );
+    if pending != network_record {
+        write_network_record(&state_dir, &pending)?;
+    }
     for (i, command) in plan.setup.iter().enumerate() {
         if i == 0 && plan.create_template.is_some() {
             let msg = format!("Creating sbx sandbox {name}");
@@ -336,6 +406,9 @@ pub fn prepare_launch(
         } else {
             run_sbx(command)?;
         }
+    }
+    if plan.network_rules != pending {
+        write_network_record(&state_dir, &plan.network_rules)?;
     }
     Ok(plan)
 }
@@ -381,6 +454,11 @@ pub fn run_exec(plan: &LaunchPlan) -> Result<i32> {
         }
         std::thread::sleep(Duration::from_millis(100));
     };
+    for command in &plan.teardown {
+        if let Err(e) = run_sbx(command) {
+            warn!(sandbox = %plan.sandbox_name, error = %e, "failed to remove sbx rule");
+        }
+    }
     Ok(status.code().unwrap_or(1))
 }
 
@@ -457,6 +535,30 @@ mod tests {
         assert_eq!(rules.len(), 2);
         assert_eq!(rules[1].scope, "sandbox:wm-proj-1");
         assert_eq!(rules[1].resources, vec!["localhost".to_string()]);
+    }
+
+    #[test]
+    fn network_record_round_trips_and_starts_empty() {
+        use super::super::plan::RuleDecision;
+
+        let dir = tempfile::tempdir().unwrap();
+        assert!(read_network_record(dir.path()).is_empty());
+
+        let rules = vec![
+            NetworkRule {
+                decision: RuleDecision::Allow,
+                resource: "**.example.com:443".to_string(),
+            },
+            NetworkRule {
+                decision: RuleDecision::Deny,
+                resource: "example.com:443".to_string(),
+            },
+        ];
+        write_network_record(dir.path(), &rules).unwrap();
+        assert_eq!(read_network_record(dir.path()), rules);
+
+        std::fs::write(dir.path().join(NETWORK_RECORD_FILE), "not json").unwrap();
+        assert!(read_network_record(dir.path()).is_empty());
     }
 
     #[test]

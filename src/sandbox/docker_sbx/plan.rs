@@ -5,7 +5,8 @@
 //! [`super::instance::gather_state`]), compute the plan, run its setup
 //! commands, then run its exec in the foreground.
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 use crate::config::SandboxConfig;
@@ -31,7 +32,8 @@ pub struct SbxState {
     pub checks: Vec<SbxCheck>,
     /// The sandbox from `sbx ls --json`, or `None` when it doesn't exist.
     pub sandbox: Option<SbxSandboxInfo>,
-    /// Rules from `sbx policy ls <name> --json`; empty when the sandbox is missing.
+    /// Rules from `sbx policy ls <name> --json`, or the global ones from
+    /// `sbx policy ls --json` when the sandbox is missing.
     pub rules: Vec<SbxRule>,
 }
 
@@ -50,6 +52,35 @@ pub struct LaunchTarget<'a> {
     pub opencode_config_dir: Option<&'a Path>,
     /// Host-side state directory for the sandbox (shims live under it).
     pub state_dir: &'a Path,
+    /// The network rules workmux last wrote for the sandbox (see
+    /// [`LaunchPlan::network_rules`]).
+    pub network_record: &'a [NetworkRule],
+}
+
+/// Whether an sbx rule allows or denies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RuleDecision {
+    Allow,
+    Deny,
+}
+
+impl RuleDecision {
+    /// sbx's name for the decision, as in `sbx policy allow|deny`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Deny => "deny",
+        }
+    }
+}
+
+/// A network rule workmux keeps on a sandbox for `sandbox.network`:
+/// `sbx policy <decision> network --sandbox <name> <resource>`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetworkRule {
+    pub decision: RuleDecision,
+    pub resource: String,
 }
 
 /// A linked worktree's git metadata, as found on the host (see
@@ -78,6 +109,9 @@ pub struct ExecRequest {
     pub env: Vec<(String, String)>,
     /// Identifies the exec's processes in the guest, so they can be hung up.
     pub session: String,
+    /// The port of the supervisor's RPC server on the workstation's
+    /// loopback, when it runs one.
+    pub rpc_port: Option<u16>,
 }
 
 /// One `sbx` invocation. Environment values are passed through the process
@@ -102,6 +136,14 @@ pub struct LaunchPlan {
     /// Hangs up the exec's processes in the guest. sbx leaves them running
     /// when the `sbx exec` client goes away, as it does when a pane closes.
     pub hangup: SbxCommand,
+    /// Commands to run after `exec` ends: removing the RPC rule.
+    pub teardown: Vec<SbxCommand>,
+    /// Notes for the user: settings sbx can't enforce that only limit access,
+    /// and what sbx allows beyond them.
+    pub notes: Vec<String>,
+    /// The `sandbox.network` rules workmux has written for the sandbox once
+    /// `setup` has run; the record the next launch reconciles against.
+    pub network_rules: Vec<NetworkRule>,
 }
 
 /// Home directory of sbx's `agent` user in the guest.
@@ -113,9 +155,8 @@ const GUEST_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbi
 /// Environment variable marking the processes of one exec in the guest.
 const SESSION_ENV: &str = "WM_SBX_SESSION";
 
-/// Policy resource for workmux's RPC server: sbx's name for the workstation,
-/// on every port (RPC ports are ephemeral).
-const RPC_RULE_RESOURCE: &str = "localhost";
+/// sbx's name for the workstation in policy rules.
+const WORKSTATION_HOST: &str = "localhost";
 
 /// Where an agent's config directory is linked under the guest home, or
 /// `None` for agents whose config directory workmux doesn't mount.
@@ -319,6 +360,99 @@ fn extra_mount_workspaces(config: &SandboxConfig, target: &LaunchTarget) -> Resu
     Ok(workspaces)
 }
 
+/// `sandbox.network` as rules scoped to the sandbox. Under `deny`, port 443
+/// to each allowed domain, as workmux's CONNECT proxy allows on the
+/// container backend; under `allow`, none.
+///
+/// workmux's `*.d` matches subdomains at any depth but not `d`; sbx's `*.d`
+/// matches one label and its `**.d` any depth and `d` too. So `*.d` becomes
+/// `**.d` with a deny for `d`, unless `d` is itself allowed.
+fn network_rules(config: &SandboxConfig) -> Vec<NetworkRule> {
+    if !config.network_policy_is_deny() {
+        return Vec::new();
+    }
+    let hosts: Vec<String> = config
+        .network
+        .allowed_domains()
+        .iter()
+        .map(|entry| entry.host().to_ascii_lowercase())
+        .collect();
+    let allowed = |host: &str| {
+        hosts.iter().any(|pattern| match pattern.strip_prefix('*') {
+            Some(suffix) => host.ends_with(suffix),
+            None => host == pattern,
+        })
+    };
+
+    let mut rules = Vec::new();
+    let mut add = |decision, resource: String| {
+        let rule = NetworkRule { decision, resource };
+        if !rules.contains(&rule) {
+            rules.push(rule);
+        }
+    };
+    for host in &hosts {
+        match host.strip_prefix("*.") {
+            Some(base) => {
+                add(RuleDecision::Allow, format!("**.{base}:443"));
+                if !allowed(base) {
+                    add(RuleDecision::Deny, format!("{base}:443"));
+                }
+            }
+            None => add(RuleDecision::Allow, format!("{host}:443")),
+        }
+    }
+    rules
+}
+
+/// What sbx enforces differently from `sandbox.network` without widening
+/// it: settings it has no equivalent for, and what the user's global sbx
+/// policy allows besides (workmux never writes it, and a sandbox's allow
+/// can't take a global one back).
+fn network_notes(config: &SandboxConfig, state: &SbxState, name: &str) -> Vec<String> {
+    if !config.network_policy_is_deny() {
+        return Vec::new();
+    }
+    let mut notes = Vec::new();
+    if config.network.max_connections.is_some() {
+        notes.push(
+            "sandbox.network.max_connections is ignored under the docker_sbx backend: \
+             sbx doesn't cap concurrent connections."
+                .to_string(),
+        );
+    }
+    let global_allows: usize = state
+        .rules
+        .iter()
+        .filter(|rule| {
+            rule.scope == "global" && rule.decision == "allow" && rule.resource_type == "network"
+        })
+        .map(|rule| rule.resources.len())
+        .sum();
+    if global_allows > 0 {
+        notes.push(format!(
+            "sbx's global network policy also allows {global_allows} destinations \
+             besides sandbox.network.allowed_domains; `sbx policy ls {name}` lists them. \
+             workmux never changes the global policy."
+        ));
+    }
+    notes
+}
+
+/// The `sbx policy` command adding or removing a rule scoped to the sandbox.
+fn policy_command(name: &str, verb: &str, resource: &str) -> SbxCommand {
+    let mut args = words(&["policy", verb, "network", "--sandbox", name]);
+    if verb == "rm" {
+        args.extend(words(&["--resource", resource, "-f"]));
+    } else {
+        args.push(resource.to_string());
+    }
+    SbxCommand {
+        args,
+        env: Vec::new(),
+    }
+}
+
 /// Whether sbx's diagnostics report `name` as failed.
 fn check_failed(state: &SbxState, name: &str) -> bool {
     state
@@ -370,8 +504,9 @@ fn check_prerequisites(state: &SbxState) -> Result<()> {
 /// the shims and `extra_mounts`, all at their host paths; then,
 /// as root, link the config directory to where the agent looks for it and
 /// seed Claude's onboarding state. On every launch: bind pi's and OMP's
-/// binaries directory to a guest-local one, and add the RPC policy rule if
-/// it's missing.
+/// binaries directory to a guest-local one, reconcile the sandbox's rules
+/// with `sandbox.network`, and allow the supervisor's RPC port until the
+/// exec ends.
 pub fn launch_plan(
     config: &SandboxConfig,
     target: &LaunchTarget,
@@ -389,6 +524,10 @@ pub fn launch_plan(
         );
     }
 
+    config
+        .network
+        .validate()
+        .context("Invalid sandbox network config")?;
     let extra_mounts = extra_mount_workspaces(config, target)?;
 
     let name = target.sandbox_name;
@@ -473,26 +612,49 @@ pub fn launch_plan(
         setup.push(root_exec(name, command));
     }
 
-    // One rule scoped to the sandbox lets the guest reach workmux's RPC
-    // server through host.docker.internal; sbx names the host `localhost`.
+    // Reconcile `sandbox.network` with the sandbox's rules. Only rules
+    // workmux wrote (its record) are ever removed; stale ones go first, as
+    // sbx refuses a rule while its scope holds the opposite decision for
+    // the same resource. A rule the user already had stays theirs.
     let sandbox_scope = format!("sandbox:{name}");
-    let has_rpc_rule = state.rules.iter().any(|rule| {
-        rule.scope == sandbox_scope
-            && rule.decision == "allow"
-            && rule.resources.iter().any(|r| r == RPC_RULE_RESOURCE)
-    });
-    if !has_rpc_rule {
-        setup.push(SbxCommand {
-            args: words(&[
-                "policy",
-                "allow",
-                "network",
-                "--sandbox",
-                name,
-                RPC_RULE_RESOURCE,
-            ]),
-            env: Vec::new(),
-        });
+    let present = |rule: &NetworkRule| {
+        state.sandbox.is_some()
+            && state.rules.iter().any(|r| {
+                r.scope == sandbox_scope
+                    && r.decision == rule.decision.as_str()
+                    && r.resources.contains(&rule.resource)
+            })
+    };
+    let wanted = network_rules(config);
+    for rule in target.network_record {
+        if !wanted.contains(rule) && present(rule) {
+            setup.push(policy_command(name, "rm", &rule.resource));
+        }
+    }
+    let mut network_rules = Vec::new();
+    for rule in wanted {
+        if !present(&rule) {
+            setup.push(policy_command(name, rule.decision.as_str(), &rule.resource));
+            network_rules.push(rule);
+        } else if target.network_record.contains(&rule) {
+            network_rules.push(rule);
+        }
+    }
+
+    // A rule scoped to the sandbox lets the guest reach the supervisor's RPC
+    // server through host.docker.internal; sbx names the workstation
+    // `localhost`. Only its port, and only while the supervisor runs: the
+    // rule is removed when the exec ends, unless it was already there.
+    let mut teardown = Vec::new();
+    if let Some(port) = exec.rpc_port {
+        let rpc_rule = NetworkRule {
+            decision: RuleDecision::Allow,
+            resource: format!("{WORKSTATION_HOST}:{port}"),
+        };
+        if !present(&rpc_rule) {
+            setup.push(policy_command(name, "allow", &rpc_rule.resource));
+            teardown.push(policy_command(name, "rm", &rpc_rule.resource));
+        }
     }
 
     Ok(LaunchPlan {
@@ -501,13 +663,18 @@ pub fn launch_plan(
         setup,
         exec: exec_command(target, exec),
         hangup: hangup_command(target, exec),
+        teardown,
+        notes: network_notes(config, state, name),
+        network_rules,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ExtraMount;
+    use crate::config::{
+        AllowedDomainDetails, AllowedDomainEntry, ExtraMount, NetworkConfig, NetworkPolicy,
+    };
     use std::path::PathBuf;
 
     fn args(words: &[&str]) -> Vec<String> {
@@ -564,6 +731,7 @@ mod tests {
         cwd: PathBuf,
         git: GitMetadata,
         state: PathBuf,
+        record: Vec<NetworkRule>,
     }
 
     fn git_metadata() -> GitMetadata {
@@ -581,6 +749,7 @@ mod tests {
             cwd: PathBuf::from("/code/proj__worktrees/feat/sub"),
             git: git_metadata(),
             state: PathBuf::from("/state/docker-sbx/wm-proj-12345678"),
+            record: Vec::new(),
         }
     }
 
@@ -592,6 +761,7 @@ mod tests {
             git: &p.git,
             opencode_config_dir: None,
             state_dir: &p.state,
+            network_record: &p.record,
         }
     }
 
@@ -603,6 +773,7 @@ mod tests {
                 ("WM_RPC_TOKEN".to_string(), "secret".to_string()),
             ],
             session: "0123456789abcdef".to_string(),
+            rpc_port: Some(4242),
         }
     }
 
@@ -677,50 +848,434 @@ mod tests {
         SbxRule {
             scope: scope.to_string(),
             decision: "allow".to_string(),
+            resource_type: "network".to_string(),
             resources: vec![resource.to_string()],
         }
     }
 
-    #[test]
-    fn localhost_rule_scoped_to_the_sandbox_lets_the_guest_reach_rpc() {
-        let p = paths();
-        let plan = launch_plan(&config(), &target(&p), "claude", &missing(), &exec()).unwrap();
+    fn with_network(policy: NetworkPolicy, domains: Vec<AllowedDomainEntry>) -> SandboxConfig {
+        SandboxConfig {
+            network: NetworkConfig {
+                policy: Some(policy),
+                allowed_domains: Some(domains),
+                max_connections: None,
+            },
+            ..config()
+        }
+    }
 
-        assert_eq!(
-            plan.setup.last().unwrap().args,
-            args(&[
+    fn domains(hosts: &[&str]) -> Vec<AllowedDomainEntry> {
+        hosts
+            .iter()
+            .map(|host| AllowedDomainEntry::Plain(host.to_string()))
+            .collect()
+    }
+
+    fn policy_commands(plan: &LaunchPlan) -> Vec<Vec<String>> {
+        plan.setup
+            .iter()
+            .filter(|c| c.args[0] == "policy")
+            .map(|c| c.args.clone())
+            .collect()
+    }
+
+    fn policy(verb: &str, resource: &str) -> Vec<String> {
+        match verb {
+            "rm" => args(&[
                 "policy",
-                "allow",
+                "rm",
                 "network",
                 "--sandbox",
                 "wm-proj-12345678",
-                "localhost",
-            ])
+                "--resource",
+                resource,
+                "-f",
+            ]),
+            _ => args(&[
+                "policy",
+                verb,
+                "network",
+                "--sandbox",
+                "wm-proj-12345678",
+                resource,
+            ]),
+        }
+    }
+
+    #[test]
+    fn rpc_rule_allows_only_the_supervisors_port_until_it_exits() {
+        // A bare `localhost` rule would reach every service on the
+        // workstation's loopback, not just workmux's RPC server.
+        let p = paths();
+        for policy_kind in [NetworkPolicy::Allow, NetworkPolicy::Deny] {
+            let config = with_network(policy_kind, Vec::new());
+            let plan = launch_plan(&config, &target(&p), "claude", &missing(), &exec()).unwrap();
+
+            assert!(
+                policy_commands(&plan).contains(&policy("allow", "localhost:4242")),
+                "{:?}",
+                plan.setup
+            );
+            assert_eq!(
+                plan.teardown
+                    .iter()
+                    .map(|c| c.args.clone())
+                    .collect::<Vec<_>>(),
+                vec![policy("rm", "localhost:4242")]
+            );
+            assert!(
+                plan.network_rules.is_empty(),
+                "the record is sandbox.network's"
+            );
+        }
+    }
+
+    #[test]
+    fn rpc_rule_already_there_is_neither_added_nor_removed() {
+        let p = paths();
+        let existing = running_with(vec![
+            rule("global", "api.anthropic.com"),
+            rule(SCOPE, "localhost:4242"),
+        ]);
+        let plan = launch_plan(&config(), &target(&p), "claude", &existing, &exec()).unwrap();
+        assert!(plan.setup.is_empty(), "{:?}", plan.setup);
+        assert!(plan.teardown.is_empty(), "{:?}", plan.teardown);
+
+        // A global rule, or one for another port, isn't this supervisor's.
+        for rules in [
+            vec![rule("global", "localhost:4242")],
+            vec![rule(SCOPE, "localhost:4243")],
+        ] {
+            let plan = launch_plan(
+                &config(),
+                &target(&p),
+                "claude",
+                &running_with(rules),
+                &exec(),
+            )
+            .unwrap();
+            assert_eq!(
+                policy_commands(&plan),
+                vec![policy("allow", "localhost:4242")]
+            );
+        }
+    }
+
+    #[test]
+    fn launch_without_an_rpc_server_adds_no_rpc_rule() {
+        // `workmux add` creating the sandbox, and `sandbox shell`.
+        let p = paths();
+        let request = ExecRequest {
+            rpc_port: None,
+            ..exec()
+        };
+        let plan = launch_plan(&config(), &target(&p), "claude", &missing(), &request).unwrap();
+        assert!(policy_commands(&plan).is_empty(), "{:?}", plan.setup);
+        assert!(plan.teardown.is_empty());
+    }
+
+    #[test]
+    fn deny_allows_port_443_to_each_allowed_domain_in_the_sandbox_only() {
+        let p = paths();
+        let config = with_network(
+            NetworkPolicy::Deny,
+            domains(&["api.anthropic.com", "github.com"]),
+        );
+        let plan = launch_plan(&config, &target(&p), "claude", &missing(), &exec()).unwrap();
+
+        let commands = policy_commands(&plan);
+        assert!(
+            commands.contains(&policy("allow", "api.anthropic.com:443")),
+            "{commands:?}"
+        );
+        assert!(
+            commands.contains(&policy("allow", "github.com:443")),
+            "{commands:?}"
         );
     }
 
     #[test]
-    fn existing_localhost_rule_is_not_added_again() {
+    fn allow_adds_no_rules_for_allowed_domains() {
         let p = paths();
-        let existing = SbxState {
+        let config = with_network(NetworkPolicy::Allow, domains(&["github.com"]));
+        let plan = launch_plan(&config, &target(&p), "claude", &missing(), &exec()).unwrap();
+
+        assert!(
+            !policy_commands(&plan)
+                .iter()
+                .any(|c| c.last().unwrap().ends_with(":443")),
+            "{:?}",
+            plan.setup
+        );
+        assert!(plan.network_rules.is_empty());
+    }
+
+    #[test]
+    fn wildcard_domains_allow_subdomains_at_any_depth_but_not_the_base() {
+        // sbx's `*.d` matches one label and `**.d` any depth plus d itself;
+        // workmux's `*.d` matches any depth without d.
+        let p = paths();
+        let config = with_network(
+            NetworkPolicy::Deny,
+            domains(&["*.googleapis.com", "*.github.com", "github.com"]),
+        );
+        let plan = launch_plan(&config, &target(&p), "claude", &missing(), &exec()).unwrap();
+
+        let commands = policy_commands(&plan);
+        for expected in [
+            policy("allow", "**.googleapis.com:443"),
+            policy("deny", "googleapis.com:443"),
+            policy("allow", "**.github.com:443"),
+            policy("allow", "github.com:443"),
+        ] {
+            assert!(commands.contains(&expected), "{expected:?} in {commands:?}");
+        }
+        assert!(
+            !commands.contains(&policy("deny", "github.com:443")),
+            "github.com is allowed: {commands:?}"
+        );
+    }
+
+    #[test]
+    fn nested_wildcards_dont_deny_a_base_an_outer_wildcard_allows() {
+        let p = paths();
+        let config = with_network(
+            NetworkPolicy::Deny,
+            domains(&["*.example.com", "*.api.example.com"]),
+        );
+        let plan = launch_plan(&config, &target(&p), "claude", &missing(), &exec()).unwrap();
+
+        let commands = policy_commands(&plan);
+        assert!(commands.contains(&policy("deny", "example.com:443")));
+        assert!(
+            !commands.contains(&policy("deny", "api.example.com:443")),
+            "*.example.com allows api.example.com: {commands:?}"
+        );
+    }
+
+    fn recorded(decision: RuleDecision, resource: &str) -> NetworkRule {
+        NetworkRule {
+            decision,
+            resource: resource.to_string(),
+        }
+    }
+
+    fn running_with(rules: Vec<SbxRule>) -> SbxState {
+        SbxState {
             sandbox: Some(sandbox("running")),
-            rules: vec![
-                rule("global", "api.anthropic.com"),
-                rule("sandbox:wm-proj-12345678", "localhost"),
-            ],
+            rules,
+            ..missing()
+        }
+    }
+
+    const SCOPE: &str = "sandbox:wm-proj-12345678";
+
+    #[test]
+    fn reconciling_removes_only_stale_rules_workmux_wrote() {
+        let mut p = paths();
+        p.record = vec![
+            recorded(RuleDecision::Allow, "kept.com:443"),
+            recorded(RuleDecision::Allow, "dropped.com:443"),
+            recorded(RuleDecision::Allow, "gone-already.com:443"),
+        ];
+        let state = running_with(vec![
+            rule("global", "dropped.com:443"),
+            rule(SCOPE, "kept.com:443"),
+            rule(SCOPE, "dropped.com:443"),
+            rule(SCOPE, "users-own.com:443"),
+        ]);
+        let config = with_network(NetworkPolicy::Deny, domains(&["kept.com", "new.com"]));
+        let plan = launch_plan(&config, &target(&p), "claude", &state, &exec()).unwrap();
+
+        let commands = policy_commands(&plan);
+        assert!(
+            commands.contains(&policy("rm", "dropped.com:443")),
+            "{commands:?}"
+        );
+        assert!(
+            commands.contains(&policy("allow", "new.com:443")),
+            "{commands:?}"
+        );
+        for untouched in ["kept.com:443", "users-own.com:443", "gone-already.com:443"] {
+            assert!(
+                !commands.iter().any(|c| c.iter().any(|a| a == untouched)),
+                "{untouched} in {commands:?}"
+            );
+        }
+        assert_eq!(
+            plan.network_rules,
+            vec![
+                recorded(RuleDecision::Allow, "kept.com:443"),
+                recorded(RuleDecision::Allow, "new.com:443"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_rule_the_user_already_had_stays_theirs() {
+        // Present before workmux would have added it: never recorded, so
+        // never removed when config drops the domain.
+        let p = paths();
+        let state = running_with(vec![rule(SCOPE, "github.com:443")]);
+        let config = with_network(NetworkPolicy::Deny, domains(&["github.com"]));
+        let plan = launch_plan(&config, &target(&p), "claude", &state, &exec()).unwrap();
+
+        assert!(
+            !policy_commands(&plan)
+                .iter()
+                .any(|c| c.contains(&"github.com:443".to_string()))
+        );
+        assert!(plan.network_rules.is_empty(), "{:?}", plan.network_rules);
+    }
+
+    #[test]
+    fn switching_to_allow_removes_every_rule_workmux_wrote() {
+        let mut p = paths();
+        p.record = vec![
+            recorded(RuleDecision::Allow, "**.example.com:443"),
+            recorded(RuleDecision::Deny, "example.com:443"),
+        ];
+        let mut deny = rule(SCOPE, "example.com:443");
+        deny.decision = "deny".to_string();
+        let state = running_with(vec![rule(SCOPE, "**.example.com:443"), deny]);
+        let config = with_network(NetworkPolicy::Allow, domains(&["*.example.com"]));
+        let plan = launch_plan(&config, &target(&p), "claude", &state, &exec()).unwrap();
+
+        let commands = policy_commands(&plan);
+        assert!(
+            commands.contains(&policy("rm", "**.example.com:443")),
+            "{commands:?}"
+        );
+        assert!(
+            commands.contains(&policy("rm", "example.com:443")),
+            "{commands:?}"
+        );
+        assert!(plan.network_rules.is_empty());
+    }
+
+    #[test]
+    fn stale_rules_are_removed_before_rules_are_added() {
+        // sbx refuses a rule while the same scope holds the opposite
+        // decision for its resource.
+        let mut p = paths();
+        p.record = vec![
+            recorded(RuleDecision::Allow, "**.example.com:443"),
+            recorded(RuleDecision::Deny, "example.com:443"),
+        ];
+        let mut deny = rule(SCOPE, "example.com:443");
+        deny.decision = "deny".to_string();
+        let state = running_with(vec![rule(SCOPE, "**.example.com:443"), deny]);
+        let config = with_network(NetworkPolicy::Deny, domains(&["example.com"]));
+        let plan = launch_plan(&config, &target(&p), "claude", &state, &exec()).unwrap();
+
+        let commands = policy_commands(&plan);
+        let removed = commands
+            .iter()
+            .position(|c| *c == policy("rm", "example.com:443"))
+            .expect("deny removed");
+        let added = commands
+            .iter()
+            .position(|c| *c == policy("allow", "example.com:443"))
+            .expect("allow added");
+        assert!(removed < added, "{commands:?}");
+    }
+
+    #[test]
+    fn ip_literals_are_refused_as_on_the_container_backend() {
+        let p = paths();
+        for host in ["10.0.0.1", "::1"] {
+            let config = with_network(NetworkPolicy::Deny, domains(&[host]));
+            let err = launch_plan(&config, &target(&p), "claude", &missing(), &exec()).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("IP literals not allowed"),
+                "{err:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn allow_private_ips_needs_no_more_since_sbx_reaches_private_addresses_anyway() {
+        let p = paths();
+        let config = with_network(
+            NetworkPolicy::Deny,
+            vec![AllowedDomainEntry::Detailed(AllowedDomainDetails {
+                host: "git.internal.example".to_string(),
+                allow_private_ips: true,
+            })],
+        );
+        let plan = launch_plan(&config, &target(&p), "claude", &missing(), &exec()).unwrap();
+
+        assert_eq!(
+            plan.network_rules,
+            vec![recorded(RuleDecision::Allow, "git.internal.example:443")]
+        );
+        assert!(plan.notes.is_empty(), "{:?}", plan.notes);
+    }
+
+    #[test]
+    fn max_connections_gets_a_note_since_sbx_has_no_cap() {
+        let p = paths();
+        let mut config = with_network(NetworkPolicy::Deny, domains(&["github.com"]));
+        let plan = launch_plan(&config, &target(&p), "claude", &missing(), &exec()).unwrap();
+        assert!(plan.notes.is_empty(), "{:?}", plan.notes);
+
+        config.network.max_connections = Some(16);
+        let plan = launch_plan(&config, &target(&p), "claude", &missing(), &exec()).unwrap();
+        assert_eq!(plan.notes.len(), 1);
+        assert!(
+            plan.notes[0].contains("max_connections"),
+            "{:?}",
+            plan.notes
+        );
+
+        // Under allow it limits nothing on any backend.
+        config.network.policy = Some(NetworkPolicy::Allow);
+        let plan = launch_plan(&config, &target(&p), "claude", &missing(), &exec()).unwrap();
+        assert!(plan.notes.is_empty(), "{:?}", plan.notes);
+    }
+
+    #[test]
+    fn deny_notes_what_the_global_sbx_policy_also_allows() {
+        // workmux never writes the global policy, and a sandbox allow can't
+        // take back a global one.
+        let p = paths();
+        let mut filesystem = rule("global", "**");
+        filesystem.resource_type = "filesystem:read".to_string();
+        let mut fallback = rule("global", "**");
+        fallback.decision = "deny".to_string();
+        let mut balanced = rule("global", "github.com:443");
+        balanced.resources.push("**.npmjs.org:443".to_string());
+        let state = SbxState {
+            rules: vec![balanced, filesystem, fallback],
             ..missing()
         };
-        let plan = launch_plan(&config(), &target(&p), "claude", &existing, &exec()).unwrap();
-        assert!(plan.setup.is_empty(), "{:?}", plan.setup);
+        let config = with_network(NetworkPolicy::Deny, domains(&["api.anthropic.com"]));
+        let plan = launch_plan(&config, &target(&p), "claude", &state, &exec()).unwrap();
 
-        // A global localhost rule is the user's, not this sandbox's.
-        let global_only = SbxState {
-            rules: vec![rule("global", "localhost")],
-            ..existing
+        assert_eq!(plan.notes.len(), 1, "{:?}", plan.notes);
+        assert!(plan.notes[0].contains("2 destinations"), "{:?}", plan.notes);
+        assert!(
+            plan.notes[0].contains("sbx policy ls wm-proj-12345678"),
+            "{:?}",
+            plan.notes
+        );
+
+        let allow = with_network(NetworkPolicy::Allow, Vec::new());
+        let plan = launch_plan(&allow, &target(&p), "claude", &state, &exec()).unwrap();
+        assert!(plan.notes.is_empty(), "{:?}", plan.notes);
+
+        let deny_all = SbxState {
+            rules: vec![rule("global", "**")]
+                .into_iter()
+                .map(|mut r| {
+                    r.decision = "deny".to_string();
+                    r
+                })
+                .collect(),
+            ..missing()
         };
-        let plan = launch_plan(&config(), &target(&p), "claude", &global_only, &exec()).unwrap();
-        assert_eq!(plan.setup.len(), 1);
-        assert_eq!(plan.setup[0].args[0], "policy");
+        let plan = launch_plan(&config, &target(&p), "claude", &deny_all, &exec()).unwrap();
+        assert!(plan.notes.is_empty(), "{:?}", plan.notes);
     }
 
     #[test]
@@ -788,7 +1343,7 @@ mod tests {
         let p = paths();
         let stopped = SbxState {
             sandbox: Some(sandbox("stopped")),
-            rules: vec![rule("sandbox:wm-proj-12345678", "localhost")],
+            rules: vec![rule("sandbox:wm-proj-12345678", "localhost:4242")],
             ..missing()
         };
         let plan = launch_plan(&config(), &target(&p), "claude", &stopped, &exec()).unwrap();
@@ -996,7 +1551,7 @@ mod tests {
         let p = paths();
         let existing = SbxState {
             sandbox: Some(sandbox("stopped")),
-            rules: vec![rule("sandbox:wm-proj-12345678", "localhost")],
+            rules: vec![rule("sandbox:wm-proj-12345678", "localhost:4242")],
             ..missing()
         };
         for (agent, host, guest) in [
