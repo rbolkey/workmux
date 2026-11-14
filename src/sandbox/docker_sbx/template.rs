@@ -2,15 +2,37 @@
 //!
 //! A template is the agent image plus the thin layer in `docker/Dockerfile.sbx`.
 //! sbx keeps templates in its own image store, so the layer is built with
-//! Docker, saved to a tarball and loaded with `sbx template load`.
+//! Docker, saved to a tarball and loaded with `sbx template load`. The
+//! template follows the agent image: when Docker's image changes (a pulled
+//! update, a local build, `install-dev`), the template is built and loaded
+//! again.
 
 use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
+
+use crate::config::SandboxRuntime;
+use crate::sandbox::freshness;
 
 /// The sbx layer added on top of the agent image.
 pub const DOCKERFILE_SBX: &str = include_str!("../../../docker/Dockerfile.sbx");
+
+/// The sbx layer for appending to a combined Dockerfile
+/// (`workmux sandbox init-dockerfile`): `Dockerfile.sbx` without its
+/// `ARG BASE`/`FROM` lines.
+pub fn dockerfile_layer() -> String {
+    DOCKERFILE_SBX
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            !trimmed.starts_with("ARG BASE=") && !trimmed.starts_with("FROM ${BASE}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 
 /// Repository name of workmux's sbx templates.
 const TEMPLATE_REPOSITORY: &str = "workmux-sbx";
@@ -83,28 +105,146 @@ fn run_docker(args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-/// Make sure the template for `image` is loaded into sbx, building it with
-/// Docker when it isn't. Returns the template tag.
-pub fn ensure_template(image: &str) -> Result<String> {
-    let tag = template_tag(image);
-    if template_loaded(&tag)? {
-        debug!(%tag, "sbx template already loaded");
-        return Ok(tag);
-    }
-
-    info!(%image, %tag, "building sbx template");
-    let image_present = Command::new("docker")
+fn image_present(image: &str) -> Result<bool> {
+    Ok(Command::new("docker")
         .args(["image", "inspect", image])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
         .context("Failed to run docker; the docker_sbx backend builds its template with Docker")?
-        .success();
-    if !image_present {
+        .success())
+}
+
+/// Docker's ID for a local image (`sha256:...`), which changes whenever
+/// the image does: a pull of a newer image, a local build, `install-dev`.
+fn local_image_id(image: &str) -> Result<String> {
+    let output = Command::new("docker")
+        .args(["image", "inspect", "--format", "{{.Id}}", image])
+        .output()
+        .context("Failed to run docker image inspect")?;
+    if !output.status.success() {
+        bail!(
+            "docker image inspect {image} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Make sure the agent image is in Docker's image store, pulling it when
+/// it's missing, and for workmux's official images pull an update the
+/// freshness check found, as the container backend does. A pulled update
+/// changes the image ID, which reloads the template.
+fn ensure_image_ready(image: &str) -> Result<()> {
+    let runtime = SandboxRuntime::Docker;
+    let is_official = freshness::is_official_image(image);
+
+    if !image_present(image)? {
         eprintln!("Pulling image {image}...");
         run_docker(&["pull", image])?;
+        if is_official {
+            freshness::mark_fresh(image, runtime);
+        }
+        return Ok(());
     }
 
+    if is_official {
+        if freshness::cached_is_stale(image, runtime) == Some(true) {
+            eprintln!("Updating sandbox image '{}'...", image);
+            match run_docker(&["pull", image]) {
+                Ok(()) => freshness::mark_fresh(image, runtime),
+                Err(e) => {
+                    eprintln!(
+                        "warning: failed to update sandbox image: {}; continuing with local image",
+                        e
+                    );
+                    freshness::check_in_background(image.to_string(), runtime);
+                }
+            }
+        } else {
+            freshness::check_in_background(image.to_string(), runtime);
+        }
+    }
+    Ok(())
+}
+
+/// Refresh the freshness cache for the agent image in the background, so
+/// the next sandbox created from it pulls an update first. Only workmux's
+/// official images are checked.
+pub fn check_freshness_in_background(image: &str) {
+    freshness::check_in_background(image.to_string(), SandboxRuntime::Docker);
+}
+
+/// Whether a template is current: loaded into sbx, from the agent image
+/// Docker has now.
+fn template_is_current(loaded: bool, recorded: Option<&str>, source_image_id: &str) -> bool {
+    loaded && recorded == Some(source_image_id)
+}
+
+/// The image ID a loaded template was built from, recorded in
+/// `$XDG_STATE_HOME/workmux/docker-sbx/templates/<tag>.json`.
+#[derive(Deserialize, Serialize)]
+struct TemplateRecord {
+    source_image_id: String,
+}
+
+fn template_record_path(tag: &str) -> Result<PathBuf> {
+    Ok(crate::xdg::state_dir()?
+        .join("docker-sbx")
+        .join("templates")
+        .join(format!("{}.json", tag.replace([':', '/'], "-"))))
+}
+
+/// The image ID recorded for a template. None if missing or corrupted.
+fn read_template_record(path: &Path) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    match serde_json::from_str::<TemplateRecord>(&content) {
+        Ok(record) => Some(record.source_image_id),
+        Err(e) => {
+            warn!(?path, error = %e, "corrupted sbx template record, ignoring");
+            None
+        }
+    }
+}
+
+fn write_template_record(path: &Path, source_image_id: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create {}", parent.display()))?;
+    }
+    let record = TemplateRecord {
+        source_image_id: source_image_id.to_string(),
+    };
+    let content = serde_json::to_string_pretty(&record)?;
+    crate::util::write_atomic(path, content.as_bytes())
+}
+
+/// Whether the template for `image` is loaded into sbx.
+pub fn template_loaded_for(image: &str) -> Result<bool> {
+    template_loaded(&template_tag(image))
+}
+
+/// Make sure the template for `image` is loaded into sbx and built from
+/// the agent image Docker has now, pulling the image first when it's
+/// missing or the freshness check found an update. Builds and reloads the
+/// template when the image changed since it was loaded. Returns the
+/// template tag.
+pub fn ensure_template(image: &str) -> Result<String> {
+    ensure_image_ready(image)?;
+    let tag = template_tag(image);
+    let source_image_id = local_image_id(image)?;
+    let record_path = template_record_path(&tag)?;
+    let recorded = read_template_record(&record_path);
+    if template_is_current(
+        template_loaded(&tag)?,
+        recorded.as_deref(),
+        &source_image_id,
+    ) {
+        debug!(%tag, "sbx template already loaded");
+        return Ok(tag);
+    }
+
+    info!(%image, %tag, "building sbx template");
     let mut build = Command::new("docker")
         .args(["build", "-q", "-t", &tag, "--build-arg"])
         .arg(format!("BASE={image}"))
@@ -145,6 +285,7 @@ pub fn ensure_template(image: &str) -> Result<String> {
         }
         Ok(())
     })?;
+    write_template_record(&record_path, &source_image_id)?;
     Ok(tag)
 }
 
@@ -161,6 +302,43 @@ mod tests {
         );
         assert_ne!(claude, template_tag("ghcr.io/raine/workmux-sandbox:codex"));
         assert_eq!(claude, template_tag("ghcr.io/raine/workmux-sandbox:claude"));
+    }
+
+    #[test]
+    fn dockerfile_layer_appends_to_a_combined_dockerfile_without_its_own_base() {
+        let layer = dockerfile_layer();
+        assert!(!layer.contains("FROM"), "{layer}");
+        assert!(!layer.contains("ARG BASE"), "{layer}");
+        assert!(layer.trim_start().starts_with('#'), "{layer}");
+        let user = layer.find("USER root").expect("switches to root");
+        assert!(user < layer.find("useradd").unwrap(), "{layer}");
+        assert!(layer.contains("ENV BASH_ENV=/etc/sandbox-persistent.sh"));
+        assert!(layer.trim_end().ends_with("WORKDIR /home/agent"), "{layer}");
+    }
+
+    #[test]
+    fn template_is_current_only_when_loaded_from_the_local_image() {
+        let pulled = "sha256:1111";
+        assert!(template_is_current(true, Some(pulled), pulled));
+        // A newer image was pulled (or install-dev patched it) since the load.
+        assert!(!template_is_current(true, Some("sha256:0000"), pulled));
+        // Loaded before workmux recorded its source, or removed from sbx.
+        assert!(!template_is_current(true, None, pulled));
+        assert!(!template_is_current(false, Some(pulled), pulled));
+    }
+
+    #[test]
+    fn template_record_round_trips_and_starts_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir
+            .path()
+            .join("templates")
+            .join("workmux-sbx-claude-1.json");
+        assert_eq!(read_template_record(&path), None);
+        write_template_record(&path, "sha256:1111").unwrap();
+        assert_eq!(read_template_record(&path).as_deref(), Some("sha256:1111"));
+        std::fs::write(&path, "not json").unwrap();
+        assert_eq!(read_template_record(&path), None);
     }
 
     #[test]

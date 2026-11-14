@@ -420,8 +420,9 @@ pub fn prepare_launch(
         eprintln!("warning: {warning}");
     }
 
+    let image = config.sandbox.resolved_image(agent);
     if plan.create_template.is_some() {
-        super::template::ensure_template(&config.sandbox.resolved_image(agent))?;
+        super::template::ensure_template(&image)?;
         info!(sandbox = %name, "creating sbx sandbox");
         eprintln!("  Workspaces:");
         if let Some(create) = plan.setup.first() {
@@ -429,6 +430,10 @@ pub fn prepare_launch(
                 eprintln!("    {workspace}");
             }
         }
+    } else {
+        // The template matters only when a sandbox is created; keep its
+        // freshness cache current for the next one.
+        super::template::check_freshness_in_background(&image);
     }
     // Record the rules about to be written before writing them, so a
     // failed launch still knows which rules are workmux's.
