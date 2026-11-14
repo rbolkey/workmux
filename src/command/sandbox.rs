@@ -2,7 +2,7 @@
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand};
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::SystemTime;
@@ -1345,11 +1345,11 @@ fn run_shell_docker_sbx(command: Vec<String>, config: &Config) -> Result<()> {
     let worktree_root = crate::git::get_repo_root()
         .context("Not inside a git repository. The docker_sbx sandbox is per worktree.")?;
 
-    // Build shell command
+    // Build shell command; its arguments reach the sandbox as given.
     let shell_cmd = if command.is_empty() {
-        "bash".to_string()
+        vec!["bash".to_string()]
     } else {
-        command.join(" ")
+        command
     };
 
     let mut env = Vec::new();
@@ -1364,11 +1364,12 @@ fn run_shell_docker_sbx(command: Vec<String>, config: &Config) -> Result<()> {
         env,
         session: docker_sbx::new_session()?,
         rpc_port: None,
+        tty: io::stdin().is_terminal(),
     };
     let plan =
         docker_sbx::prepare_launch(config, &worktree_root, &cwd, resolve_agent(config), &exec)?;
 
-    debug!(sandbox = %plan.sandbox_name, cmd = %exec.command, "starting sbx shell");
+    debug!(sandbox = %plan.sandbox_name, cmd = ?exec.command, "starting sbx shell");
     std::process::exit(docker_sbx::run_exec(&plan)?);
 }
 

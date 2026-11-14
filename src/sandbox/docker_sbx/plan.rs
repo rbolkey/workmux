@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 use crate::config::SandboxConfig;
+use crate::shell::shell_quote;
 
 use super::instance::{SbxCheck, SbxRule, SbxSandboxInfo};
 
@@ -105,13 +106,17 @@ pub struct GitMetadata {
 /// The command and environment to run in the sandbox.
 #[derive(Debug, Clone, Default)]
 pub struct ExecRequest {
-    pub command: String,
+    /// The command: one argument is a shell command line, as a pane's is;
+    /// several are its words, each passed on as is.
+    pub command: Vec<String>,
     pub env: Vec<(String, String)>,
     /// Identifies the exec's processes in the guest, so they can be hung up.
     pub session: String,
     /// The port of the supervisor's RPC server on the workstation's
     /// loopback, when it runs one.
     pub rpc_port: Option<u16>,
+    /// Whether stdin is a terminal. sbx's `exec -t` fails without one.
+    pub tty: bool,
 }
 
 /// One `sbx` invocation. Environment values are passed through the process
@@ -232,11 +237,13 @@ fn words(words: &[&str]) -> Vec<String> {
 }
 
 /// The interactive `sbx exec` that runs the command in the pane's working
-/// directory. Values travel in the process environment; argv names them only.
+/// directory, with a terminal when stdin is one. Values travel in the
+/// process environment; argv names them only.
 fn exec_command(target: &LaunchTarget, exec: &ExecRequest) -> SbxCommand {
     let mut env = exec.env.clone();
     env.push((SESSION_ENV.to_string(), exec.session.clone()));
-    let mut args = words(&["exec", "-it", "-w"]);
+    let interactive = if exec.tty { "-it" } else { "-i" };
+    let mut args = words(&["exec", interactive, "-w"]);
     args.push(target.pane_cwd.to_string_lossy().into_owned());
     for (key, _) in &env {
         args.push("-e".to_string());
@@ -252,7 +259,15 @@ fn exec_command(target: &LaunchTarget, exec: &ExecRequest) -> SbxCommand {
     args.push(target.sandbox_name.to_string());
     // bash, so BASH_ENV brings in the environment sbx keeps in
     // /etc/sandbox-persistent.sh.
-    args.extend(words(&["bash", "-c", &exec.command]));
+    let command = match exec.command.as_slice() {
+        [line] => line.clone(),
+        words => words
+            .iter()
+            .map(|word| shell_quote(word))
+            .collect::<Vec<_>>()
+            .join(" "),
+    };
+    args.extend(words(&["bash", "-c", &command]));
     SbxCommand { args, env }
 }
 
@@ -767,13 +782,14 @@ mod tests {
 
     fn exec() -> ExecRequest {
         ExecRequest {
-            command: "claude --dangerously-skip-permissions".to_string(),
+            command: args(&["claude --dangerously-skip-permissions"]),
             env: vec![
                 ("WM_RPC_PORT".to_string(), "4242".to_string()),
                 ("WM_RPC_TOKEN".to_string(), "secret".to_string()),
             ],
             session: "0123456789abcdef".to_string(),
             rpc_port: Some(4242),
+            tty: true,
         }
     }
 
@@ -1314,6 +1330,38 @@ mod tests {
                 ("WM_SBX_SESSION".to_string(), "0123456789abcdef".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn several_command_arguments_reach_the_guest_without_being_split_again() {
+        // `workmux sandbox shell -- bash -c 'set -x; echo "a b"'`
+        let p = paths();
+        let words = ExecRequest {
+            command: args(&["bash", "-c", "set -x; echo \"a b\""]),
+            ..exec()
+        };
+        let plan = launch_plan(&config(), &target(&p), "claude", &missing(), &words).unwrap();
+        assert_eq!(
+            plan.exec.args[plan.exec.args.len() - 3..],
+            args(&["bash", "-c", "bash -c 'set -x; echo \"a b\"'"])
+        );
+    }
+
+    #[test]
+    fn exec_asks_for_a_tty_only_when_stdin_is_a_terminal() {
+        // sbx's `exec -it` fails with piped stdin ("context deadline
+        // exceeded"), as when `workmux sandbox shell -- <cmd>` runs from a
+        // script.
+        let p = paths();
+        let piped = ExecRequest {
+            tty: false,
+            ..exec()
+        };
+        let plan = launch_plan(&config(), &target(&p), "claude", &missing(), &piped).unwrap();
+        assert_eq!(plan.exec.args[..3], args(&["exec", "-i", "-w"]));
+
+        let plan = launch_plan(&config(), &target(&p), "claude", &missing(), &exec()).unwrap();
+        assert_eq!(plan.exec.args[..3], args(&["exec", "-it", "-w"]));
     }
 
     #[test]
