@@ -54,6 +54,7 @@ The generic `sandbox` settings keep their meaning:
 | `env`              | `{}`                                    | Environment variables to set with explicit values. **Global config only.**                                                     |
 | `host_commands`    | `[]`                                    | Commands to proxy from the sandbox to the host via RPC (see [shared features](/guide/sandbox/features/#host-command-proxying)) |
 | `extra_mounts`     | `[]`                                    | Additional host paths to mount (see [shared features](/guide/sandbox/features/#extra-mounts)). **Global config only.**         |
+| `network`          | `policy: allow`                         | Network restrictions, enforced by sbx (see [below](#network-restrictions)). **Global config only.**                            |
 
 Settings specific to sbx are nested under `sandbox.docker_sbx`.
 
@@ -63,12 +64,12 @@ Settings specific to sbx are nested under `sandbox.docker_sbx`.
 
 1. Starts a TCP RPC server on the host's loopback interface, on a random port
 2. Writes the host-command shims into the sandbox's state directory
-3. Creates the sandbox if it doesn't exist yet, and adds its policy rule
+3. Creates the sandbox if it doesn't exist yet, reconciles its [network rules](#network-restrictions), and allows its RPC port
 4. Runs the agent command with `sbx exec -it` in the pane's working directory
 5. Handles RPC requests from the guest workmux binary
 6. When the pane closes, hangs up the processes its `sbx exec` started in the guest
 
-The guest reaches the RPC server through `host.docker.internal`. sbx names the workstation `localhost` in its policy, so workmux adds one `localhost` rule scoped to each sandbox (`sbx policy ls <sandbox>` lists it). The rule lets that sandbox reach services listening on the workstation's loopback interface. workmux never changes your global sbx policy.
+The guest reaches the RPC server through `host.docker.internal`. sbx names the workstation `localhost` in its policy, so each supervisor adds a `localhost:<port>` rule for its own RPC port, scoped to the sandbox, and removes it when the pane closes. Other services on the workstation's loopback interface stay unreachable. workmux never changes your global sbx policy.
 
 ### Lifecycle
 
@@ -117,6 +118,34 @@ sbx creates sandboxes from templates kept in its own image store. workmux builds
 ### Authentication
 
 Agents use the login in their mounted config directory, as on the container backend: Codex, Gemini, OpenCode, pi and OMP start logged in if you've logged in on the workstation. Claude stores its login in the macOS Keychain, which the sandbox can't reach. Sign in to Claude once inside a sandbox; the login is written to the mounted config directory and persists across sandboxes. See [Credentials](/guide/sandbox/features/#credentials).
+
+## Network restrictions
+
+`sandbox.network` means the same as on the [container backend](/guide/sandbox/container/#network-restrictions), and sbx enforces it. It's a global-only setting.
+
+```yaml
+# ~/.config/workmux/config.yaml
+sandbox:
+  enabled: true
+  backend: docker_sbx
+  network:
+    policy: deny
+    allowed_domains:
+      - api.anthropic.com
+      - "*.github.com"
+```
+
+Under `policy: deny`, workmux adds a rule scoped to the sandbox for port 443 of each allowed domain (`sbx policy ls <sandbox>` lists them). A wildcard such as `*.github.com` becomes sbx's `**.github.com:443` (subdomains at any depth) with a deny for `github.com:443`, so the base domain stays out unless you list it too. IP literals are refused, as on the container backend. Under `policy: allow`, workmux adds no rules.
+
+Every launch reconciles the rules: it adds missing ones and removes the ones workmux added earlier that your config no longer lists, so a removed domain stops working at the sandbox's next launch. workmux records the rules it added in the sandbox's state directory and never touches rules you added yourself, or your global sbx policy.
+
+Differences from the container backend:
+
+- **The global sbx policy still applies.** sbx allows a request when your global policy or a sandbox rule allows it, and a deny in either wins. Under `policy: allow`, what your global policy blocks stays blocked. Under `policy: deny`, the sandbox can also reach whatever your global policy allows (sbx's `balanced` policy allows package registries, code hosts and AI services); workmux prints a note saying how many destinations that is. Choose `deny-all` with `sbx policy init` for a sandbox that reaches only `allowed_domains`.
+- **Private addresses.** sbx doesn't refuse private or loopback addresses an allowed domain resolves to, so `allow_private_ips` changes nothing under `docker_sbx`.
+- **`max_connections`** is ignored: sbx has no cap on concurrent connections. workmux prints a note when it's set.
+
+sbx logs requests it blocks: `sbx policy log <sandbox>` lists them with the rule or reason. They don't appear in workmux's log.
 
 ## Sandbox management
 
