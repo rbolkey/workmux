@@ -2496,6 +2496,8 @@ pub struct SandboxConfig {
     pub image: Option<String>,
 
     /// Environment variables to pass to sandbox.
+    /// Under docker_sbx, a tool credential sbx holds a secret for (such as
+    /// GH_TOKEN) is better left to `sbx secret set`; workmux warns.
     /// Default: []
     #[serde(default)]
     pub env_passthrough: Option<Vec<String>>,
@@ -2504,6 +2506,7 @@ pub struct SandboxConfig {
     /// Unlike env_passthrough (which reads from host), these are set directly.
     /// Global-only: project config cannot set this to prevent a sandboxed agent
     /// from injecting env vars into its next session via .workmux.yaml.
+    /// Under docker_sbx, workmux warns as for env_passthrough.
     #[serde(default)]
     pub env: Option<HashMap<String, String>>,
 

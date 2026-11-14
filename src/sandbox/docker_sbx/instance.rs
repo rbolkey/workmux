@@ -62,6 +62,16 @@ pub struct SbxRule {
     pub resources: Vec<String>,
 }
 
+/// A secret from `sbx secret ls --json`: its service and scope, never its
+/// value.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SbxSecret {
+    /// `global`, or the name of the sandbox it's scoped to.
+    pub scope: String,
+    /// The service, such as `github`.
+    pub name: String,
+}
+
 /// A check from `sbx diagnose --json`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SbxCheck {
@@ -73,6 +83,12 @@ pub struct SbxCheck {
 struct SbxRules {
     #[serde(default)]
     rules: Vec<SbxRule>,
+}
+
+#[derive(Deserialize)]
+struct SbxSecrets {
+    #[serde(default)]
+    secrets: Vec<SbxSecret>,
 }
 
 #[derive(Deserialize)]
@@ -91,6 +107,13 @@ pub fn parse_sbx_rules(stdout: &[u8]) -> Result<Vec<SbxRule>> {
     Ok(serde_json::from_slice::<SbxRules>(stdout)
         .context("Failed to parse sbx policy ls output")?
         .rules)
+}
+
+/// Parse `sbx secret ls --json`. It lists services and scopes, never values.
+pub fn parse_sbx_secrets(stdout: &[u8]) -> Result<Vec<SbxSecret>> {
+    Ok(serde_json::from_slice::<SbxSecrets>(stdout)
+        .context("Failed to parse sbx secret ls output")?
+        .secrets)
 }
 
 /// Parse `sbx diagnose --json`.
@@ -258,11 +281,21 @@ pub fn gather_state(name: &str) -> Result<SbxState> {
             Vec::new()
         }
     };
+    // Secret names and scopes, never values. Advisory only: a listing
+    // failure leaves the credential warnings out.
+    let secrets = match sbx_json(&["secret", "ls"]) {
+        Ok(stdout) => parse_sbx_secrets(&stdout)?,
+        Err(e) => {
+            debug!(error = %e, "failed to list sbx secrets");
+            Vec::new()
+        }
+    };
     Ok(SbxState {
         platform,
         checks,
         sandbox,
         rules,
+        secrets,
     })
 }
 
@@ -376,6 +409,10 @@ pub fn prepare_launch(
     for note in &plan.notes {
         info!(sandbox = %name, note, "sbx network note");
         eprintln!("note: {note}");
+    }
+    for warning in &plan.warnings {
+        warn!(sandbox = %name, warning, "sbx credential override");
+        eprintln!("warning: {warning}");
     }
 
     if plan.create_template.is_some() {
@@ -554,6 +591,24 @@ mod tests {
         assert_eq!(rules.len(), 2);
         assert_eq!(rules[1].scope, "sandbox:wm-proj-1");
         assert_eq!(rules[1].resources, vec!["localhost".to_string()]);
+    }
+
+    #[test]
+    fn parses_sbx_secret_ls_json_as_services_and_scopes() {
+        let secrets = parse_sbx_secrets(
+            br#"{"secrets":[{"scope":"global","type":"service","name":"anthropic","secret":"(oauth configured)"},
+                            {"scope":"wm-proj-1","type":"service","name":"github","secret":"(stored)"}],
+                 "custom_secrets":[],"shadowed_services":[],"env_only_count":0}"#,
+        )
+        .unwrap();
+        let services: Vec<(&str, &str)> = secrets
+            .iter()
+            .map(|s| (s.scope.as_str(), s.name.as_str()))
+            .collect();
+        assert_eq!(
+            services,
+            vec![("global", "anthropic"), ("wm-proj-1", "github")]
+        );
     }
 
     #[test]

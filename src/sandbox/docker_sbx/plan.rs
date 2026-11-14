@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use crate::config::SandboxConfig;
 use crate::shell::shell_quote;
 
-use super::instance::{SbxCheck, SbxRule, SbxSandboxInfo};
+use super::instance::{SbxCheck, SbxRule, SbxSandboxInfo, SbxSecret};
 
 /// The host sbx runs on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,6 +36,8 @@ pub struct SbxState {
     /// Rules from `sbx policy ls <name> --json`, or the global ones from
     /// `sbx policy ls --json` when the sandbox is missing.
     pub rules: Vec<SbxRule>,
+    /// Secrets from `sbx secret ls --json`: names and scopes, never values.
+    pub secrets: Vec<SbxSecret>,
 }
 
 /// The worktree a launch is for, with the host paths the plan mounts.
@@ -149,6 +151,10 @@ pub struct LaunchPlan {
     /// Notes for the user: settings sbx can't enforce that only limit access,
     /// and what sbx allows beyond them.
     pub notes: Vec<String>,
+    /// Warnings for the user: variables in `sandbox.env` or
+    /// `sandbox.env_passthrough` that hand the agent a credential sbx holds
+    /// a secret for.
+    pub warnings: Vec<String>,
     /// The `sandbox.network` rules workmux has written for the sandbox once
     /// `setup` has run; the record the next launch reconciles against.
     pub network_rules: Vec<NetworkRule>,
@@ -162,6 +168,9 @@ const GUEST_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbi
 
 /// Environment variable marking the processes of one exec in the guest.
 const SESSION_ENV: &str = "WM_SBX_SESSION";
+
+/// Git config sbx includes at command scope in the guest.
+const SBX_GIT_CONFIG: &str = "/home/agent/.gitconfig_ignore_scope";
 
 /// sbx's name for the workstation in policy rules.
 const WORKSTATION_HOST: &str = "localhost";
@@ -244,6 +253,7 @@ fn words(words: &[&str]) -> Vec<String> {
 /// process environment; argv names them only.
 fn exec_command(target: &LaunchTarget, exec: &ExecRequest) -> SbxCommand {
     let mut env = exec.env.clone();
+    keep_sbx_git_config(&mut env);
     env.push((SESSION_ENV.to_string(), exec.session.clone()));
     let interactive = if exec.tty { "-it" } else { "-i" };
     let mut args = words(&["exec", interactive, "-w"]);
@@ -272,6 +282,26 @@ fn exec_command(target: &LaunchTarget, exec: &ExecRequest) -> SbxCommand {
     };
     args.extend(words(&["bash", "-c", &command]));
     SbxCommand { args, env }
+}
+
+/// sbx sets `GIT_CONFIG_COUNT=1` in the guest, including
+/// [`SBX_GIT_CONFIG`] at command scope so its `.sbx` ignore holds over the
+/// repository's own `core.excludesFile`. The git identity entries replace
+/// it; append it to them again.
+fn keep_sbx_git_config(env: &mut Vec<(String, String)>) {
+    let Some(count) = env
+        .iter_mut()
+        .find(|(key, _)| key == "GIT_CONFIG_COUNT")
+        .map(|(_, count)| count)
+    else {
+        return;
+    };
+    let Ok(n) = count.parse::<usize>() else {
+        return;
+    };
+    *count = (n + 1).to_string();
+    env.push((format!("GIT_CONFIG_KEY_{n}"), "include.path".to_string()));
+    env.push((format!("GIT_CONFIG_VALUE_{n}"), SBX_GIT_CONFIG.to_string()));
 }
 
 /// Send SIGHUP to every guest process that carries the exec's session
@@ -455,6 +485,66 @@ fn network_notes(config: &SandboxConfig, state: &SbxState, name: &str) -> Vec<St
         ));
     }
     notes
+}
+
+/// The sbx service whose credential an environment variable holds, as
+/// `sbx secret import` detects them.
+fn credential_service(var: &str) -> Option<&'static str> {
+    match var {
+        "ANTHROPIC_API_KEY" => Some("anthropic"),
+        "COPILOT_GITHUB_TOKEN" => Some("copilot"),
+        "CURSOR_API_KEY" => Some("cursor"),
+        "FACTORY_API_KEY" => Some("droid"),
+        "GH_TOKEN" | "GITHUB_TOKEN" => Some("github"),
+        "GEMINI_API_KEY" | "GOOGLE_API_KEY" | "GOOGLE_GENERATIVE_AI_API_KEY" => Some("google"),
+        "GROQ_API_KEY" => Some("groq"),
+        "MISTRAL_API_KEY" => Some("mistral"),
+        "NEBIUS_API_KEY" => Some("nebius"),
+        "OPENAI_API_KEY" => Some("openai"),
+        "OPENROUTER_API_KEY" => Some("openrouter"),
+        "XAI_API_KEY" => Some("xai"),
+        _ => None,
+    }
+}
+
+/// Variables from `sandbox.env` and `sandbox.env_passthrough` the exec
+/// passes that hold a credential sbx already holds a secret for, globally
+/// or for this sandbox. sbx's proxy would inject it with the agent holding
+/// only a placeholder; passed in, the agent holds the real value.
+fn credential_warnings(
+    config: &SandboxConfig,
+    state: &SbxState,
+    name: &str,
+    exec: &ExecRequest,
+) -> Vec<String> {
+    let passed = |var: &str| exec.env.iter().any(|(key, _)| key == var);
+    let configured = config
+        .env_vars()
+        .into_iter()
+        .map(|(var, _)| ("sandbox.env", var))
+        .chain(
+            config
+                .env_passthrough()
+                .into_iter()
+                .map(|var| ("sandbox.env_passthrough", var)),
+        );
+    let mut warnings = Vec::new();
+    for (setting, var) in configured {
+        let Some(service) = credential_service(var) else {
+            continue;
+        };
+        let held = state.secrets.iter().any(|secret| {
+            secret.name == service && (secret.scope == "global" || secret.scope == name)
+        });
+        if held && passed(var) {
+            warnings.push(format!(
+                "{setting} passes {var} into sbx sandbox {name}, replacing sbx's placeholder \
+                 for its {service} secret: the agent can read the real credential. Remove \
+                 {var} from {setting}; sbx supplies it from `sbx secret set {service}`."
+            ));
+        }
+    }
+    warnings
 }
 
 /// The `sbx policy` command adding or removing a rule scoped to the sandbox.
@@ -705,6 +795,7 @@ pub fn launch_plan(
         hangup: hangup_command(target, exec),
         teardown,
         notes: network_notes(config, state, name),
+        warnings: credential_warnings(config, state, name, exec),
         network_rules,
     })
 }
@@ -755,6 +846,7 @@ mod tests {
             checks: passing_checks(),
             sandbox: None,
             rules: Vec::new(),
+            secrets: Vec::new(),
         }
     }
 
@@ -1318,6 +1410,159 @@ mod tests {
         };
         let plan = launch_plan(&config, &target(&p), "claude", &deny_all, &exec()).unwrap();
         assert!(plan.notes.is_empty(), "{:?}", plan.notes);
+    }
+
+    fn secret(scope: &str, service: &str) -> SbxSecret {
+        SbxSecret {
+            scope: scope.to_string(),
+            name: service.to_string(),
+        }
+    }
+
+    fn with_secrets(secrets: Vec<SbxSecret>) -> SbxState {
+        SbxState {
+            secrets,
+            ..missing()
+        }
+    }
+
+    fn passing(vars: &[(&str, &str)]) -> ExecRequest {
+        let mut exec = exec();
+        exec.env.extend(
+            vars.iter()
+                .map(|(key, value)| (key.to_string(), value.to_string())),
+        );
+        exec
+    }
+
+    #[test]
+    fn passing_a_credential_sbx_holds_a_secret_for_warns_naming_sbx_secret_set() {
+        let p = paths();
+        let config = SandboxConfig {
+            env_passthrough: Some(vec!["GH_TOKEN".to_string()]),
+            ..config()
+        };
+        let state = with_secrets(vec![secret("global", "github")]);
+        let exec = passing(&[("GH_TOKEN", "gho_real")]);
+
+        let plan = launch_plan(&config, &target(&p), "claude", &state, &exec).unwrap();
+
+        assert_eq!(plan.warnings.len(), 1, "{:?}", plan.warnings);
+        let warning = &plan.warnings[0];
+        assert!(warning.contains("sandbox.env_passthrough"), "{warning}");
+        assert!(warning.contains("GH_TOKEN"), "{warning}");
+        assert!(warning.contains("`sbx secret set github`"), "{warning}");
+        assert!(!warning.contains("gho_real"), "{warning}");
+    }
+
+    #[test]
+    fn git_identity_keeps_the_git_config_sbx_sets_in_the_guest() {
+        let p = paths();
+        let exec = passing(&[
+            ("GIT_CONFIG_COUNT", "2"),
+            ("GIT_CONFIG_KEY_0", "safe.directory"),
+            ("GIT_CONFIG_VALUE_0", "/code/proj__worktrees/feat"),
+            ("GIT_CONFIG_KEY_1", "user.name"),
+            ("GIT_CONFIG_VALUE_1", "Me"),
+        ]);
+
+        let plan = launch_plan(&config(), &target(&p), "claude", &missing(), &exec).unwrap();
+
+        let env = |key: &str| {
+            plan.exec
+                .env
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(env("GIT_CONFIG_COUNT"), Some("3"));
+        assert_eq!(env("GIT_CONFIG_KEY_1"), Some("user.name"));
+        assert_eq!(env("GIT_CONFIG_KEY_2"), Some("include.path"));
+        assert_eq!(
+            env("GIT_CONFIG_VALUE_2"),
+            Some("/home/agent/.gitconfig_ignore_scope")
+        );
+        // Named, never valued, in argv like every other variable.
+        let named = |key: &str| {
+            plan.exec
+                .args
+                .windows(2)
+                .any(|w| w[0] == "-e" && w[1] == key)
+        };
+        assert!(named("GIT_CONFIG_KEY_2") && named("GIT_CONFIG_VALUE_2"));
+    }
+
+    #[test]
+    fn without_git_identity_sbx_keeps_its_own_git_config() {
+        let p = paths();
+        let plan = launch_plan(&config(), &target(&p), "claude", &missing(), &exec()).unwrap();
+
+        assert!(
+            !plan
+                .exec
+                .env
+                .iter()
+                .any(|(k, _)| k.starts_with("GIT_CONFIG")),
+            "{:?}",
+            plan.exec.env
+        );
+    }
+
+    #[test]
+    fn a_secret_scoped_to_the_sandbox_counts_for_variables_in_env() {
+        let p = paths();
+        let config = SandboxConfig {
+            env: Some([("OPENAI_API_KEY".to_string(), "sk-real".to_string())].into()),
+            ..config()
+        };
+        let state = with_secrets(vec![secret("wm-proj-12345678", "openai")]);
+        let exec = passing(&[("OPENAI_API_KEY", "sk-real")]);
+
+        let plan = launch_plan(&config, &target(&p), "claude", &state, &exec).unwrap();
+
+        assert_eq!(plan.warnings.len(), 1, "{:?}", plan.warnings);
+        assert!(plan.warnings[0].starts_with("sandbox.env passes OPENAI_API_KEY"));
+        assert!(plan.warnings[0].contains("`sbx secret set openai`"));
+    }
+
+    #[test]
+    fn no_warning_unless_sbx_holds_a_secret_for_a_variable_actually_passed() {
+        let p = paths();
+        let config = SandboxConfig {
+            env_passthrough: Some(vec![
+                "GH_TOKEN".to_string(),
+                "GEMINI_API_KEY".to_string(),
+                "NPM_TOKEN".to_string(),
+            ]),
+            ..config()
+        };
+        let passed = passing(&[
+            ("GH_TOKEN", "gho_real"),
+            ("GEMINI_API_KEY", "key"),
+            ("NPM_TOKEN", "npm"),
+        ]);
+        let cases = [
+            ("no secrets", with_secrets(Vec::new()), passed.clone()),
+            (
+                "secrets for other services",
+                with_secrets(vec![secret("global", "anthropic")]),
+                passed.clone(),
+            ),
+            (
+                "a secret scoped to another sandbox",
+                with_secrets(vec![secret("wm-other-87654321", "github")]),
+                passed.clone(),
+            ),
+            (
+                "passthrough variables unset on the workstation",
+                with_secrets(vec![secret("global", "github"), secret("global", "google")]),
+                exec(),
+            ),
+        ];
+        for (case, state, exec) in cases {
+            let plan = launch_plan(&config, &target(&p), "claude", &state, &exec).unwrap();
+            assert!(plan.warnings.is_empty(), "{case}: {:?}", plan.warnings);
+        }
     }
 
     #[test]
