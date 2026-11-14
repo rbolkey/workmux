@@ -154,7 +154,7 @@ Listed paths are relative to the worktree root. Each one is shadowed by a read-o
 
 **Security: global-only.** `excluded_files` is ignored when set in a project's `.workmux.yaml`; it must be configured in your global config (`~/.config/workmux/config.yaml`). This prevents a malicious repo from deleting protections via its own config.
 
-**Note:** `excluded_files` relies on file-level bind mounts, which Apple Container does not support (it only accepts directory mounts). When the runtime is Apple Container and `excluded_files` is set, workmux fails fast rather than silently leaving secrets readable. Use Docker or Podman if you need this feature.
+**Note:** `excluded_files` relies on file-level bind mounts, which Apple Container does not support (it only accepts directory mounts). When the runtime is Apple Container and `excluded_files` is set, workmux fails fast rather than silently leaving secrets readable. Use Docker or Podman if you need this feature. The `docker_sbx` backend masks the same files (see [What's mounted](/guide/sandbox/docker-sbx/#whats-mounted)).
 
 **Run under a VM-based OCI runtime (stronger isolation):**
 

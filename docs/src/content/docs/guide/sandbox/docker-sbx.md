@@ -119,17 +119,20 @@ sbx mounts the worktree, the git metadata and the shims at their host paths, and
 | Agent config directory                         | read-write   | Agent settings and credentials, at its usual place under `/home/agent` |
 | OpenCode's `~/.config/opencode/` (opencode)    | read-only    | OpenCode's global config, at `/home/agent/.config/opencode`            |
 | `~/.local/state/workmux/docker-sbx/<sandbox>/` | read-only    | Host-command shims                                                     |
+| `excluded_files` entries                       | masked       | An empty file mounted over each, so the agent can't read it            |
 | `extra_mounts` entries                         | read-only\*  | User-configured paths                                                  |
 
 \* As on the [container backend](/guide/sandbox/container/#whats-mounted), git pointer files, per-worktree config, object information, submodules' hooks and config, and files the repository config includes stay read-only within writable git mounts, so an agent can't plant hooks or change git config. sbx enforces read-only mounts on the host, even against root in the sandbox. Sandboxes require a linked worktree: workmux refuses to sandbox the main worktree, whose admin files are the repository's own. Hooks in the main repository must be regular files, not symbolic or hard links.
 
 See [Credentials](/guide/sandbox/features/#credentials) for each agent's config directory. These mounts are made when the sandbox is created, so switching `agent` needs a new sandbox (`workmux sandbox prune`). For Claude, workmux also writes the sandbox's own `~/.claude.json` with onboarding marked complete. Pi and OMP download Linux `fd` and `rg` binaries into their config directory; workmux binds a directory inside the sandbox over `~/.pi/agent/bin/` and `~/.omp/agent/tools/` each time a pane starts, so the workstation's binaries are never overwritten.
 
-`extra_mounts` entries are mounted at their `guest_path`, or at their host path without one. sbx mounts a single file only read-only, so a writable entry that is a file is an error. A `guest_path` inside the worktree or another mount appears on the workstation too: sbx creates the mount point there (an empty directory or file) if it's missing. `sandbox.container.excluded_files` is an error under `docker_sbx`, as it is on Apple Container: workmux doesn't mask files here, so secrets would remain readable.
+`extra_mounts` entries are mounted at their `guest_path`, or at their host path without one. sbx mounts a single file only read-only, so a writable entry that is a file is an error. A `guest_path` inside the worktree or another mount appears on the workstation too: sbx creates the mount point there (an empty directory or file) if it's missing.
+
+`sandbox.container.excluded_files` works as on the [container backend](/guide/sandbox/container/), and is global-only there too: each listed file that exists in the worktree is hidden behind an empty, read-only file that workmux keeps in the sandbox's state directory. A symbolic link is masked at the file it points to in the worktree. Missing paths and directories are skipped with a warning in the log, as are links that point outside the worktree; the main worktree, which the container backend masks too, isn't mounted here, so such links don't resolve in the sandbox. Like other mounts, masks are made when the sandbox is created: when the list changes, or a listed file appears or is deleted later, workmux warns at launch until you recreate the sandbox with `workmux sandbox prune`. sbx puts an empty file back where a masked file was deleted when it next starts the sandbox.
 
 Sandboxes are created with sbx's generic `shell` agent, never an agent kit: sbx's kits write the agent's settings and credentials into its home, which here is your mounted config directory. workmux runs the agent command itself, as on the container backend.
 
-Mounts are fixed when the sandbox is created. After changing `extra_mounts`, recreate the sandbox with `workmux sandbox prune`; sandboxes created before workmux protected the git metadata need the same.
+Mounts are fixed when the sandbox is created. After changing `extra_mounts` or `excluded_files`, recreate the sandbox with `workmux sandbox prune`; sandboxes created before workmux protected the git metadata need the same.
 
 Your `~/.gitconfig` isn't mounted; workmux passes your git identity instead (see [Git identity](/guide/sandbox/features/#git-identity)).
 
