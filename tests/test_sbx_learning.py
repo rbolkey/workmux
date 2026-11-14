@@ -9,6 +9,7 @@ ticket 01's `## Answer`.
 """
 
 import ast
+import contextlib
 import fcntl
 import json
 import os
@@ -882,6 +883,124 @@ def test_create_has_no_disk_flag():
     help_text = sbx(["create", "-h"]).stdout
     assert "--cpus" in help_text and "--memory" in help_text
     assert "--disk" not in help_text
+
+
+@pytest.mark.parametrize("memory", ["1GiB", "1gb", "1.5g", "536870912"])
+def test_memory_takes_binary_sizes_in_several_spellings(workspace: Path, memory: str):
+    """`sandbox.docker_sbx.memory` is checked at config load against these."""
+    sized, created = create_sandbox("memfmt", [str(workspace)], extra=["-m", memory])
+    try:
+        assert created.returncode == 0, created.stderr
+    finally:
+        sized.remove()
+
+
+def test_malformed_memory_is_rejected(workspace: Path):
+    name = new_sandbox_name("memfmt")
+    result = sbx(
+        [
+            "create",
+            "--name",
+            name,
+            "--no-progress",
+            "-m",
+            "abc",
+            "shell",
+            str(workspace),
+        ]
+    )
+    try:
+        assert result.returncode != 0
+        assert "invalid size: 'abc'" in result.stderr
+    finally:
+        if result.returncode == 0:
+            Sandbox(name).remove()
+
+
+# --- Provisioning and kits (ticket 10) ---------------------------------------
+
+
+@contextlib.contextmanager
+def removing_assembled_templates() -> Iterator[None]:
+    """Remove the templates sbx assembles for kit compositions made inside."""
+
+    def assembled() -> set[str]:
+        return {
+            f"{t['repository']}:{t['tag']}"
+            for t in sbx_json(["template", "ls"])
+            if t["repository"].endswith("/sandbox-kit-assembled")
+        }
+
+    before = assembled()
+    try:
+        yield
+    finally:
+        for tag in assembled() - before:
+            sbx(["template", "rm", "-f", tag])
+
+
+def test_root_exec_reaches_the_network_through_sbx_proxy(sandbox: Sandbox):
+    """Provisioning runs as root and downloads through sbx's proxy."""
+    out = sandbox.sh_ok(
+        "echo $HTTPS_PROXY; curl -s -o /dev/null -w '%{http_code}' https://deb.debian.org/",
+        user="root",
+    )
+    proxy, status = out.split()
+    assert proxy == "http://gateway.docker.internal:3128"
+    assert status in ("200", "301", "302")
+
+
+@requires_docker
+def test_mixin_kit_composes_onto_a_loaded_template(template: str, workspace: Path):
+    """A mixin's overlay lands on workmux's own template, with --pull never."""
+    with removing_assembled_templates():
+        kitted, created = create_sandbox(
+            "kit",
+            [str(workspace)],
+            extra=[
+                "-t",
+                template,
+                "--pull",
+                "never",
+                "--kit",
+                "docker.io/sbx/task:latest",
+            ],
+        )
+        try:
+            assert created.returncode == 0, created.stderr
+            out = kitted.sh_ok("task --version; command -v claude; id -un")
+            assert out.split() == ["3.50.0", "/usr/local/bin/claude", "agent"]
+        finally:
+            kitted.remove()
+
+
+def test_kit_network_rules_are_scoped_to_the_sandbox(workspace: Path):
+    """A kit's rules widen only its sandbox's access, and go with it."""
+    with removing_assembled_templates():
+        kitted, created = create_sandbox(
+            "kitnet", [str(workspace)], extra=["--kit", "docker.io/sbx/vale:latest"]
+        )
+        try:
+            assert created.returncode == 0, created.stderr
+            rules = kitted.local_rules()
+            assert [
+                (r["decision"], sorted(r["resources"]), r["provenance"]["created_via"])
+                for r in rules
+            ] == [
+                (
+                    "allow",
+                    [
+                        "github.com",
+                        "objects.githubusercontent.com",
+                        "release-assets.githubusercontent.com",
+                    ],
+                    "provisioned",
+                )
+            ]
+        finally:
+            kitted.remove()
+        global_rules = json.dumps(sbx_json(["policy", "ls"])["rules"])
+        assert kitted.name not in global_rules
 
 
 # --- Secrets and placeholders (Q6, Q9, Q16) ----------------------------------
