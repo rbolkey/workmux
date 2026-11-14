@@ -73,6 +73,17 @@ pub struct SbxSecret {
     pub scope: String,
     /// The service, such as `github`.
     pub name: String,
+    /// What's stored, never the value: `(stored)` for an API key or token,
+    /// `(oauth configured)` for an OAuth login.
+    #[serde(default)]
+    pub secret: String,
+}
+
+impl SbxSecret {
+    /// Whether the secret is an OAuth login rather than an API key.
+    pub fn is_oauth(&self) -> bool {
+        self.secret == "(oauth configured)"
+    }
 }
 
 /// A check from `sbx diagnose --json`.
@@ -761,6 +772,8 @@ mod tests {
             services,
             vec![("global", "anthropic"), ("wm-proj-1", "github")]
         );
+        assert!(secrets[0].is_oauth());
+        assert!(!secrets[1].is_oauth());
     }
 
     #[test]
@@ -803,6 +816,22 @@ mod tests {
         remove_created_record(dir.path()).unwrap();
         assert_eq!(read_created_record(dir.path()), None);
         remove_created_record(dir.path()).unwrap();
+    }
+
+    #[test]
+    fn records_from_before_placeholders_read_as_credential_mounts() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(CREATED_RECORD_FILE),
+            r#"{"agent":"claude","template":"t","toolchain":"none"}"#,
+        )
+        .unwrap();
+        let record = read_created_record(dir.path()).unwrap();
+        assert_eq!(
+            record.agent_credentials,
+            crate::config::AgentCredentials::Mount
+        );
+        assert!(record.credential_placeholders.is_empty());
     }
 
     #[test]
