@@ -819,6 +819,13 @@ pub trait Multiplexer: Send + Sync {
                                     working_dir,
                                 )
                             }
+                            crate::config::SandboxBackend::DockerSbx => {
+                                crate::sandbox::wrap_for_docker_sbx(
+                                    &command_to_wrap,
+                                    wt_root,
+                                    working_dir,
+                                )
+                            }
                         };
 
                         // Fail closed: if sandbox is enabled but wrapping fails, don't fall back to unsandboxed

@@ -939,6 +939,10 @@ fn run_shell(exec: bool, command: Vec<String>) -> Result<()> {
     match config.sandbox.backend() {
         SandboxBackend::Container => run_shell_container(exec, command, &config),
         SandboxBackend::Lima => run_shell_lima(exec, command, &config),
+        SandboxBackend::DockerSbx => bail!(
+            "'workmux sandbox shell' is not supported with the docker_sbx backend yet.\n\
+             Use 'sbx exec -it <sandbox> bash' (find the sandbox with 'sbx ls')."
+        ),
     }
 }
 

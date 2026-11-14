@@ -168,7 +168,7 @@ pub fn setup_environment(
         validate_prompt_consumption(&all_resolved_panes, agent, config, options)?;
     }
 
-    // Pre-boot Lima VM if needed BEFORE creating the tmux window.
+    // Pre-boot Lima VM (or create the sbx sandbox) if needed BEFORE creating the tmux window.
     // This ensures the user sees VM boot progress in their terminal
     // and the window only appears once the VM is ready.
     let lima_vm_name = pre_boot_lima_vm(
@@ -374,11 +374,12 @@ pub fn setup_environment(
     })
 }
 
-/// Pre-boot a Lima VM if sandbox is enabled with the Lima backend and any
-/// pane requires sandboxing. Must be called BEFORE creating the tmux window
-/// so the user sees VM boot progress in their terminal.
+/// Pre-boot a Lima VM (or create the worktree's sbx sandbox) if sandbox is
+/// enabled with the Lima or docker_sbx backend and any pane requires
+/// sandboxing. Must be called BEFORE creating the tmux window so the user
+/// sees boot progress and setup errors in their terminal.
 ///
-/// Returns the VM name if booted, None otherwise.
+/// Returns the VM name if a Lima VM was booted, None otherwise.
 #[allow(clippy::too_many_arguments)]
 fn pre_boot_lima_vm(
     mux: &dyn crate::multiplexer::Multiplexer,
@@ -392,7 +393,7 @@ fn pre_boot_lima_vm(
     if !config.sandbox.is_enabled()
         || !matches!(
             config.sandbox.backend(),
-            crate::config::SandboxBackend::Lima
+            crate::config::SandboxBackend::Lima | crate::config::SandboxBackend::DockerSbx
         )
     {
         return Ok(None);
@@ -425,6 +426,12 @@ fn pre_boot_lima_vm(
     });
 
     if !any_pane_needs_lima {
+        return Ok(None);
+    }
+
+    if config.sandbox.backend() == crate::config::SandboxBackend::DockerSbx {
+        info!("creating sbx sandbox before window creation");
+        crate::sandbox::ensure_docker_sbx_sandbox(config, worktree_path)?;
         return Ok(None);
     }
 
