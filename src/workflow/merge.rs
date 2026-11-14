@@ -350,8 +350,6 @@ pub fn merge(
 
     // Always force cleanup after a successful merge
     info!(branch = %branch_to_merge, "merge:cleanup start");
-    // An sbx sandbox outlives its panes; delete it with the worktree.
-    crate::sandbox::remove_docker_sbx_sandbox(&worktree_path);
     let cleanup_result = match cleanup::cleanup(
         context,
         &branch_to_merge,
