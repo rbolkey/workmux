@@ -55,6 +55,7 @@ The generic `sandbox` settings keep their meaning:
 | `host_commands`    | `[]`                                    | Commands to proxy from the sandbox to the host via RPC (see [shared features](/guide/sandbox/features/#host-command-proxying)) |
 | `extra_mounts`     | `[]`                                    | Additional host paths to mount (see [shared features](/guide/sandbox/features/#extra-mounts)). **Global config only.**         |
 | `network`          | `policy: allow`                         | Network restrictions, enforced by sbx (see [below](#network-restrictions)). **Global config only.**                            |
+| `toolchain`        | `auto`                                  | Toolchain mode: `auto` (detect devbox.json/flake.nix), `off`, `devbox`, or `flake` (see [below](#nix-and-devbox-toolchain))    |
 
 Settings specific to sbx are nested under `sandbox.docker_sbx`:
 
@@ -70,13 +71,13 @@ sandbox:
       apt-get update && apt-get install -y ripgrep jq
 ```
 
-| Option                              | Default                       | Description                                                                                                  |
-| ----------------------------------- | ----------------------------- | ------------------------------------------------------------------------------------------------------------ |
-| `docker_sbx.cpus`                   | all host CPUs (sbx's default) | Number of CPUs for the sandbox (`0` means all)                                                               |
-| `docker_sbx.memory`                 | half the host's memory        | Memory for the sandbox in sbx's binary units (`512m`, `8g`); at least `512m`                                 |
-| `docker_sbx.provision`              | -                             | Shell script run once, as root, when the sandbox is created (see [Provisioning](#provisioning))              |
-| `docker_sbx.skip_default_provision` | `false`                       | Accepted for parity with Lima; there is no built-in provisioning to skip (see [Provisioning](#provisioning)) |
-| `docker_sbx.kits`                   | `[]`                          | sbx mixin kits added when the sandbox is created (see [Kits](#kits)). **Global config only.**                |
+| Option                              | Default                       | Description                                                                                     |
+| ----------------------------------- | ----------------------------- | ----------------------------------------------------------------------------------------------- |
+| `docker_sbx.cpus`                   | all host CPUs (sbx's default) | Number of CPUs for the sandbox (`0` means all)                                                  |
+| `docker_sbx.memory`                 | half the host's memory        | Memory for the sandbox in sbx's binary units (`512m`, `8g`); at least `512m`                    |
+| `docker_sbx.provision`              | -                             | Shell script run once, as root, when the sandbox is created (see [Provisioning](#provisioning)) |
+| `docker_sbx.skip_default_provision` | `false`                       | Skip workmux's built-in provisioning (see [Provisioning](#provisioning))                        |
+| `docker_sbx.kits`                   | `[]`                          | sbx mixin kits added when the sandbox is created (see [Kits](#kits)). **Global config only.**   |
 
 sbx has no per-sandbox disk setting, so there is no `disk`. Resources, `provision` and `kits` apply when the sandbox is created; recreate it with `workmux sandbox prune` after changing them.
 
@@ -162,7 +163,7 @@ sbx also sets git config of its own in the sandbox (keeping its `.sbx` directori
 
 ## Provisioning
 
-The `provision` script runs once, after workmux creates the sandbox and sets it up (config directory links, Claude's onboarding state, network rules), never on later launches. It runs as root with `bash -c`, in the worktree; the template has no `sudo`, so don't use it. Its downloads go through sbx's proxy and network policy like any other request in the sandbox. sbx's `balanced` policy reaches package mirrors over HTTPS only, while the template's Debian sources use plain HTTP (refused with `403 Forbidden`), so switch them to HTTPS first, as below. A changed script applies the next time the sandbox is created (`workmux sandbox prune`, or `workmux remove`). If the script fails, workmux deletes the sandbox and stops with its error, so the next launch creates and provisions it again.
+The `provision` script runs once, after workmux creates the sandbox, sets it up (config directory links, Claude's onboarding state, network rules) and runs its [built-in provisioning](#built-in-provisioning), never on later launches. It runs as root with `bash -c`, in the worktree; the template has no `sudo`, so don't use it. Its downloads go through sbx's proxy and network policy like any other request in the sandbox. sbx's `balanced` policy reaches package mirrors over HTTPS only, while the template's Debian sources use plain HTTP (refused with `403 Forbidden`), so switch them to HTTPS first, as below. A changed script applies the next time the sandbox is created (`workmux sandbox prune`, or `workmux remove`). If the script fails, workmux deletes the sandbox and stops with its error, so the next launch creates and provisions it again.
 
 ```yaml
 sandbox:
@@ -174,7 +175,33 @@ sandbox:
       apt-get install -y ripgrep fd-find jq
 ```
 
-Lima's [built-in provisioning](/guide/sandbox/lima/#default-provisioning) installs system packages, the agent CLI and workmux into a fresh VM. Under `docker_sbx` the [template](#template) already contains all of these, so workmux runs no built-in provisioning, and `skip_default_provision` changes nothing; `provision` runs either way. To provision once for every sandbox instead, build a custom `sandbox.image`.
+### Built-in provisioning
+
+Before the `provision` script, workmux runs its own built-in provisioning, as Lima's [default provisioning](/guide/sandbox/lima/#default-provisioning) does. The [template](#template) already contains the system packages, the agent CLI and workmux, so this only:
+
+- writes `/etc/profile.d/workmux-shims.sh`, so login shells (Codex runs commands with `bash -lc`) keep the host-command shims on `PATH`
+- installs Nix and Devbox when the worktree uses a [toolchain](#nix-and-devbox-toolchain)
+
+If it fails, workmux deletes the sandbox and stops, as for `provision`; `sbx policy log <sandbox>` shows requests sbx blocked. Set `skip_default_provision: true` to skip it when your `sandbox.image` provides these already; `provision` runs either way. To provision once for every sandbox instead, build a custom `sandbox.image`.
+
+## Nix and Devbox toolchain
+
+`toolchain` works as on [Lima](/guide/sandbox/lima/#nix-and-devbox-toolchain): with `devbox.json` or `flake.nix` in the worktree (or `toolchain: devbox` or `flake`), workmux installs Nix and Devbox when it creates the sandbox and runs the agent command in the environment they declare (`devbox run` or `nix develop`). `toolchain: off` does neither. `workmux sandbox shell` runs its command outside the toolchain, as on Lima; [host commands](/guide/sandbox/features/#host-command-proxying) run in the workstation's toolchain environment, as on the other backends.
+
+The Nix store lives in the sandbox, so packages download once per sandbox and are gone after `workmux sandbox prune`. Agent commands see the image's own `PATH`, with the shims, `~/.local/bin` and Nix in front.
+
+Installing and using Nix and Devbox reaches these hosts, on port 443:
+
+| Host                                                                             | Used for                                   |
+| -------------------------------------------------------------------------------- | ------------------------------------------ |
+| `install.determinate.systems`                                                    | Nix installer, and a binary cache          |
+| `cache.nixos.org`                                                                | Nix binary cache                           |
+| `get.jetify.com`, `get.jetpack.io`, `releases.jetify.com`, `releases.jetpack.io` | Devbox installer                           |
+| `github.com`, `release-assets.githubusercontent.com`                             | Devbox's binary                            |
+| `www.nixsearch.com`                                                              | Devbox package versions                    |
+| `github.com`, `api.github.com`, `codeload.github.com`                            | nixpkgs, and flake inputs hosted on GitHub |
+
+sbx's `balanced` global policy blocks most of them, so whenever the worktree uses a toolchain workmux adds a rule scoped to the sandbox for each, under `policy: allow` as well as `deny`, and reconciles them like the [network rules](#network-restrictions): turning the toolchain off removes them at the next launch. Under `deny` they widen what the sandbox reaches, GitHub included. A flake's other inputs (hosts other than GitHub) aren't covered: add them to `allowed_domains`.
 
 ## Kits
 
@@ -207,7 +234,7 @@ sandbox:
       - "*.github.com"
 ```
 
-Under `policy: deny`, workmux adds a rule scoped to the sandbox for port 443 of each allowed domain (`sbx policy ls <sandbox>` lists them). A wildcard such as `*.github.com` becomes sbx's `**.github.com:443` (subdomains at any depth) with a deny for `github.com:443`, so the base domain stays out unless you list it too. IP literals are refused, as on the container backend. Under `policy: allow`, workmux adds no rules.
+Under `policy: deny`, workmux adds a rule scoped to the sandbox for port 443 of each allowed domain (`sbx policy ls <sandbox>` lists them), and for the [toolchain's hosts](#nix-and-devbox-toolchain) when the worktree uses one. A wildcard such as `*.github.com` becomes sbx's `**.github.com:443` (subdomains at any depth) with a deny for `github.com:443`, so the base domain stays out unless you list it too. IP literals are refused, as on the container backend. Under `policy: allow`, workmux adds none but the toolchain's.
 
 Every launch reconciles the rules: it adds missing ones and removes the ones workmux added earlier that your config no longer lists, so a removed domain stops working at the sandbox's next launch. workmux records the rules it added in the sandbox's state directory and never touches rules you added yourself, or your global sbx policy.
 
