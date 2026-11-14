@@ -28,6 +28,7 @@ from typing import Generator, Iterator, Optional
 import pytest
 
 from .support.sbx import (
+    CREATE_TIMEOUT,
     Sandbox,
     create_sandbox,
     load_learning_template,
@@ -839,6 +840,167 @@ def test_host_config_dir_reaches_agent_home_through_a_symlink(
         assert (config / "written").read_text() == "guest\n"
     finally:
         sandbox.remove()
+
+
+# --- Workspaces at another guest path (ticket 14, v0.51) --------------------
+
+
+@pytest.fixture(scope="module")
+def remap_dirs(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    root = tmp_path_factory.mktemp("sbx-remap").resolve()
+    for name in ["ws", "data", "cfg", "other"]:
+        (root / name).mkdir()
+    (root / "ws" / ".env").write_text("SECRET=1\n")
+    (root / "data" / "d.txt").write_text("data\n")
+    (root / "cfg" / "settings.json").write_text("{}\n")
+    (root / "other" / "mask.txt").write_text("masked\n")
+    return root
+
+
+@pytest.fixture(scope="module")
+def remapped(remap_dirs: Path) -> Generator[Sandbox, None, None]:
+    r = remap_dirs
+    sandbox, created = create_sandbox(
+        "remap",
+        [
+            str(r / "ws"),
+            f"{r}/data:/workspace/data",
+            f"{r}/cfg:/home/agent/.wmlearn/nested/cfg",
+            f"{r}/other:{r}/ws/sub:ro",
+            f"{r}/other/mask.txt:{r}/ws/.env:ro",
+            f"{r}/other/mask.txt:{r}/ws/new.txt:ro",
+        ],
+    )
+    try:
+        assert created.returncode == 0, created.stderr
+        yield sandbox
+    finally:
+        sandbox.remove()
+
+
+def test_workspace_mounts_a_host_dir_at_another_guest_path(
+    remapped: Sandbox, remap_dirs: Path
+):
+    """`HOST:TARGET` mounts HOST at TARGET, writable unless `:ro`, inside or
+    outside the agent's home; `sbx ls` keeps the form as given."""
+    r = remap_dirs
+    out = remapped.sh_ok(
+        "cat /workspace/data/d.txt; echo g > /workspace/data/guest.txt; "
+        "cat ~/.wmlearn/nested/cfg/settings.json; echo g > ~/.wmlearn/nested/cfg/g; "
+        "stat -c %U ~/.wmlearn/nested/cfg"
+    )
+    assert out.split() == ["data", "{}", "agent"]
+    assert (r / "data" / "guest.txt").read_text() == "g\n"
+    assert (r / "cfg" / "g").read_text() == "g\n"
+    assert not Path("/workspace/data").exists(), "nothing appears at TARGET on the host"
+    entry = list_sandboxes()[remapped.name]
+    assert f"{r}/data:/workspace/data" in entry["workspaces"]
+    assert f"{r}/data:/workspace/data" in entry["mounts"]
+
+
+def test_parents_sbx_makes_for_a_target_are_roots(remapped: Sandbox):
+    """Missing parents of a target are created root-owned, so the agent can't
+    write beside the mount until root re-owns them."""
+    out = remapped.sh_ok(
+        "stat -c %U ~/.wmlearn ~/.wmlearn/nested; "
+        "mkdir ~/.wmlearn/nested/x 2>/dev/null; echo mkdir=$?"
+    )
+    assert out.split() == ["root", "root", "mkdir=1"]
+    remapped.sh_ok(
+        "install -d -o agent -g agent ~/.wmlearn ~/.wmlearn/nested", user="root"
+    )
+    out = remapped.sh_ok("mkdir ~/.wmlearn/nested/x && echo mkdir=$?")
+    assert out.strip() == "mkdir=0"
+
+
+def test_file_at_another_guest_path_must_still_be_read_only(remap_dirs: Path):
+    r = remap_dirs
+    name = new_sandbox_name("remapfile")
+    result = sbx(
+        [
+            "create",
+            "--name",
+            name,
+            "--no-progress",
+            "shell",
+            str(r / "ws"),
+            f"{r}/other/mask.txt:/workspace/mask.txt",
+        ]
+    )
+    try:
+        assert result.returncode != 0
+        assert "is not a directory" in result.stderr
+    finally:
+        if result.returncode == 0:
+            Sandbox(name).remove()
+
+
+def test_target_nested_in_another_workspace_is_read_only_and_leaves_a_mount_point(
+    remapped: Sandbox, remap_dirs: Path
+):
+    r = remap_dirs
+    out = remapped.sh(f"ls {r}/ws/sub; touch {r}/ws/sub/x")
+    assert out.stdout.split() == ["mask.txt"]
+    assert "Read-only file system" in out.stderr
+    assert not (r / "other" / "x").exists()
+    # sbx creates a missing target inside a workspace on the host: an empty
+    # directory or file that outlives the sandbox.
+    assert (r / "ws" / "sub").is_dir()
+    assert (r / "ws" / "new.txt").read_text() == ""
+
+
+ROOT_UNMASK = """
+import ctypes, os, sys
+target, parent = sys.argv[1], sys.argv[2]
+libc = ctypes.CDLL(None, use_errno=True)
+os.makedirs("/mnt/wmlearn", exist_ok=True)
+assert libc.mount(parent.encode(), b"/mnt/wmlearn", None, 4096, None) == 0  # MS_BIND
+print(open("/mnt/wmlearn/" + os.path.basename(target)).read().strip())
+libc.umount2(b"/mnt/wmlearn", 2)
+assert libc.umount2(target.encode(), 2) == 0  # MNT_DETACH
+print(open(target).read().strip())
+"""
+
+
+def test_target_over_a_file_hides_it_from_the_agent_but_not_from_root(
+    remapped: Sandbox, remap_dirs: Path
+):
+    """A read-only file mounted over a file of another workspace replaces its
+    contents for the agent. Root in the guest can still get at the original:
+    through a bind mount of the parent, or by unmounting the mask."""
+    env = remap_dirs / "ws" / ".env"
+    out = remapped.sh(f"cat {env}; echo x >> {env}")
+    assert out.stdout == "masked\n"
+    assert "Read-only file system" in out.stderr
+    assert env.read_text() == "SECRET=1\n", "the host file is untouched"
+
+    probe = remapped.exec_args(["python3", "-", str(env), str(env.parent)], user="root")
+    out = sbx(probe[1:], input=ROOT_UNMASK)
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.split() == ["SECRET=1", "SECRET=1"]
+
+
+def test_a_device_cant_be_mounted_over_a_file(remap_dirs: Path):
+    r = remap_dirs
+    name = new_sandbox_name("devnull")
+    result = sbx(
+        [
+            "create",
+            "--name",
+            name,
+            "--no-progress",
+            "shell",
+            str(r / "ws"),
+            f"/dev/null:{r}/ws/.env:ro",
+        ],
+        timeout=CREATE_TIMEOUT,
+    )
+    try:
+        assert result.returncode != 0
+        assert name not in list_sandboxes()
+    finally:
+        if result.returncode == 0:
+            Sandbox(name).remove()
 
 
 # --- Resources (Q13) ---------------------------------------------------------
