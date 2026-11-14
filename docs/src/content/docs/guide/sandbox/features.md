@@ -32,7 +32,7 @@ Paths starting with `~` are expanded to the user's home directory. When `guest_p
 
 **Note:** Apple Container only supports directory mounts. Individual file paths in `extra_mounts` will fail with Apple Container.
 
-**Note:** Docker Sandboxes (`docker_sbx`) mounts a host path only at that same path and a file only read-only. An entry with a different `guest_path`, or a writable file, is an error.
+**Note:** Docker Sandboxes (`docker_sbx`) mounts a file only read-only. A writable file entry is an error.
 
 ## Host command proxying
 
@@ -114,7 +114,7 @@ Codex also gets `--dangerously-bypass-hook-trust`. Codex otherwise asks you to r
 
 Every sandbox backend mounts agent-specific credential directories from the host. The mounted directory depends on the configured `agent`:
 
-| Agent      | Host directory               | Container mount                 | Lima mount                       | `docker_sbx` link                      |
+| Agent      | Host directory               | Container mount                 | Lima mount                       | `docker_sbx` mount                     |
 | ---------- | ---------------------------- | ------------------------------- | -------------------------------- | -------------------------------------- |
 | `claude`   | `~/.claude/`                 | `/tmp/.claude/`                 | `$HOME/.claude/`                 | `/home/agent/.claude/`                 |
 | `copilot`  | `~/.copilot/`                | `/tmp/.copilot/`                | `$HOME/.copilot/`                | `/home/agent/.copilot/`                |
@@ -124,8 +124,6 @@ Every sandbox backend mounts agent-specific credential directories from the host
 | `opencode` | `~/.local/share/opencode/`   | `/tmp/.local/share/opencode/`   | `$HOME/.local/share/opencode/`   | `/home/agent/.local/share/opencode/`   |
 | `pi`       | `~/.pi/agent/`               | `/tmp/.pi/agent/`               | `$HOME/.pi/agent/`               | `/home/agent/.pi/agent/`               |
 | `omp`      | `~/.omp/agent/`              | `/tmp/.omp/agent/`              | `$HOME/.omp/agent/`              | `/home/agent/.omp/agent/`              |
-
-Docker Sandboxes can mount a directory only at its own host path, so under `docker_sbx` the host directory is mounted at its host path and linked to the path in the table when the sandbox is created.
 
 Other agents get no config directory mount.
 

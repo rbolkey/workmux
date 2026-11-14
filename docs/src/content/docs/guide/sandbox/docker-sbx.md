@@ -108,24 +108,24 @@ The sandbox belongs to the worktree, not to a pane:
 
 ### What's mounted
 
-sbx mounts each directory at its own host path:
+sbx mounts the worktree, the git metadata and the shims at their host paths, and the agent's config directories at their usual place under `/home/agent`:
 
-| Mount                                          | Access       | Purpose                                                                       |
-| ---------------------------------------------- | ------------ | ----------------------------------------------------------------------------- |
-| Worktree                                       | read-write   | The worktree the agent works in                                               |
-| Main repository's `.git`                       | read-only    | Git control policy and administrative namespace                               |
-| Git objects, refs, logs                        | read-write   | Commits and branch updates                                                    |
-| Current worktree admin                         | read-write\* | Index, HEAD, merge, and rebase state                                          |
-| Agent config directory                         | read-write   | Agent settings and credentials, linked to its usual place under `/home/agent` |
-| OpenCode's `~/.config/opencode/` (opencode)    | read-only    | OpenCode's global config, linked to `/home/agent/.config/opencode`            |
-| `~/.local/state/workmux/docker-sbx/<sandbox>/` | read-only    | Host-command shims                                                            |
-| `extra_mounts` entries                         | read-only\*  | User-configured paths                                                         |
+| Mount                                          | Access       | Purpose                                                                |
+| ---------------------------------------------- | ------------ | ---------------------------------------------------------------------- |
+| Worktree                                       | read-write   | The worktree the agent works in                                        |
+| Main repository's `.git`                       | read-only    | Git control policy and administrative namespace                        |
+| Git objects, refs, logs                        | read-write   | Commits and branch updates                                             |
+| Current worktree admin                         | read-write\* | Index, HEAD, merge, and rebase state                                   |
+| Agent config directory                         | read-write   | Agent settings and credentials, at its usual place under `/home/agent` |
+| OpenCode's `~/.config/opencode/` (opencode)    | read-only    | OpenCode's global config, at `/home/agent/.config/opencode`            |
+| `~/.local/state/workmux/docker-sbx/<sandbox>/` | read-only    | Host-command shims                                                     |
+| `extra_mounts` entries                         | read-only\*  | User-configured paths                                                  |
 
 \* As on the [container backend](/guide/sandbox/container/#whats-mounted), git pointer files, per-worktree config, object information, submodules' hooks and config, and files the repository config includes stay read-only within writable git mounts, so an agent can't plant hooks or change git config. sbx enforces read-only mounts on the host, even against root in the sandbox. Sandboxes require a linked worktree: workmux refuses to sandbox the main worktree, whose admin files are the repository's own. Hooks in the main repository must be regular files, not symbolic or hard links.
 
-See [Credentials](/guide/sandbox/features/#credentials) for each agent's config directory. The links are made when the sandbox is created, so switching `agent` needs a new sandbox (`workmux sandbox prune`). For Claude, workmux also writes the sandbox's own `~/.claude.json` with onboarding marked complete. Pi and OMP download Linux `fd` and `rg` binaries into their config directory; workmux binds a directory inside the sandbox over `~/.pi/agent/bin/` and `~/.omp/agent/tools/` each time a pane starts, so the workstation's binaries are never overwritten.
+See [Credentials](/guide/sandbox/features/#credentials) for each agent's config directory. These mounts are made when the sandbox is created, so switching `agent` needs a new sandbox (`workmux sandbox prune`). For Claude, workmux also writes the sandbox's own `~/.claude.json` with onboarding marked complete. Pi and OMP download Linux `fd` and `rg` binaries into their config directory; workmux binds a directory inside the sandbox over `~/.pi/agent/bin/` and `~/.omp/agent/tools/` each time a pane starts, so the workstation's binaries are never overwritten.
 
-sbx can mount a host path only at that same path, and a single file only read-only, so under `docker_sbx` an `extra_mounts` entry with a different `guest_path`, or a writable entry that is a file, is an error. sbx can't hide a file either: a read-only file mount leaves its contents readable. `sandbox.container.excluded_files` is therefore an error under `docker_sbx`, as it is on Apple Container, rather than leaving secrets readable.
+`extra_mounts` entries are mounted at their `guest_path`, or at their host path without one. sbx mounts a single file only read-only, so a writable entry that is a file is an error. A `guest_path` inside the worktree or another mount appears on the workstation too: sbx creates the mount point there (an empty directory or file) if it's missing. `sandbox.container.excluded_files` is an error under `docker_sbx`, as it is on Apple Container: workmux doesn't mask files here, so secrets would remain readable.
 
 Sandboxes are created with sbx's generic `shell` agent, never an agent kit: sbx's kits write the agent's settings and credentials into its home, which here is your mounted config directory. workmux runs the agent command itself, as on the container backend.
 
@@ -181,7 +181,7 @@ sbx also sets git config of its own in the sandbox (keeping its `.sbx` directori
 
 ## Provisioning
 
-The `provision` script runs once, after workmux creates the sandbox, sets it up (config directory links, Claude's onboarding state, network rules) and runs its [built-in provisioning](#built-in-provisioning), never on later launches. It runs as root with `bash -c`, in the worktree; the template has no `sudo`, so don't use it. Its downloads go through sbx's proxy and network policy like any other request in the sandbox; sbx's `balanced` policy reaches package mirrors over HTTPS only, which is why the [template](#template) switches the image's Debian sources to HTTPS. A changed script applies the next time the sandbox is created (`workmux sandbox prune`, or `workmux remove`). If the script fails, workmux deletes the sandbox and stops with its error, so the next launch creates and provisions it again.
+The `provision` script runs once, after workmux creates the sandbox, sets it up (config directory parents, Claude's onboarding state, network rules) and runs its [built-in provisioning](#built-in-provisioning), never on later launches. It runs as root with `bash -c`, in the worktree; the template has no `sudo`, so don't use it. Its downloads go through sbx's proxy and network policy like any other request in the sandbox; sbx's `balanced` policy reaches package mirrors over HTTPS only, which is why the [template](#template) switches the image's Debian sources to HTTPS. A changed script applies the next time the sandbox is created (`workmux sandbox prune`, or `workmux remove`). If the script fails, workmux deletes the sandbox and stops with its error, so the next launch creates and provisions it again.
 
 ```yaml
 sandbox:
