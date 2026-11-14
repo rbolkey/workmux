@@ -313,7 +313,11 @@ def test_exec_env_and_workdir(sandbox: Sandbox, workspace: Path):
 
 
 def test_exec_as_root(sandbox: Sandbox):
-    assert sandbox.sh_ok("id -u; echo $HOME", user="root").split() == ["0", "/root"]
+    # v0.50.1 set HOME=/root; since v0.51.0 root keeps the agent's HOME.
+    assert sandbox.sh_ok("id -u; echo $HOME", user="root").split() == [
+        "0",
+        "/home/agent",
+    ]
     assert sandbox.sh_ok("id -un; echo $HOME").split() == ["agent", "/home/agent"]
     assert sandbox.sh("sudo -n true").returncode == 0, (
         "the stock shell template has sudo"
@@ -384,6 +388,113 @@ def test_two_execs_run_concurrently(sandbox: Sandbox):
     finally:
         waiter.kill()
         sandbox.sh(f"rm -f {flag}")
+
+
+# --- Lifecycle: closing panes, stop and remove (ticket 03) -------------------
+
+
+def guest_has_process(sandbox: Sandbox, marker: str) -> bool:
+    # "[w]m-..." keeps the pattern from matching the shell running pgrep.
+    return sandbox.sh(f"pgrep -f '[{marker[0]}]{marker[1:]}'").returncode == 0
+
+
+def hangup_script(session: str) -> str:
+    """The guest side of workmux's hangup (docker_sbx `hangup_command`)."""
+    return (
+        "for p in /proc/[0-9]*; do "
+        f'grep -qxzF WM_SBX_SESSION={session} "$p/environ" 2>/dev/null '
+        '&& kill -HUP "${p#/proc/}"; done; true'
+    )
+
+
+def test_hanging_up_a_tty_exec_leaves_its_guest_command_running(sandbox: Sandbox):
+    """Closing a tmux window hangs up the pane's `sbx exec -it`: the client
+    exits, but sbx keeps the guest command (and its pty) alive. A hangup of
+    the processes carrying the exec's session marker ends only that session."""
+    closed = f"wm-learn-closed-{os.getpid()}"
+    kept = f"wm-learn-kept-{os.getpid()}"
+    pane, master = run_in_pty(
+        sandbox.exec_args(
+            ["bash", "-c", f"echo READY; exec -a {closed} sleep 300"],
+            tty=True,
+            interactive=True,
+            env={"WM_SBX_SESSION": "closed"},
+        ),
+        rows=24,
+        cols=80,
+    )
+    other = subprocess.Popen(
+        sandbox.exec_args(
+            ["bash", "-c", f"exec -a {kept} sleep 300"], env={"WM_SBX_SESSION": "kept"}
+        ),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        assert "READY" in read_pty_until(master, "READY", timeout=60)
+        assert wait_for(lambda: guest_has_process(sandbox, kept))
+        assert guest_has_process(sandbox, closed)
+
+        os.killpg(pane.pid, signal.SIGHUP)
+        pane.wait(timeout=30)
+        time.sleep(5)
+        assert guest_has_process(sandbox, closed), "sbx keeps the guest command"
+
+        sandbox.sh_ok(hangup_script("closed"))
+        assert wait_for(lambda: not guest_has_process(sandbox, closed))
+        assert other.poll() is None
+        assert guest_has_process(sandbox, kept)
+    finally:
+        pane.kill()
+        pane.wait()
+        os.close(master)
+        other.kill()
+        other.wait()
+        sandbox.sh(hangup_script("closed"))
+        sandbox.sh(hangup_script("kept"))
+
+
+def test_concurrent_execs_both_start_a_stopped_sandbox(sandbox: Sandbox):
+    """Panes of a worktree opening at once after sbx stopped its idle sandbox."""
+    assert sandbox.stop().returncode == 0
+    assert sandbox.status() == "stopped"
+    panes = [
+        subprocess.Popen(
+            sandbox.exec_args(["echo", f"pane-{i}"]),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for i in range(2)
+    ]
+    outputs = [pane.communicate(timeout=120) for pane in panes]
+    assert [pane.returncode for pane in panes] == [0, 0], outputs
+    assert [out for out, _ in outputs] == ["pane-0\n", "pane-1\n"]
+    assert sandbox.status() == "running"
+
+
+def test_stop_is_idempotent(sandbox: Sandbox):
+    sandbox.sh_ok("true")
+    for _ in range(2):
+        stopped = sandbox.stop()
+        assert stopped.returncode == 0, stopped.stderr
+        assert stopped.stdout == f"Stopped sandbox {sandbox.name}\n"
+        assert sandbox.status() == "stopped"
+
+
+def test_rm_deletes_the_sandboxs_rules(workspace: Path):
+    removed, created = create_sandbox("rm-rules", [str(workspace)])
+    try:
+        assert created.returncode == 0, created.stderr
+        assert removed.allow("localhost").returncode == 0
+        assert len(removed.local_rules()) == 1
+        result = sbx(["rm", "-f", removed.name], timeout=300)
+        assert result.returncode == 0, result.stderr
+        assert removed.name not in list_sandboxes()
+        rules = sbx_json(["policy", "ls"])["rules"]
+        assert [r for r in rules if r["scope"] == f"sandbox:{removed.name}"] == []
+    finally:
+        removed.remove()
 
 
 # --- Mounts (Q2, Q3, Q11, Q12) -----------------------------------------------
@@ -604,9 +715,12 @@ def test_service_list_covers_agent_providers():
 
 def test_guest_sees_placeholder_environment(sandbox: Sandbox):
     out = sandbox.sh_ok(
-        'printf "%s\\n" "$ANTHROPIC_API_KEY" "${GH_TOKEN:0:12}" "$SBX_CRED_GITHUB_MODE"'
+        'printf "[%s]\\n" "${GH_TOKEN:0:12}" "$ANTHROPIC_API_KEY" "$SBX_CRED_GITHUB_MODE"'
     ).split()
-    assert out[:2] == ["proxy-managed", "gho_sbxproxy"]
+    # v0.50.1 also set ANTHROPIC_API_KEY/OPENAI_API_KEY=proxy-managed and
+    # SBX_CRED_<SERVICE>_MODE in every sandbox; v0.51.0's shell sandboxes
+    # set only the GitHub placeholder.
+    assert out == ["[gho_sbxproxy]", "[]", "[]"]
 
 
 def gh_logged_in() -> bool:
@@ -706,9 +820,11 @@ def test_workmux_image_with_thin_agent_layer_is_a_template(
 
 
 @requires_docker
-def test_claude_kit_needs_an_agent_owned_claude_dir(workspace: Path):
-    """Documents a failure: without ~/.claude owned by agent in the image, the
-    claude kit's settings seed fails and create returns 500."""
+def test_claude_kit_no_longer_needs_an_agent_owned_claude_dir(workspace: Path):
+    """v0.50.1 failed to create a claude sandbox from an image without an
+    agent-owned ~/.claude (500, "failed to apply kit to sandbox"). Since
+    v0.51.0 the claude agent ships as a kit (docker.io/sbx/claude) and
+    create succeeds."""
     tag = "wm-learn-sbx-bare:latest"
     subprocess.run(
         [
@@ -741,8 +857,8 @@ def test_claude_kit_needs_an_agent_owned_claude_dir(workspace: Path):
             extra=["-t", tag, "--pull", "never"],
         )
         try:
-            assert created.returncode != 0
-            assert "failed to apply kit to sandbox" in created.stderr
+            assert created.returncode == 0, created.stderr
+            assert "now ships as a kit" in created.stderr
         finally:
             bare.remove()
     finally:
