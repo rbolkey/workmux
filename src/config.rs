@@ -1935,6 +1935,28 @@ pub struct DockerSbxConfig {
     /// global-only: ignored in project config.
     #[serde(default)]
     pub kits: Option<Vec<String>>,
+
+    /// How agents get their agent credential: `mount` (default) mounts the
+    /// agent's config directory with its credential files, as the other
+    /// backends do; `placeholder` mounts it with each credential file
+    /// hidden behind a placeholder, and sbx's proxy supplies the real
+    /// credential from the user's sbx secret for the agent's service.
+    /// Global-only: ignored in project config.
+    #[serde(default)]
+    pub agent_credentials: Option<AgentCredentials>,
+}
+
+/// How a docker_sbx sandbox gives its agent the agent credential.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentCredentials {
+    /// Mount the agent's config directory, credential files included
+    /// (default).
+    #[default]
+    Mount,
+    /// Hide the agent's credential files behind placeholders sbx's proxy
+    /// swaps for the user's sbx secret.
+    Placeholder,
 }
 
 /// sbx's smallest sandbox memory (`--memory`).
@@ -1991,6 +2013,11 @@ impl DockerSbxConfig {
         self.kits.as_deref().unwrap_or(&[])
     }
 
+    /// How agents get their agent credential. Defaults to `mount`.
+    pub fn agent_credentials(&self) -> AgentCredentials {
+        self.agent_credentials.unwrap_or_default()
+    }
+
     /// Check `memory` is a size sbx accepts. Called at config load.
     pub fn validate(&self) -> anyhow::Result<()> {
         if let Some(memory) = self.memory() {
@@ -2009,8 +2036,8 @@ impl DockerSbxConfig {
         Ok(())
     }
 
-    /// Merge: project overrides global, per-field, EXCEPT for `kits`, which
-    /// is global-only.
+    /// Merge: project overrides global, per-field, EXCEPT for `kits` and
+    /// `agent_credentials`, which are global-only.
     fn merge(global: Self, project: Self) -> Self {
         // Security: kits is global-only. A kit can add network rules,
         // credentials and install steps, so a repo's .workmux.yaml must not
@@ -2021,6 +2048,14 @@ impl DockerSbxConfig {
                 move it to your global config (~/.config/workmux/config.yaml)"
             );
         }
+        // Security: agent_credentials is global-only, so a repo's
+        // .workmux.yaml can't hand its agents their real credentials.
+        if project.agent_credentials.is_some() {
+            tracing::warn!(
+                "sandbox.docker_sbx.agent_credentials in project config (.workmux.yaml) is \
+                ignored -- move it to your global config (~/.config/workmux/config.yaml)"
+            );
+        }
         Self {
             cpus: project.cpus.or(global.cpus),
             memory: project.memory.or(global.memory),
@@ -2029,6 +2064,7 @@ impl DockerSbxConfig {
                 .skip_default_provision
                 .or(global.skip_default_provision),
             kits: global.kits,
+            agent_credentials: global.agent_credentials,
         }
     }
 }
@@ -4151,6 +4187,10 @@ pub const EXAMPLE_PROJECT_CONFIG: &str = r#"# workmux project configuration
 #   #   # project .workmux.yaml, since a kit can add network rules.
 #   #   # kits:
 #   #   #   - docker.io/sbx/task:latest
+#   #   # How agents get their login: mount (default) or placeholder (credential
+#   #   # files hidden, sbx's proxy supplies the `sbx secret set` secret).
+#   #   # GLOBAL-ONLY: ignored in a project .workmux.yaml.
+#   #   # agent_credentials: placeholder
 #   # lima:
 #   #   isolation: project
 #   #   cpus: 4
@@ -4255,10 +4295,10 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        AgentColumn, AgentEnvValue, AgentIconConfig, AgentIconDetails, AllowedDomainDetails,
-        AllowedDomainEntry, CLEANUP_NODE_MODULES_PLACEHOLDER, Config, ContainerConfig,
-        ContainerDevice, DEFAULT_AGENT_COLUMNS, DEFAULT_WORKTREE_COLUMNS, DashboardLayout,
-        DockerSbxConfig, ExtraMount, FileConfig, LayoutConfig, LimaConfig,
+        AgentColumn, AgentCredentials, AgentEnvValue, AgentIconConfig, AgentIconDetails,
+        AllowedDomainDetails, AllowedDomainEntry, CLEANUP_NODE_MODULES_PLACEHOLDER, Config,
+        ContainerConfig, ContainerDevice, DEFAULT_AGENT_COLUMNS, DEFAULT_WORKTREE_COLUMNS,
+        DashboardLayout, DockerSbxConfig, ExtraMount, FileConfig, LayoutConfig, LimaConfig,
         NODE_MODULES_CLEANUP_SCRIPT, NetworkConfig, NetworkPolicy, PaneConfig, SandboxBackend,
         SandboxConfig, SandboxRuntime, SandboxTarget, SidebarEnterAction, SidebarHeight,
         SidebarPosition, SidebarWidth, SplitDirection, ToolchainMode, WindowPlacement,
@@ -6751,6 +6791,42 @@ docker_sbx:
         assert_eq!(
             merged.sandbox.docker_sbx.kits(),
             &["docker.io/sbx/task:latest".to_string()]
+        );
+    }
+
+    #[test]
+    fn docker_sbx_agent_credentials_default_to_credential_mounts() {
+        assert_eq!(
+            DockerSbxConfig::default().agent_credentials(),
+            AgentCredentials::Mount
+        );
+        let config: SandboxConfig = serde_yaml::from_str(
+            "backend: docker_sbx\ndocker_sbx:\n  agent_credentials: placeholder\n",
+        )
+        .unwrap();
+        assert_eq!(
+            config.docker_sbx.agent_credentials(),
+            AgentCredentials::Placeholder
+        );
+    }
+
+    #[test]
+    fn docker_sbx_agent_credentials_project_is_ignored() {
+        let global =
+            docker_sbx_cfg(|sbx| sbx.agent_credentials = Some(AgentCredentials::Placeholder));
+        let project = docker_sbx_cfg(|sbx| sbx.agent_credentials = Some(AgentCredentials::Mount));
+        let merged = global.merge(project);
+        assert_eq!(
+            merged.sandbox.docker_sbx.agent_credentials(),
+            AgentCredentials::Placeholder
+        );
+
+        let project =
+            docker_sbx_cfg(|sbx| sbx.agent_credentials = Some(AgentCredentials::Placeholder));
+        let merged = Config::default().merge(project);
+        assert_eq!(
+            merged.sandbox.docker_sbx.agent_credentials(),
+            AgentCredentials::Mount
         );
     }
 
