@@ -71,6 +71,8 @@ Settings specific to sbx are nested under `sandbox.docker_sbx`.
 
 The guest reaches the RPC server through `host.docker.internal`. sbx names the workstation `localhost` in its policy, so each supervisor adds a `localhost:<port>` rule for its own RPC port, scoped to the sandbox, and removes it when the pane closes. Other services on the workstation's loopback interface stay unreachable. workmux never changes your global sbx policy.
 
+Everything that goes through the RPC server works as on the other backends: [host commands](/guide/sandbox/features/#host-command-proxying) (which run on your workstation, outside sbx's network policy and placeholders), [sound notifications](/guide/sandbox/features/#sound-notifications), [image paste](/guide/sandbox/features/#clipboard-proxy), status tracking, and [coordinator agents](/guide/sandbox/features/#coordinator-agents), whose `workmux add` gives each new worktree its own sandbox.
+
 ### Lifecycle
 
 The sandbox belongs to the worktree, not to a pane:
