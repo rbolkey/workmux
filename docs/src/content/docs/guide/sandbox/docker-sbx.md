@@ -5,10 +5,6 @@ description: Run agents in Docker Sandboxes (sbx) microVMs
 
 workmux can run agents in [Docker Sandboxes](https://docs.docker.com/ai/sandboxes/) (the `sbx` CLI). Each worktree gets its own sbx sandbox, a microVM with its own kernel, and sbx's host-side proxy enforces its network policy.
 
-:::caution[Early support]
-The `docker_sbx` backend currently runs the Claude agent only. Other agents fail with an error naming the agent; use the container or Lima backend for them.
-:::
-
 ## Setup
 
 ### 1. Install and set up sbx
@@ -53,7 +49,7 @@ The generic `sandbox` settings keep their meaning:
 | `backend`          | `container`                             | Set to `docker_sbx` for Docker Sandboxes                                                                                       |
 | `image`            | `ghcr.io/raine/workmux-sandbox:<agent>` | Agent image the sbx template is built from                                                                                     |
 | `rpc_host`         | `host.docker.internal`                  | Hostname the guest uses to reach workmux's RPC server. **Global config only.**                                                 |
-| `agent_config_dir` | agent's default (`~/.claude/`)          | Host directory mounted as the agent's config directory. **Global config only.**                                                |
+| `agent_config_dir` | agent's default (e.g. `~/.claude/`)     | Host directory mounted as the agent's config directory. **Global config only.**                                                |
 | `env_passthrough`  | `[]`                                    | Environment variables to pass through to the sandbox. **Global config only.**                                                  |
 | `env`              | `{}`                                    | Environment variables to set with explicit values. **Global config only.**                                                     |
 | `host_commands`    | `[]`                                    | Commands to proxy from the sandbox to the host via RPC (see [shared features](/guide/sandbox/features/#host-command-proxying)) |
@@ -86,12 +82,15 @@ The sandbox belongs to the worktree, not to a pane:
 
 sbx mounts each directory at its own host path:
 
-| Mount                                          | Access     | Purpose                                                                      |
-| ---------------------------------------------- | ---------- | ---------------------------------------------------------------------------- |
-| Worktree                                       | read-write | The worktree the agent works in                                              |
-| Main repository's `.git`                       | read-write | Git data for commits in a linked worktree                                    |
-| Agent config directory                         | read-write | Agent settings and credentials, linked to `/home/agent/.claude` in the guest |
-| `~/.local/state/workmux/docker-sbx/<sandbox>/` | read-only  | Host-command shims                                                           |
+| Mount                                          | Access     | Purpose                                                                       |
+| ---------------------------------------------- | ---------- | ----------------------------------------------------------------------------- |
+| Worktree                                       | read-write | The worktree the agent works in                                               |
+| Main repository's `.git`                       | read-write | Git data for commits in a linked worktree                                     |
+| Agent config directory                         | read-write | Agent settings and credentials, linked to its usual place under `/home/agent` |
+| OpenCode's `~/.config/opencode/` (opencode)    | read-only  | OpenCode's global config, linked to `/home/agent/.config/opencode`            |
+| `~/.local/state/workmux/docker-sbx/<sandbox>/` | read-only  | Host-command shims                                                            |
+
+See [Credentials](/guide/sandbox/features/#credentials) for each agent's config directory. The links are made when the sandbox is created, so switching `agent` needs a new sandbox (`workmux sandbox prune`). For Claude, workmux also writes the sandbox's own `~/.claude.json` with onboarding marked complete. Pi and OMP download Linux `fd` and `rg` binaries into their config directory; workmux binds a directory inside the sandbox over `~/.pi/agent/bin/` and `~/.omp/agent/tools/` each time a pane starts, so the workstation's binaries are never overwritten.
 
 Sandboxes are created with sbx's generic `shell` agent, never an agent kit: sbx's kits write the agent's settings and credentials into its home, which here is your mounted config directory. workmux runs the agent command itself, as on the container backend.
 
@@ -107,7 +106,7 @@ sbx creates sandboxes from templates kept in its own image store. workmux builds
 
 ### Authentication
 
-Claude stores its login in the macOS Keychain, which the sandbox can't reach. Sign in to Claude once inside a sandbox; the login is written to the mounted config directory and persists across sandboxes. See [Credentials](/guide/sandbox/features/#credentials).
+Agents use the login in their mounted config directory, as on the container backend: Codex, Gemini, OpenCode, pi and OMP start logged in if you've logged in on the workstation. Claude stores its login in the macOS Keychain, which the sandbox can't reach. Sign in to Claude once inside a sandbox; the login is written to the mounted config directory and persists across sandboxes. See [Credentials](/guide/sandbox/features/#credentials).
 
 ## Sandbox management
 
