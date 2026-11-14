@@ -183,6 +183,19 @@ def create_sandbox(
         ["create", "--name", sandbox.name, "--no-progress", *extra, agent, *workspaces],
         timeout=CREATE_TIMEOUT,
     )
+    if created.returncode == 0:
+        # Since v0.51.0 the stock image's bash prints a banner on the first
+        # `bash -c` (its /etc/bash.bashrc runs for exec's socket stdin);
+        # mark it shown so test output is only the command's.
+        sbx(
+            [
+                "exec",
+                sandbox.name,
+                "sh",
+                "-c",
+                "mkdir -p ~/.local/state && touch ~/.local/state/dhi-banner-shown",
+            ]
+        )
     return sandbox, created
 
 
