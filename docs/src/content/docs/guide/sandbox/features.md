@@ -201,6 +201,8 @@ tail -f ~/.local/state/workmux/workmux.log | grep rejected
 
 Rejected entries include the denied hostname. Add any expected hosts to your sandbox's `network.domains` list and retry.
 
+Under the `docker_sbx` backend, sbx blocks requests itself and logs them, not workmux: run `sbx policy log <sandbox>` (see [Network restrictions](/guide/sandbox/docker-sbx/#network-restrictions)).
+
 ## Installing local builds
 
 During development, the macOS host binary cannot run inside Linux containers or VMs. Use `install-dev` to cross-compile and install your local workmux build:
