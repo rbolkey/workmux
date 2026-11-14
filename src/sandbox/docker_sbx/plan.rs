@@ -64,6 +64,32 @@ pub struct LaunchTarget<'a> {
     /// allowed (under `deny`, only those `allowed_domains` lists), and the
     /// agent command run in it.
     pub toolchain: &'a DetectedToolchain,
+    /// The settings the sandbox was created with, recorded once creating
+    /// it fully succeeded; `None` when no launch has finished setting it
+    /// up (it's missing, or a launch failed or was killed partway).
+    pub created_with: Option<&'a CreateSettings>,
+}
+
+/// What a sandbox is created with and later launches can't change, as
+/// recorded in its state directory once it's fully set up.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CreateSettings {
+    pub agent: String,
+    /// The agent's config directory, mounted at its usual place.
+    pub agent_config_dir: Option<PathBuf>,
+    /// OpenCode's global config directory, mounted read-only.
+    pub opencode_config_dir: Option<PathBuf>,
+    /// `sandbox.extra_mounts`, as workspaces.
+    pub extra_mounts: Vec<String>,
+    pub cpus: Option<u32>,
+    pub memory: Option<String>,
+    pub kits: Vec<String>,
+    /// The template tag, which follows `sandbox.image`.
+    pub template: String,
+    /// The toolchain installed by built-in provisioning: `devbox`, `flake`
+    /// or `none`.
+    pub toolchain: String,
 }
 
 /// Whether an sbx rule allows or denies.
@@ -144,6 +170,9 @@ pub struct SbxCommand {
 #[derive(Debug, Clone)]
 pub struct LaunchPlan {
     pub sandbox_name: String,
+    /// Deletes a sandbox no launch finished setting up, before `setup`
+    /// creates it again.
+    pub remove: Option<SbxCommand>,
     /// Template the sandbox is created from, when the plan creates it.
     pub create_template: Option<String>,
     /// Commands to run, in order, before `exec`.
@@ -175,6 +204,9 @@ pub struct LaunchPlan {
     /// sandbox once `setup` has run; the record the next launch reconciles
     /// against.
     pub network_rules: Vec<NetworkRule>,
+    /// The settings to record once a sandbox the plan creates is fully set
+    /// up and provisioned.
+    pub create_settings: CreateSettings,
 }
 
 /// Home directory of sbx's `agent` user in the guest.
@@ -821,9 +853,16 @@ fn check_prerequisites(state: &SbxState) -> Result<()> {
     Ok(())
 }
 
+/// Whether the launch creates the sandbox: it's missing, or no launch
+/// finished setting it up (its create-time settings were never recorded).
+pub fn creates_sandbox(state: &SbxState, created_with: Option<&CreateSettings>) -> bool {
+    state.sandbox.is_none() || created_with.is_none()
+}
+
 /// Compute the sbx commands a launch needs.
 ///
-/// When the sandbox is missing: create it from the template with sbx's
+/// When the sandbox is missing, or no launch finished setting it up (it's
+/// removed first): create it from the template with sbx's
 /// generic `shell` agent (agent kits would write into the mounted config
 /// directory), the configured resources and mixin kits, mounting the
 /// worktree, the main repository's git dir (read-only but for what commits
@@ -863,9 +902,35 @@ pub fn launch_plan(
     let name = target.sandbox_name;
     let mut setup = Vec::new();
     let mut create_template = None;
+    let template = super::template::template_tag(&config.resolved_image(agent));
+    let config_dir = config_dir_and_home_subpath(config, agent);
+    let opencode_config_dir = target.opencode_config_dir.filter(|_| agent == "opencode");
+    let sbx = &config.docker_sbx;
+    let create_settings = CreateSettings {
+        agent: agent.to_string(),
+        agent_config_dir: config_dir.as_ref().map(|(dir, _)| dir.clone()),
+        opencode_config_dir: opencode_config_dir.map(Path::to_path_buf),
+        extra_mounts: extra_mounts.clone(),
+        cpus: sbx.cpus(),
+        memory: sbx.memory().map(str::to_string),
+        kits: sbx.kits().to_vec(),
+        template: template.clone(),
+        toolchain: match target.toolchain {
+            DetectedToolchain::Devbox => "devbox",
+            DetectedToolchain::Flake => "flake",
+            DetectedToolchain::None => "none",
+        }
+        .to_string(),
+    };
 
-    if state.sandbox.is_none() {
-        let template = super::template::template_tag(&config.resolved_image(agent));
+    // A sandbox no launch finished setting up is removed and created again.
+    let exists = !creates_sandbox(state, target.created_with);
+    let remove = (state.sandbox.is_some() && !exists).then(|| SbxCommand {
+        args: words(&["rm", "-f", name]),
+        env: Vec::new(),
+    });
+
+    if !exists {
         let mut args = words(&[
             "create",
             "--name",
@@ -876,7 +941,6 @@ pub fn launch_plan(
             "--pull",
             "never",
         ]);
-        let sbx = &config.docker_sbx;
         if let Some(cpus) = sbx.cpus() {
             args.extend(["--cpus".to_string(), cpus.to_string()]);
         }
@@ -891,11 +955,9 @@ pub fn launch_plan(
         args.extend(git_workspaces(target.git));
         // The agent's config directory where the agent looks for it, as on
         // the other backends.
-        let config_dir = config_dir_and_home_subpath(config, agent);
         if let Some((config_dir, subpath)) = &config_dir {
             args.push(format!("{}:{GUEST_HOME}/{subpath}", config_dir.display()));
         }
-        let opencode_config_dir = target.opencode_config_dir.filter(|_| agent == "opencode");
         if let Some(dir) = opencode_config_dir {
             args.push(format!(
                 "{}:{GUEST_HOME}/{OPENCODE_CONFIG_SUBPATH}:ro",
@@ -903,7 +965,7 @@ pub fn launch_plan(
             ));
         }
         args.push(format!("{}:ro", target.state_dir.display()));
-        args.extend(extra_mounts);
+        args.extend(extra_mounts.iter().cloned());
         setup.push(SbxCommand {
             args,
             env: Vec::new(),
@@ -961,7 +1023,7 @@ pub fn launch_plan(
     // the same resource. A rule the user already had stays theirs.
     let sandbox_scope = format!("sandbox:{name}");
     let present = |rule: &NetworkRule| {
-        state.sandbox.is_some()
+        exists
             && state.rules.iter().any(|r| {
                 r.scope == sandbox_scope
                     && r.decision == rule.decision.as_str()
@@ -989,7 +1051,7 @@ pub fn launch_plan(
     let provision = config
         .docker_sbx
         .provision_script()
-        .filter(|_| state.sandbox.is_none())
+        .filter(|_| !exists)
         .map(|script| root_exec(name, words(&["bash", "-c", script])));
 
     // A rule scoped to the sandbox lets the guest reach the supervisor's RPC
@@ -1008,15 +1070,15 @@ pub fn launch_plan(
         }
     }
 
-    let default_provision =
-        if state.sandbox.is_none() && !config.docker_sbx.skip_default_provision() {
-            default_provision(target)
-        } else {
-            Vec::new()
-        };
+    let default_provision = if !exists && !config.docker_sbx.skip_default_provision() {
+        default_provision(target)
+    } else {
+        Vec::new()
+    };
 
     Ok(LaunchPlan {
         sandbox_name: name.to_string(),
+        remove,
         create_template,
         setup,
         default_provision,
@@ -1031,6 +1093,7 @@ pub fn launch_plan(
             .chain(credential_warnings(config, state, name, exec))
             .collect(),
         network_rules,
+        create_settings,
     })
 }
 
@@ -1102,6 +1165,7 @@ mod tests {
         state: PathBuf,
         record: Vec<NetworkRule>,
         toolchain: DetectedToolchain,
+        created: Option<CreateSettings>,
     }
 
     fn git_metadata() -> GitMetadata {
@@ -1121,6 +1185,7 @@ mod tests {
             state: PathBuf::from("/state/docker-sbx/wm-proj-12345678"),
             record: Vec::new(),
             toolchain: DetectedToolchain::None,
+            created: Some(CreateSettings::default()),
         }
     }
 
@@ -1134,6 +1199,7 @@ mod tests {
             state_dir: &p.state,
             network_record: &p.record,
             toolchain: &p.toolchain,
+            created_with: p.created.as_ref(),
         }
     }
 
@@ -1195,6 +1261,77 @@ mod tests {
                 .all(|c| c.args[0] != "create" && !c.args.contains(&"root".to_string())),
             "{:?}",
             plan.setup
+        );
+    }
+
+    #[test]
+    fn sandbox_an_earlier_launch_didnt_finish_is_removed_and_created_again() {
+        // A launch that failed or was killed between `sbx create` and the
+        // end of provisioning leaves a sandbox with no record of its
+        // settings, which would otherwise be used half set up.
+        let mut p = paths();
+        p.created = None;
+        p.record = vec![recorded(RuleDecision::Allow, "kept.com:443")];
+        let config = with_network(NetworkPolicy::Deny, domains(&["kept.com"]));
+        let state = running_with(vec![rule(SCOPE, "kept.com:443")]);
+        let plan = launch_plan(&config, &target(&p), "claude", &state, &exec()).unwrap();
+
+        assert_eq!(
+            plan.remove.as_ref().map(|c| c.args.clone()),
+            Some(args(&["rm", "-f", "wm-proj-12345678"]))
+        );
+        assert!(plan.create_template.is_some());
+        assert_eq!(plan.setup[0].args[0], "create");
+        assert!(!plan.default_provision.is_empty());
+        // `sbx rm` takes the sandbox's rules with it.
+        assert!(
+            policy_commands(&plan).contains(&policy("allow", "kept.com:443")),
+            "{:?}",
+            plan.setup
+        );
+    }
+
+    #[test]
+    fn a_finished_or_missing_sandbox_is_never_removed() {
+        let p = paths();
+        let existing = running_with(Vec::new());
+        for state in [missing(), existing] {
+            let plan = launch_plan(&config(), &target(&p), "claude", &state, &exec()).unwrap();
+            assert!(plan.remove.is_none(), "{:?}", plan.remove);
+        }
+        let mut p = paths();
+        p.created = None;
+        let plan = launch_plan(&config(), &target(&p), "claude", &missing(), &exec()).unwrap();
+        assert!(plan.remove.is_none(), "{:?}", plan.remove);
+    }
+
+    #[test]
+    fn plan_names_the_settings_a_created_sandbox_is_recorded_with() {
+        let p = paths();
+        let config = SandboxConfig {
+            docker_sbx: DockerSbxConfig {
+                cpus: Some(4),
+                memory: Some("8g".to_string()),
+                kits: Some(vec!["docker.io/sbx/task:latest".to_string()]),
+                ..Default::default()
+            },
+            ..config()
+        };
+        let plan = launch_plan(&config, &target(&p), "claude", &missing(), &exec()).unwrap();
+
+        assert_eq!(
+            plan.create_settings,
+            CreateSettings {
+                agent: "claude".to_string(),
+                agent_config_dir: Some(PathBuf::from("/home/me/.claude")),
+                opencode_config_dir: None,
+                extra_mounts: Vec::new(),
+                cpus: Some(4),
+                memory: Some("8g".to_string()),
+                kits: vec!["docker.io/sbx/task:latest".to_string()],
+                template: super::super::template::template_tag("test-image:latest"),
+                toolchain: "none".to_string(),
+            }
         );
     }
 

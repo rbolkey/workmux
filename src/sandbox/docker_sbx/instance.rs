@@ -1,7 +1,9 @@
 //! sbx sandbox state and commands.
 
 use anyhow::{Context, Result, bail};
+use nix::fcntl::{Flock, FlockArg};
 use serde::{Deserialize, Serialize};
+use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -12,7 +14,8 @@ use tracing::{debug, info, warn};
 use crate::config::Config;
 
 use super::plan::{
-    ExecRequest, LaunchPlan, LaunchTarget, NetworkRule, Platform, SbxCommand, SbxState,
+    CreateSettings, ExecRequest, LaunchPlan, LaunchTarget, NetworkRule, Platform, SbxCommand,
+    SbxState,
 };
 
 /// A sandbox from `sbx ls --json`.
@@ -366,6 +369,57 @@ fn write_network_record(state_dir: &Path, rules: &[NetworkRule]) -> Result<()> {
     crate::util::write_atomic(&state_dir.join(NETWORK_RECORD_FILE), content.as_bytes())
 }
 
+/// File in a sandbox's state directory recording the settings it was
+/// created with, written once creating it fully succeeded. A sandbox
+/// without it was left half set up by a launch that failed or was killed.
+const CREATED_RECORD_FILE: &str = "created.json";
+
+/// The settings a sandbox was created with, or `None` if no launch
+/// finished setting it up (or the record is corrupted).
+fn read_created_record(state_dir: &Path) -> Option<CreateSettings> {
+    let path = state_dir.join(CREATED_RECORD_FILE);
+    let content = std::fs::read_to_string(&path).ok()?;
+    match serde_json::from_str(&content) {
+        Ok(settings) => Some(settings),
+        Err(e) => {
+            warn!(?path, error = %e, "corrupted sbx create record, ignoring");
+            None
+        }
+    }
+}
+
+/// Record the settings a sandbox was created with, once it's fully set up.
+fn write_created_record(state_dir: &Path, settings: &CreateSettings) -> Result<()> {
+    let content = serde_json::to_string_pretty(settings)?;
+    crate::util::write_atomic(&state_dir.join(CREATED_RECORD_FILE), content.as_bytes())
+}
+
+/// Forget a sandbox's create record before creating it again.
+fn remove_created_record(state_dir: &Path) -> Result<()> {
+    match std::fs::remove_file(state_dir.join(CREATED_RECORD_FILE)) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+        _ => Ok(()),
+    }
+}
+
+/// Hold an exclusive lock on a sandbox's state directory while a launch
+/// sets the sandbox up, so concurrent launches into one worktree's sandbox
+/// (the panes of `target: all`) neither create it twice nor remove one that
+/// another is still setting up.
+fn lock_state_dir(state_dir: &Path) -> Result<Flock<File>> {
+    let lock_path = state_dir.join(".lock");
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("Failed to open lock file: {}", lock_path.display()))?;
+    Flock::lock(file, FlockArg::LockExclusive)
+        .map_err(|(_file, errno)| errno)
+        .with_context(|| format!("Failed to acquire lock: {}", lock_path.display()))
+}
+
 /// Run one sbx command from a plan, failing with sbx's error.
 fn run_sbx(command: &SbxCommand) -> Result<()> {
     debug!(args = ?command.args, "running sbx");
@@ -425,8 +479,10 @@ pub fn prepare_launch(
     let toolchain =
         crate::sandbox::toolchain::resolve_toolchain(&config.sandbox.toolchain(), &worktree_root);
 
+    let _lock = lock_state_dir(&state_dir)?;
     let state = gather_state(&name)?;
     let network_record = read_network_record(&state_dir);
+    let created_with = read_created_record(&state_dir);
     let target = LaunchTarget {
         sandbox_name: &name,
         worktree_root: &worktree_root,
@@ -436,6 +492,7 @@ pub fn prepare_launch(
         state_dir: &state_dir,
         network_record: &network_record,
         toolchain: &toolchain,
+        created_with: created_with.as_ref(),
     };
     let plan = super::launch_plan(&config.sandbox, &target, agent, &state, exec)?;
     for note in &plan.notes {
@@ -447,9 +504,19 @@ pub fn prepare_launch(
         eprintln!("warning: {warning}");
     }
 
+    let creating = plan.create_template.is_some();
     let image = config.sandbox.resolved_image(agent);
-    if plan.create_template.is_some() {
+    if creating {
         super::template::ensure_template(&image)?;
+        if let Some(remove) = &plan.remove {
+            info!(sandbox = %name, "removing sbx sandbox no launch finished setting up");
+            eprintln!(
+                "Removing sbx sandbox {name}, which an earlier launch didn't finish setting up; \
+                 creating it again"
+            );
+            run_sbx(remove)?;
+        }
+        remove_created_record(&state_dir)?;
         info!(sandbox = %name, "creating sbx sandbox");
         eprintln!("  Workspaces:");
         if let Some(create) = plan.setup.first() {
@@ -474,10 +541,28 @@ pub fn prepare_launch(
     if pending != network_record {
         write_network_record(&state_dir, &pending)?;
     }
+    // Everything after `sbx create` finishes a sandbox this launch creates:
+    // when any of it fails, remove the sandbox so the next launch creates
+    // and provisions it again.
+    let remove_unfinished = |error: anyhow::Error| {
+        if let Err(rm) = SbxInstance::remove_by_name(&name) {
+            warn!(sandbox = %name, error = %rm, "failed to remove unfinished sbx sandbox");
+        }
+        error
+    };
     for (i, command) in plan.setup.iter().enumerate() {
-        if i == 0 && plan.create_template.is_some() {
+        if i == 0 && creating {
             let msg = format!("Creating sbx sandbox {name}");
             crate::spinner::with_spinner(&msg, || run_sbx(command))?;
+        } else if creating {
+            run_sbx(command)
+                .map_err(remove_unfinished)
+                .with_context(|| {
+                    format!(
+                        "Setting up sbx sandbox {name} failed; the sandbox was removed, \
+                     launch again"
+                    )
+                })?;
         } else {
             run_sbx(command)?;
         }
@@ -485,34 +570,27 @@ pub fn prepare_launch(
     if plan.network_rules != pending {
         write_network_record(&state_dir, &plan.network_rules)?;
     }
-    // Provisioning runs only on create: when it fails, remove the sandbox
-    // so the next launch creates and provisions it again.
-    let provision_or_remove = |command: &SbxCommand| {
+    let provision = |command: &SbxCommand| {
         let msg = format!("Provisioning sbx sandbox {name}");
-        let result = crate::spinner::with_spinner(&msg, || run_sbx(command));
-        if result.is_err()
-            && let Err(rm) = SbxInstance::remove_by_name(&name)
-        {
-            warn!(sandbox = %name, error = %rm, "failed to remove unprovisioned sbx sandbox");
-        }
-        result
+        crate::spinner::with_spinner(&msg, || run_sbx(command)).map_err(remove_unfinished)
     };
     for command in &plan.default_provision {
-        provision_or_remove(command).context(format!(
+        provision(command).context(format!(
             "workmux's built-in provisioning failed in sbx sandbox {name}; the sandbox \
              was removed. `sbx policy log` lists requests sbx blocked; launch again, or set \
              sandbox.docker_sbx.skip_default_provision if the image provides the toolchain"
         ))?;
     }
-    if let Some(provision) = &plan.provision {
-        provision_or_remove(provision).context(format!(
+    if let Some(command) = &plan.provision {
+        provision(command).context(format!(
             "sandbox.docker_sbx.provision failed in sbx sandbox {name}; \
              the sandbox was removed, fix the script and launch again"
         ))?;
-    } else if plan.create_template.is_none()
-        && config.sandbox.docker_sbx.provision_script().is_some()
-    {
+    } else if !creating && config.sandbox.docker_sbx.provision_script().is_some() {
         info!(sandbox = %name, "custom provision script only runs on sandbox creation; recreate sandbox to apply changes");
+    }
+    if creating {
+        write_created_record(&state_dir, &plan.create_settings)?;
     }
     Ok(plan)
 }
@@ -681,6 +759,24 @@ mod tests {
 
         std::fs::write(dir.path().join(NETWORK_RECORD_FILE), "not json").unwrap();
         assert!(read_network_record(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn created_record_round_trips_and_is_missing_until_written() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(read_created_record(dir.path()), None);
+
+        let settings = CreateSettings {
+            agent: "claude".to_string(),
+            memory: Some("8g".to_string()),
+            ..Default::default()
+        };
+        write_created_record(dir.path(), &settings).unwrap();
+        assert_eq!(read_created_record(dir.path()), Some(settings));
+
+        remove_created_record(dir.path()).unwrap();
+        assert_eq!(read_created_record(dir.path()), None);
+        remove_created_record(dir.path()).unwrap();
     }
 
     #[test]
