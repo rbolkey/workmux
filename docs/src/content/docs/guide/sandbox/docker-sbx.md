@@ -80,7 +80,7 @@ sandbox:
 | `docker_sbx.skip_default_provision` | `false`                       | Skip workmux's built-in provisioning (see [Provisioning](#provisioning))                        |
 | `docker_sbx.kits`                   | `[]`                          | sbx mixin kits added when the sandbox is created (see [Kits](#kits)). **Global config only.**   |
 
-sbx has no per-sandbox disk setting, so there is no `disk`. Resources, `provision` and `kits` apply when the sandbox is created; recreate it with `workmux sandbox prune` after changing them.
+sbx has no per-sandbox disk setting, so there is no `disk`. Resources, `provision` and `kits` apply when the sandbox is created; recreate it with `workmux sandbox prune` after changing them. workmux warns at launch when a setting fixed at creation (`agent`, `agent_config_dir`, `extra_mounts`, `cpus`, `memory`, `kits`, `image`, the toolchain) differs from what the sandbox was created with, naming the settings.
 
 ## How it works
 
