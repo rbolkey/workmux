@@ -1,10 +1,11 @@
 //! Docker Sandboxes (`sbx`) backend for sandbox.
 //!
 //! Runs each worktree's agents in its own sbx microVM sandbox. The worktree,
-//! the main repository's git dir and the agent's config directory are
-//! mounted at their workstation paths; the agent command runs through
+//! the main repository's git dir (read-only but for what commits write) and
+//! the agent's config directory are mounted at their workstation paths; the agent command runs through
 //! `sbx exec`, as on the container backend.
 
+mod git;
 mod instance;
 mod plan;
 mod template;
