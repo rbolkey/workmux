@@ -161,7 +161,7 @@ This is useful when you want different MCP servers, project configs, or settings
 A coordinator agent sits on the main branch, plans work, and delegates tasks to worktree agents via `/worktree`. See [Workflows](/guide/workflows/#from-an-ongoing-agent-session) for more on this pattern.
 :::
 
-Coordinator agents can run inside a sandbox using `workmux sandbox agent`. When the coordinator calls `workmux add` from inside the sandbox, the command is automatically routed through RPC to the host, where sub-agents are created normally (and sandboxed if the project config enables it).
+Coordinator agents can run inside a sandbox using `workmux sandbox agent`. When the coordinator calls `workmux add` from inside the sandbox, the command is automatically routed through RPC to the host, where sub-agents are created normally (and sandboxed if the project config enables it). workmux inside a sandbox never shows the first-run prompts (nerdfont, status tracking hooks, skills), which would otherwise install into the agent config directory mounted from your workstation.
 
 Alternatively, coordinators can run on the host (unsandboxed) and only sandbox leaf agents.
 
