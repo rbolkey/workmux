@@ -473,6 +473,13 @@ fn cleanup_impl(
             context.main_worktree_root.display()
         ));
     }
+    // An sbx sandbox outlives its panes; delete it with the worktree, on
+    // every removal path (rollbacks included). Best effort.
+    let project_root = context
+        .git_common_dir
+        .parent()
+        .unwrap_or(&context.git_common_dir);
+    crate::sandbox::remove_docker_sbx_sandbox(project_root, worktree_path);
     let (expected_identity, missing_admin_identity) =
         match capture_worktree_identity(worktree_path, &context.git_common_dir) {
             Ok(identity) => (identity, None),

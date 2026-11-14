@@ -23,7 +23,7 @@ pub use wrap::wrap_for_docker_sbx;
 /// Prefix for all workmux-managed sbx sandbox names.
 pub const SANDBOX_PREFIX: &str = "wm-";
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::path::Path;
 use tracing::debug;
 
@@ -35,15 +35,29 @@ const MAX_NAME_LEN: usize = 63;
 /// Each worktree gets its own sandbox, so the hash is of the worktree path;
 /// the project directory name is there for recognising sandboxes in `sbx ls`.
 /// Names stay within sbx's rules: lowercase letters, digits and `-`, at most
-/// 63 characters.
+/// 63 characters. The project is found from the worktree's `.git` pointer
+/// files, without running git.
 pub fn sandbox_name(worktree_root: &Path) -> Result<String> {
-    let project_root = crate::sandbox::lima::determine_project_root(worktree_root)?;
+    let identity = crate::git::RepositoryIdentity::discover(worktree_root)
+        .context("Failed to find the worktree's repository")?;
+    let project_root = identity
+        .common_dir
+        .parent()
+        .unwrap_or(&identity.common_dir)
+        .to_path_buf();
+    Ok(sandbox_name_in(&project_root, worktree_root))
+}
+
+/// The sandbox name for a worktree of the project at `project_root` (the
+/// parent of its git common dir), without looking at the worktree's git
+/// metadata, which may already be gone when it's being removed.
+pub fn sandbox_name_in(project_root: &Path, worktree_root: &Path) -> String {
     let canonical = worktree_root
         .canonicalize()
         .unwrap_or_else(|_| worktree_root.to_path_buf());
-    let name = sandbox_name_for(&project_root, &canonical);
+    let name = sandbox_name_for(project_root, &canonical);
     debug!(sandbox = %name, "resolved sbx sandbox name");
-    Ok(name)
+    name
 }
 
 fn sandbox_name_for(project_root: &Path, worktree_root: &Path) -> String {
@@ -100,6 +114,45 @@ mod tests {
             sandbox_name_for(project, Path::new("/code/proj__worktrees/a")),
             sandbox_name_for(project, Path::new("/code/proj__worktrees/a"))
         );
+    }
+
+    #[test]
+    fn worktree_names_its_sandbox_without_git_as_git_did() {
+        let temp = tempfile::tempdir().unwrap();
+        let main = temp.path().join("My_Project");
+        std::fs::create_dir(&main).unwrap();
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(&main)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        git(&["init", "-q"]);
+        git(&[
+            "-c",
+            "user.name=T",
+            "-c",
+            "user.email=t@example.com",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "base",
+        ]);
+        let worktree = temp.path().join("My_Project__worktrees/feat");
+        git(&["worktree", "add", "-qb", "feat", worktree.to_str().unwrap()]);
+
+        // Names given before stay: the project root git reports.
+        let project_root = crate::sandbox::lima::determine_project_root(&worktree).unwrap();
+        let before = sandbox_name_in(&project_root, &worktree);
+        assert_eq!(sandbox_name(&worktree).unwrap(), before);
+        assert!(before.starts_with("wm-my-project-"), "{before}");
+        // Removal names it from the project root it already knows.
+        assert_eq!(sandbox_name_in(&main, &worktree), before);
     }
 
     #[test]
