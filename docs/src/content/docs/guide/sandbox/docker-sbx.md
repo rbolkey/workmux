@@ -69,10 +69,18 @@ Settings specific to sbx are nested under `sandbox.docker_sbx`.
 3. Creates the sandbox if it doesn't exist yet, and adds its policy rule
 4. Runs the agent command with `sbx exec -it` in the pane's working directory
 5. Handles RPC requests from the guest workmux binary
+6. When the pane closes, hangs up the processes its `sbx exec` started in the guest
 
 The guest reaches the RPC server through `host.docker.internal`. sbx names the workstation `localhost` in its policy, so workmux adds one `localhost` rule scoped to each sandbox (`sbx policy ls <sandbox>` lists it). The rule lets that sandbox reach services listening on the workstation's loopback interface. workmux never changes your global sbx policy.
 
-Closing a pane ends only that pane's `sbx exec`. sbx stops an idle sandbox about 30 seconds after its last session ends, and the next pane starts it again.
+### Lifecycle
+
+The sandbox belongs to the worktree, not to a pane:
+
+- With `target: all`, every pane of the worktree runs in the worktree's one sandbox, so shells and agents see the same environment.
+- Closing a pane or window, or the agent exiting, ends only that pane's session. sbx keeps a session's processes running when its `sbx exec` goes away, so the supervisor hangs them up itself; other panes' sessions keep running.
+- sbx stops an idle sandbox about 30 seconds after its last session ends. The next pane, `workmux open` or `workmux sandbox shell` starts it again in about a second; there's no separate start step.
+- `workmux remove` (and `workmux merge`, which removes the worktree) deletes the worktree's sandbox, with its policy rules and any sbx secrets scoped to it.
 
 ### What's mounted
 
@@ -100,3 +108,24 @@ sbx creates sandboxes from templates kept in its own image store. workmux builds
 ### Authentication
 
 Claude stores its login in the macOS Keychain, which the sandbox can't reach. Sign in to Claude once inside a sandbox; the login is written to the mounted config directory and persists across sandboxes. See [Credentials](/guide/sandbox/features/#credentials).
+
+## Sandbox management
+
+`workmux sandbox stop`, `prune` and `shell` act on sbx sandboxes when the backend is `docker_sbx`, as they do on Lima VMs:
+
+```bash
+# Stop running workmux sandboxes (interactive list, a name, or --all; -y skips the prompt)
+workmux sandbox stop
+workmux sandbox stop wm-myproject-abc12345
+workmux sandbox stop --all --yes
+
+# Delete all workmux sandboxes (wm-* in `sbx ls`), after confirmation
+workmux sandbox prune
+workmux sandbox prune --force
+
+# Open a shell in the current worktree's sandbox (creating it if needed)
+workmux sandbox shell
+workmux sandbox shell -- git status
+```
+
+A stopped sandbox keeps its state and starts again when a pane needs it. A pruned sandbox is created again by the next `workmux open`. `workmux sandbox shell` has no RPC server, so host commands and status updates don't work in it; `--exec` means the same as without it, since the sandbox is already persistent.

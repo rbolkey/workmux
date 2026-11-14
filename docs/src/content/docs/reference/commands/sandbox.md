@@ -3,7 +3,7 @@ title: "sandbox"
 description: Manage sandbox backends and tooling
 ---
 
-Commands for managing sandbox functionality across container (Docker/Podman/Apple Container) and Lima backends.
+Commands for managing sandbox functionality across container (Docker/Podman/Apple Container), Lima and Docker Sandboxes (`docker_sbx`) backends.
 
 ## Container commands
 
@@ -41,11 +41,13 @@ workmux sandbox init-dockerfile [--force]
 
 Creates a `Dockerfile.sandbox` in the current directory with the base system setup (Debian, git, workmux) and agent-specific installation (e.g., Claude Code) combined into a single file.
 
-## Lima commands
+## Lima and Docker Sandboxes commands
+
+With `backend: docker_sbx`, `stop` and `prune` act on workmux's sbx sandboxes (`wm-*` in `sbx ls`) instead of Lima VMs, with the same arguments, prompts and confirmation.
 
 ### sandbox stop
 
-Stop Lima VMs to free resources.
+Stop Lima VMs (or sbx sandboxes) to free resources.
 
 ```bash
 # Interactive mode - show list and select VM
@@ -74,14 +76,14 @@ This command helps you stop running Lima VMs created by workmux to free up syste
 
 **Notes:**
 
-- This command only works with Lima backend and requires `limactl` to be installed
+- This command works with the Lima backend (requires `limactl`) and the docker_sbx backend (requires `sbx`)
 - Only running VMs are shown in interactive mode
 - If a specified VM is already stopped, the command reports this and exits successfully
 - Non-interactive environments (pipes, scripts) require `--all` or a specific VM name
 
 ### sandbox prune
 
-Delete unused Lima VMs to reclaim disk space.
+Delete unused Lima VMs (or sbx sandboxes) to reclaim disk space.
 
 ```bash
 # Interactive - show VMs and confirm deletion
@@ -96,6 +98,8 @@ workmux sandbox prune --force
 - `-f, --force` - Skip confirmation and delete all workmux VMs
 
 Lists all workmux Lima VMs (those starting with `wm-` prefix) with their size, age, and last accessed time, then prompts for confirmation before deleting them. Requires `limactl` to be installed.
+
+With the docker_sbx backend, lists workmux's sbx sandboxes with their age and last use, and deletes them with `sbx rm`, which also removes their policy rules and the sbx secrets scoped to them. Requires `sbx` to be installed.
 
 ## General commands
 
@@ -128,7 +132,7 @@ The key difference from `sandbox shell` is that this starts an RPC server, enabl
 
 ### sandbox shell
 
-Start an interactive shell in a sandbox. Uses the same mounts and environment as a normal worktree sandbox. Works with both container and Lima backends.
+Start an interactive shell in a sandbox. Uses the same mounts and environment as a normal worktree sandbox. Works with the container, Lima and docker_sbx backends.
 
 ```bash
 # Start a new shell (container backend starts a new container, Lima connects to existing VM)
@@ -143,13 +147,14 @@ workmux sandbox shell --exec
 
 **Options:**
 
-- `-e, --exec` - Exec into an existing container for this worktree instead of starting a new one (container backend only)
+- `-e, --exec` - Exec into an existing container for this worktree instead of starting a new one (container backend; docker_sbx accepts it with the same meaning as without it)
 - `<command...>` - Command to run instead of bash
 
 **Backend behavior:**
 
 - **Container:** Starts a fresh container with the same mounts and environment as a normal worktree sandbox. With `--exec`, attaches to an existing container instead.
 - **Lima:** Connects to the Lima VM for the current worktree (creating it if needed). The `--exec` flag is not supported since Lima VMs are persistent and `shell` always connects to the existing VM.
+- **Docker Sandboxes:** Runs the shell with `sbx exec` in the current worktree's sbx sandbox, creating it if needed and starting it if sbx stopped it. `--exec` means the same.
 
 ### sandbox install-dev
 
