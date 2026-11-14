@@ -112,7 +112,7 @@ Codex also gets `--dangerously-bypass-hook-trust`. Codex otherwise asks you to r
 
 ## Credentials
 
-Every sandbox backend mounts agent-specific credential directories from the host. The mounted directory depends on the configured `agent`:
+Every sandbox backend mounts agent-specific credential directories from the host (under `docker_sbx`, optionally with the credential files hidden behind placeholders; see [Placeholder agent credentials](/guide/sandbox/docker-sbx/#placeholder-agent-credentials)). The mounted directory depends on the configured `agent`:
 
 | Agent      | Host directory               | Container mount                 | Lima mount                       | `docker_sbx` mount                     |
 | ---------- | ---------------------------- | ------------------------------- | -------------------------------- | -------------------------------------- |
