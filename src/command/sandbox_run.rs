@@ -463,6 +463,7 @@ fn run_docker_sbx(
         session: docker_sbx::new_session()?,
         rpc_port: Some(rpc_port),
         tty: std::io::stdin().is_terminal(),
+        in_toolchain: true,
     };
     let plan = docker_sbx::prepare_launch(config, worktree_root, pane_cwd, agent, &exec)?;
 

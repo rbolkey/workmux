@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 use crate::config::SandboxConfig;
+use crate::sandbox::toolchain::{self, DetectedToolchain};
 use crate::shell::shell_quote;
 
 use super::instance::{SbxCheck, SbxRule, SbxSandboxInfo, SbxSecret};
@@ -58,6 +59,10 @@ pub struct LaunchTarget<'a> {
     /// The network rules workmux last wrote for the sandbox (see
     /// [`LaunchPlan::network_rules`]).
     pub network_record: &'a [NetworkRule],
+    /// The toolchain the worktree uses (see
+    /// [`toolchain::resolve_toolchain`]): installed on create, its endpoints
+    /// allowed, and the agent command run in it.
+    pub toolchain: &'a DetectedToolchain,
 }
 
 /// Whether an sbx rule allows or denies.
@@ -119,6 +124,10 @@ pub struct ExecRequest {
     pub rpc_port: Option<u16>,
     /// Whether stdin is a terminal. sbx's `exec -t` fails without one.
     pub tty: bool,
+    /// Whether the command runs in the worktree's toolchain environment, as
+    /// the supervisor runs the agent command (on Lima too); `sandbox shell`
+    /// runs its command without it.
+    pub in_toolchain: bool,
 }
 
 /// One `sbx` invocation. Environment values are passed through the process
@@ -138,6 +147,10 @@ pub struct LaunchPlan {
     pub create_template: Option<String>,
     /// Commands to run, in order, before `exec`.
     pub setup: Vec<SbxCommand>,
+    /// workmux's built-in provisioning, run after `setup` when the plan
+    /// creates the sandbox, unless `skip_default_provision` is set: login
+    /// shells keep the shims on `PATH`, and the toolchain is installed.
+    pub default_provision: Vec<SbxCommand>,
     /// The custom provision script, run as root after `setup` when the plan
     /// creates the sandbox, so the sandbox's network rules apply to it.
     pub provision: Option<SbxCommand>,
@@ -155,22 +168,40 @@ pub struct LaunchPlan {
     /// `sandbox.env_passthrough` that hand the agent a credential sbx holds
     /// a secret for.
     pub warnings: Vec<String>,
-    /// The `sandbox.network` rules workmux has written for the sandbox once
-    /// `setup` has run; the record the next launch reconciles against.
+    /// The `sandbox.network` and toolchain rules workmux has written for the
+    /// sandbox once `setup` has run; the record the next launch reconciles
+    /// against.
     pub network_rules: Vec<NetworkRule>,
 }
 
 /// Home directory of sbx's `agent` user in the guest.
 const GUEST_HOME: &str = "/home/agent";
 
-/// The image's system PATH.
-const GUEST_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+/// Where Nix puts its own binaries in the guest.
+const NIX_PROFILE_BIN: &str = "/nix/var/nix/profiles/default/bin";
 
 /// Environment variable marking the processes of one exec in the guest.
 const SESSION_ENV: &str = "WM_SBX_SESSION";
 
 /// Git config sbx includes at command scope in the guest.
 const SBX_GIT_CONFIG: &str = "/home/agent/.gitconfig_ignore_scope";
+
+/// Hosts installing and using Nix and Devbox reach: the Nix installer and
+/// binary caches, Devbox's installer, binary (a GitHub release) and package
+/// search, and GitHub, which serves nixpkgs.
+const TOOLCHAIN_HOSTS: &[&str] = &[
+    "install.determinate.systems",
+    "cache.nixos.org",
+    "get.jetify.com",
+    "get.jetpack.io",
+    "releases.jetify.com",
+    "releases.jetpack.io",
+    "www.nixsearch.com",
+    "github.com",
+    "api.github.com",
+    "codeload.github.com",
+    "release-assets.githubusercontent.com",
+];
 
 /// sbx's name for the workstation in policy rules.
 const WORKSTATION_HOST: &str = "localhost";
@@ -262,13 +293,6 @@ fn exec_command(target: &LaunchTarget, exec: &ExecRequest) -> SbxCommand {
         args.push("-e".to_string());
         args.push(key.clone());
     }
-    // Put the shims first. PATH goes by value: in sbx's own environment it
-    // would also change where sbx itself is looked up.
-    args.push("-e".to_string());
-    args.push(format!(
-        "PATH={}:{GUEST_HOME}/.local/bin:{GUEST_PATH}",
-        target.state_dir.join("shims/bin").display()
-    ));
     args.push(target.sandbox_name.to_string());
     // bash, so BASH_ENV brings in the environment sbx keeps in
     // /etc/sandbox-persistent.sh.
@@ -280,6 +304,19 @@ fn exec_command(target: &LaunchTarget, exec: &ExecRequest) -> SbxCommand {
             .collect::<Vec<_>>()
             .join(" "),
     };
+    let command = if exec.in_toolchain {
+        toolchain::wrap_command(&command, target.toolchain)
+    } else {
+        command
+    };
+    // Put the shims first, extending the image's PATH in the guest rather
+    // than passing one with `-e`, which would replace it (and, in sbx's own
+    // environment, change where sbx itself is looked up).
+    let shims = target.state_dir.join("shims/bin");
+    let command = format!(
+        "export PATH={}:{GUEST_HOME}/.local/bin:{NIX_PROFILE_BIN}:\"$PATH\"; {command}",
+        shell_quote(&shims.to_string_lossy())
+    );
     args.extend(words(&["bash", "-c", &command]));
     SbxCommand { args, env }
 }
@@ -302,6 +339,60 @@ fn keep_sbx_git_config(env: &mut Vec<(String, String)>) {
     *count = (n + 1).to_string();
     env.push((format!("GIT_CONFIG_KEY_{n}"), "include.path".to_string()));
     env.push((format!("GIT_CONFIG_VALUE_{n}"), SBX_GIT_CONFIG.to_string()));
+}
+
+/// workmux's built-in provisioning of a new sandbox, as Lima's: as root,
+/// keep the shims on `PATH` for login shells (agents like Codex run commands
+/// with `bash -lc`, whose /etc/profile resets `PATH`) and install Nix and
+/// Devbox when the worktree uses a toolchain; then, as the agent, put Nix
+/// on login shells' `PATH` and fetch Devbox's binary.
+fn default_provision(target: &LaunchTarget) -> Vec<SbxCommand> {
+    let shims = shell_quote(&target.state_dir.join("shims/bin").to_string_lossy());
+    let mut script = format!(
+        r#"set -euxo pipefail
+cat > /etc/profile.d/workmux-shims.sh <<'PROFILESCRIPT'
+if [ -d {shims} ]; then
+    PATH={shims}:"$PATH"
+    export PATH
+fi
+PROFILESCRIPT
+"#
+    );
+    let needs_nix = *target.toolchain != DetectedToolchain::None;
+    if needs_nix {
+        // Single-user sandbox: the agent owns the store, as on Lima. The
+        // launcher Devbox installs is execute-only; bash needs to read it.
+        script.push_str(
+            r#"
+if ! command -v nix >/dev/null 2>&1; then
+    curl --proto '=https' --tlsv1.2 -sSf -L https://install.determinate.systems/nix | \
+      sh -s -- install linux --init none --no-confirm
+    chown -R agent:agent /nix
+fi
+
+if ! command -v devbox >/dev/null 2>&1; then
+    curl -fsSL https://get.jetify.com/devbox | bash -s -- -f
+    chmod +r /usr/local/bin/devbox
+fi
+"#,
+        );
+    }
+    let name = target.sandbox_name;
+    let mut commands = vec![root_exec(name, words(&["bash", "-c", &script]))];
+    if needs_nix {
+        // As the agent, so Devbox's binary lands in the agent's cache.
+        let script = r#"set -euxo pipefail
+if ! grep -q 'nix-daemon.sh' ~/.profile 2>/dev/null; then
+    echo '. /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh' >> ~/.profile
+fi
+devbox version
+"#;
+        commands.push(SbxCommand {
+            args: words(&["exec", name, "bash", "-c", script]),
+            env: Vec::new(),
+        });
+    }
+    commands
 }
 
 /// Send SIGHUP to every guest process that carries the exec's session
@@ -410,21 +501,27 @@ fn extra_mount_workspaces(config: &SandboxConfig, target: &LaunchTarget) -> Resu
 
 /// `sandbox.network` as rules scoped to the sandbox. Under `deny`, port 443
 /// to each allowed domain, as workmux's CONNECT proxy allows on the
-/// container backend; under `allow`, none.
+/// container backend; under `allow`, none. Either way, port 443 to the
+/// toolchain's endpoints when the worktree uses one: the global sbx policy
+/// may block them (`balanced` does).
 ///
 /// workmux's `*.d` matches subdomains at any depth but not `d`; sbx's `*.d`
 /// matches one label and its `**.d` any depth and `d` too. So `*.d` becomes
 /// `**.d` with a deny for `d`, unless `d` is itself allowed.
-fn network_rules(config: &SandboxConfig) -> Vec<NetworkRule> {
-    if !config.network_policy_is_deny() {
-        return Vec::new();
+fn network_rules(config: &SandboxConfig, toolchain: &DetectedToolchain) -> Vec<NetworkRule> {
+    let mut hosts: Vec<String> = Vec::new();
+    if config.network_policy_is_deny() {
+        hosts.extend(
+            config
+                .network
+                .allowed_domains()
+                .iter()
+                .map(|entry| entry.host().to_ascii_lowercase()),
+        );
     }
-    let hosts: Vec<String> = config
-        .network
-        .allowed_domains()
-        .iter()
-        .map(|entry| entry.host().to_ascii_lowercase())
-        .collect();
+    if *toolchain != DetectedToolchain::None {
+        hosts.extend(TOOLCHAIN_HOSTS.iter().map(|host| host.to_string()));
+    }
     let allowed = |host: &str| {
         hosts.iter().any(|pattern| match pattern.strip_prefix('*') {
             Some(suffix) => host.ends_with(suffix),
@@ -613,9 +710,12 @@ fn check_prerequisites(state: &SbxState) -> Result<()> {
 /// at their host paths; then, as root, link the config directory to where
 /// the agent looks for it and seed Claude's onboarding state. On every
 /// launch: bind pi's and OMP's binaries directory to a guest-local one,
-/// reconcile the sandbox's rules with `sandbox.network`, and allow the
-/// supervisor's RPC port until the exec ends. Last, when the sandbox was
-/// just created, the `provision` script.
+/// reconcile the sandbox's rules with `sandbox.network` and the toolchain's
+/// endpoints, and allow the supervisor's RPC port until the exec ends. Last,
+/// when the sandbox was just created, workmux's built-in provisioning
+/// (shims on login shells' `PATH`, Nix and Devbox for a toolchain) and the
+/// `provision` script. The exec runs the agent command in the toolchain's
+/// environment.
 pub fn launch_plan(
     config: &SandboxConfig,
     target: &LaunchTarget,
@@ -744,7 +844,7 @@ pub fn launch_plan(
                     && r.resources.contains(&rule.resource)
             })
     };
-    let wanted = network_rules(config);
+    let wanted = network_rules(config, target.toolchain);
     for rule in target.network_record {
         if !wanted.contains(rule) && present(rule) {
             setup.push(policy_command(name, "rm", &rule.resource));
@@ -760,10 +860,8 @@ pub fn launch_plan(
         }
     }
 
-    // The custom provision script runs once, as root, when the sandbox is
-    // created. The template already holds what Lima's built-in provisioning
-    // installs, so there is no built-in step for skip_default_provision to
-    // skip.
+    // Provisioning runs once, when the sandbox is created: workmux's own
+    // (unless skip_default_provision), then the custom script, as root.
     let provision = config
         .docker_sbx
         .provision_script()
@@ -786,10 +884,18 @@ pub fn launch_plan(
         }
     }
 
+    let default_provision =
+        if state.sandbox.is_none() && !config.docker_sbx.skip_default_provision() {
+            default_provision(target)
+        } else {
+            Vec::new()
+        };
+
     Ok(LaunchPlan {
         sandbox_name: name.to_string(),
         create_template,
         setup,
+        default_provision,
         provision,
         exec: exec_command(target, exec),
         hangup: hangup_command(target, exec),
@@ -865,6 +971,7 @@ mod tests {
         git: GitMetadata,
         state: PathBuf,
         record: Vec<NetworkRule>,
+        toolchain: DetectedToolchain,
     }
 
     fn git_metadata() -> GitMetadata {
@@ -883,6 +990,7 @@ mod tests {
             git: git_metadata(),
             state: PathBuf::from("/state/docker-sbx/wm-proj-12345678"),
             record: Vec::new(),
+            toolchain: DetectedToolchain::None,
         }
     }
 
@@ -895,6 +1003,7 @@ mod tests {
             opencode_config_dir: None,
             state_dir: &p.state,
             network_record: &p.record,
+            toolchain: &p.toolchain,
         }
     }
 
@@ -908,6 +1017,7 @@ mod tests {
             session: "0123456789abcdef".to_string(),
             rpc_port: Some(4242),
             tty: true,
+            in_toolchain: true,
         }
     }
 
@@ -1583,13 +1693,12 @@ mod tests {
                 "WM_RPC_TOKEN",
                 "-e",
                 "WM_SBX_SESSION",
-                "-e",
-                "PATH=/state/docker-sbx/wm-proj-12345678/shims/bin:/home/agent/.local/bin:\
-                 /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
                 "wm-proj-12345678",
                 "bash",
                 "-c",
-                "claude --dangerously-skip-permissions",
+                "export PATH=/state/docker-sbx/wm-proj-12345678/shims/bin:/home/agent/.local/bin:\
+                 /nix/var/nix/profiles/default/bin:\"$PATH\"; \
+                 claude --dangerously-skip-permissions",
             ])
         );
         assert!(!plan.exec.args.iter().any(|a| a.contains("secret")));
@@ -1612,9 +1721,88 @@ mod tests {
             ..exec()
         };
         let plan = launch_plan(&config(), &target(&p), "claude", &missing(), &words).unwrap();
+        let line = plan.exec.args.last().unwrap();
+        assert!(line.ends_with("; bash -c 'set -x; echo \"a b\"'"), "{line}");
+    }
+
+    fn exec_line(plan: &LaunchPlan) -> &str {
+        plan.exec.args.last().unwrap()
+    }
+
+    fn with_toolchain(toolchain: DetectedToolchain) -> Paths {
+        Paths {
+            toolchain,
+            ..paths()
+        }
+    }
+
+    #[test]
+    fn agent_command_runs_in_the_worktrees_toolchain_as_on_lima() {
+        let p = with_toolchain(DetectedToolchain::Flake);
+        let plan = launch_plan(&config(), &target(&p), "claude", &missing(), &exec()).unwrap();
+        assert!(
+            exec_line(&plan).ends_with(
+                "; nix develop --command bash -c 'claude --dangerously-skip-permissions'"
+            ),
+            "{}",
+            exec_line(&plan)
+        );
+
+        let p = with_toolchain(DetectedToolchain::Devbox);
+        let plan = launch_plan(&config(), &target(&p), "claude", &missing(), &exec()).unwrap();
+        assert!(
+            exec_line(&plan).ends_with(
+                "devbox run -c \"$_WM_CACHE\" -- 'cd \"$_WM_CWD\" && \
+                 claude --dangerously-skip-permissions'"
+            ),
+            "{}",
+            exec_line(&plan)
+        );
+
+        let p = with_toolchain(DetectedToolchain::None);
+        let plan = launch_plan(&config(), &target(&p), "claude", &missing(), &exec()).unwrap();
+        assert!(
+            exec_line(&plan).ends_with("\"$PATH\"; claude --dangerously-skip-permissions"),
+            "{}",
+            exec_line(&plan)
+        );
+    }
+
+    #[test]
+    fn sandbox_shell_runs_outside_the_toolchain_as_on_lima() {
+        let p = with_toolchain(DetectedToolchain::Flake);
+        let shell = ExecRequest {
+            command: args(&["bash"]),
+            in_toolchain: false,
+            ..exec()
+        };
+        let plan = launch_plan(&config(), &target(&p), "claude", &missing(), &shell).unwrap();
+        assert!(
+            exec_line(&plan).ends_with("\"$PATH\"; bash"),
+            "{}",
+            exec_line(&plan)
+        );
+    }
+
+    #[test]
+    fn exec_extends_the_images_path_keeping_the_shims_first() {
+        // An image's own PATH entries (omp's /opt/bun/bin) stay reachable.
+        let p = Paths {
+            state: PathBuf::from("/Users/me/Library/State dir/wm-proj-12345678"),
+            ..paths()
+        };
+        let plan = launch_plan(&config(), &target(&p), "claude", &missing(), &exec()).unwrap();
+
+        assert!(
+            !plan.exec.args.iter().any(|a| a.starts_with("PATH=")),
+            "{:?}",
+            plan.exec.args
+        );
         assert_eq!(
-            plan.exec.args[plan.exec.args.len() - 3..],
-            args(&["bash", "-c", "bash -c 'set -x; echo \"a b\"'"])
+            plan.exec.args.last().unwrap(),
+            "export PATH='/Users/me/Library/State dir/wm-proj-12345678/shims/bin':\
+             /home/agent/.local/bin:/nix/var/nix/profiles/default/bin:\"$PATH\"; \
+             claude --dangerously-skip-permissions"
         );
     }
 
@@ -2292,5 +2480,222 @@ mod tests {
         let plan = launch_plan(&config, &target(&p), "claude", &missing(), &exec()).unwrap();
 
         assert_eq!(plan.provision, None);
+    }
+
+    /// The scripts of the plan's built-in provisioning, with the user each
+    /// runs as.
+    fn default_provision(plan: &LaunchPlan) -> Vec<(&str, &str)> {
+        plan.default_provision
+            .iter()
+            .map(|c| match c.args.as_slice() {
+                [exec, u, root, name, bash, dash_c, script]
+                    if exec == "exec"
+                        && u == "-u"
+                        && name == "wm-proj-12345678"
+                        && bash == "bash"
+                        && dash_c == "-c" =>
+                {
+                    (root.as_str(), script.as_str())
+                }
+                [exec, name, bash, dash_c, script]
+                    if exec == "exec"
+                        && name == "wm-proj-12345678"
+                        && bash == "bash"
+                        && dash_c == "-c" =>
+                {
+                    ("agent", script.as_str())
+                }
+                other => panic!("unexpected provisioning command {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn created_sandbox_keeps_the_shims_on_path_for_login_shells() {
+        // Codex runs commands with `bash -lc`, whose /etc/profile resets
+        // PATH; the image's profile.d script names the container's shims.
+        let p = paths();
+        let plan = launch_plan(&config(), &target(&p), "claude", &missing(), &exec()).unwrap();
+
+        let steps = default_provision(&plan);
+        assert_eq!(steps.len(), 1, "{steps:?}");
+        let (user, script) = steps[0];
+        assert_eq!(user, "root");
+        assert!(
+            script.contains(
+                "cat > /etc/profile.d/workmux-shims.sh <<'PROFILESCRIPT'\n\
+                 if [ -d /state/docker-sbx/wm-proj-12345678/shims/bin ]; then\n    \
+                 PATH=/state/docker-sbx/wm-proj-12345678/shims/bin:\"$PATH\"\n    \
+                 export PATH\n\
+                 fi\n\
+                 PROFILESCRIPT\n"
+            ),
+            "{script}"
+        );
+        assert!(!script.contains("install.determinate.systems"), "{script}");
+    }
+
+    #[test]
+    fn created_sandbox_gets_nix_and_devbox_when_the_worktree_uses_a_toolchain() {
+        for toolchain in [DetectedToolchain::Flake, DetectedToolchain::Devbox] {
+            let p = with_toolchain(toolchain.clone());
+            let plan = launch_plan(&config(), &target(&p), "claude", &missing(), &exec()).unwrap();
+
+            let steps = default_provision(&plan);
+            assert_eq!(steps.len(), 2, "{toolchain:?}: {steps:?}");
+            let (user, root_script) = steps[0];
+            assert_eq!(user, "root");
+            for line in [
+                "cat > /etc/profile.d/workmux-shims.sh",
+                "curl --proto '=https' --tlsv1.2 -sSf -L https://install.determinate.systems/nix | \\\n      \
+                 sh -s -- install linux --init none --no-confirm",
+                "chown -R agent:agent /nix",
+                "curl -fsSL https://get.jetify.com/devbox | bash -s -- -f",
+            ] {
+                assert!(
+                    root_script.contains(line),
+                    "{toolchain:?}: {line}\n{root_script}"
+                );
+            }
+            let (user, agent_script) = steps[1];
+            assert_eq!(user, "agent");
+            for line in [
+                "echo '. /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh' >> ~/.profile",
+                "devbox version",
+            ] {
+                assert!(
+                    agent_script.contains(line),
+                    "{toolchain:?}: {line}\n{agent_script}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn skip_default_provision_skips_the_built_in_provisioning_but_not_provision() {
+        let config = with_docker_sbx(|sbx| {
+            sbx.provision = Some("apt-get install -y ripgrep".to_string());
+            sbx.skip_default_provision = Some(true);
+        });
+        let p = with_toolchain(DetectedToolchain::Flake);
+        let plan = launch_plan(&config, &target(&p), "claude", &missing(), &exec()).unwrap();
+
+        assert!(
+            plan.default_provision.is_empty(),
+            "{:?}",
+            plan.default_provision
+        );
+        assert_eq!(
+            plan.provision.as_ref().map(|c| c.args.clone()),
+            Some(provision_command())
+        );
+        // The agent command still runs in the toolchain the image provides.
+        assert!(
+            exec_line(&plan).contains("nix develop"),
+            "{}",
+            exec_line(&plan)
+        );
+    }
+
+    #[test]
+    fn existing_sandbox_is_not_provisioned_again() {
+        let p = with_toolchain(DetectedToolchain::Devbox);
+        let state = SbxState {
+            sandbox: Some(sandbox("running")),
+            ..missing()
+        };
+        let plan = launch_plan(&config(), &target(&p), "claude", &state, &exec()).unwrap();
+
+        assert!(
+            plan.default_provision.is_empty(),
+            "{:?}",
+            plan.default_provision
+        );
+    }
+
+    /// What installing and using Nix and Devbox reached in a sandbox, as
+    /// `sbx policy log` showed them.
+    const TOOLCHAIN_RESOURCES: [&str; 11] = [
+        "install.determinate.systems:443",
+        "cache.nixos.org:443",
+        "get.jetify.com:443",
+        "get.jetpack.io:443",
+        "releases.jetify.com:443",
+        "releases.jetpack.io:443",
+        "www.nixsearch.com:443",
+        "github.com:443",
+        "api.github.com:443",
+        "codeload.github.com:443",
+        "release-assets.githubusercontent.com:443",
+    ];
+
+    #[test]
+    fn toolchain_endpoints_are_reconciled_with_the_network_rules_under_deny() {
+        let config = with_network(NetworkPolicy::Deny, domains(&["api.anthropic.com"]));
+        let p = with_toolchain(DetectedToolchain::Flake);
+        let plan = launch_plan(&config, &target(&p), "claude", &missing(), &exec()).unwrap();
+
+        let commands = policy_commands(&plan);
+        let mut expected = vec![recorded(RuleDecision::Allow, "api.anthropic.com:443")];
+        for resource in TOOLCHAIN_RESOURCES {
+            assert!(
+                commands.contains(&policy("allow", resource)),
+                "{commands:?}"
+            );
+            expected.push(recorded(RuleDecision::Allow, resource));
+        }
+        assert_eq!(plan.network_rules, expected);
+    }
+
+    #[test]
+    fn toolchain_endpoints_are_allowed_under_allow_since_the_global_policy_may_block_them() {
+        // sbx's balanced global policy refuses the Nix installer, the binary
+        // cache and Devbox's downloads.
+        let config = with_network(NetworkPolicy::Allow, domains(&["api.anthropic.com"]));
+        let p = with_toolchain(DetectedToolchain::Devbox);
+        let plan = launch_plan(&config, &target(&p), "claude", &missing(), &exec()).unwrap();
+
+        let resources: Vec<&str> = plan
+            .network_rules
+            .iter()
+            .map(|r| r.resource.as_str())
+            .collect();
+        assert_eq!(resources, TOOLCHAIN_RESOURCES);
+    }
+
+    #[test]
+    fn a_wildcard_doesnt_deny_a_base_domain_the_toolchain_needs() {
+        let config = with_network(NetworkPolicy::Deny, domains(&["*.github.com"]));
+        let p = with_toolchain(DetectedToolchain::Flake);
+        let plan = launch_plan(&config, &target(&p), "claude", &missing(), &exec()).unwrap();
+
+        let commands = policy_commands(&plan);
+        assert!(
+            commands.contains(&policy("allow", "**.github.com:443")),
+            "{commands:?}"
+        );
+        assert!(
+            commands.contains(&policy("allow", "github.com:443")),
+            "{commands:?}"
+        );
+        assert!(
+            !commands.contains(&policy("deny", "github.com:443")),
+            "{commands:?}"
+        );
+    }
+
+    #[test]
+    fn turning_the_toolchain_off_removes_its_endpoints() {
+        let mut p = paths();
+        p.record = vec![recorded(RuleDecision::Allow, "cache.nixos.org:443")];
+        let state = running_with(vec![rule(SCOPE, "cache.nixos.org:443")]);
+        let plan = launch_plan(&config(), &target(&p), "claude", &state, &exec()).unwrap();
+
+        assert!(
+            policy_commands(&plan).contains(&policy("rm", "cache.nixos.org:443")),
+            "{:?}",
+            policy_commands(&plan)
+        );
+        assert!(plan.network_rules.is_empty(), "{:?}", plan.network_rules);
     }
 }

@@ -1730,7 +1730,7 @@ pub enum SandboxTarget {
     All,
 }
 
-/// Toolchain integration mode for Lima sandboxes.
+/// Toolchain integration mode for Lima and docker_sbx sandboxes.
 /// Controls whether devbox.json/flake.nix are detected and used
 /// to wrap agent commands with the appropriate environment.
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Default)]
@@ -1922,10 +1922,9 @@ pub struct DockerSbxConfig {
     #[serde(default)]
     pub provision: Option<String>,
 
-    /// Skip built-in provisioning. The sbx template already holds what
-    /// Lima's built-in provisioning installs (system packages, the agent CLI,
-    /// workmux), so workmux runs no built-in provisioning under docker_sbx
-    /// today; the setting is accepted for parity with Lima. Custom
+    /// Skip built-in provisioning: keeping the host-command shims on login
+    /// shells' PATH, and installing Nix and Devbox when the project uses a
+    /// toolchain. Use when `image` already provides these. Custom
     /// `provision` script still runs if specified.
     #[serde(default)]
     pub skip_default_provision: Option<bool>,
@@ -1981,6 +1980,10 @@ impl DockerSbxConfig {
 
     pub fn provision_script(&self) -> Option<&str> {
         self.provision.as_deref().filter(|s| !s.trim().is_empty())
+    }
+
+    pub fn skip_default_provision(&self) -> bool {
+        self.skip_default_provision.unwrap_or(false)
     }
 
     /// Mixin kits to pass to `sbx create --kit`. Returns empty slice when unset.

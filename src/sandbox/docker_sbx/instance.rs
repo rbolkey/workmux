@@ -365,9 +365,10 @@ fn run_sbx(command: &SbxCommand) -> Result<()> {
 
 /// Gather sbx's state, compute the launch plan and run its setup commands:
 /// load the template and create the sandbox if it's missing, reconcile its
-/// policy rules, recording the ones workmux writes for `sandbox.network`,
-/// and provision a sandbox it created, removing it again if provisioning
-/// fails. Returns the plan, whose `exec` the caller runs.
+/// policy rules, recording the ones workmux writes for `sandbox.network`
+/// and the toolchain, and provision a sandbox it created (built-in
+/// provisioning, then the `provision` script), removing it again if
+/// provisioning fails. Returns the plan, whose `exec` the caller runs.
 pub fn prepare_launch(
     config: &Config,
     worktree_root: &Path,
@@ -394,6 +395,9 @@ pub fn prepare_launch(
         .filter(|dir| agent == "opencode" && dir.is_dir())
         .map(|dir| dir.canonicalize().unwrap_or(dir));
 
+    let toolchain =
+        crate::sandbox::toolchain::resolve_toolchain(&config.sandbox.toolchain(), &worktree_root);
+
     let state = gather_state(&name)?;
     let network_record = read_network_record(&state_dir);
     let target = LaunchTarget {
@@ -404,6 +408,7 @@ pub fn prepare_launch(
         opencode_config_dir: opencode_config_dir.as_deref(),
         state_dir: &state_dir,
         network_record: &network_record,
+        toolchain: &toolchain,
     };
     let plan = super::launch_plan(&config.sandbox, &target, agent, &state, exec)?;
     for note in &plan.notes {
@@ -448,19 +453,30 @@ pub fn prepare_launch(
     if plan.network_rules != pending {
         write_network_record(&state_dir, &plan.network_rules)?;
     }
-    if let Some(provision) = &plan.provision {
+    // Provisioning runs only on create: when it fails, remove the sandbox
+    // so the next launch creates and provisions it again.
+    let provision_or_remove = |command: &SbxCommand| {
         let msg = format!("Provisioning sbx sandbox {name}");
-        if let Err(e) = crate::spinner::with_spinner(&msg, || run_sbx(provision)) {
-            // Provisioning runs only on create: remove the sandbox so the
-            // next launch creates and provisions it again.
-            if let Err(rm) = SbxInstance::remove_by_name(&name) {
-                warn!(sandbox = %name, error = %rm, "failed to remove unprovisioned sbx sandbox");
-            }
-            return Err(e).context(format!(
-                "sandbox.docker_sbx.provision failed in sbx sandbox {name}; \
-                 the sandbox was removed, fix the script and launch again"
-            ));
+        let result = crate::spinner::with_spinner(&msg, || run_sbx(command));
+        if result.is_err()
+            && let Err(rm) = SbxInstance::remove_by_name(&name)
+        {
+            warn!(sandbox = %name, error = %rm, "failed to remove unprovisioned sbx sandbox");
         }
+        result
+    };
+    for command in &plan.default_provision {
+        provision_or_remove(command).context(format!(
+            "workmux's built-in provisioning failed in sbx sandbox {name}; the sandbox \
+             was removed. `sbx policy log` lists requests sbx blocked; launch again, or set \
+             sandbox.docker_sbx.skip_default_provision if the image provides the toolchain"
+        ))?;
+    }
+    if let Some(provision) = &plan.provision {
+        provision_or_remove(provision).context(format!(
+            "sandbox.docker_sbx.provision failed in sbx sandbox {name}; \
+             the sandbox was removed, fix the script and launch again"
+        ))?;
     } else if plan.create_template.is_none()
         && config.sandbox.docker_sbx.provision_script().is_some()
     {
