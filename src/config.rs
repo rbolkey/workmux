@@ -2207,6 +2207,9 @@ pub struct ContainerConfig {
     /// Only existing regular files are masked; missing paths are skipped with
     /// a warning. Directories are not supported.
     ///
+    /// Under `docker_sbx`, an empty read-only file is mounted over each one
+    /// when the sandbox is created; the main worktree isn't mounted there.
+    ///
     /// Security: this field is global-only. It is ignored when set in a
     /// project's `.workmux.yaml`, and workmux fails fast rather than running
     /// with excluded_files on a runtime that lacks file-level bind mounts
@@ -4132,6 +4135,7 @@ pub const EXAMPLE_PROJECT_CONFIG: &str = r#"# workmux project configuration
 #   #   # Mask files out of the worktree bind mounts (paths relative to the
 #   #   # worktree root). Each listed file is shadowed by /dev/null so the
 #   #   # sandboxed agent cannot read it. Missing files are skipped.
+#   #   # Also applies to docker_sbx (an empty file, when the sandbox is created).
 #   #   # GLOBAL-ONLY: ignored when set in a project .workmux.yaml.
 #   #   # excluded_files:
 #   #   #   - .env
