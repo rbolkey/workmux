@@ -9,7 +9,6 @@ mod git;
 mod instance;
 mod plan;
 mod template;
-mod wrap;
 
 pub(crate) use instance::sbx_state_dir_path;
 pub use instance::{
@@ -18,7 +17,6 @@ pub use instance::{
 };
 pub use plan::{ExecRequest, launch_plan};
 pub use template::{dockerfile_layer, ensure_template, template_loaded_for};
-pub use wrap::wrap_for_docker_sbx;
 
 /// Prefix for all workmux-managed sbx sandbox names.
 pub const SANDBOX_PREFIX: &str = "wm-";
