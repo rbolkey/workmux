@@ -67,7 +67,6 @@ sandbox:
     cpus: 8
     memory: 8g
     provision: |
-      sed -i 's|http://|https://|' /etc/apt/sources.list.d/debian.sources
       apt-get update && apt-get install -y ripgrep jq
 ```
 
@@ -138,7 +137,24 @@ Sandboxes are named `wm-<project>-<hash>` (e.g. `wm-myproject-a1b2c3d4`), where 
 
 ### Template
 
-sbx creates sandboxes from templates kept in its own image store. workmux builds the template from `sandbox.image` plus a thin layer (`docker/Dockerfile.sbx`) that adds what sbx expects: a non-root `agent` user (UID 1000, home `/home/agent`), a directory for sbx's proxy certificate, and `BASH_ENV` pointing at `/etc/sandbox-persistent.sh`. The first time a sandbox needs it, workmux builds the template with Docker, saves it and loads it with `sbx template load`. Templates are named `workmux-sbx:<image>-<hash>` (`sbx template ls`).
+sbx creates sandboxes from templates kept in its own image store. workmux builds the template from `sandbox.image` plus a thin layer (`docker/Dockerfile.sbx`) that adds what sbx expects: a non-root `agent` user (UID 1000, home `/home/agent`), a directory for sbx's proxy certificate, and `BASH_ENV` pointing at `/etc/sandbox-persistent.sh`. The layer also switches the image's Debian package sources to HTTPS, since sbx's `balanced` policy refuses plain HTTP. When a sandbox is created, workmux builds the template with Docker, saves it and loads it with `sbx template load`. Templates are named `workmux-sbx:<image>-<hash>` (`sbx template ls`).
+
+The template follows the image in Docker's store: when the image changes (a pulled update, a local build, `install-dev`), workmux builds and loads the template again the next time it creates a sandbox. As on the container backend, workmux checks the official `ghcr.io/raine/workmux-sandbox` images for updates in the background and pulls a newer one before the next template build; custom images are never pulled once present. Existing sandboxes keep the template they were created from; recreate them with `workmux sandbox prune` to pick up a new one.
+
+The image commands handle the template too:
+
+```bash
+# Pull the image and refresh the template
+workmux sandbox pull
+
+# Build the image locally (with Docker) and refresh the template
+workmux sandbox build
+
+# Export a Dockerfile for a custom image, ending with the sbx layer
+workmux sandbox init-dockerfile
+```
+
+With `backend: docker_sbx` they use Docker, whatever `sandbox.container.runtime` says. The Dockerfile from `init-dockerfile` ends with the sbx layer so a custom image already has what sbx needs; add root steps before its `USER agent`. workmux applies the layer again when it builds the template, which changes nothing in an image that has it.
 
 ### Authentication
 
@@ -163,14 +179,13 @@ sbx also sets git config of its own in the sandbox (keeping its `.sbx` directori
 
 ## Provisioning
 
-The `provision` script runs once, after workmux creates the sandbox, sets it up (config directory links, Claude's onboarding state, network rules) and runs its [built-in provisioning](#built-in-provisioning), never on later launches. It runs as root with `bash -c`, in the worktree; the template has no `sudo`, so don't use it. Its downloads go through sbx's proxy and network policy like any other request in the sandbox. sbx's `balanced` policy reaches package mirrors over HTTPS only, while the template's Debian sources use plain HTTP (refused with `403 Forbidden`), so switch them to HTTPS first, as below. A changed script applies the next time the sandbox is created (`workmux sandbox prune`, or `workmux remove`). If the script fails, workmux deletes the sandbox and stops with its error, so the next launch creates and provisions it again.
+The `provision` script runs once, after workmux creates the sandbox, sets it up (config directory links, Claude's onboarding state, network rules) and runs its [built-in provisioning](#built-in-provisioning), never on later launches. It runs as root with `bash -c`, in the worktree; the template has no `sudo`, so don't use it. Its downloads go through sbx's proxy and network policy like any other request in the sandbox; sbx's `balanced` policy reaches package mirrors over HTTPS only, which is why the [template](#template) switches the image's Debian sources to HTTPS. A changed script applies the next time the sandbox is created (`workmux sandbox prune`, or `workmux remove`). If the script fails, workmux deletes the sandbox and stops with its error, so the next launch creates and provisions it again.
 
 ```yaml
 sandbox:
   backend: docker_sbx
   docker_sbx:
     provision: |
-      sed -i 's|http://|https://|' /etc/apt/sources.list.d/debian.sources
       apt-get update
       apt-get install -y ripgrep fd-find jq
 ```
