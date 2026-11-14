@@ -819,9 +819,12 @@ pub trait Multiplexer: Send + Sync {
                                     working_dir,
                                 )
                             }
+                            // The same `workmux sandbox run` supervisor
+                            // command, which dispatches on the backend.
                             crate::config::SandboxBackend::DockerSbx => {
-                                crate::sandbox::wrap_for_docker_sbx(
+                                crate::sandbox::wrap_for_container(
                                     &command_to_wrap,
+                                    None,
                                     wt_root,
                                     working_dir,
                                 )
