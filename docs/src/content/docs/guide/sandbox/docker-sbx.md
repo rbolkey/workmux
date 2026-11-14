@@ -56,7 +56,29 @@ The generic `sandbox` settings keep their meaning:
 | `extra_mounts`     | `[]`                                    | Additional host paths to mount (see [shared features](/guide/sandbox/features/#extra-mounts)). **Global config only.**         |
 | `network`          | `policy: allow`                         | Network restrictions, enforced by sbx (see [below](#network-restrictions)). **Global config only.**                            |
 
-Settings specific to sbx are nested under `sandbox.docker_sbx`.
+Settings specific to sbx are nested under `sandbox.docker_sbx`:
+
+```yaml
+sandbox:
+  enabled: true
+  backend: docker_sbx
+  docker_sbx:
+    cpus: 8
+    memory: 8g
+    provision: |
+      sed -i 's|http://|https://|' /etc/apt/sources.list.d/debian.sources
+      apt-get update && apt-get install -y ripgrep jq
+```
+
+| Option                              | Default                       | Description                                                                                                  |
+| ----------------------------------- | ----------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| `docker_sbx.cpus`                   | all host CPUs (sbx's default) | Number of CPUs for the sandbox (`0` means all)                                                               |
+| `docker_sbx.memory`                 | half the host's memory        | Memory for the sandbox in sbx's binary units (`512m`, `8g`); at least `512m`                                 |
+| `docker_sbx.provision`              | -                             | Shell script run once, as root, when the sandbox is created (see [Provisioning](#provisioning))              |
+| `docker_sbx.skip_default_provision` | `false`                       | Accepted for parity with Lima; there is no built-in provisioning to skip (see [Provisioning](#provisioning)) |
+| `docker_sbx.kits`                   | `[]`                          | sbx mixin kits added when the sandbox is created (see [Kits](#kits)). **Global config only.**                |
+
+sbx has no per-sandbox disk setting, so there is no `disk`. Resources, `provision` and `kits` apply when the sandbox is created; recreate it with `workmux sandbox prune` after changing them.
 
 ## How it works
 
@@ -120,6 +142,37 @@ sbx creates sandboxes from templates kept in its own image store. workmux builds
 ### Authentication
 
 Agents use the login in their mounted config directory, as on the container backend: Codex, Gemini, OpenCode, pi and OMP start logged in if you've logged in on the workstation. Claude stores its login in the macOS Keychain, which the sandbox can't reach. Sign in to Claude once inside a sandbox; the login is written to the mounted config directory and persists across sandboxes. See [Credentials](/guide/sandbox/features/#credentials).
+
+## Provisioning
+
+The `provision` script runs once, after workmux creates the sandbox and sets it up (config directory links, Claude's onboarding state, network rules), never on later launches. It runs as root with `bash -c`, in the worktree; the template has no `sudo`, so don't use it. Its downloads go through sbx's proxy and network policy like any other request in the sandbox. sbx's `balanced` policy reaches package mirrors over HTTPS only, while the template's Debian sources use plain HTTP (refused with `403 Forbidden`), so switch them to HTTPS first, as below. A changed script applies the next time the sandbox is created (`workmux sandbox prune`, or `workmux remove`). If the script fails, workmux deletes the sandbox and stops with its error, so the next launch creates and provisions it again.
+
+```yaml
+sandbox:
+  backend: docker_sbx
+  docker_sbx:
+    provision: |
+      sed -i 's|http://|https://|' /etc/apt/sources.list.d/debian.sources
+      apt-get update
+      apt-get install -y ripgrep fd-find jq
+```
+
+Lima's [built-in provisioning](/guide/sandbox/lima/#default-provisioning) installs system packages, the agent CLI and workmux into a fresh VM. Under `docker_sbx` the [template](#template) already contains all of these, so workmux runs no built-in provisioning, and `skip_default_provision` changes nothing; `provision` runs either way. To provision once for every sandbox instead, build a custom `sandbox.image`.
+
+## Kits
+
+sbx [kits](https://docs.docker.com/ai/sandboxes/customize/use-kits/) package tools for sandboxes. `sandbox.docker_sbx.kits` adds mixin kits (`sbx create --kit`) to each sandbox when it's created: OCI references such as `docker.io/sbx/task:latest`, git URLs, directories or ZIP files. sbx composes them onto workmux's template.
+
+```yaml
+# ~/.config/workmux/config.yaml
+sandbox:
+  backend: docker_sbx
+  docker_sbx:
+    kits:
+      - docker.io/sbx/task:latest
+```
+
+A kit can add network rules, credentials and install steps to the sandbox. sbx adds a kit's network rules as rules scoped to the sandbox, so they widen its access beyond `network.allowed_domains`, and workmux leaves them alone (`sbx policy ls <sandbox>` lists them). `kits` is therefore a global-only setting: workmux ignores it in a project's `.workmux.yaml`, with a warning. Use only mixin kits: workmux creates sandboxes with sbx's `shell` agent itself, as described [above](#whats-mounted). sbx keeps composed kits in its template store (`sbx template ls`, as `sandbox-kit-assembled`).
 
 ## Network restrictions
 
