@@ -1364,6 +1364,7 @@ fn run_shell_docker_sbx(command: Vec<String>, config: &Config) -> Result<()> {
         session: docker_sbx::new_session()?,
         rpc_port: None,
         tty: io::stdin().is_terminal(),
+        in_toolchain: false,
     };
     let plan =
         docker_sbx::prepare_launch(config, &worktree_root, &cwd, resolve_agent(config), &exec)?;
