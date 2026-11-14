@@ -294,17 +294,19 @@ pub fn gather_state(name: &str) -> Result<SbxState> {
     );
     // An existing sandbox's rules include the global ones; before it exists,
     // the global ones are what it will get. Listing fails before the global
-    // policy is initialised, which the plan reports.
+    // policy is initialised, which the plan reports. Otherwise the plan
+    // needs the rules to keep `deny` from being widened: fail closed.
     let policy_ls = match &sandbox {
         Some(_) => vec!["policy", "ls", name],
         None => vec!["policy", "ls"],
     };
     let rules = match sbx_json(&policy_ls) {
         Ok(stdout) => parse_sbx_rules(&stdout)?,
-        Err(e) => {
+        Err(e) if e.to_string().contains(POLICY_NOT_INITIALIZED) => {
             debug!(error = %e, "failed to list sbx rules");
             Vec::new()
         }
+        Err(e) => return Err(e.context("Failed to list sbx network rules")),
     };
     // Secret names and scopes, never values. Advisory only: a listing
     // failure leaves the credential warnings out.

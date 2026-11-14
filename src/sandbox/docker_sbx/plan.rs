@@ -162,11 +162,12 @@ pub struct LaunchPlan {
     pub hangup: SbxCommand,
     /// Commands to run after `exec` ends: removing the RPC rule.
     pub teardown: Vec<SbxCommand>,
-    /// Notes for the user: settings sbx can't enforce that only limit access,
-    /// and what sbx allows beyond them.
+    /// Notes for the user: settings sbx can't enforce that only limit
+    /// access, and toolchain endpoints `deny` leaves blocked.
     pub notes: Vec<String>,
     /// Warnings for the user: checks `sbx diagnose` fails that don't stop
-    /// the launch, and variables in `sandbox.env` or
+    /// the launch, what sbx lets a `deny` sandbox reach beyond
+    /// `allowed_domains`, and variables in `sandbox.env` or
     /// `sandbox.env_passthrough` that hand the agent a credential sbx holds
     /// a secret for.
     pub warnings: Vec<String>,
@@ -584,16 +585,9 @@ fn network_rules(config: &SandboxConfig, toolchain: &DetectedToolchain) -> Vec<N
 }
 
 /// What sbx enforces differently from `sandbox.network` without widening
-/// it: settings it has no equivalent for, the toolchain's endpoints
-/// `allowed_domains` leaves blocked, and what the user's global sbx policy
-/// allows besides (workmux never writes it, and a sandbox's allow can't
-/// take a global one back).
-fn network_notes(
-    config: &SandboxConfig,
-    state: &SbxState,
-    name: &str,
-    toolchain: &DetectedToolchain,
-) -> Vec<String> {
+/// it: settings it has no equivalent for, and the toolchain's endpoints
+/// `allowed_domains` leaves blocked.
+fn network_notes(config: &SandboxConfig, toolchain: &DetectedToolchain) -> Vec<String> {
     if !config.network_policy_is_deny() {
         return Vec::new();
     }
@@ -614,22 +608,73 @@ fn network_notes(
                 .to_string(),
         );
     }
-    let global_allows: usize = state
+    notes
+}
+
+/// How many destinations the user's global sbx policy allows. Every
+/// sandbox can reach them, whatever its own rules say.
+fn global_network_allows(state: &SbxState) -> usize {
+    state
         .rules
         .iter()
         .filter(|rule| {
             rule.scope == "global" && rule.decision == "allow" && rule.resource_type == "network"
         })
         .map(|rule| rule.resources.len())
-        .sum();
+        .sum()
+}
+
+/// Where sbx under `deny` gives the sandbox more than workmux's CONNECT
+/// proxy would on the container backend, which it can't take back per
+/// sandbox: what the global sbx policy allows, and private or loopback
+/// addresses an allowed domain resolves to. Warned on every launch.
+fn network_warnings(config: &SandboxConfig, state: &SbxState, name: &str) -> Vec<String> {
+    if !config.network_policy_is_deny() {
+        return Vec::new();
+    }
+    let mut warnings = Vec::new();
+    let global_allows = global_network_allows(state);
     if global_allows > 0 {
-        notes.push(format!(
-            "sbx's global network policy also allows {global_allows} destinations \
-             besides sandbox.network.allowed_domains; `sbx policy ls {name}` lists them. \
-             workmux never changes the global policy."
+        warnings.push(format!(
+            "sandbox.network.policy is deny, but sbx's global network policy also allows \
+             {global_allows} destinations besides sandbox.network.allowed_domains \
+             (`sbx policy ls {name}` lists them), and a sandbox's rules can't take them back. \
+             For the container backend's behaviour, choose `sbx policy init deny-all` \
+             (after `sbx policy reset`); workmux never changes the global policy."
         ));
     }
-    notes
+    if global_allows > 0
+        || config
+            .network
+            .allowed_domains()
+            .iter()
+            .any(|entry| !entry.allow_private_ips())
+    {
+        warnings.push(
+            "sbx doesn't refuse private or loopback addresses an allowed domain resolves to, \
+             so allow_private_ips: false can't be enforced under the docker_sbx backend."
+                .to_string(),
+        );
+    }
+    warnings
+}
+
+/// Fail closed when a project's `.workmux.yaml` chose docker_sbx for a
+/// global `deny` that sbx's global policy would widen: a repository can
+/// lower its own sandbox's protection only with the user's say-so.
+fn check_backend_choice(config: &SandboxConfig, state: &SbxState) -> Result<()> {
+    let global_allows = global_network_allows(state);
+    if config.backend_from_project && config.network_policy_is_deny() && global_allows > 0 {
+        bail!(
+            "sandbox.backend: docker_sbx comes from the project config (.workmux.yaml), but \
+             your global config sets sandbox.network.policy: deny and sbx's global network \
+             policy allows {global_allows} destinations beyond sandbox.network.allowed_domains. \
+             A repository can't move a deny sandbox onto a wider policy. Set \
+             sandbox.backend: docker_sbx in your global config to accept sbx's global policy, \
+             or choose `sbx policy init deny-all` (after `sbx policy reset`)."
+        );
+    }
+    Ok(())
 }
 
 /// The sbx service whose credential an environment variable holds, as
@@ -800,6 +845,7 @@ pub fn launch_plan(
     exec: &ExecRequest,
 ) -> Result<LaunchPlan> {
     check_prerequisites(state)?;
+    check_backend_choice(config, state)?;
     if !config.container.excluded_files().is_empty() {
         bail!(
             "sandbox.container.excluded_files is set but the docker_sbx backend \
@@ -978,9 +1024,10 @@ pub fn launch_plan(
         exec: exec_command(target, exec),
         hangup: hangup_command(target, exec),
         teardown,
-        notes: network_notes(config, state, name, target.toolchain),
+        notes: network_notes(config, target.toolchain),
         warnings: check_warnings(state)
             .into_iter()
+            .chain(network_warnings(config, state, name))
             .chain(credential_warnings(config, state, name, exec))
             .collect(),
         network_rules,
@@ -1541,48 +1588,146 @@ mod tests {
         assert!(plan.notes.is_empty(), "{:?}", plan.notes);
     }
 
-    #[test]
-    fn deny_notes_what_the_global_sbx_policy_also_allows() {
-        // workmux never writes the global policy, and a sandbox allow can't
-        // take back a global one.
-        let p = paths();
+    /// Global rules as sbx's balanced policy lists them: two allowed
+    /// destinations, a filesystem rule and the fallback deny.
+    fn balanced_global_rules() -> Vec<SbxRule> {
         let mut filesystem = rule("global", "**");
         filesystem.resource_type = "filesystem:read".to_string();
         let mut fallback = rule("global", "**");
         fallback.decision = "deny".to_string();
         let mut balanced = rule("global", "github.com:443");
         balanced.resources.push("**.npmjs.org:443".to_string());
-        let state = SbxState {
-            rules: vec![balanced, filesystem, fallback],
-            ..missing()
-        };
-        let config = with_network(NetworkPolicy::Deny, domains(&["api.anthropic.com"]));
-        let plan = launch_plan(&config, &target(&p), "claude", &state, &exec()).unwrap();
+        vec![balanced, filesystem, fallback]
+    }
 
-        assert_eq!(plan.notes.len(), 1, "{:?}", plan.notes);
-        assert!(plan.notes[0].contains("2 destinations"), "{:?}", plan.notes);
-        assert!(
-            plan.notes[0].contains("sbx policy ls wm-proj-12345678"),
-            "{:?}",
-            plan.notes
+    fn deny_all_global_rules() -> Vec<SbxRule> {
+        let mut fallback = rule("global", "**");
+        fallback.decision = "deny".to_string();
+        vec![fallback]
+    }
+
+    fn private_ips_allowed(hosts: &[&str]) -> Vec<AllowedDomainEntry> {
+        hosts
+            .iter()
+            .map(|host| {
+                AllowedDomainEntry::Detailed(AllowedDomainDetails {
+                    host: host.to_string(),
+                    allow_private_ips: true,
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn deny_warns_on_every_launch_what_the_global_sbx_policy_also_allows() {
+        // workmux never writes the global policy, and a sandbox allow can't
+        // take back a global one.
+        let p = paths();
+        let config = with_network(
+            NetworkPolicy::Deny,
+            private_ips_allowed(&["api.anthropic.com"]),
         );
+        for sandbox in [None, Some(sandbox("running"))] {
+            let state = SbxState {
+                sandbox,
+                rules: balanced_global_rules(),
+                ..missing()
+            };
+            let plan = launch_plan(&config, &target(&p), "claude", &state, &exec()).unwrap();
+
+            assert!(plan.notes.is_empty(), "{:?}", plan.notes);
+            // The global policy's destinations can resolve to private
+            // addresses too.
+            assert_eq!(plan.warnings.len(), 2, "{:?}", plan.warnings);
+            let warning = &plan.warnings[0];
+            for expected in [
+                "2 destinations",
+                "sbx policy ls wm-proj-12345678",
+                "sbx policy init deny-all",
+            ] {
+                assert!(warning.contains(expected), "{expected}: {warning}");
+            }
+        }
 
         let allow = with_network(NetworkPolicy::Allow, Vec::new());
+        let state = SbxState {
+            rules: balanced_global_rules(),
+            ..missing()
+        };
         let plan = launch_plan(&allow, &target(&p), "claude", &state, &exec()).unwrap();
-        assert!(plan.notes.is_empty(), "{:?}", plan.notes);
+        assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
 
         let deny_all = SbxState {
-            rules: vec![rule("global", "**")]
-                .into_iter()
-                .map(|mut r| {
-                    r.decision = "deny".to_string();
-                    r
-                })
-                .collect(),
+            rules: deny_all_global_rules(),
             ..missing()
         };
         let plan = launch_plan(&config, &target(&p), "claude", &deny_all, &exec()).unwrap();
-        assert!(plan.notes.is_empty(), "{:?}", plan.notes);
+        assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
+    }
+
+    #[test]
+    fn deny_warns_that_sbx_reaches_private_addresses_allowed_domains_resolve_to() {
+        // sbx has no equivalent of allow_private_ips: false. An error would
+        // make deny unusable, so it's a warning.
+        let p = paths();
+        let deny_all = SbxState {
+            rules: deny_all_global_rules(),
+            ..missing()
+        };
+        let config = with_network(
+            NetworkPolicy::Deny,
+            vec![
+                AllowedDomainEntry::Plain("api.anthropic.com".to_string()),
+                private_ips_allowed(&["git.internal.example"]).remove(0),
+            ],
+        );
+        let plan = launch_plan(&config, &target(&p), "claude", &deny_all, &exec()).unwrap();
+        assert_eq!(plan.warnings.len(), 1, "{:?}", plan.warnings);
+        assert!(
+            plan.warnings[0].contains("private or loopback")
+                && plan.warnings[0].contains("allow_private_ips"),
+            "{:?}",
+            plan.warnings
+        );
+
+        // Nothing allowed reaches a private address unasked.
+        let config = with_network(
+            NetworkPolicy::Deny,
+            private_ips_allowed(&["git.internal.example"]),
+        );
+        let plan = launch_plan(&config, &target(&p), "claude", &deny_all, &exec()).unwrap();
+        assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
+    }
+
+    #[test]
+    fn a_project_cant_move_a_deny_sandbox_onto_a_wider_global_sbx_policy() {
+        let p = paths();
+        let balanced = SbxState {
+            rules: balanced_global_rules(),
+            ..missing()
+        };
+        let mut config = with_network(NetworkPolicy::Deny, domains(&["api.anthropic.com"]));
+        config.backend_from_project = true;
+        let err = launch_plan(&config, &target(&p), "claude", &balanced, &exec()).unwrap_err();
+        let message = format!("{err:#}");
+        for expected in [".workmux.yaml", "policy: deny", "sbx policy init deny-all"] {
+            assert!(message.contains(expected), "{expected}: {message}");
+        }
+
+        // A deny-all global policy matches deny; allow has nothing to keep.
+        let deny_all = SbxState {
+            rules: deny_all_global_rules(),
+            ..missing()
+        };
+        assert!(launch_plan(&config, &target(&p), "claude", &deny_all, &exec()).is_ok());
+        let mut allow = with_network(NetworkPolicy::Allow, Vec::new());
+        allow.backend_from_project = true;
+        assert!(launch_plan(&allow, &target(&p), "claude", &balanced, &exec()).is_ok());
+
+        // Chosen in the global config, it's the user's call: a warning.
+        config.backend_from_project = false;
+        let plan = launch_plan(&config, &target(&p), "claude", &balanced, &exec()).unwrap();
+        assert!(!plan.warnings.is_empty());
     }
 
     fn secret(scope: &str, service: &str) -> SbxSecret {
