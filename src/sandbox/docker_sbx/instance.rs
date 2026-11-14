@@ -4,7 +4,10 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use tracing::{debug, info};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, SystemTime};
+use tracing::{debug, info, warn};
 
 use crate::config::Config;
 
@@ -15,6 +18,10 @@ use super::plan::{ExecRequest, LaunchPlan, LaunchTarget, Platform, SbxCommand, S
 pub struct SbxSandboxInfo {
     pub name: String,
     pub status: String,
+    #[serde(default)]
+    pub created_at: Option<String>,
+    #[serde(default)]
+    pub last_used_at: Option<String>,
 }
 
 impl SbxSandboxInfo {
@@ -22,6 +29,22 @@ impl SbxSandboxInfo {
     pub fn is_running(&self) -> bool {
         self.status == "running"
     }
+
+    /// When the sandbox was created.
+    pub fn created(&self) -> Option<SystemTime> {
+        self.created_at.as_deref().and_then(parse_timestamp)
+    }
+
+    /// When the sandbox last ran a session.
+    pub fn last_used(&self) -> Option<SystemTime> {
+        self.last_used_at.as_deref().and_then(parse_timestamp)
+    }
+}
+
+/// Parse sbx's UTC timestamps (`2026-11-14T03:26:22.21548Z`).
+fn parse_timestamp(timestamp: &str) -> Option<SystemTime> {
+    crate::github::parse_github_timestamp(timestamp)
+        .map(|secs| SystemTime::UNIX_EPOCH + Duration::from_secs(secs))
 }
 
 /// A rule from `sbx policy ls <name> --json`.
@@ -120,6 +143,67 @@ impl SbxInstance {
     /// List all sbx sandboxes.
     pub fn list() -> Result<Vec<SbxSandboxInfo>> {
         parse_sbx_sandboxes(&sbx_json(&["ls"])?)
+    }
+
+    /// Stop a sandbox by name. Succeeds if it is already stopped.
+    pub fn stop_by_name(name: &str) -> Result<()> {
+        run_sbx_args(&["stop", name])
+    }
+
+    /// Delete a sandbox by name, with its policy rules and the secrets
+    /// scoped to it. Succeeds if it doesn't exist.
+    pub fn remove_by_name(name: &str) -> Result<()> {
+        match run_sbx_args(&["rm", "-f", name]) {
+            Err(e) if e.to_string().contains("not found") => Ok(()),
+            result => result,
+        }
+    }
+}
+
+/// Run an sbx command, failing with sbx's error.
+fn run_sbx_args(args: &[&str]) -> Result<()> {
+    let output = Command::new("sbx")
+        .args(args)
+        .output()
+        .with_context(|| format!("Failed to run sbx {}", args.join(" ")))?;
+    if !output.status.success() {
+        bail!(
+            "sbx {} failed: {}",
+            args.join(" "),
+            sbx_error(&String::from_utf8_lossy(&output.stderr))
+        );
+    }
+    Ok(())
+}
+
+/// Delete the worktree's sbx sandbox and its state directory, if workmux
+/// created one for it (its state directory exists).
+///
+/// Called when a worktree is removed, before its directory goes away: the
+/// sandbox name is derived from the worktree's path and git metadata.
+/// Best effort: failures are logged, never fatal.
+pub fn remove_sandbox_for_worktree(worktree_root: &Path) {
+    let name = match super::sandbox_name(worktree_root) {
+        Ok(name) => name,
+        Err(e) => {
+            debug!(worktree = %worktree_root.display(), error = %e, "no sbx sandbox name");
+            return;
+        }
+    };
+    let Ok(state_dir) = sbx_state_dir_path(&name) else {
+        return;
+    };
+    if !state_dir.exists() {
+        return;
+    }
+    info!(sandbox = %name, "removing sbx sandbox");
+    if let Err(e) = SbxInstance::remove_by_name(&name) {
+        warn!(sandbox = %name, error = %e, "failed to remove sbx sandbox");
+        eprintln!("Warning: failed to remove sbx sandbox {name}: {e}");
+        return;
+    }
+    if let Err(e) = std::fs::remove_dir_all(&state_dir) {
+        warn!(sandbox = %name, error = %e, "failed to clean up state dir");
     }
 }
 
@@ -255,6 +339,57 @@ pub fn prepare_launch(
     Ok(plan)
 }
 
+/// A fresh identifier for one exec's processes in the guest.
+pub fn new_session() -> Result<String> {
+    Ok(format!(
+        "{:016x}",
+        getrandom::u64().context("Failed to generate an sbx session id")?
+    ))
+}
+
+/// Run the plan's `sbx exec` in the foreground and return its exit code.
+///
+/// sbx leaves the guest command running when the `sbx exec` client goes
+/// away, so a hangup or termination (closing the pane) hangs up the
+/// session's processes in the guest before returning.
+pub fn run_exec(plan: &LaunchPlan) -> Result<i32> {
+    let hangup = Arc::new(AtomicBool::new(false));
+    for signal in [libc::SIGHUP, libc::SIGTERM] {
+        signal_hook::flag::register(signal, Arc::clone(&hangup))
+            .context("Failed to install a signal handler")?;
+    }
+
+    debug!(sandbox = %plan.sandbox_name, args = ?plan.exec.args, "spawning sbx exec");
+    let mut child = Command::new("sbx")
+        .args(&plan.exec.args)
+        .envs(plan.exec.env.iter().map(|(k, v)| (k, v)))
+        .spawn()
+        .context("Failed to execute sbx exec")?;
+    // The client usually exits on the same hangup; hang up the guest side
+    // whether it has or not. Its command ending then ends the client.
+    let status = loop {
+        if hangup.load(Ordering::Relaxed) {
+            hang_up(plan);
+            break child.wait()?;
+        }
+        if let Some(status) = child.try_wait()? {
+            if hangup.load(Ordering::Relaxed) {
+                hang_up(plan);
+            }
+            break status;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    Ok(status.code().unwrap_or(1))
+}
+
+fn hang_up(plan: &LaunchPlan) {
+    info!(sandbox = %plan.sandbox_name, "hanging up the sbx session");
+    if let Err(e) = run_sbx(&plan.hangup) {
+        warn!(sandbox = %plan.sandbox_name, error = %e, "failed to hang up the sbx session");
+    }
+}
+
 /// Ensure the worktree's sbx sandbox exists, creating it if necessary.
 ///
 /// Should be called from the main process BEFORE creating tmux panes, so
@@ -289,6 +424,26 @@ mod tests {
         .unwrap();
         assert_eq!(sandboxes[0].name, "wm-proj-1");
         assert!(!sandboxes[0].is_running());
+    }
+
+    #[test]
+    fn sbx_ls_timestamps_are_when_the_sandbox_was_created_and_last_used() {
+        use std::time::{Duration, UNIX_EPOCH};
+
+        let sandboxes = parse_sbx_sandboxes(
+            br#"[{"name":"wm-proj-1","status":"running","last_used_at":"2026-11-14T03:26:22.21548Z","created_at":"2026-11-14T03:26:20Z"},
+                 {"name":"wm-proj-2","status":"stopped"}]"#,
+        )
+        .unwrap();
+        // 2026-11-14T03:26:20Z
+        let created = UNIX_EPOCH + Duration::from_secs(1_794_626_780);
+        assert_eq!(sandboxes[0].created(), Some(created));
+        assert_eq!(
+            sandboxes[0].last_used(),
+            Some(created + Duration::from_secs(2))
+        );
+        assert_eq!(sandboxes[1].created(), None);
+        assert_eq!(sandboxes[1].last_used(), None);
     }
 
     #[test]

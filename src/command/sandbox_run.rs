@@ -459,17 +459,11 @@ fn run_docker_sbx(
     let exec = docker_sbx::ExecRequest {
         command: command.join(" "),
         env,
+        session: docker_sbx::new_session()?,
     };
     let plan = docker_sbx::prepare_launch(config, worktree_root, pane_cwd, agent, &exec)?;
 
-    debug!(sandbox = %plan.sandbox_name, args = ?plan.exec.args, "spawning sbx exec");
-    let status = Command::new("sbx")
-        .args(&plan.exec.args)
-        .envs(plan.exec.env.iter().map(|(k, v)| (k, v)))
-        .status()
-        .context("Failed to execute sbx exec")?;
-
-    let exit_code = status.code().unwrap_or(1);
+    let exit_code = docker_sbx::run_exec(&plan)?;
     info!(exit_code, "agent command exited");
     Ok(exit_code)
 }

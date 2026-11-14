@@ -11,7 +11,10 @@ mod template;
 mod wrap;
 
 pub(crate) use instance::sbx_state_dir_path;
-pub use instance::{ensure_sandbox, prepare_launch};
+pub use instance::{
+    SbxInstance, SbxSandboxInfo, ensure_sandbox, new_session, prepare_launch,
+    remove_sandbox_for_worktree, run_exec,
+};
 pub use plan::{ExecRequest, launch_plan};
 pub use wrap::wrap_for_docker_sbx;
 

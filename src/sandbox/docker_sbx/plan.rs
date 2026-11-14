@@ -53,6 +53,8 @@ pub struct LaunchTarget<'a> {
 pub struct ExecRequest {
     pub command: String,
     pub env: Vec<(String, String)>,
+    /// Identifies the exec's processes in the guest, so they can be hung up.
+    pub session: String,
 }
 
 /// One `sbx` invocation. Environment values are passed through the process
@@ -74,6 +76,9 @@ pub struct LaunchPlan {
     pub setup: Vec<SbxCommand>,
     /// The interactive exec that runs the command.
     pub exec: SbxCommand,
+    /// Hangs up the exec's processes in the guest. sbx leaves them running
+    /// when the `sbx exec` client goes away, as it does when a pane closes.
+    pub hangup: SbxCommand,
 }
 
 /// Home directory of sbx's `agent` user in the guest.
@@ -81,6 +86,9 @@ const GUEST_HOME: &str = "/home/agent";
 
 /// The image's system PATH.
 const GUEST_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+/// Environment variable marking the processes of one exec in the guest.
+const SESSION_ENV: &str = "WM_SBX_SESSION";
 
 /// Policy resource for workmux's RPC server: sbx's name for the workstation,
 /// on every port (RPC ports are ephemeral).
@@ -102,9 +110,11 @@ fn words(words: &[&str]) -> Vec<String> {
 /// The interactive `sbx exec` that runs the command in the pane's working
 /// directory. Values travel in the process environment; argv names them only.
 fn exec_command(target: &LaunchTarget, exec: &ExecRequest) -> SbxCommand {
+    let mut env = exec.env.clone();
+    env.push((SESSION_ENV.to_string(), exec.session.clone()));
     let mut args = words(&["exec", "-it", "-w"]);
     args.push(target.pane_cwd.to_string_lossy().into_owned());
-    for (key, _) in &exec.env {
+    for (key, _) in &env {
         args.push("-e".to_string());
         args.push(key.clone());
     }
@@ -119,9 +129,21 @@ fn exec_command(target: &LaunchTarget, exec: &ExecRequest) -> SbxCommand {
     // bash, so BASH_ENV brings in the environment sbx keeps in
     // /etc/sandbox-persistent.sh.
     args.extend(words(&["bash", "-c", &exec.command]));
+    SbxCommand { args, env }
+}
+
+/// Send SIGHUP to every guest process that carries the exec's session
+/// marker, as a closing terminal would: the command and what it started.
+fn hangup_command(target: &LaunchTarget, exec: &ExecRequest) -> SbxCommand {
+    let script = format!(
+        "for p in /proc/[0-9]*; do \
+         grep -qxzF {SESSION_ENV}={} \"$p/environ\" 2>/dev/null \
+         && kill -HUP \"${{p#/proc/}}\"; done; true",
+        exec.session
+    );
     SbxCommand {
-        args,
-        env: exec.env.clone(),
+        args: words(&["exec", target.sandbox_name, "sh", "-c", &script]),
+        env: Vec::new(),
     }
 }
 
@@ -260,6 +282,7 @@ pub fn launch_plan(
         create_template,
         setup,
         exec: exec_command(target, exec),
+        hangup: hangup_command(target, exec),
     })
 }
 
@@ -308,6 +331,15 @@ mod tests {
         }
     }
 
+    fn sandbox(status: &str) -> SbxSandboxInfo {
+        SbxSandboxInfo {
+            name: "wm-proj-12345678".to_string(),
+            status: status.to_string(),
+            created_at: None,
+            last_used_at: None,
+        }
+    }
+
     struct Paths {
         worktree: PathBuf,
         cwd: PathBuf,
@@ -341,6 +373,7 @@ mod tests {
                 ("WM_RPC_PORT".to_string(), "4242".to_string()),
                 ("WM_RPC_TOKEN".to_string(), "secret".to_string()),
             ],
+            session: "0123456789abcdef".to_string(),
         }
     }
 
@@ -395,10 +428,7 @@ mod tests {
     fn existing_sandbox_is_neither_created_nor_set_up_again() {
         let p = paths();
         let state = SbxState {
-            sandbox: Some(SbxSandboxInfo {
-                name: "wm-proj-12345678".to_string(),
-                status: "stopped".to_string(),
-            }),
+            sandbox: Some(sandbox("stopped")),
             ..missing()
         };
         let plan = launch_plan(&config(), &target(&p), "claude", &state, &exec()).unwrap();
@@ -443,10 +473,7 @@ mod tests {
     fn existing_localhost_rule_is_not_added_again() {
         let p = paths();
         let existing = SbxState {
-            sandbox: Some(SbxSandboxInfo {
-                name: "wm-proj-12345678".to_string(),
-                status: "running".to_string(),
-            }),
+            sandbox: Some(sandbox("running")),
             rules: vec![
                 rule("global", "api.anthropic.com"),
                 rule("sandbox:wm-proj-12345678", "localhost"),
@@ -483,6 +510,8 @@ mod tests {
                 "-e",
                 "WM_RPC_TOKEN",
                 "-e",
+                "WM_SBX_SESSION",
+                "-e",
                 "PATH=/state/docker-sbx/wm-proj-12345678/shims/bin:/home/agent/.local/bin:\
                  /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
                 "wm-proj-12345678",
@@ -497,8 +526,45 @@ mod tests {
             vec![
                 ("WM_RPC_PORT".to_string(), "4242".to_string()),
                 ("WM_RPC_TOKEN".to_string(), "secret".to_string()),
+                ("WM_SBX_SESSION".to_string(), "0123456789abcdef".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn hangup_ends_only_the_processes_of_the_panes_session() {
+        // sbx leaves the guest command running when its `sbx exec` client
+        // hangs up, so the supervisor hangs up the session's processes itself.
+        let p = paths();
+        let plan = launch_plan(&config(), &target(&p), "claude", &missing(), &exec()).unwrap();
+
+        assert_eq!(
+            plan.hangup.args,
+            args(&[
+                "exec",
+                "wm-proj-12345678",
+                "sh",
+                "-c",
+                "for p in /proc/[0-9]*; do \
+                 grep -qxzF WM_SBX_SESSION=0123456789abcdef \"$p/environ\" 2>/dev/null \
+                 && kill -HUP \"${p#/proc/}\"; done; true",
+            ])
+        );
+        assert!(plan.hangup.env.is_empty());
+    }
+
+    #[test]
+    fn stopped_sandbox_needs_no_start_step_since_exec_starts_it() {
+        let p = paths();
+        let stopped = SbxState {
+            sandbox: Some(sandbox("stopped")),
+            rules: vec![rule("sandbox:wm-proj-12345678", "localhost")],
+            ..missing()
+        };
+        let plan = launch_plan(&config(), &target(&p), "claude", &stopped, &exec()).unwrap();
+
+        assert!(plan.setup.is_empty(), "{:?}", plan.setup);
+        assert_eq!(plan.exec.args[..2], args(&["exec", "-it"]));
     }
 
     fn failing(check: &str) -> SbxState {

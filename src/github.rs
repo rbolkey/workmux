@@ -144,7 +144,8 @@ struct CheckRollupItem {
 }
 
 /// Parse a GitHub ISO 8601 UTC timestamp (e.g., "2026-03-24T14:02:00Z") to Unix seconds.
-fn parse_github_timestamp(s: &str) -> Option<u64> {
+/// Fractional seconds are ignored.
+pub(crate) fn parse_github_timestamp(s: &str) -> Option<u64> {
     // GitHub always returns UTC timestamps in format: YYYY-MM-DDTHH:MM:SSZ
     let s = s.trim();
     if s.len() < 20 || !s.ends_with('Z') {

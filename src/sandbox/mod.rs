@@ -31,6 +31,7 @@ pub use container::stop_containers_for_handle;
 pub(crate) use container::validate_git_metadata_boundary;
 pub use container::wrap_for_container;
 pub use docker_sbx::ensure_sandbox as ensure_docker_sbx_sandbox;
+pub use docker_sbx::remove_sandbox_for_worktree as remove_docker_sbx_sandbox;
 pub use docker_sbx::wrap_for_docker_sbx;
 pub use lima::ensure_vm_running as ensure_lima_vm;
 pub use lima::wrap_for_lima;
