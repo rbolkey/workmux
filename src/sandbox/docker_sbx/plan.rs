@@ -223,6 +223,9 @@ fn agent_home_subpath(agent: &str) -> Option<&'static str> {
     }
 }
 
+/// Where OpenCode's global config directory goes under the guest home.
+const OPENCODE_CONFIG_SUBPATH: &str = ".config/opencode";
+
 /// The subdirectory of an agent's config directory it downloads binaries
 /// into, and the guest-local directory that takes its place.
 fn guest_binaries_dir(agent: &str) -> Option<(&'static str, &'static str)> {
@@ -253,27 +256,29 @@ fn root_exec(name: &str, command: Vec<String>) -> SbxCommand {
     }
 }
 
-/// Link a host directory, mounted at its host path, to `subpath` under the
-/// guest home. Parent directories are created first and owned by the agent,
-/// so it can still write beside the link (`~/.local/state`).
-fn link_into_home(name: &str, host_dir: &Path, subpath: &str) -> Vec<SbxCommand> {
-    let mut commands = Vec::new();
-    let parents: Vec<String> = Path::new(subpath)
-        .ancestors()
-        .skip(1)
-        .filter(|p| !p.as_os_str().is_empty())
-        .map(|p| format!("{GUEST_HOME}/{}", p.display()))
-        .collect();
-    if !parents.is_empty() {
-        let mut command = words(&["install", "-d", "-o", "agent", "-g", "agent"]);
-        command.extend(parents.into_iter().rev());
-        commands.push(root_exec(name, command));
+/// Make the agent own the parents of `subpaths` under the guest home.
+fn own_home_parents(name: &str, subpaths: &[&str]) -> Option<SbxCommand> {
+    let mut parents: Vec<String> = Vec::new();
+    for subpath in subpaths {
+        let mut ancestors: Vec<String> = Path::new(subpath)
+            .ancestors()
+            .skip(1)
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| format!("{GUEST_HOME}/{}", p.display()))
+            .collect();
+        ancestors.reverse();
+        for parent in ancestors {
+            if !parents.contains(&parent) {
+                parents.push(parent);
+            }
+        }
     }
-    let mut command = words(&["ln", "-sfnT"]);
-    command.push(host_dir.to_string_lossy().into_owned());
-    command.push(format!("{GUEST_HOME}/{subpath}"));
-    commands.push(root_exec(name, command));
-    commands
+    if parents.is_empty() {
+        return None;
+    }
+    let mut command = words(&["install", "-d", "-o", "agent", "-g", "agent"]);
+    command.extend(parents);
+    Some(root_exec(name, command))
 }
 
 fn words(words: &[&str]) -> Vec<String> {
@@ -453,8 +458,8 @@ fn git_workspaces(git: &GitMetadata) -> Vec<String> {
     workspaces
 }
 
-/// `sandbox.extra_mounts` as workspaces, read-only unless writable. sbx
-/// mounts a host path only at that same path, and a file only read-only.
+/// `sandbox.extra_mounts` as workspaces (`HOST[:GUEST]`), read-only unless
+/// writable. sbx mounts a file only read-only.
 fn extra_mount_workspaces(config: &SandboxConfig, target: &LaunchTarget) -> Result<Vec<String>> {
     let protected = [
         target.worktree_root.join(".git"),
@@ -464,17 +469,13 @@ fn extra_mount_workspaces(config: &SandboxConfig, target: &LaunchTarget) -> Resu
     let mut workspaces = Vec::new();
     for mount in config.extra_mounts() {
         let (host, guest, read_only) = mount.resolve()?;
-        if guest != host {
-            bail!(
-                "sandbox.extra_mounts entry {} sets guest_path {} but the docker_sbx \
-                 backend mounts a host path only at that same path. Remove guest_path, \
-                 or use the container or lima backend.",
-                host.display(),
-                guest.display()
-            );
-        }
+        let workspace = if guest == host {
+            host.to_string_lossy().into_owned()
+        } else {
+            format!("{}:{}", host.display(), guest.display())
+        };
         if read_only {
-            workspaces.push(format!("{}:ro", host.display()));
+            workspaces.push(format!("{workspace}:ro"));
             continue;
         }
         // Checking the host is the plan's only look at the filesystem.
@@ -495,7 +496,7 @@ fn extra_mount_workspaces(config: &SandboxConfig, target: &LaunchTarget) -> Resu
                 guest.display()
             );
         }
-        workspaces.push(host.to_string_lossy().into_owned());
+        workspaces.push(workspace);
     }
     Ok(workspaces)
 }
@@ -735,15 +736,15 @@ fn check_prerequisites(state: &SbxState) -> Result<()> {
 /// generic `shell` agent (agent kits would write into the mounted config
 /// directory), the configured resources and mixin kits, mounting the
 /// worktree, the main repository's git dir (read-only but for what commits
-/// write), the agent's config directory, the shims and `extra_mounts`, all
-/// at their host paths; then, as root, link the config directory to where
-/// the agent looks for it and seed Claude's onboarding state. On every
-/// launch: bind pi's and OMP's binaries directory to a guest-local one,
-/// reconcile the sandbox's rules with `sandbox.network` and the toolchain's
-/// endpoints, and allow the supervisor's RPC port until the exec ends. Last,
-/// when the sandbox was just created, workmux's built-in provisioning
-/// (shims on login shells' `PATH`, Nix and Devbox for a toolchain) and the
-/// `provision` script. The exec runs the agent command in the toolchain's
+/// write) and the shims at their host paths, the agent's config directory
+/// where the agent looks for it, and `extra_mounts`; then, as root, give the
+/// agent the config directory's parents and seed Claude's onboarding state.
+/// On every launch: bind pi's and OMP's binaries directory to a guest-local
+/// one, reconcile the sandbox's rules with `sandbox.network` and the
+/// toolchain's endpoints, and allow the supervisor's RPC port until the exec
+/// ends. Last, when the sandbox was just created, workmux's built-in
+/// provisioning (shims on login shells' `PATH`, Nix and Devbox for a
+/// toolchain) and the `provision` script. The exec runs the agent command in the toolchain's
 /// environment.
 pub fn launch_plan(
     config: &SandboxConfig,
@@ -756,8 +757,7 @@ pub fn launch_plan(
     if !config.container.excluded_files().is_empty() {
         bail!(
             "sandbox.container.excluded_files is set but the docker_sbx backend \
-             can't mask files: sbx mounts a host path only at that same path. \
-             Secrets would remain readable inside the sandbox. Use the container \
+             doesn't mask files. Secrets would remain readable inside the sandbox. Use the container \
              backend with docker or podman, or remove sandbox.container.excluded_files."
         );
     }
@@ -797,13 +797,18 @@ pub fn launch_plan(
         args.push("shell".to_string());
         args.push(target.worktree_root.to_string_lossy().into_owned());
         args.extend(git_workspaces(target.git));
+        // The agent's config directory where the agent looks for it, as on
+        // the other backends.
         let config_dir = config_dir_and_home_subpath(config, agent);
-        if let Some((config_dir, _)) = &config_dir {
-            args.push(config_dir.to_string_lossy().into_owned());
+        if let Some((config_dir, subpath)) = &config_dir {
+            args.push(format!("{}:{GUEST_HOME}/{subpath}", config_dir.display()));
         }
         let opencode_config_dir = target.opencode_config_dir.filter(|_| agent == "opencode");
         if let Some(dir) = opencode_config_dir {
-            args.push(format!("{}:ro", dir.display()));
+            args.push(format!(
+                "{}:{GUEST_HOME}/{OPENCODE_CONFIG_SUBPATH}:ro",
+                dir.display()
+            ));
         }
         args.push(format!("{}:ro", target.state_dir.display()));
         args.extend(extra_mounts);
@@ -813,16 +818,14 @@ pub fn launch_plan(
         });
         create_template = Some(template);
 
-        // sbx mounts workspaces only at their host paths: link the agent's
-        // config directory to where the agent looks for it.
-        if let Some((config_dir, subpath)) = config_dir {
-            setup.extend(link_into_home(name, &config_dir, subpath));
+        // sbx creates the missing parents of a mount's guest path as root;
+        // hand them to the agent, so it can still write beside the mount
+        // (`~/.local/state`).
+        let mut subpaths: Vec<&str> = config_dir.iter().map(|(_, subpath)| *subpath).collect();
+        if opencode_config_dir.is_some() {
+            subpaths.push(OPENCODE_CONFIG_SUBPATH);
         }
-        // OpenCode's global config (opencode.json, plugins, global MCP
-        // definitions) lives apart from its data directory.
-        if let Some(dir) = opencode_config_dir {
-            setup.extend(link_into_home(name, dir, ".config/opencode"));
-        }
+        setup.extend(own_home_parents(name, &subpaths));
 
         // Claude keeps its onboarding state in ~/.claude.json, outside the
         // config directory. Seed the sandbox's own copy, as Lima seeds each
@@ -846,7 +849,7 @@ pub fn launch_plan(
     // overlays pi's bin/. A guest mount ends when sbx stops the sandbox, so
     // every launch makes it.
     if let Some((subdir, guest_dir)) = guest_binaries_dir(agent)
-        && let Some((config_dir, _)) = config_dir_and_home_subpath(config, agent)
+        && let Some((_, subpath)) = config_dir_and_home_subpath(config, agent)
     {
         let mut command = words(&[
             "sh",
@@ -855,7 +858,7 @@ pub fn launch_plan(
              && mkdir -p \"$1\" && mount --bind \"$2\" \"$1\"; }",
             "sh",
         ]);
-        command.push(config_dir.join(subdir).to_string_lossy().into_owned());
+        command.push(format!("{GUEST_HOME}/{subpath}/{subdir}"));
         command.push(guest_dir.to_string());
         setup.push(root_exec(name, command));
     }
@@ -1080,26 +1083,6 @@ mod tests {
         assert_eq!(
             plan.setup[0].args.last().unwrap(),
             "/state/docker-sbx/wm-proj-12345678:ro"
-        );
-    }
-
-    #[test]
-    fn created_sandbox_links_the_agent_config_dir_into_the_agent_home_as_root() {
-        let p = paths();
-        let plan = launch_plan(&config(), &target(&p), "claude", &missing(), &exec()).unwrap();
-
-        assert_eq!(
-            plan.setup[1].args,
-            args(&[
-                "exec",
-                "-u",
-                "root",
-                "wm-proj-12345678",
-                "ln",
-                "-sfnT",
-                "/home/me/.claude",
-                "/home/agent/.claude",
-            ])
         );
     }
 
@@ -1986,7 +1969,7 @@ mod tests {
     }
 
     #[test]
-    fn each_agents_config_dir_is_mounted_and_linked_to_its_usual_place() {
+    fn each_agents_config_dir_is_mounted_at_its_usual_place() {
         for (agent, home_path) in [
             ("claude", "/home/agent/.claude"),
             ("copilot", "/home/agent/.copilot"),
@@ -1999,25 +1982,17 @@ mod tests {
         ] {
             let p = paths();
             let plan = launch_plan(&config(), &target(&p), agent, &missing(), &exec()).unwrap();
-            let host = format!("/home/me/.{agent}");
+            let workspace = format!("/home/me/.{agent}:{home_path}");
 
             assert!(
-                plan.setup[0].args.contains(&host),
+                workspaces(&plan).contains(&workspace),
                 "{agent}: {:?}",
                 plan.setup[0]
             );
-            let link = args(&[
-                "exec",
-                "-u",
-                "root",
-                "wm-proj-12345678",
-                "ln",
-                "-sfnT",
-                &host,
-                home_path,
-            ]);
             assert!(
-                setup_args(&plan).contains(&link),
+                !setup_args(&plan)
+                    .iter()
+                    .any(|a| a.contains(&"ln".to_string())),
                 "{agent}: {:?}",
                 plan.setup
             );
@@ -2054,7 +2029,7 @@ mod tests {
     }
 
     #[test]
-    fn opencode_global_config_dir_is_mounted_read_only_and_linked() {
+    fn opencode_global_config_dir_is_mounted_read_only_at_its_usual_place() {
         let p = paths();
         let opencode_config = PathBuf::from("/home/me/.config/opencode");
         let target = LaunchTarget {
@@ -2066,7 +2041,7 @@ mod tests {
         assert!(
             plan.setup[0]
                 .args
-                .contains(&"/home/me/.config/opencode:ro".to_string()),
+                .contains(&"/home/me/.config/opencode:/home/agent/.config/opencode:ro".to_string()),
             "{:?}",
             plan.setup[0]
         );
@@ -2077,10 +2052,15 @@ mod tests {
                 "-u",
                 "root",
                 "wm-proj-12345678",
-                "ln",
-                "-sfnT",
-                "/home/me/.config/opencode",
-                "/home/agent/.config/opencode",
+                "install",
+                "-d",
+                "-o",
+                "agent",
+                "-g",
+                "agent",
+                "/home/agent/.local",
+                "/home/agent/.local/share",
+                "/home/agent/.config",
             ])),
             "{setup:?}"
         );
@@ -2124,10 +2104,14 @@ mod tests {
             ..missing()
         };
         for (agent, host, guest) in [
-            ("pi", "/home/me/.pi/bin", "/var/lib/workmux/pi-agent-bin"),
+            (
+                "pi",
+                "/home/agent/.pi/agent/bin",
+                "/var/lib/workmux/pi-agent-bin",
+            ),
             (
                 "omp",
-                "/home/me/.omp/tools",
+                "/home/agent/.omp/agent/tools",
                 "/var/lib/workmux/omp-agent-tools",
             ),
         ] {
@@ -2146,9 +2130,9 @@ mod tests {
     }
 
     #[test]
-    fn nested_links_get_parent_dirs_the_agent_owns_first() {
-        // Root creates the link; parents it made would be root's, and the
-        // agent couldn't write elsewhere under them (~/.local/state).
+    fn nested_mounts_get_parent_dirs_the_agent_owns() {
+        // sbx creates a mount's missing parents as root; the agent couldn't
+        // write elsewhere under them (~/.local/state).
         let p = paths();
         let plan = launch_plan(&config(), &target(&p), "opencode", &missing(), &exec()).unwrap();
         let setup = setup_args(&plan);
@@ -2166,12 +2150,7 @@ mod tests {
             "/home/agent/.local",
             "/home/agent/.local/share",
         ]);
-        let parents_at = setup.iter().position(|a| *a == parents).expect("parents");
-        let link_at = setup
-            .iter()
-            .position(|a| a.contains(&"/home/agent/.local/share/opencode".to_string()))
-            .expect("link");
-        assert!(parents_at < link_at, "{setup:?}");
+        assert!(setup[1..].contains(&parents), "{setup:?}");
 
         let plan = launch_plan(&config(), &target(&p), "codex", &missing(), &exec()).unwrap();
         assert!(
@@ -2184,7 +2163,7 @@ mod tests {
     }
 
     #[test]
-    fn agents_without_a_config_dir_get_no_mount_or_link() {
+    fn agents_without_a_config_dir_get_no_mount() {
         let p = paths();
         let config = SandboxConfig {
             agent_config_dir: None,
@@ -2201,7 +2180,7 @@ mod tests {
             !plan
                 .setup
                 .iter()
-                .any(|c| c.args.contains(&"ln".to_string())),
+                .any(|c| c.args.contains(&"install".to_string())),
             "{:?}",
             plan.setup
         );
@@ -2239,7 +2218,7 @@ mod tests {
                 "/code/proj/.git/worktrees/feat/gitdir:ro",
                 "/code/proj/.git/worktrees/feat/commondir:ro",
                 "/code/proj__worktrees/feat/.git:ro",
-                "/home/me/.claude",
+                "/home/me/.claude:/home/agent/.claude",
                 "/state/docker-sbx/wm-proj-12345678:ro",
             ])
         );
@@ -2327,16 +2306,27 @@ mod tests {
     }
 
     #[test]
-    fn extra_mount_at_a_different_guest_path_is_an_error() {
-        let config = with_extra_mounts(vec![ExtraMount::Spec {
-            host_path: "/data/notes".to_string(),
-            guest_path: Some("/mnt/notes".to_string()),
-            writable: None,
-        }]);
+    fn extra_mounts_at_a_different_guest_path_mount_there() {
+        let config = with_extra_mounts(vec![
+            ExtraMount::Spec {
+                host_path: "/data/notes".to_string(),
+                guest_path: Some("/mnt/notes".to_string()),
+                writable: None,
+            },
+            ExtraMount::Spec {
+                host_path: "/data/scratch".to_string(),
+                guest_path: Some("/mnt/scratch".to_string()),
+                writable: Some(true),
+            },
+        ]);
+        let p = paths();
+        let plan = launch_plan(&config, &target(&p), "claude", &missing(), &exec()).unwrap();
 
-        let message = config_error(&config);
-        assert!(message.contains("/mnt/notes"), "{message}");
-        assert!(message.contains("guest_path"), "{message}");
+        let workspaces = workspaces(&plan);
+        assert_eq!(
+            workspaces[workspaces.len() - 2..],
+            args(&["/data/notes:/mnt/notes:ro", "/data/scratch:/mnt/scratch"])
+        );
     }
 
     #[test]
@@ -2475,8 +2465,8 @@ mod tests {
         let p = paths();
         let plan = launch_plan(&config, &target(&p), "claude", &missing(), &exec()).unwrap();
 
-        // Provisioning runs after every setup command: the seed, the links
-        // and the domain rules its downloads may need.
+        // Provisioning runs after every setup command: the seed, the parent
+        // dirs and the domain rules its downloads may need.
         let setup = setup_args(&plan);
         assert!(
             setup
