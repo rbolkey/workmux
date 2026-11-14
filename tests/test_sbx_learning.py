@@ -612,6 +612,59 @@ def test_root_unmounting_a_read_only_mount_does_not_make_it_writable(
     assert not (hooks / "x").exists()
 
 
+def test_writable_mounts_nested_in_a_read_only_git_dir_let_commits_through(
+    repo: Path,
+):
+    """The container backend's git-metadata layout: the main git dir read-only,
+    the parts commits write (objects, refs, logs, the worktree's admin dir)
+    writable inside it, and its files workmux protects read-only again. sbx
+    mounts parents before children whatever order the workspaces are listed in."""
+    git_dir = repo / "repo" / ".git"
+    worktree = repo / "repo__worktrees" / "feat"
+    admin = git_dir / "worktrees" / "feat"
+    sandbox, created = create_sandbox(
+        "gitro",
+        [
+            str(worktree),
+            str(git_dir / "objects"),
+            str(git_dir / "refs"),
+            str(git_dir / "logs"),
+            str(admin),
+            f"{git_dir}/objects/info:ro",
+            f"{admin}/gitdir:ro",
+            f"{worktree}/.git:ro",
+            f"{git_dir}:ro",
+        ],
+    )
+    try:
+        assert created.returncode == 0, created.stderr
+        script = f"""
+            touch {git_dir}/hooks/pre-commit 2>/dev/null; echo hooks=$?
+            touch {git_dir}/wm-probe 2>/dev/null; echo git_dir=$?
+            touch {git_dir}/objects/info/wm-probe 2>/dev/null; echo objects_info=$?
+            echo x >> {admin}/gitdir 2>/dev/null; echo gitdir=$?
+            echo x >> {worktree}/.git 2>/dev/null; echo pointer=$?
+            mkdir {git_dir}/worktrees/other 2>/dev/null; echo other_admin=$?
+        """
+        for user in [None, "root"]:
+            out = sandbox.sh_ok(script, user=user).split()
+            assert out == [
+                "hooks=1",
+                "git_dir=1",
+                "objects_info=1",
+                "gitdir=1",
+                "pointer=1",
+                "other_admin=1",
+            ], user
+        sandbox.sh_ok(
+            "echo y > nested.txt && git add nested.txt && git -c user.name=wm "
+            "-c user.email=wm@example.invalid commit -q -m nested"
+        )
+        assert git("log", "-1", "--format=%s", cwd=worktree) == "nested\n"
+    finally:
+        sandbox.remove()
+
+
 def test_file_ownership_maps_between_guest_agent_and_host_user(
     mounted: Sandbox, repo: Path
 ):
