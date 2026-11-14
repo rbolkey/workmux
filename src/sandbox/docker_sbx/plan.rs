@@ -5,7 +5,7 @@
 //! commands, then run its exec in the foreground.
 
 use anyhow::{Result, bail};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::config::SandboxConfig;
 
@@ -44,6 +44,9 @@ pub struct LaunchTarget<'a> {
     pub pane_cwd: &'a Path,
     /// The main repository's git dir, when it lies outside `worktree_root`.
     pub git_common_dir: Option<&'a Path>,
+    /// OpenCode's global config directory (`~/.config/opencode/`), when it
+    /// exists; mounted read-only for the opencode agent.
+    pub opencode_config_dir: Option<&'a Path>,
     /// Host-side state directory for the sandbox (shims live under it).
     pub state_dir: &'a Path,
 }
@@ -95,12 +98,72 @@ const SESSION_ENV: &str = "WM_SBX_SESSION";
 const RPC_RULE_RESOURCE: &str = "localhost";
 
 /// Where an agent's config directory is linked under the guest home, or
-/// `None` for agents the docker_sbx backend doesn't support yet.
+/// `None` for agents whose config directory workmux doesn't mount.
 fn agent_home_subpath(agent: &str) -> Option<&'static str> {
     match agent {
         "claude" => Some(".claude"),
+        "copilot" => Some(".copilot"),
+        "gemini" => Some(".gemini"),
+        "agy" => Some(".gemini/antigravity-cli"),
+        "codex" => Some(".codex"),
+        "opencode" => Some(".local/share/opencode"),
+        "pi" => Some(".pi/agent"),
+        "omp" => Some(".omp/agent"),
         _ => None,
     }
+}
+
+/// The subdirectory of an agent's config directory it downloads binaries
+/// into, and the guest-local directory that takes its place.
+fn guest_binaries_dir(agent: &str) -> Option<(&'static str, &'static str)> {
+    match agent {
+        "pi" => Some(("bin", "/var/lib/workmux/pi-agent-bin")),
+        "omp" => Some(("tools", "/var/lib/workmux/omp-agent-tools")),
+        _ => None,
+    }
+}
+
+/// The agent's host config directory and where it's linked under the guest
+/// home, for agents whose config directory workmux mounts.
+fn config_dir_and_home_subpath(
+    config: &SandboxConfig,
+    agent: &str,
+) -> Option<(PathBuf, &'static str)> {
+    let subpath = agent_home_subpath(agent)?;
+    Some((config.resolved_agent_config_dir(agent)?, subpath))
+}
+
+/// A command run as root in the sandbox.
+fn root_exec(name: &str, command: Vec<String>) -> SbxCommand {
+    let mut args = words(&["exec", "-u", "root", name]);
+    args.extend(command);
+    SbxCommand {
+        args,
+        env: Vec::new(),
+    }
+}
+
+/// Link a host directory, mounted at its host path, to `subpath` under the
+/// guest home. Parent directories are created first and owned by the agent,
+/// so it can still write beside the link (`~/.local/state`).
+fn link_into_home(name: &str, host_dir: &Path, subpath: &str) -> Vec<SbxCommand> {
+    let mut commands = Vec::new();
+    let parents: Vec<String> = Path::new(subpath)
+        .ancestors()
+        .skip(1)
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| format!("{GUEST_HOME}/{}", p.display()))
+        .collect();
+    if !parents.is_empty() {
+        let mut command = words(&["install", "-d", "-o", "agent", "-g", "agent"]);
+        command.extend(parents.into_iter().rev());
+        commands.push(root_exec(name, command));
+    }
+    let mut command = words(&["ln", "-sfnT"]);
+    command.push(host_dir.to_string_lossy().into_owned());
+    command.push(format!("{GUEST_HOME}/{subpath}"));
+    commands.push(root_exec(name, command));
+    commands
 }
 
 fn words(words: &[&str]) -> Vec<String> {
@@ -194,7 +257,11 @@ fn check_prerequisites(state: &SbxState) -> Result<()> {
 /// When the sandbox is missing: create it from the template with sbx's
 /// generic `shell` agent (agent kits would write into the mounted config
 /// directory), mounting the worktree, the main repository's git dir, the
-/// agent's config directory and the shims, all at their host paths.
+/// agent's config directory and the shims, all at their host paths; then,
+/// as root, link the config directory to where the agent looks for it and
+/// seed Claude's onboarding state. On every launch: bind pi's and OMP's
+/// binaries directory to a guest-local one, and add the RPC policy rule if
+/// it's missing.
 pub fn launch_plan(
     config: &SandboxConfig,
     target: &LaunchTarget,
@@ -203,12 +270,6 @@ pub fn launch_plan(
     exec: &ExecRequest,
 ) -> Result<LaunchPlan> {
     check_prerequisites(state)?;
-    if agent_home_subpath(agent).is_none() {
-        bail!(
-            "The docker_sbx sandbox backend doesn't support agent '{agent}' yet; \
-             it supports claude. Use the container or lima backend for {agent}."
-        );
-    }
 
     let name = target.sandbox_name;
     let mut setup = Vec::new();
@@ -231,9 +292,13 @@ pub fn launch_plan(
         if let Some(git_dir) = target.git_common_dir {
             args.push(git_dir.to_string_lossy().into_owned());
         }
-        let config_dir = config.resolved_agent_config_dir(agent);
-        if let Some(config_dir) = &config_dir {
+        let config_dir = config_dir_and_home_subpath(config, agent);
+        if let Some((config_dir, _)) = &config_dir {
             args.push(config_dir.to_string_lossy().into_owned());
+        }
+        let opencode_config_dir = target.opencode_config_dir.filter(|_| agent == "opencode");
+        if let Some(dir) = opencode_config_dir {
+            args.push(format!("{}:ro", dir.display()));
         }
         args.push(format!("{}:ro", target.state_dir.display()));
         setup.push(SbxCommand {
@@ -244,15 +309,49 @@ pub fn launch_plan(
 
         // sbx mounts workspaces only at their host paths: link the agent's
         // config directory to where the agent looks for it.
-        if let (Some(config_dir), Some(subpath)) = (config_dir, agent_home_subpath(agent)) {
-            let mut args = words(&["exec", "-u", "root", name, "ln", "-sfnT"]);
-            args.push(config_dir.to_string_lossy().into_owned());
-            args.push(format!("{GUEST_HOME}/{subpath}"));
-            setup.push(SbxCommand {
-                args,
-                env: Vec::new(),
-            });
+        if let Some((config_dir, subpath)) = config_dir {
+            setup.extend(link_into_home(name, &config_dir, subpath));
         }
+        // OpenCode's global config (opencode.json, plugins, global MCP
+        // definitions) lives apart from its data directory.
+        if let Some(dir) = opencode_config_dir {
+            setup.extend(link_into_home(name, dir, ".config/opencode"));
+        }
+
+        // Claude keeps its onboarding state in ~/.claude.json, outside the
+        // config directory. Seed the sandbox's own copy, as Lima seeds each
+        // VM's, so Claude doesn't run onboarding in every sandbox.
+        if agent == "claude" {
+            let mut command = words(&[
+                "sh",
+                "-c",
+                "[ -e \"$1\" ] || { printf %s \"$2\" > \"$1\" && chown agent:agent \"$1\"; }",
+                "sh",
+            ]);
+            command.push(format!("{GUEST_HOME}/.claude.json"));
+            command.push(crate::sandbox::CLAUDE_ONBOARDING_JSON.to_string());
+            setup.push(root_exec(name, command));
+        }
+    }
+
+    // Pi and OMP download platform-specific fd/rg binaries into their config
+    // directory, which would overwrite the workstation's own through the
+    // mount. Bind a guest-local directory over it, as the container backend
+    // overlays pi's bin/. A guest mount ends when sbx stops the sandbox, so
+    // every launch makes it.
+    if let Some((subdir, guest_dir)) = guest_binaries_dir(agent)
+        && let Some((config_dir, _)) = config_dir_and_home_subpath(config, agent)
+    {
+        let mut command = words(&[
+            "sh",
+            "-c",
+            "mountpoint -q \"$1\" || { install -d -o agent -g agent \"$2\" \
+             && mkdir -p \"$1\" && mount --bind \"$2\" \"$1\"; }",
+            "sh",
+        ]);
+        command.push(config_dir.join(subdir).to_string_lossy().into_owned());
+        command.push(guest_dir.to_string());
+        setup.push(root_exec(name, command));
     }
 
     // One rule scoped to the sandbox lets the guest reach workmux's RPC
@@ -362,6 +461,7 @@ mod tests {
             worktree_root: &p.worktree,
             pane_cwd: &p.cwd,
             git_common_dir: Some(&p.git),
+            opencode_config_dir: None,
             state_dir: &p.state,
         }
     }
@@ -627,11 +727,233 @@ mod tests {
         assert!(launch_plan(&config(), &target(&p), "claude", &linux_with_kvm, &exec()).is_ok());
     }
 
+    fn setup_args(plan: &LaunchPlan) -> Vec<Vec<String>> {
+        plan.setup.iter().map(|c| c.args.clone()).collect()
+    }
+
     #[test]
-    fn agents_without_sbx_support_fail_closed() {
-        let message = plan_error(&missing(), "codex");
-        assert!(message.contains("codex"), "{message}");
-        assert!(message.contains("claude"), "{message}");
+    fn each_agents_config_dir_is_mounted_and_linked_to_its_usual_place() {
+        for (agent, home_path) in [
+            ("claude", "/home/agent/.claude"),
+            ("copilot", "/home/agent/.copilot"),
+            ("gemini", "/home/agent/.gemini"),
+            ("agy", "/home/agent/.gemini/antigravity-cli"),
+            ("codex", "/home/agent/.codex"),
+            ("opencode", "/home/agent/.local/share/opencode"),
+            ("pi", "/home/agent/.pi/agent"),
+            ("omp", "/home/agent/.omp/agent"),
+        ] {
+            let p = paths();
+            let plan = launch_plan(&config(), &target(&p), agent, &missing(), &exec()).unwrap();
+            let host = format!("/home/me/.{agent}");
+
+            assert!(
+                plan.setup[0].args.contains(&host),
+                "{agent}: {:?}",
+                plan.setup[0]
+            );
+            let link = args(&[
+                "exec",
+                "-u",
+                "root",
+                "wm-proj-12345678",
+                "ln",
+                "-sfnT",
+                &host,
+                home_path,
+            ]);
+            assert!(
+                setup_args(&plan).contains(&link),
+                "{agent}: {:?}",
+                plan.setup
+            );
+        }
+    }
+
+    #[test]
+    fn created_claude_sandbox_is_seeded_with_completed_onboarding() {
+        let p = paths();
+        let plan = launch_plan(&config(), &target(&p), "claude", &missing(), &exec()).unwrap();
+
+        let seed = args(&[
+            "exec",
+            "-u",
+            "root",
+            "wm-proj-12345678",
+            "sh",
+            "-c",
+            "[ -e \"$1\" ] || { printf %s \"$2\" > \"$1\" && chown agent:agent \"$1\"; }",
+            "sh",
+            "/home/agent/.claude.json",
+            r#"{"hasCompletedOnboarding":true,"bypassPermissionsModeAccepted":true}"#,
+        ]);
+        assert!(setup_args(&plan).contains(&seed), "{:?}", plan.setup);
+
+        let plan = launch_plan(&config(), &target(&p), "codex", &missing(), &exec()).unwrap();
+        assert!(
+            !setup_args(&plan)
+                .iter()
+                .any(|a| a.iter().any(|w| w.contains(".claude.json"))),
+            "{:?}",
+            plan.setup
+        );
+    }
+
+    #[test]
+    fn opencode_global_config_dir_is_mounted_read_only_and_linked() {
+        let p = paths();
+        let opencode_config = PathBuf::from("/home/me/.config/opencode");
+        let target = LaunchTarget {
+            opencode_config_dir: Some(&opencode_config),
+            ..target(&p)
+        };
+        let plan = launch_plan(&config(), &target, "opencode", &missing(), &exec()).unwrap();
+
+        assert!(
+            plan.setup[0]
+                .args
+                .contains(&"/home/me/.config/opencode:ro".to_string()),
+            "{:?}",
+            plan.setup[0]
+        );
+        let setup = setup_args(&plan);
+        assert!(
+            setup.contains(&args(&[
+                "exec",
+                "-u",
+                "root",
+                "wm-proj-12345678",
+                "ln",
+                "-sfnT",
+                "/home/me/.config/opencode",
+                "/home/agent/.config/opencode",
+            ])),
+            "{setup:?}"
+        );
+
+        // Only OpenCode gets it.
+        let plan = launch_plan(&config(), &target, "codex", &missing(), &exec()).unwrap();
+        assert!(
+            !setup_args(&plan)
+                .iter()
+                .any(|a| a.iter().any(|w| w.contains(".config/opencode"))),
+            "{:?}",
+            plan.setup
+        );
+    }
+
+    fn bind_guest_dir(host: &str, guest: &str) -> Vec<String> {
+        args(&[
+            "exec",
+            "-u",
+            "root",
+            "wm-proj-12345678",
+            "sh",
+            "-c",
+            "mountpoint -q \"$1\" || { install -d -o agent -g agent \"$2\" \
+             && mkdir -p \"$1\" && mount --bind \"$2\" \"$1\"; }",
+            "sh",
+            host,
+            guest,
+        ])
+    }
+
+    #[test]
+    fn pi_and_omp_download_their_binaries_into_a_guest_local_dir_on_every_launch() {
+        // They download Linux fd/rg into the mounted config dir, over the
+        // workstation's own binaries. A guest bind mount covers that dir; it
+        // doesn't survive sbx stopping the sandbox, so every launch makes it.
+        let p = paths();
+        let existing = SbxState {
+            sandbox: Some(sandbox("stopped")),
+            rules: vec![rule("sandbox:wm-proj-12345678", "localhost")],
+            ..missing()
+        };
+        for (agent, host, guest) in [
+            ("pi", "/home/me/.pi/bin", "/var/lib/workmux/pi-agent-bin"),
+            (
+                "omp",
+                "/home/me/.omp/tools",
+                "/var/lib/workmux/omp-agent-tools",
+            ),
+        ] {
+            for state in [missing(), existing.clone()] {
+                let plan = launch_plan(&config(), &target(&p), agent, &state, &exec()).unwrap();
+                assert!(
+                    setup_args(&plan).contains(&bind_guest_dir(host, guest)),
+                    "{agent}: {:?}",
+                    plan.setup
+                );
+            }
+        }
+
+        let plan = launch_plan(&config(), &target(&p), "codex", &existing, &exec()).unwrap();
+        assert!(plan.setup.is_empty(), "{:?}", plan.setup);
+    }
+
+    #[test]
+    fn nested_links_get_parent_dirs_the_agent_owns_first() {
+        // Root creates the link; parents it made would be root's, and the
+        // agent couldn't write elsewhere under them (~/.local/state).
+        let p = paths();
+        let plan = launch_plan(&config(), &target(&p), "opencode", &missing(), &exec()).unwrap();
+        let setup = setup_args(&plan);
+        let parents = args(&[
+            "exec",
+            "-u",
+            "root",
+            "wm-proj-12345678",
+            "install",
+            "-d",
+            "-o",
+            "agent",
+            "-g",
+            "agent",
+            "/home/agent/.local",
+            "/home/agent/.local/share",
+        ]);
+        let parents_at = setup.iter().position(|a| *a == parents).expect("parents");
+        let link_at = setup
+            .iter()
+            .position(|a| a.contains(&"/home/agent/.local/share/opencode".to_string()))
+            .expect("link");
+        assert!(parents_at < link_at, "{setup:?}");
+
+        let plan = launch_plan(&config(), &target(&p), "codex", &missing(), &exec()).unwrap();
+        assert!(
+            !setup_args(&plan)
+                .iter()
+                .any(|a| a.contains(&"install".to_string())),
+            "{:?}",
+            plan.setup
+        );
+    }
+
+    #[test]
+    fn agents_without_a_config_dir_get_no_mount_or_link() {
+        let p = paths();
+        let config = SandboxConfig {
+            agent_config_dir: None,
+            ..config()
+        };
+        let plan = launch_plan(&config, &target(&p), "default", &missing(), &exec()).unwrap();
+
+        assert_eq!(
+            plan.setup[0].args[9..],
+            args(&[
+                "/code/proj__worktrees/feat",
+                "/code/proj/.git",
+                "/state/docker-sbx/wm-proj-12345678:ro",
+            ])
+        );
+        assert!(
+            !plan
+                .setup
+                .iter()
+                .any(|c| c.args.contains(&"ln".to_string())),
+            "{:?}",
+            plan.setup
+        );
     }
 
     #[test]

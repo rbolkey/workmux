@@ -307,6 +307,13 @@ pub fn prepare_launch(
     std::fs::create_dir_all(&state_dir)
         .with_context(|| format!("Failed to create {}", state_dir.display()))?;
     let git_common_dir = git_common_dir_outside(&worktree_root)?;
+    // sbx mounts only directories that exist.
+    if let Some(config_dir) = config.sandbox.resolved_agent_config_dir(agent) {
+        let _ = std::fs::create_dir_all(&config_dir);
+    }
+    let opencode_config_dir = crate::agent_setup::opencode::opencode_config_dir()
+        .filter(|dir| agent == "opencode" && dir.is_dir())
+        .map(|dir| dir.canonicalize().unwrap_or(dir));
 
     let state = gather_state(&name)?;
     let target = LaunchTarget {
@@ -314,6 +321,7 @@ pub fn prepare_launch(
         worktree_root: &worktree_root,
         pane_cwd: &pane_cwd,
         git_common_dir: git_common_dir.as_deref(),
+        opencode_config_dir: opencode_config_dir.as_deref(),
         state_dir: &state_dir,
     };
     let plan = super::launch_plan(&config.sandbox, &target, agent, &state, exec)?;
