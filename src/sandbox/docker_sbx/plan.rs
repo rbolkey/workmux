@@ -196,9 +196,10 @@ pub struct LaunchPlan {
     pub notes: Vec<String>,
     /// Warnings for the user: checks `sbx diagnose` fails that don't stop
     /// the launch, what sbx lets a `deny` sandbox reach beyond
-    /// `allowed_domains`, and variables in `sandbox.env` or
+    /// `allowed_domains`, variables in `sandbox.env` or
     /// `sandbox.env_passthrough` that hand the agent a credential sbx holds
-    /// a secret for.
+    /// a secret for, and create-time settings changed since the sandbox
+    /// was created.
     pub warnings: Vec<String>,
     /// The `sandbox.network` and toolchain rules workmux has written for the
     /// sandbox once `setup` has run; the record the next launch reconciles
@@ -853,6 +854,49 @@ fn check_prerequisites(state: &SbxState) -> Result<()> {
     Ok(())
 }
 
+/// Settings that differ from what an existing sandbox was created with,
+/// which apply only to a new one: a warning naming them and how to
+/// recreate it, as Lima says for `provision`.
+fn create_settings_warnings(
+    current: &CreateSettings,
+    created_with: Option<&CreateSettings>,
+    name: &str,
+) -> Vec<String> {
+    let Some(created) = created_with else {
+        return Vec::new();
+    };
+    let changed: Vec<&str> = [
+        ("agent", current.agent != created.agent),
+        (
+            "agent_config_dir",
+            current.agent_config_dir != created.agent_config_dir,
+        ),
+        (
+            "OpenCode's config directory",
+            current.opencode_config_dir != created.opencode_config_dir,
+        ),
+        ("extra_mounts", current.extra_mounts != created.extra_mounts),
+        ("docker_sbx.cpus", current.cpus != created.cpus),
+        ("docker_sbx.memory", current.memory != created.memory),
+        ("docker_sbx.kits", current.kits != created.kits),
+        ("image", current.template != created.template),
+        ("toolchain", current.toolchain != created.toolchain),
+    ]
+    .into_iter()
+    .filter(|(_, differs)| *differs)
+    .map(|(setting, _)| setting)
+    .collect();
+    if changed.is_empty() {
+        return Vec::new();
+    }
+    vec![format!(
+        "sbx sandbox {name} was created with different settings ({}), which apply only \
+         when the sandbox is created; recreate it to apply them with `workmux sandbox prune` \
+         or `sbx rm -f {name}`.",
+        changed.join(", ")
+    )]
+}
+
 /// Whether the launch creates the sandbox: it's missing, or no launch
 /// finished setting it up (its create-time settings were never recorded).
 pub fn creates_sandbox(state: &SbxState, created_with: Option<&CreateSettings>) -> bool {
@@ -1091,6 +1135,11 @@ pub fn launch_plan(
             .into_iter()
             .chain(network_warnings(config, state, name))
             .chain(credential_warnings(config, state, name, exec))
+            .chain(if exists {
+                create_settings_warnings(&create_settings, target.created_with, name)
+            } else {
+                Vec::new()
+            })
             .collect(),
         network_rules,
         create_settings,
@@ -1177,6 +1226,17 @@ mod tests {
         }
     }
 
+    /// What `config()` creates a claude sandbox with.
+    fn created_settings() -> CreateSettings {
+        CreateSettings {
+            agent: "claude".to_string(),
+            agent_config_dir: Some(PathBuf::from("/home/me/.claude")),
+            template: super::super::template::template_tag("test-image:latest"),
+            toolchain: "none".to_string(),
+            ..Default::default()
+        }
+    }
+
     fn paths() -> Paths {
         Paths {
             worktree: PathBuf::from("/code/proj__worktrees/feat"),
@@ -1185,7 +1245,7 @@ mod tests {
             state: PathBuf::from("/state/docker-sbx/wm-proj-12345678"),
             record: Vec::new(),
             toolchain: DetectedToolchain::None,
-            created: Some(CreateSettings::default()),
+            created: Some(created_settings()),
         }
     }
 
@@ -1333,6 +1393,50 @@ mod tests {
                 toolchain: "none".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn existing_sandbox_created_with_other_settings_warns_how_to_recreate_it() {
+        // Mounts, resources, kits, the template and the toolchain are fixed
+        // when sbx creates the sandbox.
+        let mut p = paths();
+        p.created = Some(CreateSettings {
+            agent: "codex".to_string(),
+            agent_config_dir: Some(PathBuf::from("/home/me/.codex")),
+            memory: Some("4g".to_string()),
+            ..created_settings()
+        });
+        let config = SandboxConfig {
+            docker_sbx: DockerSbxConfig {
+                memory: Some("8g".to_string()),
+                ..Default::default()
+            },
+            ..config()
+        };
+        let state = running_with(Vec::new());
+        let plan = launch_plan(&config, &target(&p), "claude", &state, &exec()).unwrap();
+
+        assert!(plan.create_template.is_none());
+        assert_eq!(plan.warnings.len(), 1, "{:?}", plan.warnings);
+        let warning = &plan.warnings[0];
+        for expected in [
+            "wm-proj-12345678",
+            "agent, agent_config_dir, docker_sbx.memory",
+            "workmux sandbox prune",
+            "sbx rm -f wm-proj-12345678",
+        ] {
+            assert!(warning.contains(expected), "{expected}: {warning}");
+        }
+        assert!(!warning.contains("docker_sbx.cpus"), "{warning}");
+    }
+
+    #[test]
+    fn unchanged_or_new_sandboxes_get_no_settings_warning() {
+        let p = paths();
+        for state in [running_with(Vec::new()), missing()] {
+            let plan = launch_plan(&config(), &target(&p), "claude", &state, &exec()).unwrap();
+            assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
+        }
     }
 
     fn rule(scope: &str, resource: &str) -> SbxRule {
