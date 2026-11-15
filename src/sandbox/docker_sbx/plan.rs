@@ -1277,6 +1277,31 @@ fn create_settings_warnings(
     )]
 }
 
+/// Fail closed when the agent could read a file workmux hides: one of
+/// `excluded_files` that exists now but the existing sandbox wasn't created
+/// masking, listed or created since. Masks are fixed when sbx creates the
+/// sandbox, where the container backend masks on every launch. A masked
+/// file deleted since only gets the settings warning: sbx puts an empty
+/// file back over it.
+fn check_masked_since_create(
+    excluded: &[Mask],
+    created: &CreateSettings,
+    name: &str,
+) -> Result<()> {
+    if let Some(mask) = excluded
+        .iter()
+        .find(|mask| !created.excluded_files.contains(&mask.target))
+    {
+        bail!(
+            "sandbox.container.excluded_files lists {}, but sbx sandbox {name} was created \
+             without a mask over it, so the agent could read it. Masks are fixed when the \
+             sandbox is created; recreate it with `workmux sandbox prune` or `sbx rm -f {name}`.",
+            mask.target.display()
+        );
+    }
+    Ok(())
+}
+
 /// Whether the launch creates the sandbox: it's missing, or no launch
 /// finished setting it up (its create-time settings were never recorded).
 pub fn creates_sandbox(state: &SbxState, created_with: Option<&CreateSettings>) -> bool {
@@ -1355,6 +1380,10 @@ pub fn launch_plan(
         args: words(&["rm", "-f", name]),
         env: Vec::new(),
     });
+
+    if exists && let Some(created) = target.created_with {
+        check_masked_since_create(&excluded, created, name)?;
+    }
 
     if !exists {
         let git = target
@@ -3207,11 +3236,13 @@ mod tests {
     }
 
     #[test]
-    fn excluded_files_masked_differently_than_at_create_warn_how_to_recreate() {
-        // A changed list, or a listed file created since, isn't masked
-        // until the sandbox is created again.
+    fn an_excluded_file_the_sandbox_wasnt_created_masking_is_an_error() {
+        // A file listed or created since the sandbox was created is
+        // readable to the agent until the sandbox is created again: fail
+        // closed, as the container backend masks every launch.
         let (_dir, mut p) = worktree_with(&[".env", ".env.local"]);
         let env = p.worktree.join(".env");
+        let local = p.worktree.join(".env.local");
         p.created = Some(CreateSettings {
             excluded_files: vec![env.clone()],
             ..created_settings()
@@ -3229,22 +3260,46 @@ mod tests {
         assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
 
         let config = excluding(&[".env", ".env.local"]);
+        let error = launch_plan(&config, &target(&p), "claude", &state, &exec())
+            .unwrap_err()
+            .to_string();
+        for expected in [
+            local.display().to_string().as_str(),
+            "container.excluded_files",
+            "sbx rm -f wm-proj-12345678",
+        ] {
+            assert!(error.contains(expected), "{expected}: {error}");
+        }
+
+        let plan = launch_plan(&config, &target(&p), "claude", &missing(), &exec()).unwrap();
+        assert_eq!(plan.create_settings.excluded_files, vec![env, local]);
+    }
+
+    #[test]
+    fn an_excluded_file_masked_at_create_and_deleted_since_warns_how_to_recreate() {
+        // sbx puts an empty file back where it was; nothing is readable.
+        let (_dir, mut p) = worktree_with(&[".env"]);
+        p.created = Some(CreateSettings {
+            excluded_files: vec![p.worktree.join(".env"), p.worktree.join(".env.old")],
+            ..created_settings()
+        });
+        let config = excluding(&[".env", ".env.old"]);
+        let state = running_with(Vec::new());
         let plan = launch_plan(&config, &target(&p), "claude", &state, &exec()).unwrap();
+
         assert_eq!(plan.warnings.len(), 1, "{:?}", plan.warnings);
         let warning = &plan.warnings[0];
         assert!(warning.contains("(container.excluded_files)"), "{warning}");
         assert!(warning.contains("workmux sandbox prune"), "{warning}");
-
-        let plan = launch_plan(&config, &target(&p), "claude", &missing(), &exec()).unwrap();
-        assert_eq!(
-            plan.create_settings.excluded_files,
-            vec![env, p.worktree.join(".env.local")]
-        );
     }
 
     #[test]
     fn excluded_files_are_masked_only_when_the_sandbox_is_created() {
-        let (_dir, p) = worktree_with(&[".env"]);
+        let (_dir, mut p) = worktree_with(&[".env"]);
+        p.created = Some(CreateSettings {
+            excluded_files: vec![p.worktree.join(".env")],
+            ..created_settings()
+        });
         let plan = launch_plan(
             &excluding(&[".env"]),
             &target(&p),
