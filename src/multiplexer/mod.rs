@@ -797,7 +797,11 @@ pub trait Multiplexer: Send + Sync {
 
                         // Choose backend based on config
                         let wrap_result = match config.sandbox.backend() {
-                            crate::config::SandboxBackend::Container => {
+                            // docker_sbx runs the same `workmux sandbox run`
+                            // supervisor command, which dispatches on the
+                            // backend.
+                            crate::config::SandboxBackend::Container
+                            | crate::config::SandboxBackend::DockerSbx => {
                                 crate::sandbox::wrap_for_container(
                                     &command_to_wrap,
                                     options.sandbox_supervisor,
@@ -816,16 +820,6 @@ pub trait Multiplexer: Send + Sync {
                                     &command_to_wrap,
                                     config,
                                     vm_name,
-                                    working_dir,
-                                )
-                            }
-                            // The same `workmux sandbox run` supervisor
-                            // command, which dispatches on the backend.
-                            crate::config::SandboxBackend::DockerSbx => {
-                                crate::sandbox::wrap_for_container(
-                                    &command_to_wrap,
-                                    None,
-                                    wt_root,
                                     working_dir,
                                 )
                             }
