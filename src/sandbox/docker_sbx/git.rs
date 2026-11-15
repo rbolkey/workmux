@@ -200,7 +200,9 @@ fn config_entries(config: &Path, pattern: &str) -> Result<Vec<(String, String)>>
 /// file that names it; `core.hooksPath` and the programs (`core.fsmonitor`,
 /// diff, filter and merge drivers) relative to the top of `worktree`, where
 /// git runs hooks and commands, a program without a slash being looked up
-/// on `PATH`; `~/` in the home directory.
+/// on `PATH`; `~/` in the home directory. Every word of a program's command
+/// that names a file counts, so a script run through an interpreter is
+/// protected too.
 fn config_paths(config: &Path, worktree: &Path) -> Result<Vec<PathBuf>> {
     fn visit(
         config: &Path,
@@ -233,32 +235,36 @@ fn config_paths(config: &Path, worktree: &Path) -> Result<Vec<PathBuf>> {
             &config,
             "^(core\\.(hookspath|fsmonitor)|diff\\..*\\.(command|textconv)|filter\\..*\\.(clean|smudge|process)|merge\\..*\\.driver)$",
         )? {
-            let hooks_path = key.eq_ignore_ascii_case("core.hooksPath");
+            if key.eq_ignore_ascii_case("core.hooksPath") {
+                if !value.is_empty() && !value.contains(['$', '`', '%']) {
+                    let candidate = worktree.join(crate::util::expand_tilde(&value));
+                    if candidate.exists() {
+                        paths.push(candidate);
+                    }
+                }
+                continue;
+            }
             if key.eq_ignore_ascii_case("core.fsmonitor")
                 && matches!(value.as_str(), "true" | "false")
             {
                 continue;
             }
-            let token = if hooks_path {
-                value.as_str()
-            } else {
-                value
-                    .trim_start_matches('!')
-                    .split_whitespace()
-                    .next()
-                    .unwrap_or("")
-                    .trim_matches(['\'', '"'])
-            };
-            if token.is_empty() || token.contains(['$', '`', '%']) {
-                continue;
-            }
-            // A program named without a slash comes from PATH.
-            if !hooks_path && !token.contains('/') {
-                continue;
-            }
-            let candidate = worktree.join(crate::util::expand_tilde(token));
-            if candidate.exists() {
-                paths.push(candidate);
+            // Every word naming a file, so a script run through an
+            // interpreter (`sh ./scripts/clean.sh`) is protected with it.
+            let words = value.trim_start_matches('!').split_whitespace();
+            for (i, word) in words.enumerate() {
+                let token = word.trim_matches(['\'', '"']);
+                if token.is_empty() || token.contains(['$', '`', '%']) {
+                    continue;
+                }
+                // A program named without a slash comes from PATH.
+                if i == 0 && !token.contains('/') {
+                    continue;
+                }
+                let candidate = worktree.join(crate::util::expand_tilde(token));
+                if candidate.is_file() && !paths.contains(&candidate) {
+                    paths.push(candidate);
+                }
             }
         }
         Ok(())
@@ -383,6 +389,40 @@ mod tests {
             git.config_paths,
             vec![worktree.join(".husky/_"), worktree.join("scripts/clean.sh")]
         );
+    }
+
+    #[test]
+    fn scripts_programs_run_through_an_interpreter_are_protected_too() {
+        // `sh ./scripts/clean.sh` runs the script, not just `sh`: every word
+        // naming a file in the worktree or git dir is protected. Directories
+        // and words naming nothing stay writable.
+        let (_temp, main, worktree) = linked_worktree();
+        std::fs::create_dir_all(worktree.join("scripts")).unwrap();
+        for file in ["scripts/clean.sh", "scripts/smudge.py", "merge.rb"] {
+            std::fs::write(worktree.join(file), "").unwrap();
+        }
+        std::fs::write(main.join(".git/textconv.sh"), "").unwrap();
+        let textconv = main.join(".git/textconv.sh");
+        for (key, value) in [
+            ("filter.x.clean", "sh ./scripts/clean.sh %f"),
+            ("filter.x.smudge", "python3 'scripts/smudge.py' --quiet ."),
+            ("merge.x.driver", "ruby merge.rb %O %A %B"),
+            ("diff.x.textconv", &format!("bash {}", textconv.display())),
+        ] {
+            git(&["config", key, value], &main);
+        }
+
+        let git = git_metadata(&worktree).unwrap();
+        let mut paths = git.config_paths.clone();
+        paths.sort();
+        let mut expected = vec![
+            worktree.join("scripts/clean.sh"),
+            worktree.join("scripts/smudge.py"),
+            worktree.join("merge.rb"),
+            textconv,
+        ];
+        expected.sort();
+        assert_eq!(paths, expected);
     }
 
     #[test]
