@@ -105,7 +105,7 @@ The sandbox belongs to the worktree, not to a pane:
 - With `target: all`, every pane of the worktree runs in the worktree's one sandbox, so shells and agents see the same environment.
 - Closing a pane or window, or the agent exiting, ends only that pane's session. sbx keeps a session's processes running when its `sbx exec` goes away, so the supervisor hangs them up itself; other panes' sessions keep running.
 - sbx stops an idle sandbox about 30 seconds after its last session ends. The next pane, `workmux open` or `workmux sandbox shell` starts it again in about a second; there's no separate start step.
-- Removing the worktree deletes its sandbox, with its policy rules and any sbx secrets scoped to it: `workmux remove`, `workmux merge`, and a `workmux add` that rolls back a worktree it couldn't finish.
+- Removing the worktree deletes its sandbox, with its policy rules and any sbx secrets scoped to it: `workmux remove`, `workmux merge`, and a `workmux add` that rolls back a worktree it couldn't finish. The sandbox goes only once the removal can no longer fail: a failing `pre_remove` hook leaves both the worktree and its sandbox.
 
 ### What's mounted
 
