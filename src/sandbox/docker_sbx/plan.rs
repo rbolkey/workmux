@@ -1277,27 +1277,55 @@ fn create_settings_warnings(
     )]
 }
 
-/// Fail closed when the agent could read a file workmux hides: one of
-/// `excluded_files` that exists now but the existing sandbox wasn't created
-/// masking, listed or created since. Masks are fixed when sbx creates the
-/// sandbox, where the container backend masks on every launch. A masked
-/// file deleted since only gets the settings warning: sbx puts an empty
-/// file back over it.
+/// Fail closed when the agent could read a file workmux hides, one that
+/// exists now but the existing sandbox wasn't created masking: one of
+/// `excluded_files`, listed or created since, or under placeholder mode one
+/// of the agent's credential files in the config directory the sandbox
+/// mounts. Masks are fixed when sbx creates the sandbox, where the
+/// container backend masks on every launch. A masked file deleted since,
+/// or a placeholder that changed, only gets the settings warning: nothing
+/// is exposed.
 fn check_masked_since_create(
     excluded: &[Mask],
+    placeholders: &[Mask],
+    config_dir: Option<&(PathBuf, &'static str)>,
     created: &CreateSettings,
     name: &str,
 ) -> Result<()> {
+    let recreate = format!(
+        "Masks are fixed when the sandbox is created; recreate it with \
+         `workmux sandbox prune` or `sbx rm -f {name}`."
+    );
     if let Some(mask) = excluded
         .iter()
         .find(|mask| !created.excluded_files.contains(&mask.target))
     {
         bail!(
             "sandbox.container.excluded_files lists {}, but sbx sandbox {name} was created \
-             without a mask over it, so the agent could read it. Masks are fixed when the \
-             sandbox is created; recreate it with `workmux sandbox prune` or `sbx rm -f {name}`.",
+             without a mask over it, so the agent could read it. {recreate}",
             mask.target.display()
         );
+    }
+    let Some((config_dir, subpath)) = config_dir else {
+        return Ok(());
+    };
+    if created.agent_config_dir.as_ref() != Some(config_dir) {
+        return Ok(());
+    }
+    let guest_dir = Path::new(GUEST_HOME).join(subpath);
+    for mask in placeholders {
+        let hidden = created
+            .credential_placeholders
+            .iter()
+            .any(|created| created.target == mask.target);
+        if !hidden && let Ok(file) = mask.target.strip_prefix(&guest_dir) {
+            bail!(
+                "docker_sbx.agent_credentials: placeholder hides {}, but sbx sandbox {name} \
+                 was created without a placeholder over it, so the agent could read it. \
+                 {recreate}",
+                config_dir.join(file).display()
+            );
+        }
     }
     Ok(())
 }
@@ -1382,7 +1410,13 @@ pub fn launch_plan(
     });
 
     if exists && let Some(created) = target.created_with {
-        check_masked_since_create(&excluded, created, name)?;
+        check_masked_since_create(
+            &excluded,
+            &placeholders.masks,
+            config_dir.as_ref(),
+            created,
+            name,
+        )?;
     }
 
     if !exists {
@@ -4248,6 +4282,43 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("ANTHROPIC_API_KEY"), "{error}");
+    }
+
+    #[test]
+    fn a_credential_file_the_sandbox_wasnt_created_hiding_is_an_error() {
+        // The file appeared on the workstation after the sandbox was
+        // created (Claude with an API key needs none), or the sandbox was
+        // created under credential mounts: the agent could read it.
+        let (dir, config) = placeholder_config(&["claude/.credentials.json"]);
+        let file = dir
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("claude/.credentials.json");
+        let config_dir = file.parent().unwrap().to_path_buf();
+        let secrets = vec![stored("global", "anthropic")];
+        for agent_credentials in [AgentCredentials::Placeholder, AgentCredentials::Mount] {
+            let mut p = paths();
+            p.created = Some(CreateSettings {
+                agent_config_dir: Some(config_dir.clone()),
+                agent_credentials,
+                ..created_settings()
+            });
+            let state = SbxState {
+                secrets: secrets.clone(),
+                ..running_with(Vec::new())
+            };
+            let error = launch_plan(&config, &target(&p), "claude", &state, &exec())
+                .unwrap_err()
+                .to_string();
+            for expected in [
+                file.display().to_string().as_str(),
+                "agent_credentials: placeholder",
+                "sbx rm -f wm-proj-12345678",
+            ] {
+                assert!(error.contains(expected), "{expected}: {error}");
+            }
+        }
     }
 
     #[test]
