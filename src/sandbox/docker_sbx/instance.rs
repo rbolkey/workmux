@@ -246,37 +246,57 @@ fn run_sbx_args(args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-/// Delete a worktree's sbx sandbox, `name` (see [`super::sandbox_name_in`]),
-/// and its state directory, if workmux created one for it (its state
-/// directory exists).
+/// A worktree's sbx sandbox about to be deleted with it, locked so that no
+/// launch sets it up in the meantime.
+pub struct SandboxRemoval {
+    name: String,
+    state_dir: PathBuf,
+    _lock: Flock<File>,
+}
+
+/// Prepare to delete a worktree's sbx sandbox, `name` (see
+/// [`super::sandbox_name_in`]), if workmux created one for it (its state
+/// directory exists): wait for a launch setting it up to finish, then hold
+/// its lock until [`SandboxRemoval::remove`], or until the removal is
+/// called off and the value dropped.
 ///
-/// Called whenever a worktree is removed, once nothing can stop the
-/// removal. Best effort: failures are logged, never fatal.
-pub fn remove_sandbox_for_worktree(name: &str) {
-    let Ok(state_dir) = sbx_state_dir_path(name) else {
-        return;
-    };
+/// Called whenever a worktree is removed, before the worktree leaves its
+/// path, which a launch setting the sandbox up still needs. Best effort:
+/// failures are logged, never fatal.
+pub fn prepare_sandbox_removal(name: &str) -> Option<SandboxRemoval> {
+    let state_dir = sbx_state_dir_path(name).ok()?;
     if !state_dir.exists() {
-        return;
+        return None;
     }
-    // Wait for a launch setting the sandbox up, so it isn't removed halfway
-    // through being created or recreated.
-    let _lock = match lock_state_dir(&state_dir) {
-        Ok(lock) => lock,
+    match lock_state_dir(&state_dir) {
+        Ok(lock) => Some(SandboxRemoval {
+            name: name.to_string(),
+            state_dir,
+            _lock: lock,
+        }),
         Err(e) => {
             warn!(sandbox = %name, error = %e, "failed to lock sbx state dir");
             eprintln!("Warning: failed to remove sbx sandbox {name}: {e:#}");
+            None
+        }
+    }
+}
+
+impl SandboxRemoval {
+    /// Delete the sandbox and its state directory, once nothing can stop
+    /// the worktree's removal. Best effort: failures are logged, never
+    /// fatal.
+    pub fn remove(self) {
+        let name = &self.name;
+        info!(sandbox = %name, "removing sbx sandbox");
+        if let Err(e) = SbxInstance::remove_by_name(name) {
+            warn!(sandbox = %name, error = %e, "failed to remove sbx sandbox");
+            eprintln!("Warning: failed to remove sbx sandbox {name}: {e}");
             return;
         }
-    };
-    info!(sandbox = %name, "removing sbx sandbox");
-    if let Err(e) = SbxInstance::remove_by_name(name) {
-        warn!(sandbox = %name, error = %e, "failed to remove sbx sandbox");
-        eprintln!("Warning: failed to remove sbx sandbox {name}: {e}");
-        return;
-    }
-    if let Err(e) = std::fs::remove_dir_all(&state_dir) {
-        warn!(sandbox = %name, error = %e, "failed to clean up state dir");
+        if let Err(e) = std::fs::remove_dir_all(&self.state_dir) {
+            warn!(sandbox = %name, error = %e, "failed to clean up state dir");
+        }
     }
 }
 
