@@ -41,6 +41,8 @@ pub struct SbxState {
     pub rules: Vec<SbxRule>,
     /// Secrets from `sbx secret ls --json`: names and scopes, never values.
     pub secrets: Vec<SbxSecret>,
+    /// sbx's error when `sbx secret ls` failed, leaving `secrets` empty.
+    pub secrets_error: Option<String>,
 }
 
 /// The worktree a launch is for, with the host paths the plan mounts.
@@ -986,6 +988,15 @@ fn agent_placeholders(
         return Ok(placeholders);
     };
     check_agent_credential_env(config, agent)?;
+    // Without the listing, sbx can't tell whether it holds the secret.
+    if let Some(error) = &state.secrets_error
+        && !agent_services(agent).is_empty()
+    {
+        bail!(
+            "docker_sbx.agent_credentials: placeholder needs the sbx secret serving \
+             {agent}'s credential, but listing sbx's secrets failed: {error}"
+        );
+    }
     let missing = |service: &str| {
         anyhow!(
             "sbx holds no secret for {service}, which serves {agent}'s credential under \
@@ -1566,6 +1577,7 @@ mod tests {
             sandbox: None,
             rules: Vec::new(),
             secrets: Vec::new(),
+            secrets_error: None,
         }
     }
 
@@ -4018,6 +4030,38 @@ mod tests {
                 "{agent}: {error}"
             );
         }
+    }
+
+    #[test]
+    fn a_failed_secret_listing_is_an_error_under_placeholders_naming_sbxs_own() {
+        // Not "sbx holds no secret": sbx couldn't say.
+        let (_dir, config) = placeholder_config(&["claude/.credentials.json"]);
+        let p = paths();
+        let state = SbxState {
+            secrets_error: Some("sbx secret ls failed: keychain is locked".to_string()),
+            ..missing()
+        };
+        let error = launch_plan(&config, &target(&p), "claude", &state, &exec())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("keychain is locked"), "{error}");
+        assert!(!error.contains("holds no secret"), "{error}");
+
+        // Under credential mounts it only leaves the env warnings out.
+        let config = SandboxConfig {
+            docker_sbx: DockerSbxConfig::default(),
+            env_passthrough: Some(vec!["GH_TOKEN".to_string()]),
+            ..config
+        };
+        let plan = launch_plan(
+            &config,
+            &target(&p),
+            "claude",
+            &state,
+            &passing(&[("GH_TOKEN", "gho_real")]),
+        )
+        .unwrap();
+        assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
     }
 
     #[test]
