@@ -919,11 +919,27 @@ fn agent_services(agent: &str) -> Vec<&'static str> {
     }
 }
 
+/// Whether sbx holds an API key for `service` serving the sandbox, which
+/// gets OpenCode a placeholder key for that provider.
+fn opencode_serves(state: &SbxState, name: &str, service: &str) -> bool {
+    service_secret(state, name, service).is_some_and(|secret| !secret.is_oauth())
+}
+
 /// Fail if `sandbox.env` or `sandbox.env_passthrough` would hand the agent
-/// its own credential, which placeholder mode keeps from it. Unlike a tool
-/// credential's warning, this doesn't depend on the variable being set.
-fn check_agent_credential_env(config: &SandboxConfig, agent: &str) -> Result<()> {
-    let services = agent_services(agent);
+/// its own credential, which placeholder mode keeps from it: for OpenCode,
+/// the keys of the providers sbx serves it; another provider's key is the
+/// user's own, as under credential mounts. Unlike a tool credential's
+/// warning, this doesn't depend on the variable being set.
+fn check_agent_credential_env(
+    config: &SandboxConfig,
+    agent: &str,
+    state: &SbxState,
+    name: &str,
+) -> Result<()> {
+    let services: Vec<&str> = agent_services(agent)
+        .into_iter()
+        .filter(|service| agent != "opencode" || opencode_serves(state, name, service))
+        .collect();
     let configured = config
         .env_vars()
         .into_iter()
@@ -987,7 +1003,7 @@ fn agent_placeholders(
     let Some((config_dir, subpath)) = config_dir_and_home_subpath(config, agent) else {
         return Ok(placeholders);
     };
-    check_agent_credential_env(config, agent)?;
+    check_agent_credential_env(config, agent, state, name)?;
     // Without the listing, sbx can't tell whether it holds the secret.
     if let Some(error) = &state.secrets_error
         && !agent_services(agent).is_empty()
@@ -1063,7 +1079,7 @@ fn agent_placeholders(
         // proxy-managed; logins stored in auth.json stay hidden.
         "opencode" => {
             for (service, var) in OPENCODE_PROVIDER_KEYS {
-                if service_secret(state, name, service).is_some_and(|s| !s.is_oauth()) {
+                if opencode_serves(state, name, service) {
                     placeholders
                         .env
                         .push((var.to_string(), PROXY_MANAGED.to_string()));
@@ -4139,6 +4155,44 @@ mod tests {
         let plan = launch_plan(&config, &target(&p), "claude", &state, &exec).unwrap();
         assert_eq!(plan.warnings.len(), 1, "{:?}", plan.warnings);
         assert!(plan.warnings[0].contains("OPENAI_API_KEY"));
+    }
+
+    #[test]
+    fn opencode_keeps_its_own_keys_for_providers_sbx_holds_none_for() {
+        // Only the providers sbx gets a placeholder for are kept from
+        // OpenCode; for the others the key is the user's own, as under
+        // credential mounts.
+        let (_dir, placeholders) = placeholder_config(&["opencode/auth.json"]);
+        let config = SandboxConfig {
+            env_passthrough: Some(vec![
+                "OPENAI_API_KEY".to_string(),
+                "GROQ_API_KEY".to_string(),
+            ]),
+            ..placeholders.clone()
+        };
+        let p = paths();
+        let state = with_secrets(vec![stored("global", "anthropic")]);
+        let exec = passing(&[("OPENAI_API_KEY", "sk-own"), ("GROQ_API_KEY", "gsk-own")]);
+        let plan = launch_plan(&config, &target(&p), "opencode", &state, &exec).unwrap();
+        assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
+        assert_eq!(
+            exec_value(&plan, "OPENAI_API_KEY").as_deref(),
+            Some("sk-own")
+        );
+        assert_eq!(
+            exec_value(&plan, "ANTHROPIC_API_KEY").as_deref(),
+            Some("proxy-managed")
+        );
+
+        // The provider sbx serves is kept from it.
+        let config = SandboxConfig {
+            env_passthrough: Some(vec!["ANTHROPIC_API_KEY".to_string()]),
+            ..placeholders
+        };
+        let error = launch_plan(&config, &target(&p), "opencode", &state, &exec)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("ANTHROPIC_API_KEY"), "{error}");
     }
 
     #[test]
