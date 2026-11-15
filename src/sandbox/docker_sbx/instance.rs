@@ -259,6 +259,16 @@ pub fn remove_sandbox_for_worktree(name: &str) {
     if !state_dir.exists() {
         return;
     }
+    // Wait for a launch setting the sandbox up, so it isn't removed halfway
+    // through being created or recreated.
+    let _lock = match lock_state_dir(&state_dir) {
+        Ok(lock) => lock,
+        Err(e) => {
+            warn!(sandbox = %name, error = %e, "failed to lock sbx state dir");
+            eprintln!("Warning: failed to remove sbx sandbox {name}: {e:#}");
+            return;
+        }
+    };
     info!(sandbox = %name, "removing sbx sandbox");
     if let Err(e) = SbxInstance::remove_by_name(name) {
         warn!(sandbox = %name, error = %e, "failed to remove sbx sandbox");
@@ -429,12 +439,15 @@ fn remove_created_record(state_dir: &Path) -> Result<()> {
     }
 }
 
+/// Lock file in a sandbox's state directory.
+const LOCK_FILE: &str = ".lock";
+
 /// Hold an exclusive lock on a sandbox's state directory while a launch
 /// sets the sandbox up, so concurrent launches into one worktree's sandbox
 /// (the panes of `target: all`) neither create it twice nor remove one that
-/// another is still setting up.
+/// another is still setting up, and removing the worktree waits for them.
 fn lock_state_dir(state_dir: &Path) -> Result<Flock<File>> {
-    let lock_path = state_dir.join(".lock");
+    let lock_path = state_dir.join(LOCK_FILE);
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -507,6 +520,10 @@ pub fn prepare_launch(
         crate::sandbox::toolchain::resolve_toolchain(&config.sandbox.toolchain(), &worktree_root);
 
     let _lock = lock_state_dir(&state_dir)?;
+    // Removing the worktree removed the sandbox while this launch waited.
+    if !state_dir.join(LOCK_FILE).exists() {
+        bail!("sbx sandbox {name} was removed with its worktree");
+    }
     let state = gather_state(&name)?;
     let network_record = read_network_record(&state_dir);
     let created_with = read_created_record(&state_dir);
