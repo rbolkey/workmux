@@ -246,23 +246,21 @@ fn run_sbx_args(args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-/// Delete the worktree's sbx sandbox and its state directory, if workmux
-/// created one for it (its state directory exists).
+/// Delete a worktree's sbx sandbox, `name` (see [`super::sandbox_name_in`]),
+/// and its state directory, if workmux created one for it (its state
+/// directory exists).
 ///
-/// Called whenever a worktree is removed, before its directory goes away:
-/// the sandbox name is derived from the worktree's path and its project's
-/// root, so the worktree's git metadata isn't needed. Best effort:
-/// failures are logged, never fatal.
-pub fn remove_sandbox_for_worktree(project_root: &Path, worktree_root: &Path) {
-    let name = super::sandbox_name_in(project_root, worktree_root);
-    let Ok(state_dir) = sbx_state_dir_path(&name) else {
+/// Called whenever a worktree is removed, once nothing can stop the
+/// removal. Best effort: failures are logged, never fatal.
+pub fn remove_sandbox_for_worktree(name: &str) {
+    let Ok(state_dir) = sbx_state_dir_path(name) else {
         return;
     };
     if !state_dir.exists() {
         return;
     }
     info!(sandbox = %name, "removing sbx sandbox");
-    if let Err(e) = SbxInstance::remove_by_name(&name) {
+    if let Err(e) = SbxInstance::remove_by_name(name) {
         warn!(sandbox = %name, error = %e, "failed to remove sbx sandbox");
         eprintln!("Warning: failed to remove sbx sandbox {name}: {e}");
         return;

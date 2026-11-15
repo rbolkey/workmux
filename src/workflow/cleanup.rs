@@ -402,9 +402,18 @@ fn perform_destructive_cleanup(
         }
     }
 
+    // The sandbox is named after the worktree's path, which must still
+    // resolve.
+    let project_root = git_common_dir.parent().unwrap_or(git_common_dir);
+    let sbx_sandbox = crate::sandbox::docker_sbx::sandbox_name_in(project_root, worktree_path);
     let quarantine = expected
         .map(|expected| quarantine_worktree(worktree_path, expected.directory, expected.repository))
         .transpose()?;
+    // An sbx sandbox outlives its panes; delete it with the worktree, on
+    // every removal path (rollbacks and deferred cleanup included), once
+    // the worktree is gone from its path and nothing can call the removal
+    // off. Best effort.
+    crate::sandbox::remove_docker_sbx_sandbox(&sbx_sandbox);
 
     // The original worktree path is absent after quarantine, allowing Git to
     // discard its linked-worktree registration. These Git operations use the
@@ -473,13 +482,6 @@ fn cleanup_impl(
             context.main_worktree_root.display()
         ));
     }
-    // An sbx sandbox outlives its panes; delete it with the worktree, on
-    // every removal path (rollbacks included). Best effort.
-    let project_root = context
-        .git_common_dir
-        .parent()
-        .unwrap_or(&context.git_common_dir);
-    crate::sandbox::remove_docker_sbx_sandbox(project_root, worktree_path);
     let (expected_identity, missing_admin_identity) =
         match capture_worktree_identity(worktree_path, &context.git_common_dir) {
             Ok(identity) => (identity, None),
