@@ -202,17 +202,6 @@ fn config_entries(config: &Path, pattern: &str) -> Result<Vec<(String, String)>>
 /// git runs hooks and commands, a program without a slash being looked up
 /// on `PATH`; `~/` in the home directory.
 fn config_paths(config: &Path, worktree: &Path) -> Result<Vec<PathBuf>> {
-    fn expand_home(path: &str) -> Result<Option<PathBuf>> {
-        Ok(match path.strip_prefix("~/") {
-            Some(rest) => Some(
-                home::home_dir()
-                    .context("Could not resolve home directory for Git config path")?
-                    .join(rest),
-            ),
-            None => None,
-        })
-    }
-
     fn visit(
         config: &Path,
         worktree: &Path,
@@ -228,10 +217,7 @@ fn config_paths(config: &Path, worktree: &Path) -> Result<Vec<PathBuf>> {
             if value.contains(['*', '?', '[', '%']) {
                 bail!("Git config include path cannot be protected safely: {value}");
             }
-            let include = match expand_home(&value)? {
-                Some(path) => path,
-                None => dir.join(&value),
-            };
+            let include = dir.join(crate::util::expand_tilde(&value));
             if !include.is_file() {
                 bail!(
                     "Git config include target must exist before sandbox startup: {}",
@@ -270,10 +256,7 @@ fn config_paths(config: &Path, worktree: &Path) -> Result<Vec<PathBuf>> {
             if !hooks_path && !token.contains('/') {
                 continue;
             }
-            let candidate = match expand_home(token)? {
-                Some(path) => path,
-                None => worktree.join(token),
-            };
+            let candidate = worktree.join(crate::util::expand_tilde(token));
             if candidate.exists() {
                 paths.push(candidate);
             }
