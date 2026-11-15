@@ -320,14 +320,15 @@ fn list_sandbox_and_rules(name: &str) -> Result<(Option<SbxSandboxInfo>, Vec<Sbx
     Ok((sandbox, rules))
 }
 
-/// Secret names and scopes from `sbx secret ls`, never values. Advisory
-/// only: a listing failure leaves the credential warnings out.
-fn list_secrets() -> Result<Vec<SbxSecret>> {
+/// Secret names and scopes from `sbx secret ls`, never values, or sbx's
+/// error when listing them failed. The credential warnings are advisory
+/// and leave a failure out; placeholder agent credentials fail on it.
+fn list_secrets() -> Result<(Vec<SbxSecret>, Option<String>)> {
     match sbx_json(&["secret", "ls"]) {
-        Ok(stdout) => parse_sbx_secrets(&stdout),
+        Ok(stdout) => Ok((parse_sbx_secrets(&stdout)?, None)),
         Err(e) => {
             debug!(error = %e, "failed to list sbx secrets");
-            Ok(Vec::new())
+            Ok((Vec::new(), Some(e.to_string())))
         }
     }
 }
@@ -356,13 +357,14 @@ pub fn gather_state(name: &str) -> Result<SbxState> {
     });
     let checks = checks?;
     let (sandbox, rules) = sandbox_and_rules?;
-    let secrets = secrets?;
+    let (secrets, secrets_error) = secrets?;
     Ok(SbxState {
         platform,
         checks,
         sandbox,
         rules,
         secrets,
+        secrets_error,
     })
 }
 
