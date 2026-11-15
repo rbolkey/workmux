@@ -435,7 +435,16 @@ fn write_created_record(state_dir: &Path, settings: &CreateSettings) -> Result<(
 
 /// Forget a sandbox's create record before creating it again.
 fn remove_created_record(state_dir: &Path) -> Result<()> {
-    match std::fs::remove_file(state_dir.join(CREATED_RECORD_FILE)) {
+    remove_state_file(state_dir, CREATED_RECORD_FILE)
+}
+
+/// File in a sandbox's state directory marking it as being created, from
+/// just before `sbx create` until the create record is written. A sandbox
+/// with neither predates the record.
+const CREATING_MARKER_FILE: &str = "creating";
+
+fn remove_state_file(state_dir: &Path, file: &str) -> Result<()> {
+    match std::fs::remove_file(state_dir.join(file)) {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
         _ => Ok(()),
     }
@@ -529,9 +538,10 @@ pub fn prepare_launch(
     let state = gather_state(&name)?;
     let network_record = read_network_record(&state_dir);
     let created_with = read_created_record(&state_dir);
+    let unfinished = state_dir.join(CREATING_MARKER_FILE).exists();
     // Only creating the sandbox mounts the git metadata; finding it walks
     // the worktree.
-    let git = if super::plan::creates_sandbox(&state, created_with.as_ref()) {
+    let git = if super::plan::creates_sandbox(&state, created_with.as_ref(), unfinished) {
         Some(super::git::git_metadata(&worktree_root)?)
     } else {
         None
@@ -546,6 +556,7 @@ pub fn prepare_launch(
         network_record: &network_record,
         toolchain: &toolchain,
         created_with: created_with.as_ref(),
+        unfinished,
     };
     let plan = super::launch_plan(&config.sandbox, &target, agent, &state, exec)?;
     for note in &plan.notes {
@@ -562,14 +573,18 @@ pub fn prepare_launch(
     if creating {
         super::template::ensure_template(&image)?;
         if let Some(remove) = &plan.remove {
-            info!(sandbox = %name, "removing sbx sandbox no launch finished setting up");
-            eprintln!(
-                "Removing sbx sandbox {name}, which an earlier launch didn't finish setting up; \
-                 creating it again"
-            );
+            let why = if unfinished {
+                "an earlier launch didn't finish setting it up"
+            } else {
+                "it predates workmux's record of how it was created"
+            };
+            info!(sandbox = %name, why, "removing sbx sandbox to create it again");
+            eprintln!("Removing sbx sandbox {name}, as {why}; creating it again");
             run_sbx(remove)?;
         }
         remove_created_record(&state_dir)?;
+        std::fs::write(state_dir.join(CREATING_MARKER_FILE), b"")
+            .context("Failed to mark the sbx sandbox as being created")?;
         super::mask::write_masks(&state_dir, &plan.masks)?;
         info!(sandbox = %name, "creating sbx sandbox");
         eprintln!("  Workspaces:");
@@ -645,6 +660,7 @@ pub fn prepare_launch(
     }
     if creating {
         write_created_record(&state_dir, &plan.create_settings)?;
+        remove_state_file(&state_dir, CREATING_MARKER_FILE)?;
     }
     Ok(plan)
 }

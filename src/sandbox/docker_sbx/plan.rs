@@ -72,8 +72,12 @@ pub struct LaunchTarget<'a> {
     pub toolchain: &'a DetectedToolchain,
     /// The settings the sandbox was created with, recorded once creating
     /// it fully succeeded; `None` when no launch has finished setting it
-    /// up (it's missing, or a launch failed or was killed partway).
+    /// up (it's missing, or a launch failed or was killed partway), or the
+    /// sandbox predates the record.
     pub created_with: Option<&'a CreateSettings>,
+    /// Whether a launch began creating the sandbox and didn't finish (it
+    /// failed or was killed partway), as its state directory records.
+    pub unfinished: bool,
 }
 
 /// What a sandbox is created with and later launches can't change, as
@@ -1330,16 +1334,54 @@ fn check_masked_since_create(
     Ok(())
 }
 
-/// Whether the launch creates the sandbox: it's missing, or no launch
-/// finished setting it up (its create-time settings were never recorded).
-pub fn creates_sandbox(state: &SbxState, created_with: Option<&CreateSettings>) -> bool {
-    state.sandbox.is_none() || created_with.is_none()
+/// Whether the launch creates the sandbox: it's missing, a launch began
+/// creating it and didn't finish, or it predates the record of the settings
+/// it was created with and isn't running. A running sandbox may have panes
+/// in it, which removing it would kill.
+pub fn creates_sandbox(
+    state: &SbxState,
+    created_with: Option<&CreateSettings>,
+    unfinished: bool,
+) -> bool {
+    match (&state.sandbox, created_with) {
+        (None, _) => true,
+        (Some(_), Some(_)) => false,
+        (Some(sandbox), None) => unfinished || !sandbox.is_running(),
+    }
+}
+
+/// A running sandbox that predates the record of the settings it was
+/// created with is launched into as it is, but for the files workmux hides,
+/// which it has no mask over: the agent could read them.
+fn predates_record_warnings(
+    excluded: &[Mask],
+    placeholders: &[Mask],
+    name: &str,
+) -> Result<Vec<String>> {
+    let recreate = format!(
+        "Close the worktree's panes: the first launch once sbx has stopped the sandbox \
+         (about 30 seconds later) recreates it. Or remove it with `sbx rm -f {name}`."
+    );
+    if let Some(mask) = excluded.iter().chain(placeholders).next() {
+        bail!(
+            "sbx sandbox {name} was created before workmux recorded how it creates sandboxes, \
+             so it has no mask over {}, which the agent could read. It's running, so workmux \
+             won't remove it. {recreate}",
+            mask.target.display()
+        );
+    }
+    Ok(vec![format!(
+        "sbx sandbox {name} was created before workmux recorded how it creates sandboxes; \
+         it's running, so workmux launches into it as it is, without the settings later \
+         workmux applies at create. {recreate}"
+    )])
 }
 
 /// Compute the sbx commands a launch needs.
 ///
-/// When the sandbox is missing, or no launch finished setting it up (it's
-/// removed first): create it from the template with sbx's
+/// When the sandbox is missing, or no launch finished setting it up, or it
+/// predates the record of its settings and isn't running (it's removed
+/// first): create it from the template with sbx's
 /// generic `shell` agent (agent kits would write into the mounted config
 /// directory), the configured resources and mixin kits, mounting the
 /// worktree, the main repository's git dir (read-only but for what commits
@@ -1351,7 +1393,9 @@ pub fn creates_sandbox(state: &SbxState, created_with: Option<&CreateSettings>) 
 /// On every launch: bind pi's and OMP's binaries directory to a guest-local
 /// one, reconcile the sandbox's rules with `sandbox.network` and the
 /// toolchain's endpoints, and allow the supervisor's RPC port until the exec
-/// ends. Last, when the sandbox was just created, workmux's built-in
+/// ends. Launching into an existing sandbox fails when the agent could read
+/// a file workmux hides that the sandbox has no mask over. Last, when the
+/// sandbox was just created, workmux's built-in
 /// provisioning (shims on login shells' `PATH`, Nix and Devbox for a
 /// toolchain) and the `provision` script. The exec runs the agent command in the toolchain's
 /// environment, with placeholder keys under placeholder mode.
@@ -1402,22 +1446,28 @@ pub fn launch_plan(
         .to_string(),
     };
 
-    // A sandbox no launch finished setting up is removed and created again.
-    let exists = !creates_sandbox(state, target.created_with);
+    // A sandbox no launch finished setting up is removed and created again,
+    // as is one from before the record that isn't running.
+    let exists = !creates_sandbox(state, target.created_with, target.unfinished);
     let remove = (state.sandbox.is_some() && !exists).then(|| SbxCommand {
         args: words(&["rm", "-f", name]),
         env: Vec::new(),
     });
 
-    if exists && let Some(created) = target.created_with {
-        check_masked_since_create(
-            &excluded,
-            &placeholders.masks,
-            config_dir.as_ref(),
-            created,
-            name,
-        )?;
-    }
+    let predates_record = match target.created_with {
+        Some(created) if exists => {
+            check_masked_since_create(
+                &excluded,
+                &placeholders.masks,
+                config_dir.as_ref(),
+                created,
+                name,
+            )?;
+            Vec::new()
+        }
+        None if exists => predates_record_warnings(&excluded, &placeholders.masks, name)?,
+        _ => Vec::new(),
+    };
 
     if !exists {
         let git = target
@@ -1596,6 +1646,7 @@ pub fn launch_plan(
             .into_iter()
             .chain(network_warnings(config, state, name))
             .chain(credential_warnings(config, state, name, exec))
+            .chain(predates_record)
             .chain(if exists {
                 create_settings_warnings(&create_settings, target.created_with, name)
             } else {
@@ -1677,6 +1728,7 @@ mod tests {
         record: Vec<NetworkRule>,
         toolchain: DetectedToolchain,
         created: Option<CreateSettings>,
+        unfinished: bool,
     }
 
     fn git_metadata() -> GitMetadata {
@@ -1708,6 +1760,7 @@ mod tests {
             record: Vec::new(),
             toolchain: DetectedToolchain::None,
             created: Some(created_settings()),
+            unfinished: false,
         }
     }
 
@@ -1722,6 +1775,7 @@ mod tests {
             network_record: &p.record,
             toolchain: &p.toolchain,
             created_with: p.created.as_ref(),
+            unfinished: p.unfinished,
         }
     }
 
@@ -1793,6 +1847,7 @@ mod tests {
         // settings, which would otherwise be used half set up.
         let mut p = paths();
         p.created = None;
+        p.unfinished = true;
         p.record = vec![recorded(RuleDecision::Allow, "kept.com:443")];
         let config = with_network(NetworkPolicy::Deny, domains(&["kept.com"]));
         let state = running_with(vec![rule(SCOPE, "kept.com:443")]);
@@ -1811,6 +1866,67 @@ mod tests {
             "{:?}",
             plan.setup
         );
+    }
+
+    #[test]
+    fn a_running_sandbox_from_before_the_record_is_launched_into_with_a_warning() {
+        // Panes may be running in it: removing it would kill them.
+        let mut p = paths();
+        p.created = None;
+        let plan = launch_plan(
+            &config(),
+            &target(&p),
+            "claude",
+            &running_with(Vec::new()),
+            &exec(),
+        )
+        .unwrap();
+
+        assert!(plan.remove.is_none(), "{:?}", plan.remove);
+        assert!(plan.create_template.is_none());
+        assert_eq!(plan.exec.args[0], "exec");
+        assert_eq!(plan.warnings.len(), 1, "{:?}", plan.warnings);
+        let warning = &plan.warnings[0];
+        for expected in ["wm-proj-12345678", "recreate", "sbx rm -f wm-proj-12345678"] {
+            assert!(warning.contains(expected), "{expected}: {warning}");
+        }
+    }
+
+    #[test]
+    fn a_stopped_sandbox_from_before_the_record_is_removed_and_created_again() {
+        let mut p = paths();
+        p.created = None;
+        let state = SbxState {
+            sandbox: Some(sandbox("stopped")),
+            ..missing()
+        };
+        let plan = launch_plan(&config(), &target(&p), "claude", &state, &exec()).unwrap();
+
+        assert!(plan.remove.is_some());
+        assert_eq!(plan.setup[0].args[0], "create");
+        assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
+    }
+
+    #[test]
+    fn a_running_sandbox_from_before_the_record_is_an_error_when_files_need_hiding() {
+        // It was created before workmux masked anything.
+        let (_dir, mut p) = worktree_with(&[".env"]);
+        p.created = None;
+        let error = launch_plan(
+            &excluding(&[".env"]),
+            &target(&p),
+            "claude",
+            &running_with(Vec::new()),
+            &exec(),
+        )
+        .unwrap_err()
+        .to_string();
+        for expected in [
+            p.worktree.join(".env").display().to_string().as_str(),
+            "sbx rm -f wm-proj-12345678",
+        ] {
+            assert!(error.contains(expected), "{expected}: {error}");
+        }
     }
 
     #[test]
