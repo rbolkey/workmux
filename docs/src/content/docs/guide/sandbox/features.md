@@ -112,7 +112,7 @@ Codex also gets `--dangerously-bypass-hook-trust`. Codex otherwise asks you to r
 
 ## Credentials
 
-Every sandbox backend mounts agent-specific credential directories from the host. The mounted directory depends on the configured `agent`:
+Every sandbox backend mounts agent-specific credential directories from the host, the Docker Sandboxes backend only under `sandbox.docker_sbx.agent: shell` (under its default, `kit`, sbx's agent kit sets the agent up and sbx holds its credential; see [Agent setup](/guide/sandbox/docker-sbx/#agent-setup-kit-or-shell)). The mounted directory depends on the configured `agent`:
 
 | Agent      | Host directory               | Container mount                 | Lima mount                       | `docker_sbx` mount                     |
 | ---------- | ---------------------------- | ------------------------------- | -------------------------------- | -------------------------------------- |
@@ -139,7 +139,7 @@ Key behaviors:
 - OMP uses file-backed state and credentials mounted from `~/.omp/agent/`.
 - Under `docker_sbx`, give tools such as `gh` their credentials with `sbx secret set` (for example `sbx secret set github --command 'gh auth token'`) rather than `env` or `env_passthrough`: the agent then holds only a placeholder. See [Tool credentials](/guide/sandbox/docker-sbx/#tool-credentials).
 
-The container backend also uses a separate config file for Claude, mounted to `/tmp/.claude.json` inside the container. Docker/Podman use `~/.claude-sandbox.json` (file mount); Apple Container uses `~/.claude-sandbox-config/claude.json` (directory mount, since Apple Container only supports directory mounts). Lima and `docker_sbx` instead give each VM or sandbox its own `~/.claude.json`, seeded with Claude's onboarding marked complete.
+The container backend also uses a separate config file for Claude, mounted to `/tmp/.claude.json` inside the container. Docker/Podman use `~/.claude-sandbox.json` (file mount); Apple Container uses `~/.claude-sandbox-config/claude.json` (directory mount, since Apple Container only supports directory mounts). Lima and `docker_sbx` instead give each VM or sandbox its own `~/.claude.json`, seeded with Claude's onboarding marked complete (under `docker_sbx`'s `agent: kit`, by sbx's Claude kit).
 
 ### Custom config directory
 
