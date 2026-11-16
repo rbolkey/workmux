@@ -3,7 +3,7 @@ title: "Shared features"
 description: Features shared across the container, Lima and Docker Sandboxes backends
 ---
 
-These features work with the container, Lima and Docker Sandboxes (`docker_sbx`) sandbox backends.
+These features work with the container, Lima and [Docker Sandboxes](/guide/sandbox/docker-sbx/) sandbox backends.
 
 ## Extra mounts
 
@@ -28,11 +28,9 @@ sandbox:
 
 Paths starting with `~` are expanded to the user's home directory. When `guest_path` is omitted, the expanded host path is used as the guest mount point.
 
-**Note:** For the Lima and `docker_sbx` backends, mount changes only take effect when the VM or sandbox is created. To apply changes to an existing one, recreate it with `workmux sandbox prune`.
+**Note:** For the Lima backend, mount changes only take effect when the VM is created. To apply changes to an existing VM, recreate it with `workmux sandbox prune`.
 
 **Note:** Apple Container only supports directory mounts. Individual file paths in `extra_mounts` will fail with Apple Container.
-
-**Note:** Docker Sandboxes (`docker_sbx`) mounts a file only read-only. A writable file entry is an error.
 
 ## Host command proxying
 
@@ -53,8 +51,6 @@ sandbox:
 `host_commands` is only read from your global config. If set in a project's `.workmux.yaml`, it is ignored and a warning is logged. This ensures that only you control which commands get host access, not the projects you clone.
 
 When configured, workmux creates shim scripts inside the sandbox that transparently forward these commands to the host via RPC. The host runs them in the project's toolchain environment (Devbox/Nix if available), streams stdout/stderr back to the sandbox in real-time, and returns the exit code.
-
-Under `docker_sbx`, host commands run on your workstation, outside sbx's network policy and its placeholder credentials. They reach whatever your workstation can reach, and see the real credentials it holds rather than sbx's placeholders, within the filesystem sandbox described below. Weigh each command you add with that in mind.
 
 Some commands are built-in and always available as host-exec shims without configuration (e.g., `afplay` for sound notifications). Only commands listed in `host_commands` or built-in are allowed; there is no wildcard or auto-discovery.
 
@@ -82,7 +78,7 @@ Host-exec applies several layers of defense to limit what a compromised agent in
 
 ## Sound notifications
 
-Claude Code hooks often use `afplay` to play notification sounds (e.g., when an agent finishes). Since `afplay` is a macOS-only binary, it doesn't exist inside the Linux guest. workmux includes `afplay` as a built-in host-exec shim that forwards sound playback to the host. This works with every sandbox backend.
+Claude Code hooks often use `afplay` to play notification sounds (e.g., when an agent finishes). Since `afplay` is a macOS-only binary, it doesn't exist inside the Linux guest. workmux includes `afplay` as a built-in host-exec shim that forwards sound playback to the host. This works with both Lima and container backends.
 
 This is transparent: when a hook runs `afplay /System/Library/Sounds/Glass.aiff` inside the sandbox, the shim runs `afplay` on the host via the host-exec RPC mechanism. No configuration is needed.
 
@@ -106,24 +102,24 @@ Inside a sandbox the sandbox is the security boundary, so workmux starts agents 
 
 Codex also gets `--no-daemon`. The sandbox mounts the host's `~/.codex`, where Codex installs and tracks its shared background server, but a sandboxed Codex can't reach a server running outside the sandbox. Without the flag, it fails to start once Codex on the host has installed the server ("daemon executable not found"), or installs a server of its own into the host's `~/.codex`.
 
-Codex also gets `--dangerously-bypass-hook-trust`. Codex otherwise asks you to review every new or changed hook before it runs, including the hooks workmux installs for [status tracking](/guide/status-tracking/), and approvals given on the host don't apply in the sandbox. The sandbox path of `~/.codex/hooks.json` differs from the host's, and under Docker Sandboxes' `agent: kit` the sandbox has a `~/.codex` of its own. Codex shows a startup warning that the flag is on. Hooks run inside the sandbox, the same as any command the agent runs with `--yolo`, so the review adds no protection there. Hooks you disabled in Codex stay disabled. The flag applies to that launch only and records no approval.
+Codex also gets `--dangerously-bypass-hook-trust`. Codex otherwise asks you to review every new or changed hook before it runs, including the hooks workmux installs for [status tracking](/guide/status-tracking/), and the sandbox path of `~/.codex/hooks.json` differs from the host's, so approvals given on the host don't apply. Hooks run inside the sandbox, the same as any command the agent runs with `--yolo`, so the review adds no protection there. Hooks you disabled in Codex stay disabled. The flag applies to that launch only and records no approval.
 
 `--no-daemon` needs Codex 0.156 or newer. The workmux image installs the latest release. A custom image (`sandbox.image`) or a Lima VM with an older Codex fails to start Codex with "unexpected argument '--no-daemon'": update Codex in the image, or recreate the VM with `workmux sandbox prune`.
 
 ## Credentials
 
-Every sandbox backend mounts agent-specific credential directories from the host. The Docker Sandboxes backend does so only under `sandbox.docker_sbx.agent: shell`. Under its default, `kit`, sbx's agent kit sets the agent up and sbx holds its credential (see [Agent setup](/guide/sandbox/docker-sbx/#agent-setup-kit-or-shell)). The mounted directory depends on the configured `agent`:
+Both sandbox backends mount agent-specific credential directories from the host. The mounted directory depends on the configured `agent`:
 
-| Agent      | Host directory               | Container mount                 | Lima mount                       | `docker_sbx` mount                     |
-| ---------- | ---------------------------- | ------------------------------- | -------------------------------- | -------------------------------------- |
-| `claude`   | `~/.claude/`                 | `/tmp/.claude/`                 | `$HOME/.claude/`                 | `/home/agent/.claude/`                 |
-| `copilot`  | `~/.copilot/`                | `/tmp/.copilot/`                | `$HOME/.copilot/`                | `/home/agent/.copilot/`                |
-| `gemini`   | `~/.gemini/`                 | `/tmp/.gemini/`                 | `$HOME/.gemini/`                 | `/home/agent/.gemini/`                 |
-| `agy`      | `~/.gemini/antigravity-cli/` | `/tmp/.gemini/antigravity-cli/` | `$HOME/.gemini/antigravity-cli/` | `/home/agent/.gemini/antigravity-cli/` |
-| `codex`    | `~/.codex/`                  | `/home/user/.codex/`            | `$HOME/.codex/`                  | `/home/agent/.codex/`                  |
-| `opencode` | `~/.local/share/opencode/`   | `/tmp/.local/share/opencode/`   | `$HOME/.local/share/opencode/`   | `/home/agent/.local/share/opencode/`   |
-| `pi`       | `~/.pi/agent/`               | `/tmp/.pi/agent/`               | `$HOME/.pi/agent/`               | `/home/agent/.pi/agent/`               |
-| `omp`      | `~/.omp/agent/`              | `/tmp/.omp/agent/`              | `$HOME/.omp/agent/`              | `/home/agent/.omp/agent/`              |
+| Agent      | Host directory               | Container mount                 | Lima mount                       |
+| ---------- | ---------------------------- | ------------------------------- | -------------------------------- |
+| `claude`   | `~/.claude/`                 | `/tmp/.claude/`                 | `$HOME/.claude/`                 |
+| `copilot`  | `~/.copilot/`                | `/tmp/.copilot/`                | `$HOME/.copilot/`                |
+| `gemini`   | `~/.gemini/`                 | `/tmp/.gemini/`                 | `$HOME/.gemini/`                 |
+| `agy`      | `~/.gemini/antigravity-cli/` | `/tmp/.gemini/antigravity-cli/` | `$HOME/.gemini/antigravity-cli/` |
+| `codex`    | `~/.codex/`                  | `/home/user/.codex/`            | `$HOME/.codex/`                  |
+| `opencode` | `~/.local/share/opencode/`   | `/tmp/.local/share/opencode/`   | `$HOME/.local/share/opencode/`   |
+| `pi`       | `~/.pi/agent/`               | `/tmp/.pi/agent/`               | `$HOME/.pi/agent/`               |
+| `omp`      | `~/.omp/agent/`              | `/tmp/.omp/agent/`              | `$HOME/.omp/agent/`              |
 
 Other agents get no config directory mount.
 
@@ -134,12 +130,13 @@ Key behaviors:
 - Gemini, Codex, OpenCode, and OMP store credentials in files. If you've authenticated on the host, the sandbox automatically has access.
 - Claude stores auth in macOS Keychain, which isn't accessible from containers or Linux VMs. You need to authenticate Claude separately inside the sandbox.
 - Authentication done inside the sandbox writes back to the host directory. Credentials persist across sandbox recreations.
-- The credential mount is determined by the `agent` setting. Switching agents requires recreating the sandbox (Lima, with `workmux sandbox prune`) or starting a new container. Under `docker_sbx`, each agent of a worktree has its own sandbox, created when a pane first runs it.
-- For `pi`, the entire `~/.pi/agent/` is shared except `bin/`. Pi auto-downloads platform-specific `fd` and `rg` binaries into `bin/`, so a Linux sandbox would otherwise overwrite a macOS host's Mach-O binaries through the bind mount. Workmux overlays a per-sandbox, arch-keyed directory on `bin/` to keep host and guest binaries separate. Under `docker_sbx`, the overlay is a directory inside the sandbox, bound over `bin/` each time a pane starts. OMP's `~/.omp/agent/tools/`, where OMP downloads the same binaries, gets the same treatment.
+- The credential mount is determined by the `agent` setting. Switching agents requires recreating the sandbox (Lima) or starting a new container.
+- For `pi`, the entire `~/.pi/agent/` is shared except `bin/`. Pi auto-downloads platform-specific `fd` and `rg` binaries into `bin/`, so a Linux sandbox would otherwise overwrite a macOS host's Mach-O binaries through the bind mount. Workmux overlays a per-sandbox, arch-keyed directory on `bin/` to keep host and guest binaries separate.
 - OMP uses file-backed state and credentials mounted from `~/.omp/agent/`.
-- Under `docker_sbx`, give tools such as `gh` their credentials with `sbx secret set` (for example `sbx secret set github --command 'gh auth token'`) rather than `env` or `env_passthrough`, so the agent holds only a placeholder. See [Tool credentials](/guide/sandbox/docker-sbx/#tool-credentials).
 
-The container backend also uses a separate config file for Claude, mounted to `/tmp/.claude.json` inside the container. Docker/Podman use `~/.claude-sandbox.json` (file mount); Apple Container uses `~/.claude-sandbox-config/claude.json` (directory mount, since Apple Container only supports directory mounts). Lima and `docker_sbx` instead give each VM or sandbox its own `~/.claude.json`, seeded with Claude's onboarding marked complete. Under `docker_sbx`'s `agent: kit`, sbx's Claude kit does the seeding.
+The container backend also uses a separate config file for Claude, mounted to `/tmp/.claude.json` inside the container. Docker/Podman use `~/.claude-sandbox.json` (file mount); Apple Container uses `~/.claude-sandbox-config/claude.json` (directory mount, since Apple Container only supports directory mounts).
+
+For the Docker Sandboxes backend's credentials, see [Agent setup](/guide/sandbox/docker-sbx/#agent-setup-kit-or-shell) and [Tool credentials](/guide/sandbox/docker-sbx/#tool-credentials).
 
 ### Custom config directory
 
@@ -161,7 +158,7 @@ This is useful when you want different MCP servers, project configs, or settings
 A coordinator agent sits on the main branch, plans work, and delegates tasks to worktree agents via `/worktree`. See [Workflows](/guide/workflows/#from-an-ongoing-agent-session) for more on this pattern.
 :::
 
-Coordinator agents can run inside a sandbox using `workmux sandbox agent`. When the coordinator calls `workmux add` from inside the sandbox, the command is automatically routed through RPC to the host, where sub-agents are created normally (and sandboxed if the project config enables it). workmux inside a sandbox never shows the first-run prompts (nerdfont, status tracking hooks, skills), which would otherwise install into the agent config directory mounted from your workstation.
+Coordinator agents can run inside a sandbox using `workmux sandbox agent`. When the coordinator calls `workmux add` from inside the sandbox, the command is automatically routed through RPC to the host, where sub-agents are created normally (and sandboxed if the project config enables it).
 
 Alternatively, coordinators can run on the host (unsandboxed) and only sandbox leaf agents.
 
@@ -202,8 +199,6 @@ tail -f ~/.local/state/workmux/workmux.log | grep rejected
 
 Rejected entries include the denied hostname. Add any expected hosts to your sandbox's `network.domains` list and retry.
 
-Under the `docker_sbx` backend, sbx blocks and logs requests, not workmux. Run `sbx policy log <sandbox>` to see them (see [Network restrictions](/guide/sandbox/docker-sbx/#network-restrictions)).
-
 ## Installing local builds
 
 During development, the macOS host binary cannot run inside Linux containers or VMs. Use `install-dev` to cross-compile and install your local workmux build:
@@ -213,7 +208,7 @@ During development, the macOS host binary cannot run inside Linux containers or 
 rustup target add aarch64-unknown-linux-gnu
 brew install messense/macos-cross-toolchains/aarch64-unknown-linux-gnu
 
-# Cross-compile and install into containers, running VMs and running sbx sandboxes
+# Cross-compile and install into containers and running VMs
 workmux sandbox install-dev
 
 # After code changes, rebuild and reinstall
@@ -226,4 +221,4 @@ workmux sandbox install-dev --release
 workmux sandbox install-dev --skip-build
 ```
 
-For containers, this builds a thin overlay image (`FROM <image>` + `COPY workmux`) on top of the configured sandbox image, replacing it in-place. For Lima VMs, the binary is installed to `~/.local/bin/workmux` inside each running VM. For Docker Sandboxes, the binary replaces `/usr/local/bin/workmux` in each running `wm-*` sbx sandbox. With `backend: docker_sbx`, the overlay is built on the image in Docker's store and the sbx template is loaded again from it, so new sandboxes get the build too. Run `workmux sandbox pull` to go back to the released image.
+For containers, this builds a thin overlay image (`FROM <image>` + `COPY workmux`) on top of the configured sandbox image, replacing it in-place. For Lima VMs, the binary is installed to `~/.local/bin/workmux` inside each running VM.
