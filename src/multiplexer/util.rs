@@ -217,10 +217,8 @@ impl ResolvedCommand {
     }
 }
 
-/// The panes `setup_panes` lays out, in order, each with its index and its
-/// command resolved by [`resolve_pane_command_with_config`] (`None` when it
-/// runs none). A pane after the first without a split direction isn't laid
-/// out.
+/// List the panes `setup_panes` lays out, with their index and resolved
+/// command. A pane after the first without a split direction isn't laid out.
 #[allow(clippy::too_many_arguments)]
 pub fn laid_out_panes<'a>(
     panes: &'a [crate::config::PaneConfig],

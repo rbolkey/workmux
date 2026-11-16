@@ -36,12 +36,12 @@ impl SbxSandboxInfo {
         self.status == "running"
     }
 
-    /// When the sandbox was created.
+    /// Return when the sandbox was created.
     pub fn created(&self) -> Option<SystemTime> {
         self.created_at.as_deref().and_then(parse_timestamp)
     }
 
-    /// When the sandbox last ran a session.
+    /// Return when the sandbox last ran a session.
     pub fn last_used(&self) -> Option<SystemTime> {
         self.last_used_at.as_deref().and_then(parse_timestamp)
     }
@@ -64,8 +64,7 @@ pub struct SbxRule {
     pub resource_type: String,
     #[serde(default)]
     pub resources: Vec<String>,
-    /// How the rule came to be: `added` (`sbx policy allow`/`deny`, by
-    /// workmux or the user), `provisioned` (by a kit, at create), or
+    /// `added` (by workmux or the user), `provisioned` (by a kit) or
     /// `default` (the global policy).
     #[serde(default)]
     pub provenance: SbxRuleProvenance,
@@ -145,9 +144,8 @@ fn sbx_json(args: &[&str]) -> Result<Vec<u8>> {
     Ok(output.stdout)
 }
 
-/// Run `sbx diagnose --json`. It exits 1 when any check fails, disk space
-/// included, but still prints every check: read them whatever the exit
-/// status, so the plan can name the failing one.
+/// Run `sbx diagnose --json`, reading its checks even when it exits 1 for a
+/// failed check.
 fn sbx_diagnose() -> Result<Vec<SbxCheck>> {
     let output = Command::new("sbx")
         .args(["diagnose", "--json"])
@@ -164,8 +162,7 @@ fn sbx_diagnose() -> Result<Vec<SbxCheck>> {
     }
 }
 
-/// Turn sbx's stderr into an error message, naming the fix for errors the
-/// user has to resolve.
+/// Turn sbx's stderr into an error message that names the fix.
 fn sbx_error(stderr: &str) -> String {
     if stderr.contains(POLICY_NOT_INITIALIZED) {
         return format!(
@@ -199,8 +196,7 @@ impl SbxInstance {
         run_sbx_args(&["stop", name])
     }
 
-    /// Delete a sandbox by name, with its policy rules and the secrets
-    /// scoped to it. Succeeds if it doesn't exist.
+    /// Delete a sandbox by name. Succeeds if it doesn't exist.
     pub fn remove_by_name(name: &str) -> Result<()> {
         match run_sbx_args(&["rm", "-f", name]) {
             Err(e) if e.to_string().contains("not found") => Ok(()),
@@ -225,22 +221,17 @@ fn run_sbx_args(args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-/// A worktree's sbx sandbox about to be deleted with it, locked so that no
-/// launch sets it up in the meantime.
+/// A worktree's sbx sandbox about to be deleted, locked against launches.
 pub struct SandboxRemoval {
     name: String,
     state_dir: PathBuf,
     _lock: Flock<File>,
 }
 
-/// Prepare to delete a worktree's sbx sandboxes, one per agent it ran, that
-/// workmux created (their state directories exist): wait for a launch setting each up to
-/// finish, then hold its lock until [`SandboxRemoval::remove`], or until
-/// the removal is called off and the values dropped.
+/// Lock a worktree's sbx sandboxes for deletion, one per agent it ran.
 ///
-/// Called whenever a worktree is removed, before the worktree leaves its
-/// path, which a launch setting a sandbox up still needs. Best effort:
-/// failures are logged, never fatal.
+/// Waits for any launch setting a sandbox up, then holds its lock until
+/// [`SandboxRemoval::remove`] or drop. Best effort: failures are logged.
 pub fn prepare_sandbox_removal(project_root: &Path, worktree_root: &Path) -> Vec<SandboxRemoval> {
     let Ok(state_root) = sbx_state_root() else {
         return Vec::new();
@@ -270,9 +261,8 @@ fn prepare_one_removal(name: &str) -> Option<SandboxRemoval> {
 }
 
 impl SandboxRemoval {
-    /// Delete the sandbox and its state directory, once nothing can stop
-    /// the worktree's removal. Best effort: failures are logged, never
-    /// fatal.
+    /// Delete the sandbox and its state directory. Best effort: failures are
+    /// logged.
     pub fn remove(self) {
         let name = &self.name;
         info!(sandbox = %name, "removing sbx sandbox");
@@ -287,7 +277,7 @@ impl SandboxRemoval {
     }
 }
 
-/// The platform workmux is running on.
+/// Describe the platform workmux is running on.
 fn current_platform() -> Platform {
     Platform {
         os: std::env::consts::OS.to_string(),
@@ -296,8 +286,8 @@ fn current_platform() -> Platform {
     }
 }
 
-/// The sandbox `name` from `sbx ls`, and its rules (the global ones while
-/// it doesn't exist).
+/// List the sandbox `name` and its rules, or the global rules while it
+/// doesn't exist.
 fn list_sandbox_and_rules(name: &str) -> Result<(Option<SbxSandboxInfo>, Vec<SbxRule>)> {
     let sandbox = SbxInstance::list()?
         .into_iter()
@@ -308,10 +298,8 @@ fn list_sandbox_and_rules(name: &str) -> Result<(Option<SbxSandboxInfo>, Vec<Sbx
         running = sandbox.as_ref().is_some_and(SbxSandboxInfo::is_running),
         "sbx sandbox state"
     );
-    // An existing sandbox's rules include the global ones; before it exists,
-    // the global ones are what it will get. Listing fails before the global
-    // policy is initialised, which the plan reports. Otherwise the plan
-    // needs the rules to keep `deny` from being widened: fail closed.
+    // An uninitialised global policy is reported by the plan. Any other
+    // failure is fatal: the plan needs the rules to keep `deny` narrow.
     let policy_ls = match &sandbox {
         Some(_) => vec!["policy", "ls", name],
         None => vec!["policy", "ls"],
@@ -337,8 +325,7 @@ pub fn gather_state(name: &str) -> Result<SbxState> {
         );
     }
     let platform = current_platform();
-    // The listings are independent but for the rules, which depend on
-    // whether the sandbox exists; run them side by side.
+    // Run diagnose alongside the listings, which it doesn't depend on.
     let (checks, sandbox_and_rules) = std::thread::scope(|scope| {
         let checks = scope.spawn(sbx_diagnose);
         let sandbox_and_rules = list_sandbox_and_rules(name);
@@ -357,19 +344,18 @@ pub fn gather_state(name: &str) -> Result<SbxState> {
     })
 }
 
-/// Host-side state directory for a sandbox: `$XDG_STATE_HOME/workmux/docker-sbx/<name>/`.
+/// Return a sandbox's host-side state directory.
 pub(crate) fn sbx_state_dir_path(name: &str) -> Result<PathBuf> {
     Ok(sbx_state_root()?.join(name))
 }
 
-/// Directory holding every sbx sandbox's state directory.
+/// Return the directory holding every sbx sandbox's state directory.
 fn sbx_state_root() -> Result<PathBuf> {
     Ok(crate::xdg::state_dir()?.join("docker-sbx"))
 }
 
-/// File in a sandbox's state directory recording the worktree and agent it
-/// was created for, written before anything else, so that removing the
-/// worktree finds the sandbox by its exact name.
+/// State file recording the worktree and agent a sandbox is for, written
+/// first so that removing the worktree finds the sandbox by its exact name.
 const SANDBOX_RECORD_FILE: &str = "sandbox.json";
 
 #[derive(Deserialize, Serialize)]
@@ -390,9 +376,9 @@ fn write_sandbox_record(state_dir: &Path, worktree_root: &Path, agent: &str) -> 
     crate::util::write_atomic(&state_dir.join(SANDBOX_RECORD_FILE), content.as_bytes())
 }
 
-/// The names of the worktree's sandboxes that have state directories under
-/// `state_root`: one per agent its launches recorded, named exactly as a
-/// launch names it (a name prefix could match another project's).
+/// List the worktree's sandboxes that have state directories under
+/// `state_root`, matching exact names, since a prefix could match another
+/// project's.
 fn worktree_sandboxes_in(
     state_root: &Path,
     project_root: &Path,
@@ -427,8 +413,7 @@ fn worktree_sandboxes_in(
     names
 }
 
-/// File in a sandbox's state directory holding the network rules workmux
-/// last wrote for it. Removed with the state directory when the sandbox is.
+/// State file holding the network rules workmux last wrote for a sandbox.
 const NETWORK_RECORD_FILE: &str = "network-rules.json";
 
 #[derive(Default, Deserialize, Serialize)]
@@ -437,8 +422,8 @@ struct NetworkRecord {
     rules: Vec<NetworkRule>,
 }
 
-/// The network rules workmux last wrote for a sandbox. Empty if missing or
-/// corrupted.
+/// Read the network rules workmux last wrote for a sandbox. Empty if missing
+/// or corrupted.
 fn read_network_record(state_dir: &Path) -> Vec<NetworkRule> {
     let path = state_dir.join(NETWORK_RECORD_FILE);
     match std::fs::read_to_string(&path) {
@@ -462,12 +447,11 @@ fn write_network_record(state_dir: &Path, rules: &[NetworkRule]) -> Result<()> {
     crate::util::write_atomic(&state_dir.join(NETWORK_RECORD_FILE), content.as_bytes())
 }
 
-/// File in a sandbox's state directory recording the settings it was
-/// created with, written once creating it fully succeeded. A sandbox
-/// without it was left half set up by a launch that failed or was killed.
+/// State file recording the settings a sandbox was created with, written once
+/// creating it fully succeeded.
 const CREATED_RECORD_FILE: &str = "created.json";
 
-/// The settings a sandbox was created with, as its create record holds.
+/// Read a sandbox's create record.
 fn read_created_record(state_dir: &Path) -> CreateRecord {
     let path = state_dir.join(CREATED_RECORD_FILE);
     let content = match std::fs::read_to_string(&path) {
@@ -502,10 +486,10 @@ fn remove_state_file(state_dir: &Path, file: &str) -> Result<()> {
 /// Lock file in a sandbox's state directory.
 const LOCK_FILE: &str = ".lock";
 
-/// Hold an exclusive lock on a sandbox's state directory while a launch
-/// sets the sandbox up, so concurrent launches into one worktree's sandbox
-/// (the panes of `target: all`) neither create it twice nor remove one that
-/// another is still setting up, and removing the worktree waits for them.
+/// Lock a sandbox's state directory while a launch sets the sandbox up.
+///
+/// Concurrent launches (the panes of `target: all`) then never create it
+/// twice, and removing the worktree waits for them.
 fn lock_state_dir(state_dir: &Path) -> Result<Flock<File>> {
     let lock_path = state_dir.join(LOCK_FILE);
     let file = OpenOptions::new()
@@ -520,8 +504,7 @@ fn lock_state_dir(state_dir: &Path) -> Result<Flock<File>> {
         .with_context(|| format!("Failed to acquire lock: {}", lock_path.display()))
 }
 
-/// Run one sbx command from a plan, failing with sbx's error. Returns what
-/// it printed on stderr.
+/// Run one sbx command from a plan and return its stderr.
 fn run_sbx(command: &SbxCommand) -> Result<String> {
     debug!(args = ?command.args, "running sbx");
     let output = Command::new("sbx")
@@ -545,9 +528,8 @@ fn run_sbx(command: &SbxCommand) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stderr).into_owned())
 }
 
-/// The warnings and notes sbx printed on stderr while creating a sandbox,
-/// each with its indented continuation lines, such as that it withheld a
-/// kit's credential. Its progress lines (`○`, `✓`) are left out.
+/// Extract the warnings and notes `sbx create` printed, without its progress
+/// lines.
 fn create_notices(stderr: &str) -> Vec<String> {
     let mut notices: Vec<String> = Vec::new();
     let mut continuing = false;
@@ -571,15 +553,10 @@ fn create_notices(stderr: &str) -> Vec<String> {
     notices
 }
 
-/// Gather sbx's state, compute the launch plan and run its setup commands:
-/// load the template, write its masks' sources and create the sandbox if
-/// it's missing, reconcile its
-/// policy rules, recording the ones workmux writes for `sandbox.network`
-/// and the toolchain, and provision a sandbox it created (built-in
-/// provisioning, then the `provision` script), removing it again if
-/// provisioning fails. `selected_agent` is the pane's agent (a named agent,
-/// or an agent type by its own name), whose own sandbox it is. Returns the
-/// plan, whose `exec` the caller runs.
+/// Set up the sandbox of `selected_agent`, the pane agent, for a launch.
+///
+/// Gathers sbx's state, computes the plan and runs everything up to its
+/// `exec`, which the caller runs.
 pub fn prepare_launch(
     config: &Config,
     worktree_root: &Path,
@@ -599,7 +576,7 @@ pub fn prepare_launch(
     std::fs::create_dir_all(&state_dir)
         .with_context(|| format!("Failed to create {}", state_dir.display()))?;
     write_sandbox_record(&state_dir, &worktree_root, selected_agent)?;
-    // sbx mounts only directories that exist. Under `kit` it isn't mounted.
+    // sbx mounts only directories that exist.
     if config.sandbox.docker_sbx.agent() == DockerSbxAgent::Shell
         && let Some(config_dir) = config.sandbox.resolved_agent_config_dir(agent)
     {
@@ -620,8 +597,7 @@ pub fn prepare_launch(
     let state = gather_state(&name)?;
     let network_record = read_network_record(&state_dir);
     let created_with = read_created_record(&state_dir);
-    // Only creating the sandbox mounts the git metadata; finding it walks
-    // the worktree.
+    // Only creating the sandbox mounts the git metadata.
     let git = if super::plan::creates_sandbox(&state, &created_with) {
         Some(super::git::git_metadata(&worktree_root)?)
     } else {
@@ -646,10 +622,8 @@ pub fn prepare_launch(
         warn!(sandbox = %name, warning, "sbx launch warning");
     }
 
-    // Under `deny`, the user accepts what a sandbox reaches beyond
-    // allowed_domains before it's created. When kits add their rules at
-    // create and the user would be asked, the question waits for them, so
-    // it's asked once (see `after_create`).
+    // Ask before creating the sandbox, unless kits add rules at create: then
+    // `after_create` asks once, after seeing them.
     let sbx = &config.sandbox.docker_sbx;
     let kits_add_rules = sbx.agent() == DockerSbxAgent::Kit || !sbx.kits().is_empty();
     if plan.create.is_some()
@@ -662,15 +636,13 @@ pub fn prepare_launch(
     if plan.create.is_some() {
         super::template::ensure_template(&image)?;
     } else {
-        // The template matters only when a sandbox is created; keep its
-        // freshness cache current for the next one.
+        // Keep the template's freshness cache current for the next create.
         super::template::check_freshness_in_background(&image);
         if config.sandbox.docker_sbx.provision_script().is_some() {
             info!(sandbox = %name, "custom provision script only runs on sandbox creation; recreate sandbox to apply changes");
         }
     }
-    // The plan saw the rules from before the sandbox existed; its kits add
-    // theirs at create.
+    // Kits add their rules at create, after the plan listed them.
     let after_create = || {
         if !config.sandbox.network_policy_is_deny() {
             return Ok(());
@@ -693,17 +665,13 @@ pub fn prepare_launch(
     Ok(plan)
 }
 
-/// Run a plan's commands up to its exec, keeping the sandbox's state
-/// directory in step so that a launch that fails or is killed partway is
-/// recovered by the next one: the create record is removed and the masks'
-/// sources written before the sandbox is created, the network rules about to be
-/// written are recorded before they're written, and the create record is
-/// written only once the sandbox is fully set up and provisioned. A
+/// Run a plan's commands up to its exec and return sbx's create notices.
+///
+/// The state directory is kept in step so the next launch recovers from one
+/// that fails or is killed partway: rules are recorded before they're
+/// written, and the create record only once the sandbox is fully set up. A
 /// sandbox this launch creates is removed again when anything after
-/// `sbx create` fails, `after_create` first, which runs right after it.
-/// `run` runs one sbx command, returning its stderr.
-/// Returns the warnings and notes sbx printed creating the sandbox (see
-/// [`create_notices`]).
+/// `sbx create` fails.
 fn apply_plan_with(
     plan: &LaunchPlan,
     state_dir: &Path,
@@ -729,8 +697,8 @@ fn apply_plan_with(
             eprintln!("    {workspace}");
         }
     }
-    // Record the rules about to be written before writing them, so a
-    // failed launch still knows which rules are workmux's.
+    // Record the rules first, so a failed launch still knows they're
+    // workmux's.
     let mut pending = network_record.to_vec();
     pending.extend(
         plan.network_rules
@@ -751,9 +719,6 @@ fn apply_plan_with(
             return Err(error);
         }
     }
-    // Everything after `sbx create` finishes a sandbox this launch creates:
-    // when any of it fails, remove the sandbox so the next launch creates
-    // and provisions it again.
     let creating = plan.create.is_some();
     for command in &plan.setup {
         if let Err(error) = run(command) {
@@ -769,8 +734,7 @@ fn apply_plan_with(
     if plan.network_rules != pending {
         write_network_record(state_dir, &plan.network_rules)?;
     }
-    // The hooks come from the template's workmux, which may predate the
-    // setup mode this one runs.
+    // The template's workmux may predate the setup flags this one passes.
     if let Some(command) = &plan.status_hooks
         && let Err(error) = run(command)
     {
@@ -813,8 +777,7 @@ fn apply_plan_with(
     Ok(notices)
 }
 
-/// Remove a sandbox this launch created but couldn't finish setting up.
-/// Best effort: a failure is logged.
+/// Remove a sandbox this launch couldn't finish setting up. Best effort.
 fn remove_unfinished(name: &str, run: &mut impl FnMut(&SbxCommand) -> Result<String>) {
     let remove = SbxCommand {
         args: vec!["rm".to_string(), "-f".to_string(), name.to_string()],
@@ -825,7 +788,7 @@ fn remove_unfinished(name: &str, run: &mut impl FnMut(&SbxCommand) -> Result<Str
     }
 }
 
-/// A fresh identifier for one exec's processes in the guest.
+/// Generate an identifier for one exec's processes in the guest.
 pub fn new_session() -> Result<String> {
     Ok(format!(
         "{:016x}",
@@ -835,9 +798,8 @@ pub fn new_session() -> Result<String> {
 
 /// Run the plan's `sbx exec` in the foreground and return its exit code.
 ///
-/// sbx leaves the guest command running when the `sbx exec` client goes
-/// away, so a hangup or termination (closing the pane) hangs up the
-/// session's processes in the guest before returning.
+/// sbx leaves the guest command running when the client goes away, so
+/// SIGHUP or SIGTERM hangs up the session's guest processes.
 pub fn run_exec(plan: &LaunchPlan) -> Result<i32> {
     let hangup = Arc::new(AtomicBool::new(false));
     for signal in [libc::SIGHUP, libc::SIGTERM] {
@@ -851,8 +813,7 @@ pub fn run_exec(plan: &LaunchPlan) -> Result<i32> {
         .envs(plan.exec.env.iter().map(|(k, v)| (k, v)))
         .spawn()
         .context("Failed to execute sbx exec")?;
-    // The client usually exits on the same hangup; hang up the guest side
-    // whether it has or not. Its command ending then ends the client.
+    // Hang up the guest side whether or not the client already exited.
     let status = loop {
         if hangup.load(Ordering::Relaxed) {
             hang_up(plan);
@@ -881,8 +842,8 @@ fn hang_up(plan: &LaunchPlan) {
     }
 }
 
-/// Ensure the worktree's sbx sandbox for `agent` (a named agent, or an
-/// agent type by its own name) exists, creating it if necessary.
+/// Ensure the worktree's sbx sandbox for `agent` exists, creating it if
+/// necessary.
 ///
 /// Should be called from the main process BEFORE creating tmux panes, so
 /// setup errors and progress appear in the user's terminal. Returns the

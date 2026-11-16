@@ -1,6 +1,5 @@
-//! The user's acceptance, once per sandbox, of what sbx lets a sandbox under
-//! `policy: deny` reach beyond `allowed_domains`, as Lima asks to accept its
-//! reduced Git metadata isolation.
+//! Per-sandbox acceptance of what sbx lets a `deny` sandbox reach beyond
+//! `allowed_domains`, like Lima's reduced-isolation acknowledgement.
 
 use anyhow::{Result, bail};
 use std::path::PathBuf;
@@ -13,24 +12,23 @@ use super::plan::Widening;
 /// What an acknowledgement file holds.
 const ACCEPTED: &str = "accepted-v1\n";
 
-/// Directory of the acknowledgement files, one per sandbox, beside Lima's.
+/// Return the directory of the acknowledgement files, beside Lima's.
 fn acknowledgement_dir() -> Result<PathBuf> {
     Ok(crate::xdg::state_dir()?
         .join("docker-sbx-acknowledgements")
         .join("wider-network-policy-v1"))
 }
 
-/// Whether stdin is a terminal the user can answer from.
+/// Check whether stdin is a terminal the user can answer from.
 pub(super) fn can_ask() -> bool {
     use std::io::IsTerminal;
     std::io::stdin().is_terminal()
 }
 
-/// Have the user accept `widenings` for sandbox `name`, unless they did when
-/// it was created: print a `warning:` for each, then accept by
-/// `sandbox.docker_sbx.accept_wider_network_policy`, or by asking when
-/// stdin is a terminal, and record the acceptance. Fails when it isn't
-/// accepted.
+/// Have the user accept `widenings` for sandbox `name`, once per sandbox.
+///
+/// Accepts by `accept_wider_network_policy` or by asking on a terminal, and
+/// fails otherwise.
 pub(super) fn acknowledge(config: &Config, name: &str, widenings: &[Widening]) -> Result<()> {
     use std::io::Write;
 
@@ -97,9 +95,8 @@ pub(super) fn acknowledge(config: &Config, name: &str, widenings: &[Widening]) -
     Ok(())
 }
 
-/// Forget the acceptance for sandbox `name`, as it's removed, so a sandbox
-/// created again under that name asks again. Best effort: a failure is
-/// logged.
+/// Forget the acceptance for a removed sandbox, so a new one asks again.
+/// Best effort: a failure is logged.
 pub(crate) fn remove_acknowledgement(name: &str) {
     let Ok(dir) = acknowledgement_dir() else {
         return;

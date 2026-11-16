@@ -402,11 +402,8 @@ fn perform_destructive_cleanup(
         }
     }
 
-    // sbx sandboxes outlive their panes; delete the worktree's (one per
-    // agent) with it, on every removal path (rollbacks and deferred cleanup
-    // included). Their names follow the worktree's path, and a launch
-    // setting one up needs the worktree there: wait for one before moving
-    // the worktree. Best effort.
+    // sbx sandboxes outlive their panes, so delete them with the worktree,
+    // after any launch setting one up, which needs the worktree in place.
     let project_root = git_common_dir.parent().unwrap_or(git_common_dir);
     let sbx_removals = crate::sandbox::prepare_docker_sbx_removal(project_root, worktree_path);
     let quarantine = expected

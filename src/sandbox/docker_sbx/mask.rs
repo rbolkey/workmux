@@ -1,10 +1,7 @@
-//! Masks: files the agent reads in place of others.
+//! Masks: files mounted read-only over others to hide them from the agent.
 //!
-//! sbx mounts a file read-only over another (`SOURCE:TARGET:ro`), which
-//! hides the target from the agent, as the container backend's `/dev/null`
-//! mounts do. A device can't be an sbx source, so each mask's source is a
-//! file workmux writes into the sandbox's state directory before creating
-//! the sandbox. Masks are fixed when the sandbox is created.
+//! A device can't be an sbx mount source, so unlike the container backend's
+//! `/dev/null` mounts, each mask's source is a file in the state directory.
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
@@ -12,8 +9,7 @@ use std::path::{Path, PathBuf};
 /// Directory in a sandbox's state directory holding its masks' sources.
 const MASKS_DIR: &str = "masks";
 
-/// A file mounted read-only over `target`, so the agent reads `contents`
-/// there instead of the file.
+/// A file mounted read-only over `target`, holding `contents`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Mask {
     /// The guest path hidden.
@@ -23,7 +19,7 @@ pub struct Mask {
 }
 
 impl Mask {
-    /// A mask that leaves `target` empty.
+    /// Create a mask that leaves `target` empty.
     pub fn empty(target: PathBuf) -> Self {
         Self {
             target,
@@ -31,14 +27,13 @@ impl Mask {
         }
     }
 
-    /// The mask's source file in the sandbox's state directory, one per
-    /// target.
+    /// Return the mask's source file in the sandbox's state directory.
     pub fn source(&self, state_dir: &Path) -> PathBuf {
         let key = crate::sandbox::hash_key(&self.target.to_string_lossy(), 16);
         state_dir.join(MASKS_DIR).join(key)
     }
 
-    /// The workspace that mounts the mask: `SOURCE:TARGET:ro`.
+    /// Format the workspace that mounts the mask: `SOURCE:TARGET:ro`.
     pub fn workspace(&self, state_dir: &Path) -> String {
         format!(
             "{}:{}:ro",
@@ -48,8 +43,7 @@ impl Mask {
     }
 }
 
-/// Write the masks' sources into the sandbox's state directory before the
-/// sandbox is created, replacing any an earlier sandbox left.
+/// Write the masks' sources, replacing any an earlier sandbox left.
 pub fn write_masks(state_dir: &Path, masks: &[Mask]) -> Result<()> {
     let dir = state_dir.join(MASKS_DIR);
     match std::fs::remove_dir_all(&dir) {

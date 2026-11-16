@@ -1,7 +1,7 @@
 //! Checks and discovery for the git metadata a sandbox mounts read-only.
 //!
-//! The container and docker_sbx backends both keep an agent from changing
-//! what git runs on the host. Each builds its own mounts from what these find.
+//! Both the container and docker_sbx backends keep an agent from changing what
+//! git runs on the host, each building its own mounts from these.
 
 use std::path::{Path, PathBuf};
 
@@ -33,7 +33,7 @@ pub(super) fn validate_git_hooks(common_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Make a policy file exist, refusing one a read-only mount wouldn't protect.
+/// Create a policy file, refusing one a read-only mount wouldn't protect.
 pub(super) fn ensure_policy_file(path: &Path) -> Result<()> {
     if path.exists() {
         let metadata = std::fs::symlink_metadata(path)?;
@@ -59,7 +59,7 @@ pub(super) fn ensure_policy_file(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Make a policy directory exist, refusing a symlink or a non-directory.
+/// Create a policy directory, refusing a symlink or a non-directory.
 pub(super) fn ensure_policy_dir(path: &Path) -> Result<()> {
     std::fs::create_dir_all(path)?;
     let metadata = std::fs::symlink_metadata(path)?;
@@ -69,7 +69,7 @@ pub(super) fn ensure_policy_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// `.git` pointer files under the worktree, not following symlinks.
+/// Collect `.git` pointer files under the worktree, not following symlinks.
 pub(super) fn collect_worktree_git_pointers(worktree: &Path) -> Result<Vec<PathBuf>> {
     fn visit(dir: &Path, pointers: &mut Vec<PathBuf>) -> Result<()> {
         for entry in std::fs::read_dir(dir)? {
@@ -96,7 +96,7 @@ pub(super) fn collect_worktree_git_pointers(worktree: &Path) -> Result<Vec<PathB
     Ok(pointers)
 }
 
-/// Submodule git dirs under `<common_dir>/modules`, nested ones included.
+/// Collect submodule git dirs under `<common_dir>/modules`, nested ones included.
 pub(super) fn module_git_roots(common_dir: &Path) -> Result<Vec<PathBuf>> {
     fn visit(path: &Path, roots: &mut Vec<PathBuf>) -> Result<()> {
         if !path.is_dir() {
@@ -138,23 +138,19 @@ pub(super) fn module_git_roots(common_dir: &Path) -> Result<Vec<PathBuf>> {
 /// Where `config_include_paths` looks for the programs a config runs.
 #[derive(Clone, Copy)]
 pub(super) enum ProgramPaths<'a> {
-    /// The first word of each program, relative to the directory of the
-    /// config that names it. The container backend's rule.
+    /// The first word of each program, relative to its config's directory.
+    /// The container backend's rule.
     BesideConfig,
-    /// As git resolves them, from the top of this worktree, where git runs
-    /// hooks and commands. `core.hooksPath` is one path. In a program, every
-    /// word naming a file counts, so a script run through an interpreter is
-    /// protected too, and a first word without a slash comes from `PATH`.
+    /// As git resolves them, from the top of this worktree. Every word naming
+    /// a file counts, so a script run through an interpreter is protected too.
     InWorktree(&'a Path),
 }
 
 impl ProgramPaths<'_> {
-    /// The `git config --get-regexp` pattern for the keys naming programs.
+    /// Return the `git config --get-regexp` pattern for keys naming programs.
     ///
-    /// git matches a pattern with alternatives against the lowercased key, so
-    /// `hooksPath` never matches. `BesideConfig` keeps that pattern, which
-    /// leaves `core.hooksPath` out, so the container backend's mounts don't
-    /// change here.
+    /// git lowercases keys before matching, so `BesideConfig`'s `hooksPath`
+    /// never matches. It's kept so the container backend's mounts don't change.
     fn pattern(self) -> &'static str {
         match self {
             ProgramPaths::BesideConfig => {
@@ -167,9 +163,8 @@ impl ProgramPaths<'_> {
     }
 }
 
-/// Files the repository config includes, and the programs it runs (hooks,
-/// `core.fsmonitor`, diff, filter and merge drivers), that exist: an agent
-/// able to change them could change what git does on the host.
+/// Collect the existing files the repository config includes or runs, which
+/// an agent could change to change what git does on the host.
 pub(super) fn config_include_paths(
     config: &Path,
     programs: ProgramPaths<'_>,

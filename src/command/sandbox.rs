@@ -202,9 +202,8 @@ pub fn run(args: SandboxArgs) -> Result<()> {
     }
 }
 
-/// The runtime whose image store holds the agent image. Under docker_sbx
-/// that's Docker, whatever `sandbox.container.runtime` says, since workmux
-/// builds sbx templates from it with Docker.
+/// Return the runtime whose image store holds the agent image. Under
+/// docker_sbx that's always Docker, which builds the sbx templates.
 fn image_runtime(config: &Config) -> SandboxRuntime {
     if config.sandbox.backend() == SandboxBackend::DockerSbx {
         SandboxRuntime::Docker
@@ -213,8 +212,7 @@ fn image_runtime(config: &Config) -> SandboxRuntime {
     }
 }
 
-/// Under docker_sbx, build and load the sbx template for `image` if it
-/// isn't loaded from the image Docker has now.
+/// Under docker_sbx, ensure the sbx template for `image` is current.
 fn ensure_docker_sbx_template(config: &Config, image: &str) -> Result<()> {
     if config.sandbox.backend() == SandboxBackend::DockerSbx {
         let tag = docker_sbx::ensure_template(image)?;
@@ -641,8 +639,7 @@ fn run_install_dev(skip_build: bool, release: bool) -> Result<()> {
     }
 
     // --- sbx sandbox installation ---
-    // Best effort, whatever the backend: skipped unless sbx can list its
-    // sandboxes.
+    // Best effort, whatever the backend.
     if SbxInstance::is_sbx_available() {
         let sandboxes = SbxInstance::list().unwrap_or_else(|e| {
             tracing::warn!(error = %e, "failed to list sbx sandboxes");
@@ -1476,9 +1473,8 @@ fn run_shell_lima(exec: bool, command: Vec<String>, config: &Config) -> Result<(
     std::process::exit(status.code().unwrap_or(1));
 }
 
-/// Exec a shell into the current worktree's sbx sandbox for `agent` (the
-/// selected agent by default), creating it if needed. sbx sandboxes
-/// persist, so `--exec` means the same.
+/// Exec a shell into the current worktree's sbx sandbox for `agent`,
+/// creating it if needed. sbx sandboxes persist, so `--exec` changes nothing.
 fn run_shell_docker_sbx(command: Vec<String>, agent: Option<&str>, config: &Config) -> Result<()> {
     let cwd = std::env::current_dir().context("Failed to get current directory")?;
     let cwd = cwd.canonicalize().unwrap_or(cwd);

@@ -1,9 +1,7 @@
 //! The git metadata a worktree's sandbox mounts, as found on the host.
 //!
-//! The launch plan decides which of these paths are read-only (see
-//! `plan::git_workspaces`). The checks and discovery are the container
-//! backend's, in `sandbox::git_boundary`. sbx mounts only paths that exist, so
-//! the policy files and directories the plan protects are created here first.
+//! sbx mounts only paths that exist, so the files and directories the plan
+//! protects are created here first.
 
 use anyhow::{Context, Result, bail};
 use std::path::Path;
@@ -14,9 +12,8 @@ use crate::sandbox::git_boundary::{
     ensure_policy_file, module_git_roots, validate_git_hooks,
 };
 
-/// Find a linked worktree's git metadata and make the paths the plan protects
-/// exist. Fails for the main worktree, as the container backend does: its
-/// admin files are the main repository's own.
+/// Find a linked worktree's git metadata and create the paths the plan
+/// protects. Fails for the main worktree, as the container backend does.
 pub fn git_metadata(worktree: &Path) -> Result<GitMetadata> {
     let identity = crate::git::RepositoryIdentity::discover(worktree)
         .context("Refusing to sandbox a worktree with invalid Git metadata")?;
