@@ -13,11 +13,10 @@ mod mask;
 mod plan;
 mod template;
 
-pub(crate) use acknowledgement::remove_acknowledgement;
 pub(crate) use instance::sbx_state_dir_path;
 pub use instance::{
     SbxInstance, SbxSandboxInfo, ensure_sandbox, new_session, prepare_launch,
-    prepare_sandbox_removal, run_exec,
+    prepare_sandbox_removal, remove_sandbox, run_exec,
 };
 pub use plan::{ExecRequest, launch_plan};
 pub use template::{dockerfile_layer, ensure_template, template_loaded_for};

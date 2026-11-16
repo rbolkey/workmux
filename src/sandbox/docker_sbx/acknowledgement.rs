@@ -2,7 +2,7 @@
 //! `allowed_domains`, like Lima's reduced-isolation acknowledgement.
 
 use anyhow::Result;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tracing::warn;
 
 use crate::config::{Config, DockerSbxAgent};
@@ -11,7 +11,7 @@ use crate::sandbox::acknowledgement::{Acknowledgement, ask_on_stdin, can_ask};
 use super::plan::Widening;
 
 /// Return the acknowledgement file of sandbox `name`, beside Lima's.
-fn marker(name: &str) -> Result<PathBuf> {
+pub(super) fn marker(name: &str) -> Result<PathBuf> {
     Ok(crate::xdg::state_dir()?
         .join("docker-sbx-acknowledgements")
         .join("wider-network-policy-v1")
@@ -55,12 +55,9 @@ pub(super) fn acknowledge(config: &Config, name: &str, widenings: &[Widening]) -
     .acknowledge(can_ask().then_some(ask_on_stdin))
 }
 
-/// Forget the acceptance for a removed sandbox, so a new one asks again.
-/// Best effort: a failure is logged.
-pub(crate) fn remove_acknowledgement(name: &str) {
-    let Ok(marker) = marker(name) else {
-        return;
-    };
+/// Forget sandbox `name`'s acceptance at `marker`. Best effort: a failure is
+/// logged.
+pub(super) fn forget(name: &str, marker: &Path) {
     match std::fs::remove_file(marker) {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
             warn!(sandbox = %name, error = %e, "failed to remove sbx network acknowledgement")

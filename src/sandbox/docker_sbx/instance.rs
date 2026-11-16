@@ -196,14 +196,39 @@ impl SbxInstance {
     pub fn stop_by_name(name: &str) -> Result<()> {
         run_sbx_args(&["stop", name])
     }
+}
 
-    /// Delete a sandbox by name. Succeeds if it doesn't exist.
-    pub fn remove_by_name(name: &str) -> Result<()> {
-        match run_sbx_args(&["rm", "-f", name]) {
-            Err(e) if e.to_string().contains("not found") => Ok(()),
-            result => result,
-        }
+/// Delete sandbox `name` and everything workmux keeps for it. Succeeds if it
+/// doesn't exist.
+pub fn remove_sandbox(name: &str) -> Result<()> {
+    remove_sandbox_with(name, &acknowledgement::marker(name)?, &mut run_sbx)?;
+    if let Ok(state_dir) = sbx_state_dir_path(name)
+        && let Err(e) = std::fs::remove_dir_all(&state_dir)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        warn!(sandbox = %name, error = %e, "failed to clean up state dir");
     }
+    Ok(())
+}
+
+/// Delete sandbox `name` with `run`, then its acknowledgement, so a new
+/// sandbox of that name asks again. Keeps the acknowledgement when sbx fails.
+fn remove_sandbox_with(
+    name: &str,
+    acknowledgement: &Path,
+    run: &mut impl FnMut(&SbxCommand) -> Result<SbxOutput>,
+) -> Result<()> {
+    let remove = SbxCommand {
+        args: vec!["rm".to_string(), "-f".to_string(), name.to_string()],
+        env: Vec::new(),
+        stdin: None,
+    };
+    match run(&remove) {
+        Err(e) if !e.to_string().contains("not found") => return Err(e),
+        _ => {}
+    }
+    acknowledgement::forget(name, acknowledgement);
+    Ok(())
 }
 
 /// Run an sbx command, failing with sbx's error.
@@ -225,7 +250,6 @@ fn run_sbx_args(args: &[&str]) -> Result<()> {
 /// A worktree's sbx sandbox about to be deleted, locked against launches.
 pub struct SandboxRemoval {
     name: String,
-    state_dir: PathBuf,
     _lock: Flock<File>,
 }
 
@@ -251,7 +275,6 @@ fn prepare_one_removal(name: &str) -> Option<SandboxRemoval> {
     match lock_state_dir(&state_dir) {
         Ok(lock) => Some(SandboxRemoval {
             name: name.to_string(),
-            state_dir,
             _lock: lock,
         }),
         Err(e) => {
@@ -262,19 +285,14 @@ fn prepare_one_removal(name: &str) -> Option<SandboxRemoval> {
 }
 
 impl SandboxRemoval {
-    /// Delete the sandbox and its state directory. Best effort: failures are
-    /// logged.
+    /// Delete the sandbox and what workmux keeps for it. Best effort:
+    /// failures are logged.
     pub fn remove(self) {
         let name = &self.name;
         info!(sandbox = %name, "removing sbx sandbox");
-        if let Err(e) = SbxInstance::remove_by_name(name) {
+        if let Err(e) = remove_sandbox(name) {
             warn!(sandbox = %name, error = %e, "failed to remove sbx sandbox");
-            return;
         }
-        if let Err(e) = std::fs::remove_dir_all(&self.state_dir) {
-            warn!(sandbox = %name, error = %e, "failed to clean up state dir");
-        }
-        acknowledgement::remove_acknowledgement(name);
     }
 }
 
@@ -679,7 +697,14 @@ pub fn prepare_launch(
         }
         acknowledgement::acknowledge(config, &name, &widenings)
     };
-    let notices = apply_plan_with(&plan, &state_dir, &network_record, after_create, run_sbx)?;
+    let notices = apply_plan_with(
+        &plan,
+        &state_dir,
+        &acknowledgement::marker(&name)?,
+        &network_record,
+        after_create,
+        run_sbx,
+    )?;
     for notice in &notices {
         warn!(sandbox = %name, notice, "sbx create notice");
     }
@@ -696,6 +721,7 @@ pub fn prepare_launch(
 fn apply_plan_with(
     plan: &LaunchPlan,
     state_dir: &Path,
+    acknowledgement: &Path,
     network_record: &[NetworkRule],
     after_create: impl FnOnce() -> Result<()>,
     mut run: impl FnMut(&SbxCommand) -> Result<SbxOutput>,
@@ -736,7 +762,7 @@ fn apply_plan_with(
         let output = crate::spinner::with_spinner(&msg, || run(&create.command))?;
         notices = create_notices(&output.stderr);
         if let Err(error) = after_create() {
-            remove_unfinished(name, &mut run);
+            remove_unfinished(name, acknowledgement, &mut run);
             return Err(error);
         }
     }
@@ -746,7 +772,7 @@ fn apply_plan_with(
             if !creating {
                 return Err(error);
             }
-            remove_unfinished(name, &mut run);
+            remove_unfinished(name, acknowledgement, &mut run);
             return Err(error.context(format!(
                 "Setting up sbx sandbox {name} failed; the sandbox was removed, launch again"
             )));
@@ -758,7 +784,7 @@ fn apply_plan_with(
     if let Some(hooks) = &plan.status_hooks
         && let Err(error) = super::hooks::install(name, hooks, &mut run)
     {
-        remove_unfinished(name, &mut run);
+        remove_unfinished(name, acknowledgement, &mut run);
         return Err(error.context(format!(
             "Installing workmux's status hooks for {} in sbx sandbox {name} failed; the \
              sandbox was removed, launch again",
@@ -786,7 +812,7 @@ fn apply_plan_with(
     for (command, failed) in provisioning {
         let msg = format!("Provisioning sbx sandbox {name}");
         if let Err(error) = crate::spinner::with_spinner(&msg, || run(command)) {
-            remove_unfinished(name, &mut run);
+            remove_unfinished(name, acknowledgement, &mut run);
             return Err(error.context(failed.clone()));
         }
     }
@@ -797,13 +823,13 @@ fn apply_plan_with(
 }
 
 /// Remove a sandbox this launch couldn't finish setting up. Best effort.
-fn remove_unfinished(name: &str, run: &mut impl FnMut(&SbxCommand) -> Result<SbxOutput>) {
-    let remove = SbxCommand {
-        args: vec!["rm".to_string(), "-f".to_string(), name.to_string()],
-        env: Vec::new(),
-        stdin: None,
-    };
-    if let Err(e) = run(&remove) {
+fn remove_unfinished(
+    name: &str,
+    acknowledgement: &Path,
+    run: &mut impl FnMut(&SbxCommand) -> Result<SbxOutput>,
+) {
+    // The state directory stays: it holds the lock and the rules record.
+    if let Err(e) = remove_sandbox_with(name, acknowledgement, run) {
         warn!(sandbox = %name, error = %e, "failed to remove unfinished sbx sandbox");
     }
 }
@@ -1131,6 +1157,7 @@ mod tests {
         let result = apply_plan_with(
             plan,
             state_dir,
+            &state_dir.join("acknowledgement"),
             &[],
             || Ok(()),
             |command| {
@@ -1156,6 +1183,7 @@ mod tests {
         apply_plan_with(
             &plan,
             state_dir,
+            &state_dir.join("acknowledgement"),
             &[],
             || Ok(()),
             |command| {
@@ -1207,6 +1235,7 @@ mod tests {
         let notices = apply_plan_with(
             &plan,
             dir.path(),
+            &dir.path().join("acknowledgement"),
             &[],
             || Ok(()),
             |command| {
@@ -1261,6 +1290,40 @@ mod tests {
             );
             // The rules recorded before the failure stay workmux's.
             assert_eq!(read_network_record(state_dir), vec![rule()], "{fail}");
+        }
+    }
+
+    #[test]
+    fn a_sandbox_removed_after_a_failure_loses_its_acknowledgement() {
+        // A refusal after create, or any later step failing.
+        for fail in ["after create", "setup", HOOKS_WRITE, "exec custom"] {
+            let dir = tempfile::tempdir().unwrap();
+            let state_dir = dir.path();
+            let acknowledgement = state_dir.join("acknowledgement");
+            std::fs::write(&acknowledgement, "accepted-v1\n").unwrap();
+
+            let result = apply_plan_with(
+                &creating_plan(),
+                state_dir,
+                &acknowledgement,
+                &[],
+                || {
+                    if fail == "after create" {
+                        bail!("declined");
+                    }
+                    Ok(())
+                },
+                |command| {
+                    if describe(command) == fail {
+                        bail!("sbx {fail} failed");
+                    }
+                    Ok(SbxOutput::default())
+                },
+            );
+
+            assert!(result.is_err(), "{fail}");
+            // A new sandbox of that name asks again.
+            assert!(!acknowledgement.exists(), "{fail}");
         }
     }
 
