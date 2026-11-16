@@ -126,7 +126,7 @@ pub enum SandboxCommand {
         exec: bool,
         /// The agent (a named agent or an agent type) whose sandbox to open
         /// (docker_sbx; default: the selected agent)
-        #[arg(long)]
+        #[arg(short = 'a', long)]
         agent: Option<String>,
         /// Command to run instead of bash
         #[arg(last = true)]
