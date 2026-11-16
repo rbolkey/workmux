@@ -85,6 +85,9 @@ pub fn install() -> Result<String> {
     install_dir(&dir)
 }
 
+/// The file [`install_dir`] writes, relative to `dir`.
+pub(super) const DIR_FILES: &[&str] = &["extensions/workmux-status.ts"];
+
 /// [`install`] into the OMP agent directory `dir`.
 pub(crate) fn install_dir(dir: &Path) -> Result<String> {
     let path = extension_path_in(dir);
