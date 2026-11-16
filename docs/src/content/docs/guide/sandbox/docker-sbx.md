@@ -118,6 +118,8 @@ When it creates the sandbox, workmux adds its [status hooks](/guide/status-track
 - Copilot: `~/.copilot/hooks/`
 - OpenCode: a plugin in `~/.config/opencode/plugins/`
 
+The workmux in the template installs them, as the agent user, so the hooks match that workmux rather than the one on your workstation. If its workmux is too old to install them, creating the sandbox fails and workmux removes it again. Update the template's workmux with `workmux sandbox pull`, or with `workmux sandbox install-dev` for a local build.
+
 workmux's panes start Codex with `--dangerously-bypass-hook-trust` (see [Agent flags](/guide/sandbox/features/#agent-flags)), so Codex runs these hooks without asking you to review them. Approvals given on your workstation wouldn't apply anyway, because the sandbox has a `~/.codex` of its own. Codex shows a startup warning that the flag is on. A Codex you start yourself in the sandbox, such as with `workmux sandbox shell -- codex`, asks once, and trusting the hooks records that in the sandbox's `~/.codex/config.toml`.
 
 The claude kit's own hooks and status line call `sbx-claude-hook`, and the codex kit's `notify` calls `sbx-codex-hook`. Both helpers come with sbx's own agent images, not workmux's template, so workmux drops those hooks when the template doesn't have the helpers. Your workstation's agent settings, hooks, plugins and sessions aren't in the sandbox. Configure sbx's own settings (secrets, MCP servers, skills) with sbx.

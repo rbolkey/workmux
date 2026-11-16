@@ -1,6 +1,7 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use console::style;
 use std::io::{self, IsTerminal};
+use std::path::Path;
 
 use crate::agent_setup::{self, Agent, StatusCheck};
 use crate::skills;
@@ -39,6 +40,23 @@ pub fn run(hooks_only: bool, skills_only: bool) -> Result<()> {
         run_skills_setup(&checks)?;
     }
 
+    Ok(())
+}
+
+/// Install status hooks for the agent type `agent` into its config directory
+/// `config_dir`, without prompting. Sandbox guests run this as the agent
+/// user.
+pub fn run_for_agent(agent: &str, config_dir: &Path) -> Result<()> {
+    let agent: Agent = serde_json::from_value(serde_json::Value::String(agent.to_string()))
+        .map_err(|_| anyhow::anyhow!("Unknown agent type '{agent}'"))?;
+    let message = agent_setup::install_in(agent, config_dir).with_context(|| {
+        format!(
+            "Failed to install {} status hooks in {}",
+            agent.name(),
+            config_dir.display()
+        )
+    })?;
+    println!("{message}");
     Ok(())
 }
 

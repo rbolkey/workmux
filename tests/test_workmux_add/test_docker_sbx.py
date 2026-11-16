@@ -83,6 +83,46 @@ def test_add_creates_each_agents_sandbox_before_the_window_opens(
         assert get_window_name(branch_name) not in call.windows, call.windows
 
 
+def test_add_installs_status_hooks_with_the_guests_workmux_setup(
+    mux_server: MuxEnvironment,
+    workmux_exe_path: Path,
+    mux_repo_path: Path,
+    fake_sbx: FakeSbx,
+):
+    add_claude_and_codex(
+        mux_server, workmux_exe_path, mux_repo_path, "feature-sbx-hooks"
+    )
+
+    created = created_sandboxes(fake_sbx)
+    hook_installs = [
+        call.argv
+        for call in fake_sbx.verb_calls("exec")
+        if call.argv[2:4] == ["workmux", "setup"]
+    ]
+    assert hook_installs == [
+        [
+            "exec",
+            created[0],
+            "workmux",
+            "setup",
+            "--agent",
+            "claude",
+            "--config-dir",
+            "/home/agent/.claude",
+        ],
+        [
+            "exec",
+            created[1],
+            "workmux",
+            "setup",
+            "--agent",
+            "codex",
+            "--config-dir",
+            "/home/agent/.codex",
+        ],
+    ]
+
+
 def test_remove_deletes_each_agents_sandbox(
     mux_server: MuxEnvironment,
     workmux_exe_path: Path,
