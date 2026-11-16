@@ -13,9 +13,10 @@ use tracing::{debug, info, warn};
 
 use crate::config::{Config, DockerSbxAgent};
 
+use super::acknowledgement;
 use super::plan::{
     CreateRecord, CreateSettings, ExecRequest, LaunchPlan, LaunchTarget, NetworkRule, Platform,
-    SbxCommand, SbxState,
+    SbxCommand, SbxState, Widening,
 };
 
 /// A sandbox from `sbx ls --json`.
@@ -282,6 +283,7 @@ impl SandboxRemoval {
         if let Err(e) = std::fs::remove_dir_all(&self.state_dir) {
             warn!(sandbox = %name, error = %e, "failed to clean up state dir");
         }
+        acknowledgement::remove_acknowledgement(name);
     }
 }
 
@@ -644,6 +646,18 @@ pub fn prepare_launch(
         warn!(sandbox = %name, warning, "sbx launch warning");
     }
 
+    // Under `deny`, the user accepts what a sandbox reaches beyond
+    // allowed_domains before it's created. When kits add their rules at
+    // create and the user would be asked, the question waits for them, so
+    // it's asked once (see `after_create`).
+    let sbx = &config.sandbox.docker_sbx;
+    let kits_add_rules = sbx.agent() == DockerSbxAgent::Kit || !sbx.kits().is_empty();
+    if plan.create.is_some()
+        && !(kits_add_rules && acknowledgement::can_ask() && !sbx.accepts_wider_network_policy())
+    {
+        acknowledgement::acknowledge(config, &name, &plan.widenings)?;
+    }
+
     let image = config.sandbox.resolved_image(agent);
     if plan.create.is_some() {
         super::template::ensure_template(&image)?;
@@ -655,27 +669,26 @@ pub fn prepare_launch(
             info!(sandbox = %name, "custom provision script only runs on sandbox creation; recreate sandbox to apply changes");
         }
     }
-    let notices = apply_plan_with(&plan, &state_dir, &network_record, run_sbx)?;
-    for notice in &notices {
-        warn!(sandbox = %name, notice, "sbx create notice");
-    }
     // The plan saw the rules from before the sandbox existed; its kits add
     // theirs at create.
-    if plan.create.is_some() && config.sandbox.network_policy_is_deny() {
-        match list_sandbox_and_rules(&name) {
-            Ok((_, rules)) => {
-                let warnings = super::plan::kit_rule_warnings(
-                    &config.sandbox,
-                    &rules,
-                    &name,
-                    &plan.network_rules,
-                );
-                for warning in &warnings {
-                    warn!(sandbox = %name, warning, "sbx launch warning");
-                }
-            }
-            Err(e) => debug!(sandbox = %name, error = %e, "failed to list sbx rules after create"),
+    let after_create = || {
+        if !config.sandbox.network_policy_is_deny() {
+            return Ok(());
         }
+        let (_, rules) = list_sandbox_and_rules(&name)
+            .context("Failed to list the new sbx sandbox's network rules")?;
+        let widenings = super::plan::widenings(&config.sandbox, &rules, &name, &plan.network_rules);
+        for widening in &widenings {
+            if let Widening::KitHosts(_) = widening {
+                let warning = widening.warning(&name);
+                warn!(sandbox = %name, warning, "sbx launch warning");
+            }
+        }
+        acknowledgement::acknowledge(config, &name, &widenings)
+    };
+    let notices = apply_plan_with(&plan, &state_dir, &network_record, after_create, run_sbx)?;
+    for notice in &notices {
+        warn!(sandbox = %name, notice, "sbx create notice");
     }
     Ok(plan)
 }
@@ -687,13 +700,15 @@ pub fn prepare_launch(
 /// written are recorded before they're written, and the create record is
 /// written only once the sandbox is fully set up and provisioned. A
 /// sandbox this launch creates is removed again when anything after
-/// `sbx create` fails. `run` runs one sbx command, returning its stderr.
+/// `sbx create` fails, `after_create` first, which runs right after it.
+/// `run` runs one sbx command, returning its stderr.
 /// Returns the warnings and notes sbx printed creating the sandbox (see
 /// [`create_notices`]).
 fn apply_plan_with(
     plan: &LaunchPlan,
     state_dir: &Path,
     network_record: &[NetworkRule],
+    after_create: impl FnOnce() -> Result<()>,
     mut run: impl FnMut(&SbxCommand) -> Result<String>,
 ) -> Result<Vec<String>> {
     let name = &plan.sandbox_name;
@@ -731,6 +746,10 @@ fn apply_plan_with(
         let msg = format!("Creating sbx sandbox {name}");
         let stderr = crate::spinner::with_spinner(&msg, || run(&create.command))?;
         notices = create_notices(&stderr);
+        if let Err(error) = after_create() {
+            remove_unfinished(name, &mut run);
+            return Err(error);
+        }
     }
     // Everything after `sbx create` finishes a sandbox this launch creates:
     // when any of it fails, remove the sandbox so the next launch creates
@@ -1090,6 +1109,7 @@ mod tests {
             teardown: Vec::new(),
             notes: Vec::new(),
             warnings: Vec::new(),
+            widenings: Vec::new(),
             network_rules: vec![rule()],
             create_settings: CreateSettings {
                 agent: "claude".to_string(),
@@ -1106,14 +1126,20 @@ mod tests {
         fail: &str,
     ) -> (Vec<String>, Result<Vec<String>>) {
         let mut ran = Vec::new();
-        let result = apply_plan_with(plan, state_dir, &[], |command| {
-            let line = command.args.join(" ");
-            ran.push(line.clone());
-            if line == fail {
-                bail!("sbx {line} failed");
-            }
-            Ok(String::new())
-        });
+        let result = apply_plan_with(
+            plan,
+            state_dir,
+            &[],
+            || Ok(()),
+            |command| {
+                let line = command.args.join(" ");
+                ran.push(line.clone());
+                if line == fail {
+                    bail!("sbx {line} failed");
+                }
+                Ok(String::new())
+            },
+        );
         (ran, result)
     }
 
@@ -1125,17 +1151,23 @@ mod tests {
         let plan = creating_plan();
 
         let mut ran = Vec::new();
-        apply_plan_with(&plan, state_dir, &[], |command| {
-            let line = command.args.join(" ");
-            if line.starts_with("create") {
-                // A launch killed from here on is recovered by the next.
-                assert_eq!(read_created_record(state_dir), CreateRecord::Missing);
-                assert!(state_dir.join("masks").is_dir());
-                assert_eq!(read_network_record(state_dir), vec![rule()]);
-            }
-            ran.push(line);
-            Ok(String::new())
-        })
+        apply_plan_with(
+            &plan,
+            state_dir,
+            &[],
+            || Ok(()),
+            |command| {
+                let line = command.args.join(" ");
+                if line.starts_with("create") {
+                    // A launch killed from here on is recovered by the next.
+                    assert_eq!(read_created_record(state_dir), CreateRecord::Missing);
+                    assert!(state_dir.join("masks").is_dir());
+                    assert_eq!(read_network_record(state_dir), vec![rule()]);
+                }
+                ran.push(line);
+                Ok(String::new())
+            },
+        )
         .unwrap();
 
         assert_eq!(
@@ -1169,13 +1201,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let plan = creating_plan();
 
-        let notices = apply_plan_with(&plan, dir.path(), &[], |command| {
-            Ok(if command.args[0] == "create" {
-                stderr.to_string()
-            } else {
-                String::new()
-            })
-        })
+        let notices = apply_plan_with(
+            &plan,
+            dir.path(),
+            &[],
+            || Ok(()),
+            |command| {
+                Ok(if command.args[0] == "create" {
+                    stderr.to_string()
+                } else {
+                    String::new()
+                })
+            },
+        )
         .unwrap();
 
         assert_eq!(

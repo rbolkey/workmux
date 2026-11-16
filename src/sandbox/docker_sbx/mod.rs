@@ -5,12 +5,14 @@
 //! the agent's config directory are mounted at their workstation paths; the agent command runs through
 //! `sbx exec`, as on the container backend.
 
+mod acknowledgement;
 mod git;
 mod instance;
 mod mask;
 mod plan;
 mod template;
 
+pub(crate) use acknowledgement::remove_acknowledgement;
 pub(crate) use instance::sbx_state_dir_path;
 pub use instance::{
     SbxInstance, SbxSandboxInfo, ensure_sandbox, new_session, prepare_launch,

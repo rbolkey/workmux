@@ -1953,6 +1953,14 @@ pub struct DockerSbxConfig {
     /// project config, so a repository can't unhide its own secrets.
     #[serde(default)]
     pub excluded_files: Option<Vec<String>>,
+
+    /// Accept, without asking, that a sandbox created under
+    /// `sandbox.network.policy: deny` reaches more than `allowed_domains`
+    /// (what sbx's global policy allows, private addresses, the agent kit's
+    /// hosts). Global-only: ignored in project config, so a repository
+    /// can't accept it for the user.
+    #[serde(default)]
+    pub accept_wider_network_policy: Option<bool>,
 }
 
 /// How the agent is set up in a `docker_sbx` sandbox
@@ -2043,6 +2051,12 @@ impl DockerSbxConfig {
         self.excluded_files.as_deref().unwrap_or(&[])
     }
 
+    /// Whether a wider network policy under `deny` is accepted without
+    /// asking. Defaults to false.
+    pub fn accepts_wider_network_policy(&self) -> bool {
+        self.accept_wider_network_policy.unwrap_or(false)
+    }
+
     /// Check `memory` is a size sbx accepts. Called at config load.
     pub fn validate(&self) -> anyhow::Result<()> {
         if let Some(memory) = self.memory() {
@@ -2062,7 +2076,8 @@ impl DockerSbxConfig {
     }
 
     /// Merge: project overrides global, per-field, EXCEPT for `kits`,
-    /// `agent` and `excluded_files`, which are global-only.
+    /// `agent`, `excluded_files` and `accept_wider_network_policy`, which
+    /// are global-only.
     fn merge(global: Self, project: Self) -> Self {
         // Security: kits is global-only. A kit can add network rules,
         // credentials and install steps, so a repo's .workmux.yaml must not
@@ -2089,6 +2104,14 @@ impl DockerSbxConfig {
                 move it to your global config (~/.config/workmux/config.yaml)"
             );
         }
+        // Security: a repo must not accept a wider network policy for the
+        // user.
+        if project.accept_wider_network_policy.is_some() {
+            tracing::warn!(
+                "sandbox.docker_sbx.accept_wider_network_policy in project config (.workmux.yaml) is ignored -- \
+                move it to your global config (~/.config/workmux/config.yaml)"
+            );
+        }
         Self {
             cpus: project.cpus.or(global.cpus),
             memory: project.memory.or(global.memory),
@@ -2099,6 +2122,7 @@ impl DockerSbxConfig {
             kits: global.kits,
             agent: global.agent,
             excluded_files: global.excluded_files,
+            accept_wider_network_policy: global.accept_wider_network_policy,
         }
     }
 }
@@ -4226,6 +4250,10 @@ pub const EXAMPLE_PROJECT_CONFIG: &str = r#"# workmux project configuration
 #   #   # GLOBAL-ONLY: ignored when set in a project .workmux.yaml.
 #   #   # excluded_files:
 #   #   #   - .env
+#   #   # Under network policy: deny, accept without asking that a new
+#   #   # sandbox reaches more than allowed_domains (sbx's global policy,
+#   #   # private addresses, the agent kit's hosts). GLOBAL-ONLY.
+#   #   # accept_wider_network_policy: true
 #   # lima:
 #   #   isolation: project
 #   #   cpus: 4
@@ -6903,6 +6931,38 @@ docker_sbx:
                 .docker_sbx
                 .excluded_files(),
             &[".env.production".to_string()]
+        );
+    }
+
+    #[test]
+    fn docker_sbx_accept_wider_network_policy_project_is_ignored() {
+        // A repository can't accept a wider network policy for the user.
+        let config: Config = serde_yaml::from_str(
+            "sandbox:\n  docker_sbx:\n    accept_wider_network_policy: true\n",
+        )
+        .unwrap();
+        assert!(
+            !Config::default()
+                .merge(config.clone())
+                .sandbox
+                .docker_sbx
+                .accepts_wider_network_policy()
+        );
+        assert!(
+            config
+                .merge(Config::default())
+                .sandbox
+                .docker_sbx
+                .accepts_wider_network_policy()
+        );
+        let refused = docker_sbx_cfg(|sbx| sbx.accept_wider_network_policy = Some(false));
+        let accepted = docker_sbx_cfg(|sbx| sbx.accept_wider_network_policy = Some(true));
+        assert!(
+            !refused
+                .merge(accepted)
+                .sandbox
+                .docker_sbx
+                .accepts_wider_network_policy()
         );
     }
 
