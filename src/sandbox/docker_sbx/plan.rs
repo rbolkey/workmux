@@ -183,21 +183,30 @@ pub struct SbxCommand {
     pub env: Vec<(String, String)>,
 }
 
+/// Creating a missing sandbox.
+#[derive(Debug, Clone)]
+pub struct CreateStep {
+    /// The `sbx create` command, from the template.
+    pub command: SbxCommand,
+    /// The workspaces `command` mounts, for showing the user.
+    pub workspaces: Vec<String>,
+}
+
 /// The ordered sbx commands for one launch.
 #[derive(Debug, Clone)]
 pub struct LaunchPlan {
     pub sandbox_name: String,
-    /// Deletes a sandbox no launch finished setting up, before `setup`
+    /// Deletes a sandbox no launch finished setting up, before `create`
     /// creates it again.
     pub remove: Option<SbxCommand>,
-    /// Template the sandbox is created from, when the plan creates it.
-    pub create_template: Option<String>,
+    /// Creates the sandbox, when it's missing.
+    pub create: Option<CreateStep>,
     /// Files mounted over others when the plan creates the sandbox
     /// (`excluded_files`, and under placeholder mode the agent's credential
     /// files), whose sources must be written (see
-    /// [`super::mask::write_masks`]) before `setup` runs.
+    /// [`super::mask::write_masks`]) before `create` runs.
     pub masks: Vec<Mask>,
-    /// Commands to run, in order, before `exec`.
+    /// Commands to run, in order, after `create` and before `exec`.
     pub setup: Vec<SbxCommand>,
     /// workmux's built-in provisioning, run after `setup` when the plan
     /// creates the sandbox, unless `skip_default_provision` is set: login
@@ -1415,7 +1424,7 @@ pub fn launch_plan(
 
     let name = target.sandbox_name;
     let mut setup = Vec::new();
-    let mut create_template = None;
+    let mut create = None;
     let excluded = excluded_file_masks(config, target.worktree_root);
     let mut masks = Vec::new();
     let template = super::template::template_tag(&config.resolved_image(agent));
@@ -1494,16 +1503,16 @@ pub fn launch_plan(
             args.extend(["--kit".to_string(), kit.clone()]);
         }
         args.push("shell".to_string());
-        args.push(target.worktree_root.to_string_lossy().into_owned());
-        args.extend(git_workspaces(git));
-        args.extend(excluded.iter().map(|mask| mask.workspace(target.state_dir)));
+        let mut workspaces = vec![target.worktree_root.to_string_lossy().into_owned()];
+        workspaces.extend(git_workspaces(git));
+        workspaces.extend(excluded.iter().map(|mask| mask.workspace(target.state_dir)));
         masks.extend(excluded);
         // The agent's config directory where the agent looks for it, as on
         // the other backends.
         if let Some((config_dir, subpath)) = &config_dir {
-            args.push(format!("{}:{GUEST_HOME}/{subpath}", config_dir.display()));
+            workspaces.push(format!("{}:{GUEST_HOME}/{subpath}", config_dir.display()));
         }
-        args.extend(
+        workspaces.extend(
             placeholders
                 .masks
                 .iter()
@@ -1511,18 +1520,21 @@ pub fn launch_plan(
         );
         masks.extend(placeholders.masks.iter().cloned());
         if let Some(dir) = opencode_config_dir {
-            args.push(format!(
+            workspaces.push(format!(
                 "{}:{GUEST_HOME}/{OPENCODE_CONFIG_SUBPATH}:ro",
                 dir.display()
             ));
         }
-        args.push(format!("{}:ro", target.state_dir.display()));
-        args.extend(extra_mounts);
-        setup.push(SbxCommand {
-            args,
-            env: Vec::new(),
+        workspaces.push(format!("{}:ro", target.state_dir.display()));
+        workspaces.extend(extra_mounts);
+        args.extend(workspaces.iter().cloned());
+        create = Some(CreateStep {
+            command: SbxCommand {
+                args,
+                env: Vec::new(),
+            },
+            workspaces,
         });
-        create_template = Some(template);
 
         // sbx creates the missing parents of a mount's guest path as root;
         // hand them to the agent, so it can still write beside the mount
@@ -1633,7 +1645,7 @@ pub fn launch_plan(
     Ok(LaunchPlan {
         sandbox_name: name.to_string(),
         remove,
-        create_template,
+        create,
         masks,
         setup,
         default_provision,
@@ -1799,9 +1811,10 @@ mod tests {
         let plan = launch_plan(&config(), &target(&p), "claude", &missing(), &exec()).unwrap();
 
         let tag = super::super::template::template_tag("test-image:latest");
-        assert_eq!(plan.create_template.as_deref(), Some(tag.as_str()));
+        let create = plan.create.as_ref().unwrap();
+        assert_eq!(create.command.args[9..], create.workspaces[..]);
         assert_eq!(
-            plan.setup[0].args[..10],
+            create_args(&plan)[..10],
             args(&[
                 "create",
                 "--name",
@@ -1816,7 +1829,7 @@ mod tests {
             ])
         );
         assert_eq!(
-            plan.setup[0].args.last().unwrap(),
+            create_args(&plan).last().unwrap(),
             "/state/docker-sbx/wm-proj-12345678:ro"
         );
     }
@@ -1830,7 +1843,7 @@ mod tests {
         };
         let plan = launch_plan(&config(), &target(&p), "claude", &state, &exec()).unwrap();
 
-        assert_eq!(plan.create_template, None);
+        assert!(plan.create.is_none(), "{:?}", plan.create);
         assert!(
             plan.setup
                 .iter()
@@ -1857,8 +1870,7 @@ mod tests {
             plan.remove.as_ref().map(|c| c.args.clone()),
             Some(args(&["rm", "-f", "wm-proj-12345678"]))
         );
-        assert!(plan.create_template.is_some());
-        assert_eq!(plan.setup[0].args[0], "create");
+        assert!(plan.create.is_some());
         assert!(!plan.default_provision.is_empty());
         // `sbx rm` takes the sandbox's rules with it.
         assert!(
@@ -1883,7 +1895,7 @@ mod tests {
         .unwrap();
 
         assert!(plan.remove.is_none(), "{:?}", plan.remove);
-        assert!(plan.create_template.is_none());
+        assert!(plan.create.is_none(), "{:?}", plan.create);
         assert_eq!(plan.exec.args[0], "exec");
         assert_eq!(plan.warnings.len(), 1, "{:?}", plan.warnings);
         let warning = &plan.warnings[0];
@@ -1903,7 +1915,7 @@ mod tests {
         let plan = launch_plan(&config(), &target(&p), "claude", &state, &exec()).unwrap();
 
         assert!(plan.remove.is_some());
-        assert_eq!(plan.setup[0].args[0], "create");
+        assert!(plan.create.is_some());
         assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
     }
 
@@ -1997,7 +2009,7 @@ mod tests {
         let state = running_with(Vec::new());
         let plan = launch_plan(&config, &target(&p), "claude", &state, &exec()).unwrap();
 
-        assert!(plan.create_template.is_none());
+        assert!(plan.create.is_none(), "{:?}", plan.create);
         assert_eq!(plan.warnings.len(), 1, "{:?}", plan.warnings);
         let warning = &plan.warnings[0];
         for expected in [
@@ -3023,7 +3035,7 @@ mod tests {
             assert!(
                 workspaces(&plan).contains(&workspace),
                 "{agent}: {:?}",
-                plan.setup[0]
+                plan.create
             );
             assert!(
                 !setup_args(&plan)
@@ -3075,11 +3087,10 @@ mod tests {
         let plan = launch_plan(&config(), &target, "opencode", &missing(), &exec()).unwrap();
 
         assert!(
-            plan.setup[0]
-                .args
+            create_args(&plan)
                 .contains(&"/home/me/.config/opencode:/home/agent/.config/opencode:ro".to_string()),
             "{:?}",
-            plan.setup[0]
+            plan.create
         );
         let setup = setup_args(&plan);
         assert!(
@@ -3186,7 +3197,7 @@ mod tests {
             "/home/agent/.local",
             "/home/agent/.local/share",
         ]);
-        assert!(setup[1..].contains(&parents), "{setup:?}");
+        assert!(setup.contains(&parents), "{setup:?}");
 
         let plan = launch_plan(&config(), &target(&p), "codex", &missing(), &exec()).unwrap();
         assert!(
@@ -3210,7 +3221,7 @@ mod tests {
         assert!(
             !workspaces(&plan).iter().any(|w| w.starts_with("/home/me")),
             "{:?}",
-            plan.setup[0]
+            plan.create
         );
         assert!(
             !plan
@@ -3222,14 +3233,23 @@ mod tests {
         );
     }
 
-    fn workspaces(plan: &LaunchPlan) -> Vec<String> {
-        plan.setup[0]
+    /// The `sbx create` command's arguments, for a plan that creates the
+    /// sandbox.
+    fn create_args(plan: &LaunchPlan) -> &[String] {
+        &plan
+            .create
+            .as_ref()
+            .expect("plan creates the sandbox")
+            .command
             .args
-            .iter()
-            .skip_while(|a| *a != "shell")
-            .skip(1)
-            .cloned()
-            .collect()
+    }
+
+    fn workspaces(plan: &LaunchPlan) -> Vec<String> {
+        plan.create
+            .as_ref()
+            .expect("plan creates the sandbox")
+            .workspaces
+            .clone()
     }
 
     #[test]
@@ -3573,8 +3593,7 @@ mod tests {
 
     /// The flags `sbx create` gets before the agent.
     fn create_flags(plan: &LaunchPlan) -> Vec<String> {
-        plan.setup[0]
-            .args
+        create_args(plan)
             .iter()
             .take_while(|a| *a != "shell")
             .cloned()
@@ -3686,11 +3705,7 @@ mod tests {
         let plan = launch_plan(&config, &target(&p), "claude", &state, &exec()).unwrap();
 
         assert_eq!(plan.provision, None);
-        assert!(
-            plan.setup.iter().all(|c| c.args[0] != "create"),
-            "{:?}",
-            plan.setup
-        );
+        assert!(plan.create.is_none(), "{:?}", plan.create);
     }
 
     #[test]
