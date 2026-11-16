@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 use tracing::{debug, info, warn};
 
-use crate::config::Config;
+use crate::config::{Config, DockerSbxAgent};
 
 use super::plan::{
     CreateSettings, ExecRequest, LaunchPlan, LaunchTarget, NetworkRule, Platform, SbxCommand,
@@ -615,8 +615,10 @@ pub fn prepare_launch(
     std::fs::create_dir_all(&state_dir)
         .with_context(|| format!("Failed to create {}", state_dir.display()))?;
     write_sandbox_record(&state_dir, &worktree_root, selected_agent)?;
-    // sbx mounts only directories that exist.
-    if let Some(config_dir) = config.sandbox.resolved_agent_config_dir(agent) {
+    // sbx mounts only directories that exist. Under `kit` it isn't mounted.
+    if config.sandbox.docker_sbx.agent() == DockerSbxAgent::Shell
+        && let Some(config_dir) = config.sandbox.resolved_agent_config_dir(agent)
+    {
         let _ = std::fs::create_dir_all(&config_dir);
     }
     let opencode_config_dir = crate::agent_setup::opencode::opencode_config_dir()
@@ -972,6 +974,27 @@ mod tests {
         remove_created_record(dir.path()).unwrap();
         assert_eq!(read_created_record(dir.path()), None);
         remove_created_record(dir.path()).unwrap();
+    }
+
+    #[test]
+    fn records_from_before_the_agent_mode_are_shell_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(CREATED_RECORD_FILE),
+            r#"{"agent":"claude","agent_config_dir":"/home/me/.claude","template":"t"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            read_created_record(dir.path()).map(|record| record.agent_mode),
+            Some(DockerSbxAgent::Shell)
+        );
+
+        let kit = CreateSettings {
+            agent_mode: DockerSbxAgent::Kit,
+            ..Default::default()
+        };
+        write_created_record(dir.path(), &kit).unwrap();
+        assert_eq!(read_created_record(dir.path()), Some(kit));
     }
 
     #[test]

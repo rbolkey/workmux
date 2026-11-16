@@ -1936,10 +1936,45 @@ pub struct DockerSbxConfig {
     #[serde(default)]
     pub kits: Option<Vec<String>>,
 
+    /// How the agent is set up in its sandbox: `kit` (default) creates the
+    /// sandbox for sbx's agent kit, which installs the agent in the
+    /// sandbox's own home and holds its credential as an sbx secret, so the
+    /// agent sees only placeholders; `shell` creates it with sbx's generic
+    /// `shell` agent and mounts the agent's config directory from the
+    /// workstation, as the other backends do. Global-only: ignored in
+    /// project config.
+    #[serde(default)]
+    pub agent: Option<DockerSbxAgent>,
+
     /// Withdrawn: placeholder agent credentials (`mount | placeholder`).
     /// Read only so a leftover value warns that it's no longer read.
     #[serde(default, skip_serializing)]
     pub agent_credentials: Option<serde_yaml::Value>,
+}
+
+/// How the agent is set up in a `docker_sbx` sandbox
+/// (`sandbox.docker_sbx.agent`).
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum DockerSbxAgent {
+    /// sbx's agent kit sets the agent up and holds its credential (the
+    /// config default).
+    Kit,
+    /// sbx's generic `shell` agent, with the agent's config directory
+    /// mounted from the workstation. The default of this type only because
+    /// sandboxes recorded before the mode was are `shell` ones.
+    #[default]
+    Shell,
+}
+
+impl DockerSbxAgent {
+    /// The config's name for the mode.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Kit => "kit",
+            Self::Shell => "shell",
+        }
+    }
 }
 
 /// sbx's smallest sandbox memory (`--memory`).
@@ -1996,6 +2031,11 @@ impl DockerSbxConfig {
         self.kits.as_deref().unwrap_or(&[])
     }
 
+    /// How the agent is set up in its sandbox. Defaults to `kit`.
+    pub fn agent(&self) -> DockerSbxAgent {
+        self.agent.unwrap_or(DockerSbxAgent::Kit)
+    }
+
     /// The warning for a withdrawn key set in the config file `file`.
     pub fn withdrawn_warning(&self, file: &str) -> Option<String> {
         self.agent_credentials.as_ref().map(|_| {
@@ -2025,8 +2065,8 @@ impl DockerSbxConfig {
         Ok(())
     }
 
-    /// Merge: project overrides global, per-field, EXCEPT for `kits`, which
-    /// is global-only.
+    /// Merge: project overrides global, per-field, EXCEPT for `kits` and
+    /// `agent`, which are global-only.
     fn merge(global: Self, project: Self) -> Self {
         // Security: kits is global-only. A kit can add network rules,
         // credentials and install steps, so a repo's .workmux.yaml must not
@@ -2034,6 +2074,14 @@ impl DockerSbxConfig {
         if project.kits.is_some() {
             tracing::warn!(
                 "sandbox.docker_sbx.kits in project config (.workmux.yaml) is ignored -- \
+                move it to your global config (~/.config/workmux/config.yaml)"
+            );
+        }
+        // Security: agent is global-only. Under `shell` the agent holds its
+        // real credential, so a repo must not be able to choose it.
+        if project.agent.is_some() {
+            tracing::warn!(
+                "sandbox.docker_sbx.agent in project config (.workmux.yaml) is ignored -- \
                 move it to your global config (~/.config/workmux/config.yaml)"
             );
         }
@@ -2053,6 +2101,7 @@ impl DockerSbxConfig {
                 .skip_default_provision
                 .or(global.skip_default_provision),
             kits: global.kits,
+            agent: global.agent,
             agent_credentials: None,
         }
     }
@@ -4166,6 +4215,10 @@ pub const EXAMPLE_PROJECT_CONFIG: &str = r#"# workmux project configuration
 #   #   #   - .env
 #   #   #   - .env.local
 #   # docker_sbx:            # with backend: docker_sbx (Docker Sandboxes)
+#   #   # kit (default): sbx's agent kit sets the agent up and holds its
+#   #   # credential; shell: mount the agent's config dir from the workstation.
+#   #   # GLOBAL-ONLY: ignored when set in a project .workmux.yaml.
+#   #   # agent: kit
 #   #   cpus: 4                # only passed when set (sbx default: all CPUs)
 #   #   memory: 8g             # sbx binary units, at least 512m
 #   #   # Custom provision script (runs once on sandbox creation, as root).
@@ -4283,7 +4336,7 @@ mod tests {
         AgentColumn, AgentEnvValue, AgentIconConfig, AgentIconDetails, AllowedDomainDetails,
         AllowedDomainEntry, CLEANUP_NODE_MODULES_PLACEHOLDER, Config, ContainerConfig,
         ContainerDevice, DEFAULT_AGENT_COLUMNS, DEFAULT_WORKTREE_COLUMNS, DashboardLayout,
-        DockerSbxConfig, ExtraMount, FileConfig, LayoutConfig, LimaConfig,
+        DockerSbxAgent, DockerSbxConfig, ExtraMount, FileConfig, LayoutConfig, LimaConfig,
         NODE_MODULES_CLEANUP_SCRIPT, NetworkConfig, NetworkPolicy, PaneConfig, SandboxBackend,
         SandboxConfig, SandboxRuntime, SandboxTarget, SidebarEnterAction, SidebarHeight,
         SidebarPosition, SidebarWidth, SplitDirection, ToolchainMode, WindowPlacement,
@@ -6776,6 +6829,46 @@ docker_sbx:
         assert_eq!(
             merged.sandbox.docker_sbx.kits(),
             &["docker.io/sbx/task:latest".to_string()]
+        );
+    }
+
+    #[test]
+    fn docker_sbx_agent_defaults_to_the_kit() {
+        assert_eq!(DockerSbxConfig::default().agent(), DockerSbxAgent::Kit);
+        for (value, agent) in [
+            ("kit", DockerSbxAgent::Kit),
+            ("shell", DockerSbxAgent::Shell),
+        ] {
+            let config: SandboxConfig = serde_yaml::from_str(&format!(
+                "backend: docker_sbx\ndocker_sbx:\n  agent: {value}\n"
+            ))
+            .unwrap();
+            assert_eq!(config.docker_sbx.agent(), agent, "{value}");
+        }
+        assert!(serde_yaml::from_str::<SandboxConfig>("docker_sbx:\n  agent: claude\n").is_err());
+    }
+
+    #[test]
+    fn docker_sbx_agent_project_is_ignored() {
+        // A repository can't choose whether its agent holds its real
+        // credential.
+        let shell = docker_sbx_cfg(|sbx| sbx.agent = Some(DockerSbxAgent::Shell));
+        let kit = docker_sbx_cfg(|sbx| sbx.agent = Some(DockerSbxAgent::Kit));
+        assert_eq!(
+            Config::default()
+                .merge(shell.clone())
+                .sandbox
+                .docker_sbx
+                .agent(),
+            DockerSbxAgent::Kit
+        );
+        assert_eq!(
+            shell.clone().merge(kit).sandbox.docker_sbx.agent(),
+            DockerSbxAgent::Shell
+        );
+        assert_eq!(
+            shell.merge(Config::default()).sandbox.docker_sbx.agent(),
+            DockerSbxAgent::Shell
         );
     }
 
