@@ -20,7 +20,7 @@ sbx policy init   # choose allow-all, balanced or deny-all
 
 workmux never runs `sbx login` or `sbx policy init` for you. It checks both before creating a sandbox and stops with an error naming the command to run.
 
-Under `agent: kit`, sign the agent in through sbx. For Claude, either sign in once inside a sandbox (`/login` when Claude says "Not logged in"): sbx keeps the subscription login as its global `anthropic` secret, so every later sandbox starts logged in; or give sbx an API key with `sbx secret set anthropic`. For Codex, sign in to ChatGPT with `sbx secret set openai --oauth`, or give it an API key with `sbx secret set openai`; for Gemini, `sbx secret set google`. sbx gives OpenCode's and Copilot's credentials only to kits a binding in `~/.config/sbx/credentials.yaml` authorizes, and `sbx create` doesn't ask for one, so write the binding first (see Docker's docs); when sbx withholds a credential, workmux shows sbx's note from creating the sandbox. A subscription login is global to sbx; for a different account per sandbox, use API keys scoped to the sandbox (`sbx secret set anthropic --sandbox <sandbox>`).
+Under `agent: kit`, sign the agent in through sbx. For Claude, either sign in once inside a sandbox (`/login` when Claude says "Not logged in"): sbx keeps the subscription login as its global `anthropic` secret, so every later sandbox starts logged in; or give sbx an API key with `sbx secret set anthropic`. For Codex, sign in to ChatGPT with `sbx secret set openai --oauth`, or give it an API key with `sbx secret set openai`; for Gemini, `sbx secret set google`. sbx gives OpenCode's and Copilot's credentials only to kits a binding in `~/.config/sbx/credentials.yaml` authorizes, and `sbx create` doesn't ask for one, so write the binding first (see Docker's docs); when sbx withholds a credential, workmux shows sbx's note from creating the sandbox. A subscription login is global to sbx; for a different account per sandbox, use API keys scoped to the sandbox (see [Accounts per named agent](#accounts-per-named-agent)).
 
 workmux also needs Docker (`docker` on `PATH`) to build the sandbox template.
 
@@ -108,11 +108,55 @@ sbx has no per-sandbox disk setting, so there is no `disk`. Resources, `provisio
 - `sandbox.agent_config_dir`, which `kit` doesn't mount;
 - `workmux add --fork` and `--continue` (and `workmux open --continue`), which resume a conversation from your workstation's agent config.
 
-A [named agent](/guide/agents/) whose `env` sets a variable to a workstation path, such as `CLAUDE_CONFIG_DIR: ~/.claude-work`, gets a warning on every launch: the sandbox runs the kit's own setup and login, not that directory's. Each named agent has its own sandbox, so give it its own account with a secret scoped to that sandbox (`sbx secret set <service> --sandbox <sandbox>`).
+A [named agent](/guide/agents/) whose `env` sets a variable to a workstation path, such as `CLAUDE_CONFIG_DIR: ~/.claude-work`, gets a warning on every launch: the sandbox runs the kit's own setup and login, not that directory's. Give it its own account through sbx instead (see [Accounts per named agent](#accounts-per-named-agent)).
 
 **`shell`.** workmux creates the sandbox with sbx's generic `shell` agent and mounts the agent's config directory from your workstation where the agent looks for it (see [What's mounted](#whats-mounted)), as on the container and Lima backends: the agent keeps your settings, hooks and login, which it holds itself. sbx's kits can't share that home: they write the agent's settings and credentials into it.
 
 Under both, workmux runs the agent command itself with `sbx exec`, never `sbx run`. The mode is fixed when the sandbox is created and recorded with it. A sandbox created under the other mode fails to launch with an error naming how to recreate it (`workmux sandbox prune`, or `sbx rm -f <sandbox>`), so switching to `kit` never keeps running a sandbox with your real credential mounted; sandboxes from before workmux recorded the mode count as `shell`.
+
+### Accounts per named agent
+
+Under `agent: kit`, an agent's account is the sbx secret for its service: `anthropic` for Claude, `openai` for Codex, `google` for Gemini. A secret scoped to a sandbox wins over the global one there, and each [named agent](/guide/agents/) runs in a sandbox of its own (`wm-<project>-<hash>-<agent>`, see [Sandbox naming](#sandbox-naming)), so `cc-work` and `cc-personal` can each have their own API key:
+
+```bash
+sbx secret set anthropic --sandbox wm-myproject-a1b2c3d4-cc-work
+```
+
+What sbx allows decides how far this goes:
+
+- **Only API keys can be scoped to a sandbox.** A subscription login (Claude's, or ChatGPT's with `sbx secret set openai --oauth`) is global to sbx and serves every sandbox, so two named agents can't use two subscription accounts under `kit`. A `/login` inside a Claude sandbox replaces sbx's global `anthropic` login, for every sandbox without a key of its own; sbx notes that a `codex login` inside a sandbox stays in that sandbox.
+- **Claude's login is chosen when the sandbox is created.** The kit sets Claude up for the key scoped to the sandbox at that moment; a key added later isn't used, and Claude stays on the global login. sbx accepts a secret for a sandbox that doesn't exist yet, and removing a sandbox removes the secrets scoped to it. For a sandbox that already exists, remove it with `sbx rm -f <sandbox>`, set the key, and the next pane (or `workmux open`) creates it again with the key.
+- **Codex uses a scoped key at once, unless sbx holds a ChatGPT login.** With a global ChatGPT login, the codex kit uses the login and ignores an OpenAI key scoped to the sandbox, so per-agent Codex accounts work only without a global ChatGPT login.
+- **A scoped key lasts as long as the sandbox.** Removing the worktree deletes its sandboxes and their scoped secrets, so each new worktree's sandbox needs the key set again.
+
+### Tools that call other agents
+
+Tools such as [consult-llm](https://github.com/raine/consult-llm) (a second opinion from another model) or a cross-model review panel call other models from inside the agent's sandbox. workmux doesn't run the other agent in a sandbox of its own; these tools work with settings you already have, under either mode.
+
+**API calls.** consult-llm's `api` backend calls the provider's API with a key it requires in a variable such as `OPENAI_API_KEY` or `GEMINI_API_KEY`. Give the key to sbx (`sbx secret set openai`, or with `--sandbox` for one sandbox) and give the tool the variable with sbx's placeholder as its value:
+
+```yaml
+# ~/.config/workmux/config.yaml
+sandbox:
+  env:
+    OPENAI_API_KEY: proxy-managed
+```
+
+The tool sends the placeholder, and sbx's proxy replaces it with the key in requests to the provider's domains; the agent never holds the key, and workmux doesn't warn about the variable (see [Tool credentials](#tool-credentials)). A subscription login doesn't serve API calls: with only a ChatGPT login in sbx, the request goes out with the placeholder and OpenAI refuses it. When sbx holds a ChatGPT login for Codex, scope the API key to the sandbox that calls the API rather than replacing the login globally; in a Codex sandbox, sbx uses the login instead (see [above](#accounts-per-named-agent)). Under `policy: deny`, add the API's domain (such as `api.openai.com`) to `allowed_domains`: the agent's kit allows only its own vendor's hosts (see [Network restrictions](#network-restrictions)).
+
+**Other agents' CLIs.** consult-llm's CLI backends (`codex-cli`, `gemini-cli`, `claude-cli`, `opencode`, `pi`, and `profile`) run another agent's CLI, which has to be installed and signed in where it runs:
+
+- workmux's image for an agent has only that agent's CLI. Add the others in a custom `sandbox.image` (`workmux sandbox init-dockerfile`, see [Template](#template)).
+- Under `kit`, the kit signs in only the sandbox's own agent, so another agent's CLI has no login of its own there; one that takes an API key from a variable can use a `proxy-managed` value as above. Under `agent: shell`, mount its config directory with [`extra_mounts`](/guide/sandbox/features/#extra-mounts) (for Codex, `~/.codex` with `guest_path: /home/agent/.codex` and `writable: true`, so it can refresh its login), which gives the sandbox that agent's real credential, as the agent's own config mount does.
+- Listing the tool in [`host_commands`](/guide/sandbox/features/#host-command-proxying) runs it on the workstation, outside sbx's network policy and placeholders. Host commands can't read the agents' config directories (`~/.claude`, `~/.codex`, `~/.gemini`, …) or API key variables from your shell, so a CLI backend isn't signed in there.
+
+**Proxies on the workstation.** A profile that sends an agent's traffic to a proxy on your workstation, such as `ANTHROPIC_BASE_URL: http://localhost:18765` in a consult-llm `profile` or a [named agent](/guide/agents/#named-agents), doesn't reach it from a sandbox: `localhost` there is the sandbox. Point it at `http://host.docker.internal:18765` and allow the port with an sbx rule, since sbx names the workstation `localhost` in its policy:
+
+```bash
+sbx policy allow network --sandbox wm-myproject-a1b2c3d4-claude localhost:18765
+```
+
+Without `--sandbox`, the rule goes in your global sbx policy and serves every sandbox. workmux leaves rules you add alone; one scoped to a sandbox goes when the sandbox does.
 
 ## How it works
 
