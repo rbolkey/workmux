@@ -106,7 +106,9 @@ sbx has no per-sandbox disk setting, so there is no `disk`. Resources, `provisio
 
 - an agent type sbx has no kit for (agy, pi, OMP, or a custom agent);
 - `sandbox.agent_config_dir`, which `kit` doesn't mount;
-- `workmux add --fork` and `--continue` (and `workmux open --continue`), which resume a conversation from your workstation's agent config.
+- `workmux add --fork`, which forks a conversation from your workstation's agent config.
+
+`--continue` (`workmux add`, `workmux open`, and resuming after a restart) continues the agent's conversation in the sandbox's own home, which lasts as long as the sandbox: closing a window or stopping the sandbox keeps it, while `workmux remove` and `workmux sandbox prune` remove it, so a new sandbox has no conversation to continue.
 
 A [named agent](/guide/agents/) whose `env` sets a variable to a workstation path, such as `CLAUDE_CONFIG_DIR: ~/.claude-work`, gets a warning on every launch: the sandbox runs the kit's own setup and login, not that directory's. Give it its own account through sbx instead (see [Accounts per named agent](#accounts-per-named-agent)).
 
