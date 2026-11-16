@@ -152,7 +152,7 @@ workmux sandbox shell --exec
 **Options:**
 
 - `-e, --exec` - Exec into an existing container for this worktree instead of starting a new one (container backend; docker_sbx accepts it with the same meaning as without it)
-- `--agent <name>` - The agent whose sandbox to open: a named agent or an agent type (docker_sbx, where each agent of a worktree has its own sandbox; default: the selected agent)
+- `-a, --agent <name>` - The agent whose sandbox to open: a named agent or an agent type (docker_sbx, where each agent of a worktree has its own sandbox; default: the selected agent)
 - `<command...>` - Command to run instead of bash
 
 **Backend behavior:**
