@@ -7,7 +7,6 @@
 //! the sandbox. Masks are fixed when the sandbox is created.
 
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// Directory in a sandbox's state directory holding its masks' sources.
@@ -15,7 +14,7 @@ const MASKS_DIR: &str = "masks";
 
 /// A file mounted read-only over `target`, so the agent reads `contents`
 /// there instead of the file.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Mask {
     /// The guest path hidden.
     pub target: PathBuf,
