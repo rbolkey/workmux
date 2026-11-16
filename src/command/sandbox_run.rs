@@ -449,6 +449,29 @@ fn run_docker_sbx(
         ("WM_RPC_PORT".into(), rpc_port.to_string()),
         ("WM_RPC_TOKEN".into(), rpc_token),
     ];
+    env.extend(docker_sbx_guest_env(config, worktree_root));
+
+    let exec = docker_sbx::ExecRequest {
+        command: command.to_vec(),
+        env,
+        session: docker_sbx::new_session()?,
+        rpc_port: Some(rpc_port),
+        tty: std::io::stdin().is_terminal(),
+        in_toolchain: true,
+    };
+    let plan = docker_sbx::prepare_launch(config, worktree_root, pane_cwd, agent, &exec)?;
+
+    let exit_code = docker_sbx::run_exec(&plan)?;
+    info!(exit_code, "agent command exited");
+    Ok(exit_code)
+}
+
+/// The environment a command in a docker_sbx sandbox gets from the
+/// workstation, in the pane supervisor and `workmux sandbox shell` alike:
+/// the terminal's `TERM` and `COLORTERM`, `sandbox.env_passthrough` and
+/// `sandbox.env`, and the git identity of the repository at `repo`.
+pub(crate) fn docker_sbx_guest_env(config: &Config, repo: &Path) -> Vec<(String, String)> {
+    let mut env = Vec::new();
     for term_var in ["TERM", "COLORTERM"] {
         if let Ok(val) = std::env::var(term_var) {
             env.push((term_var.to_string(), val));
@@ -464,21 +487,8 @@ fn run_docker_sbx(
         env.push((key.to_string(), val.to_string()));
     }
     // Inject host git user config (user.name, user.email) for commits
-    env.extend(git_user_config_envs(worktree_root));
-
-    let exec = docker_sbx::ExecRequest {
-        command: command.to_vec(),
-        env,
-        session: docker_sbx::new_session()?,
-        rpc_port: Some(rpc_port),
-        tty: std::io::stdin().is_terminal(),
-        in_toolchain: true,
-    };
-    let plan = docker_sbx::prepare_launch(config, worktree_root, pane_cwd, agent, &exec)?;
-
-    let exit_code = docker_sbx::run_exec(&plan)?;
-    info!(exit_code, "agent command exited");
-    Ok(exit_code)
+    env.extend(git_user_config_envs(repo));
+    env
 }
 
 fn run_container(
@@ -746,6 +756,24 @@ mod tests {
         for bad in ["", "\n", "0.0.0.0", "203.0.113.5", "fd00::1"] {
             assert!(parse_bridge_gateway(bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn docker_sbx_guest_env_carries_sandbox_env_and_passthrough() {
+        let home = std::env::var("HOME").expect("HOME is set for tests");
+        let mut config = Config::default();
+        config.sandbox.env = Some([("OPENAI_API_KEY".into(), "proxy-managed".into())].into());
+        config.sandbox.env_passthrough = Some(vec!["HOME".into(), "WM_TEST_UNSET_VAR".into()]);
+        let tmp = tempfile::tempdir().unwrap();
+
+        let env = docker_sbx_guest_env(&config, tmp.path());
+
+        assert!(
+            env.contains(&("OPENAI_API_KEY".into(), "proxy-managed".into())),
+            "{env:?}"
+        );
+        assert!(env.contains(&("HOME".into(), home)), "{env:?}");
+        assert!(!env.iter().any(|(key, _)| key == "WM_TEST_UNSET_VAR"));
     }
 
     #[test]

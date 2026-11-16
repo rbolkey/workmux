@@ -1491,16 +1491,9 @@ fn run_shell_docker_sbx(command: Vec<String>, agent: Option<&str>, config: &Conf
         command
     };
 
-    let mut env = Vec::new();
-    for term_var in ["TERM", "COLORTERM"] {
-        if let Ok(val) = std::env::var(term_var) {
-            env.push((term_var.to_string(), val));
-        }
-    }
-    env.extend(super::sandbox_run::git_user_config_envs(&cwd));
     let exec = docker_sbx::ExecRequest {
         command: shell_cmd,
-        env,
+        env: super::sandbox_run::docker_sbx_guest_env(config, &cwd),
         session: docker_sbx::new_session()?,
         rpc_port: None,
         tty: io::stdin().is_terminal(),
