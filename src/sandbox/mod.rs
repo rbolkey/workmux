@@ -6,6 +6,7 @@ mod constant_time;
 mod container;
 pub mod docker_sbx;
 pub mod freshness;
+mod git_boundary;
 pub mod guest;
 pub(crate) mod host_exec_sandbox;
 pub mod lima;
