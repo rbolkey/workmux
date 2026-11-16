@@ -9,6 +9,7 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::agent_setup::Agent;
 use crate::config::{DockerSbxAgent, SandboxConfig};
+use crate::sandbox::git_boundary::POLICY_DIRS;
 use crate::sandbox::network_proxy::domain_matches;
 use crate::sandbox::toolchain::{self, DetectedToolchain};
 use crate::shell::shell_quote;
@@ -620,15 +621,7 @@ fn git_workspaces(git: &GitMetadata) -> Vec<String> {
         workspaces.push(ro(git.admin_dir.join(name)));
     }
     for root in &git.module_roots {
-        for name in [
-            "hooks",
-            "info",
-            "objects/info",
-            "modules",
-            "worktrees",
-            "config",
-            "config.worktree",
-        ] {
+        for name in POLICY_DIRS.iter().chain(&["config", "config.worktree"]) {
             workspaces.push(ro(root.join(name)));
         }
     }

@@ -8,8 +8,8 @@ use std::path::Path;
 
 use super::plan::GitMetadata;
 use crate::sandbox::git_boundary::{
-    ProgramPaths, collect_worktree_git_pointers, config_include_paths, ensure_policy_dir,
-    ensure_policy_file, module_git_roots, validate_git_hooks,
+    POLICY_DIRS, ProgramPaths, collect_worktree_git_pointers, config_include_paths,
+    ensure_policy_dir, ensure_policy_file, module_git_roots, validate_git_hooks,
 };
 
 /// Find a linked worktree's git metadata and create the paths the plan
@@ -30,7 +30,7 @@ pub fn git_metadata(worktree: &Path) -> Result<GitMetadata> {
 
     let module_roots = module_git_roots(common)?;
     for root in &module_roots {
-        for dir in ["hooks", "info", "objects/info", "modules", "worktrees"] {
+        for dir in POLICY_DIRS {
             ensure_policy_dir(&root.join(dir))?;
         }
         for name in ["config", "config.worktree"] {
