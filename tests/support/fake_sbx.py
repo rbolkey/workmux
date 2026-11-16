@@ -3,8 +3,11 @@
 The fake `sbx` keeps its sandboxes in a JSON file, answers the queries workmux
 makes (`ls`, `policy ls`, `diagnose`, `template ls`) with canned JSON and
 succeeds at everything else. `policy ls <name>` of an existing sandbox also
-lists the rule its agent kit added at create. Both fakes record each invocation, in order, so a
-test asserts on the commands workmux issued.
+lists the rule its agent kit added at create. Each sandbox has a home
+directory, seeded at create with the files its kit writes; an `sbx exec` of
+`sh -c <script> <arg0> <args>...` runs the script there with real `sh`. Both
+fakes record each invocation, in order, so a test asserts on the commands
+workmux issued.
 """
 
 import json
@@ -45,6 +48,30 @@ def flag(name):
     return argv[argv.index(name) + 1] if name in argv else None
 
 
+GUEST_HOME = "/home/agent"
+
+
+def home(name):
+    return STATE / "homes" / name
+
+
+def exec_in_guest():
+    # Run an `exec` of `sh -c <script> <arg0> <args>...` in the sandbox's home.
+    i = 1
+    while i < len(argv) and argv[i].startswith("-"):
+        i += 2 if argv[i] in ("-u", "-w", "-e") else 1
+    name, command = argv[i], argv[i + 1 :]
+    if command[:2] != ["sh", "-c"] or len(command) < 5:
+        return
+    root = str(home(name))
+    args = [arg.replace(GUEST_HOME, root) for arg in command]
+    stdin = sys.stdin.buffer.read() if "-i" in argv[1:i] else b""
+    result = subprocess.run(args, input=stdin, capture_output=True)
+    sys.stdout.buffer.write(result.stdout)
+    sys.stderr.buffer.write(result.stderr)
+    sys.exit(result.returncode)
+
+
 def sbx():
     sandboxes = read("sandboxes.json")
     verb = argv[0] if argv else ""
@@ -68,8 +95,15 @@ def sbx():
     elif verb == "template" and argv[1:2] == ["ls"]:
         print("[]")
     elif verb == "create":
-        sandboxes.append({"name": flag("--name"), "status": "running"})
+        name = flag("--name")
+        sandboxes.append({"name": name, "status": "running"})
         write("sandboxes.json", sandboxes)
+        for path, content in read("kit_files.json").items():
+            file = home(name) / path
+            file.parent.mkdir(parents=True, exist_ok=True)
+            file.write_text(content)
+    elif verb == "exec":
+        exec_in_guest()
     elif verb == "rm":
         names = [word for word in argv[1:] if not word.startswith("-")]
         write("sandboxes.json", [s for s in sandboxes if s["name"] not in names])
@@ -137,6 +171,7 @@ class FakeSbx:
         self.sandboxes = []
         self.global_rules = []
         self.kit_resources = []
+        self.kit_files = {}
         self.checks = passing_checks()
         for program in ("sbx", "docker"):
             install_script(
@@ -181,6 +216,20 @@ class FakeSbx:
     @kit_resources.setter
     def kit_resources(self, value: list[str]) -> None:
         self._write("kit_resources.json", value)
+
+    @property
+    def kit_files(self) -> dict[str, str]:
+        """Files each sandbox's kit writes at create, by path under the guest home."""
+        return self._read("kit_files.json")
+
+    @kit_files.setter
+    def kit_files(self, value: dict[str, str]) -> None:
+        self._write("kit_files.json", value)
+
+    def guest_file(self, sandbox: str, path: str) -> Optional[str]:
+        """A file in `sandbox`'s guest home, by path under it, if it exists."""
+        file = self.state_dir / "homes" / sandbox / path
+        return file.read_text() if file.is_file() else None
 
     @property
     def checks(self) -> list[dict[str, str]]:

@@ -408,18 +408,16 @@ pub fn check_in(agent: Agent, dir: &Path) -> Result<StatusCheck> {
     }
 }
 
-/// Install status tracking for `agent` in `dir`; see [`check_in`]. OpenCode's
-/// plugin layout follows the version of the `opencode` on `PATH`.
+/// Install status tracking for `agent` in `dir`; see [`check_in`].
 pub fn install_in(agent: Agent, dir: &Path) -> Result<String> {
     match agent {
         Agent::Claude => claude::install_dir(dir),
         Agent::Codex => codex::install_dir(dir),
         Agent::Copilot => copilot::install_dir(dir),
         Agent::Gemini => gemini::install_dir(dir),
-        Agent::OpenCode => opencode::install_dir(dir),
         Agent::Pi => pi::install_dir(dir),
         Agent::Omp => omp::install_dir(dir),
-        Agent::Antigravity | Agent::Grok => {
+        Agent::Antigravity | Agent::Grok | Agent::OpenCode => {
             anyhow::bail!("{} cannot be set up in a given directory", agent.name())
         }
     }

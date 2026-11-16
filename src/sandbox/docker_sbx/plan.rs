@@ -7,6 +7,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::path::{Component, Path, PathBuf};
 
+use crate::agent_setup::Agent;
 use crate::config::{DockerSbxAgent, SandboxConfig};
 use crate::sandbox::network_proxy::domain_matches;
 use crate::sandbox::toolchain::{self, DetectedToolchain};
@@ -162,6 +163,8 @@ pub struct SbxCommand {
     /// Arguments after `sbx`.
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
+    /// Written to sbx's stdin, for an `exec -i`.
+    pub stdin: Option<Vec<u8>>,
 }
 
 /// Creating a missing sandbox.
@@ -171,6 +174,16 @@ pub struct CreateStep {
     pub command: SbxCommand,
     /// The workspaces `command` mounts, for showing the user.
     pub workspaces: Vec<String>,
+}
+
+/// The config a kit wrote, to merge workmux's status hooks into.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusHooks {
+    pub agent: Agent,
+    /// The agent's config directory in the guest.
+    pub config_dir: String,
+    /// The files `agent_setup` reads or writes there, relative to it.
+    pub files: &'static [&'static str],
 }
 
 /// The ordered sbx commands for one launch.
@@ -185,8 +198,8 @@ pub struct LaunchPlan {
     pub masks: Vec<Mask>,
     /// Commands to run, in order, after `create` and before `exec`.
     pub setup: Vec<SbxCommand>,
-    /// Installs workmux's status hooks in a new `agent: kit` sandbox.
-    pub status_hooks: Option<SbxCommand>,
+    /// Merges workmux's status hooks into a new `agent: kit` sandbox's config.
+    pub status_hooks: Option<StatusHooks>,
     /// Built-in provisioning for a new sandbox: shims on `PATH` and the
     /// toolchain.
     pub default_provision: Vec<SbxCommand>,
@@ -321,21 +334,29 @@ impl Kit {
         }
     }
 
-    /// Install workmux's status hooks with the guest's own `workmux setup`.
-    fn status_hooks(self, name: &str) -> SbxCommand {
-        let config_dir = format!("{GUEST_HOME}/{}", self.config_subpath());
-        SbxCommand {
-            args: words(&[
-                "exec",
-                name,
-                "workmux",
-                "setup",
-                "--agent",
-                self.name(),
-                "--config-dir",
-                &config_dir,
-            ]),
-            env: Vec::new(),
+    /// Merge workmux's status hooks into the config the kit wrote.
+    fn status_hooks(self) -> StatusHooks {
+        let (agent, files): (Agent, &'static [&'static str]) = match self {
+            Self::Claude => (Agent::Claude, &["settings.json"]),
+            Self::Codex => (Agent::Codex, &["hooks.json", "config.toml"]),
+            Self::Copilot => (Agent::Copilot, &["hooks/workmux-status.json"]),
+            Self::Gemini => (Agent::Gemini, &["settings.json"]),
+            Self::OpenCode => (
+                Agent::OpenCode,
+                &[
+                    ".workmux-status.json",
+                    "plugins/workmux-status.ts",
+                    "plugin/workmux-status.ts",
+                    "plugins/workmux-status/index.ts",
+                    "plugins/workmux-status/tui.ts",
+                    "plugins/workmux-status/status.ts",
+                ],
+            ),
+        };
+        StatusHooks {
+            agent,
+            config_dir: format!("{GUEST_HOME}/{}", self.config_subpath()),
+            files,
         }
     }
 
@@ -400,6 +421,7 @@ fn agent_script(name: &str, script: &str) -> SbxCommand {
     SbxCommand {
         args: words(&["exec", name, "sh", "-c", script]),
         env: Vec::new(),
+        stdin: None,
     }
 }
 
@@ -410,6 +432,7 @@ fn root_exec(name: &str, command: Vec<String>) -> SbxCommand {
     SbxCommand {
         args,
         env: Vec::new(),
+        stdin: None,
     }
 }
 
@@ -478,7 +501,11 @@ fn exec_command(target: &LaunchTarget, exec: &ExecRequest) -> SbxCommand {
         shell_quote(&shims.to_string_lossy())
     );
     args.extend(words(&["bash", "-c", &command]));
-    SbxCommand { args, env }
+    SbxCommand {
+        args,
+        env,
+        stdin: None,
+    }
 }
 
 /// Keep sbx's command-scope git config when passing git identity entries.
@@ -550,6 +577,7 @@ devbox version
         commands.push(SbxCommand {
             args: words(&["exec", name, "bash", "-c", script]),
             env: Vec::new(),
+            stdin: None,
         });
     }
     commands
@@ -566,6 +594,7 @@ fn hangup_command(target: &LaunchTarget, exec: &ExecRequest) -> SbxCommand {
     SbxCommand {
         args: words(&["exec", target.sandbox_name, "sh", "-c", &script]),
         env: Vec::new(),
+        stdin: None,
     }
 }
 
@@ -964,6 +993,7 @@ fn policy_command(name: &str, verb: &str, resource: &str) -> SbxCommand {
     SbxCommand {
         args,
         env: Vec::new(),
+        stdin: None,
     }
 }
 
@@ -1218,6 +1248,7 @@ pub fn launch_plan(
     let remove = (state.sandbox.is_some() && !exists).then(|| SbxCommand {
         args: words(&["rm", "-f", name]),
         env: Vec::new(),
+        stdin: None,
     });
 
     let created_with = if exists {
@@ -1274,6 +1305,7 @@ pub fn launch_plan(
             command: SbxCommand {
                 args,
                 env: Vec::new(),
+                stdin: None,
             },
             workspaces,
         });
@@ -1303,7 +1335,7 @@ pub fn launch_plan(
         // The kit writes its config only at create, so hooks added now last.
         if let Some(kit) = kit {
             setup.extend(kit.helper_removal(name));
-            status_hooks = Some(kit.status_hooks(name));
+            status_hooks = Some(kit.status_hooks());
         }
     }
 
@@ -3128,37 +3160,29 @@ mod tests {
         }
     }
 
-    /// The arguments of the plan's status-hook step, if it has one.
-    fn status_hooks_args(plan: &LaunchPlan) -> Option<Vec<String>> {
-        plan.status_hooks.as_ref().map(|c| c.args.clone())
+    /// The agent and guest config directory of the plan's status-hook step.
+    fn status_hooks_target(plan: &LaunchPlan) -> Option<(Agent, String)> {
+        plan.status_hooks
+            .as_ref()
+            .map(|hooks| (hooks.agent, hooks.config_dir.clone()))
     }
 
     #[test]
-    fn under_kit_a_created_sandbox_gets_workmuxs_status_hooks_from_the_guests_workmux_setup() {
-        // The workstation's hooks aren't mounted under `kit`: the guest's
-        // workmux installs its status hooks into the config the kit wrote,
-        // as the agent user.
+    fn under_kit_a_created_sandbox_gets_workmuxs_status_hooks_in_the_kits_config() {
+        // The workstation's hooks aren't mounted under `kit`: workmux merges
+        // its status hooks into the config the kit wrote.
         let p = paths();
-        for (agent, config_dir) in [
-            ("claude", "/home/agent/.claude"),
-            ("codex", "/home/agent/.codex"),
-            ("copilot", "/home/agent/.copilot"),
-            ("gemini", "/home/agent/.gemini"),
-            ("opencode", "/home/agent/.config/opencode"),
+        for (agent, kind, config_dir) in [
+            ("claude", Agent::Claude, "/home/agent/.claude"),
+            ("codex", Agent::Codex, "/home/agent/.codex"),
+            ("copilot", Agent::Copilot, "/home/agent/.copilot"),
+            ("gemini", Agent::Gemini, "/home/agent/.gemini"),
+            ("opencode", Agent::OpenCode, "/home/agent/.config/opencode"),
         ] {
             let plan = launch_plan(&kit_config(), &target(&p), agent, &missing(), &exec()).unwrap();
             assert_eq!(
-                status_hooks_args(&plan),
-                Some(args(&[
-                    "exec",
-                    "wm-proj-12345678",
-                    "workmux",
-                    "setup",
-                    "--agent",
-                    agent,
-                    "--config-dir",
-                    config_dir,
-                ])),
+                status_hooks_target(&plan),
+                Some((kind, config_dir.to_string())),
                 "{agent}"
             );
 
@@ -3173,12 +3197,12 @@ mod tests {
                 &exec(),
             )
             .unwrap();
-            assert_eq!(status_hooks_args(&plan), None, "{agent}");
+            assert_eq!(status_hooks_target(&plan), None, "{agent}");
         }
 
         // Under `shell`, the agent has the workstation's own hooks.
         let plan = launch_plan(&config(), &target(&p), "claude", &missing(), &exec()).unwrap();
-        assert_eq!(status_hooks_args(&plan), None);
+        assert_eq!(status_hooks_target(&plan), None);
     }
 
     #[test]

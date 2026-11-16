@@ -1,5 +1,6 @@
 """`workmux add` and `remove` with the docker_sbx sandbox backend, against a fake `sbx`."""
 
+import json
 import os
 import platform
 from pathlib import Path
@@ -88,44 +89,38 @@ def test_add_creates_each_agents_sandbox_before_the_window_opens(
         assert get_window_name(branch_name) not in call.windows, call.windows
 
 
-def test_add_installs_status_hooks_with_the_guests_workmux_setup(
+def test_add_merges_status_hooks_into_the_config_each_kit_wrote(
     mux_server: MuxEnvironment,
     workmux_exe_path: Path,
     mux_repo_path: Path,
     fake_sbx: FakeSbx,
 ):
+    fake_sbx.kit_files = {
+        ".claude/settings.json": json.dumps({"model": "opus"}),
+        ".codex/config.toml": 'model_provider = "sandboxd"\n',
+    }
+
     add_claude_and_codex(
         mux_server, workmux_exe_path, mux_repo_path, "feature-sbx-hooks"
     )
 
-    created = created_sandboxes(fake_sbx)
-    hook_installs = [
-        call.argv
-        for call in fake_sbx.verb_calls("exec")
-        if call.argv[2:4] == ["workmux", "setup"]
+    claude, codex = created_sandboxes(fake_sbx)
+    settings = json.loads(fake_sbx.guest_file(claude, ".claude/settings.json") or "")
+    assert settings["model"] == "opus"
+    stop = [
+        hook["command"]
+        for group in settings["hooks"]["Stop"]
+        for hook in group["hooks"]
     ]
-    assert hook_installs == [
-        [
-            "exec",
-            created[0],
-            "workmux",
-            "setup",
-            "--agent",
-            "claude",
-            "--config-dir",
-            "/home/agent/.claude",
-        ],
-        [
-            "exec",
-            created[1],
-            "workmux",
-            "setup",
-            "--agent",
-            "codex",
-            "--config-dir",
-            "/home/agent/.codex",
-        ],
-    ]
+    assert "workmux set-window-status done" in stop
+
+    config = fake_sbx.guest_file(codex, ".codex/config.toml") or ""
+    assert 'model_provider = "sandboxd"' in config
+    assert "hooks = true" in config
+    # The codex kit wrote no hooks.json; workmux's is created.
+    assert "workmux set-window-status" in (
+        fake_sbx.guest_file(codex, ".codex/hooks.json") or ""
+    )
 
 
 def test_remove_deletes_each_agents_sandbox(
