@@ -151,7 +151,7 @@ workmux sandbox shell --exec
 
 **Options:**
 
-- `-e, --exec` - Exec into an existing container for this worktree instead of starting a new one (container backend; docker_sbx accepts it with the same meaning as without it)
+- `-e, --exec` - Exec into an existing container for this worktree instead of starting a new one (container backend; docker_sbx accepts it and behaves the same as without it)
 - `-a, --agent <name>` - The agent whose sandbox to open: a named agent or an agent type (docker_sbx, where each agent of a worktree has its own sandbox; default: the selected agent)
 - `<command...>` - Command to run instead of bash
 
@@ -159,7 +159,7 @@ workmux sandbox shell --exec
 
 - **Container:** Starts a fresh container with the same mounts and environment as a normal worktree sandbox. With `--exec`, attaches to an existing container instead.
 - **Lima:** Connects to the Lima VM for the current worktree (creating it if needed). The `--exec` flag is not supported since Lima VMs are persistent and `shell` always connects to the existing VM.
-- **Docker Sandboxes:** Runs the shell with `sbx exec` in the current worktree's sbx sandbox for the selected agent (or `--agent`'s), creating it if needed and starting it if sbx stopped it, with the environment the agent's pane gets (`sandbox.env`, `sandbox.env_passthrough`, your git identity) but no RPC server. `--exec` means the same. A single argument after `--` runs as a shell command line (`-- 'git log | head'`); several are passed on as separate words, keeping their quoting (`-- bash -c 'set -x; make'`). It gets a terminal only when stdin is one, so it also works from scripts and pipes.
+- **Docker Sandboxes:** Runs the shell with `sbx exec` in the current worktree's sbx sandbox for the selected agent (or the agent `--agent` names), creating the sandbox if needed and starting it if sbx stopped it. The shell gets the environment the agent's pane gets (`sandbox.env`, `sandbox.env_passthrough`, your git identity) but no RPC server. `--exec` makes no difference. A single argument after `--` runs as a shell command line (`-- 'git log | head'`). Several arguments are passed on as separate words, keeping their quoting (`-- bash -c 'set -x; make'`). It gets a terminal only when stdin is one, so it also works from scripts and pipes.
 
 ### sandbox install-dev
 
@@ -183,7 +183,7 @@ workmux sandbox install-dev --skip-build
 
 This is a developer-only command for getting local workmux builds into sandbox environments. The host macOS binary cannot run inside Linux containers or VMs, so this command cross-compiles for the correct Linux architecture.
 
-For container sandboxes, it builds a thin overlay image (`FROM <image>` + `COPY workmux`) on top of the configured sandbox image, replacing it in-place. For Lima VMs, it copies the binary into each running VM. For Docker Sandboxes, it copies the binary into each running `wm-*` sbx sandbox (`/usr/local/bin/workmux`, installed as root); with `backend: docker_sbx` it also patches the image in Docker's store and loads the sbx template again from it.
+For container sandboxes, it builds a thin overlay image (`FROM <image>` + `COPY workmux`) on top of the configured sandbox image, replacing it in-place. For Lima VMs, it copies the binary into each running VM. For Docker Sandboxes, it copies the binary into each running `wm-*` sbx sandbox (`/usr/local/bin/workmux`, installed as root). With `backend: docker_sbx`, it also patches the image in Docker's store and loads the sbx template again from it.
 
 **Prerequisites:**
 
