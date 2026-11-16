@@ -1945,6 +1945,14 @@ pub struct DockerSbxConfig {
     /// project config.
     #[serde(default)]
     pub agent: Option<DockerSbxAgent>,
+
+    /// Files (relative to the worktree root) to hide from the agent. An
+    /// empty read-only file is mounted over each existing regular file when
+    /// the sandbox is created; missing paths, directories and paths outside
+    /// the worktree are skipped with a warning. Global-only: ignored in
+    /// project config, so a repository can't unhide its own secrets.
+    #[serde(default)]
+    pub excluded_files: Option<Vec<String>>,
 }
 
 /// How the agent is set up in a `docker_sbx` sandbox
@@ -2029,6 +2037,12 @@ impl DockerSbxConfig {
         self.agent.unwrap_or_default()
     }
 
+    /// Files to hide from the agent (relative to the worktree root).
+    /// Returns empty slice when unset.
+    pub fn excluded_files(&self) -> &[String] {
+        self.excluded_files.as_deref().unwrap_or(&[])
+    }
+
     /// Check `memory` is a size sbx accepts. Called at config load.
     pub fn validate(&self) -> anyhow::Result<()> {
         if let Some(memory) = self.memory() {
@@ -2047,8 +2061,8 @@ impl DockerSbxConfig {
         Ok(())
     }
 
-    /// Merge: project overrides global, per-field, EXCEPT for `kits` and
-    /// `agent`, which are global-only.
+    /// Merge: project overrides global, per-field, EXCEPT for `kits`,
+    /// `agent` and `excluded_files`, which are global-only.
     fn merge(global: Self, project: Self) -> Self {
         // Security: kits is global-only. A kit can add network rules,
         // credentials and install steps, so a repo's .workmux.yaml must not
@@ -2067,6 +2081,14 @@ impl DockerSbxConfig {
                 move it to your global config (~/.config/workmux/config.yaml)"
             );
         }
+        // Security: excluded_files is global-only, so a repo's .workmux.yaml
+        // can't unhide its own secrets.
+        if project.excluded_files.is_some() {
+            tracing::warn!(
+                "sandbox.docker_sbx.excluded_files in project config (.workmux.yaml) is ignored -- \
+                move it to your global config (~/.config/workmux/config.yaml)"
+            );
+        }
         Self {
             cpus: project.cpus.or(global.cpus),
             memory: project.memory.or(global.memory),
@@ -2076,6 +2098,7 @@ impl DockerSbxConfig {
                 .or(global.skip_default_provision),
             kits: global.kits,
             agent: global.agent,
+            excluded_files: global.excluded_files,
         }
     }
 }
@@ -2253,9 +2276,6 @@ pub struct ContainerConfig {
     ///
     /// Only existing regular files are masked; missing paths are skipped with
     /// a warning. Directories are not supported.
-    ///
-    /// Under `docker_sbx`, an empty read-only file is mounted over each one
-    /// when the sandbox is created; the main worktree isn't mounted there.
     ///
     /// Security: this field is global-only. It is ignored when set in a
     /// project's `.workmux.yaml`, and workmux fails fast rather than running
@@ -4182,7 +4202,6 @@ pub const EXAMPLE_PROJECT_CONFIG: &str = r#"# workmux project configuration
 #   #   # Mask files out of the worktree bind mounts (paths relative to the
 #   #   # worktree root). Each listed file is shadowed by /dev/null so the
 #   #   # sandboxed agent cannot read it. Missing files are skipped.
-#   #   # Also applies to docker_sbx (an empty file, when the sandbox is created).
 #   #   # GLOBAL-ONLY: ignored when set in a project .workmux.yaml.
 #   #   # excluded_files:
 #   #   #   - .env
@@ -4202,6 +4221,11 @@ pub const EXAMPLE_PROJECT_CONFIG: &str = r#"# workmux project configuration
 #   #   # project .workmux.yaml, since a kit can add network rules.
 #   #   # kits:
 #   #   #   - docker.io/sbx/task:latest
+#   #   # Hide files from the agent behind an empty read-only file, mounted
+#   #   # when the sandbox is created (paths relative to the worktree root).
+#   #   # GLOBAL-ONLY: ignored when set in a project .workmux.yaml.
+#   #   # excluded_files:
+#   #   #   - .env
 #   # lima:
 #   #   isolation: project
 #   #   cpus: 4
@@ -6842,6 +6866,43 @@ docker_sbx:
         assert_eq!(
             shell.merge(Config::default()).sandbox.docker_sbx.agent(),
             DockerSbxAgent::Shell
+        );
+    }
+
+    #[test]
+    fn docker_sbx_excluded_files_project_is_ignored() {
+        // A repository can't unhide its own secrets, by an empty list or
+        // one of its own.
+        let global = docker_sbx_cfg(|sbx| sbx.excluded_files = Some(vec![".env".into()]));
+        let project = docker_sbx_cfg(|sbx| sbx.excluded_files = Some(vec![]));
+        let config: Config = serde_yaml::from_str(
+            "sandbox:\n  docker_sbx:\n    excluded_files: [.env.production]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            global
+                .clone()
+                .merge(project)
+                .sandbox
+                .docker_sbx
+                .excluded_files(),
+            &[".env".to_string()]
+        );
+        assert!(
+            Config::default()
+                .merge(config.clone())
+                .sandbox
+                .docker_sbx
+                .excluded_files()
+                .is_empty()
+        );
+        assert_eq!(
+            config
+                .merge(Config::default())
+                .sandbox
+                .docker_sbx
+                .excluded_files(),
+            &[".env.production".to_string()]
         );
     }
 

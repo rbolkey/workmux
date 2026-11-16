@@ -100,6 +100,7 @@ sandbox:
 | `docker_sbx.provision`              | -                             | Shell script run once, as root, when the sandbox is created (see [Provisioning](#provisioning)) |
 | `docker_sbx.skip_default_provision` | `false`                       | Skip workmux's built-in provisioning (see [Provisioning](#provisioning))                        |
 | `docker_sbx.kits`                   | `[]`                          | sbx mixin kits added when the sandbox is created (see [Kits](#kits)). **Global config only.**   |
+| `docker_sbx.excluded_files`         | `[]`                          | Files to hide from the agent (see [What's mounted](#whats-mounted)). **Global config only.**    |
 
 sbx has no per-sandbox disk setting, so there is no `disk` option. Resources, `provision` and `kits` apply when the sandbox is created, so recreate the sandbox with `workmux sandbox prune` after changing them. When a setting fixed at creation (`agent`, `agent_config_dir`, `extra_mounts`, `cpus`, `memory`, `kits`, `image`, the toolchain) differs from what the sandbox was created with, workmux logs a warning at launch naming the settings. Two changes are errors instead: one that would leave a file the agent shouldn't read unhidden (see [`excluded_files`](#whats-mounted)), and a change of `docker_sbx.agent` (see [Agent setup](#agent-setup-kit-or-shell)).
 
@@ -222,7 +223,7 @@ sbx mounts the worktree, the git metadata and the shims at their host paths, and
 | Agent config directory (`shell`)               | read-write   | Agent settings and credentials, at its usual place under `/home/agent` |
 | OpenCode's `~/.config/opencode/` (`shell`)     | read-only    | OpenCode's global config, at `/home/agent/.config/opencode`            |
 | `~/.local/state/workmux/docker-sbx/<sandbox>/` | read-only    | Host-command shims                                                     |
-| `excluded_files` entries                       | masked       | An empty file mounted over each, so the agent can't read it            |
+| `docker_sbx.excluded_files` entries            | masked       | An empty file mounted over each, so the agent can't read it            |
 | `extra_mounts` entries                         | read-only\*  | User-configured paths                                                  |
 
 \* As on the [container backend](/guide/sandbox/container/#whats-mounted), git pointer files, per-worktree config, object information, submodules' hooks and config, and files the repository config includes or runs stay read-only within writable git mounts, so an agent can't plant hooks or change git config. For a filter, a diff or merge driver, or fsmonitor, the protected files include every file in the worktree or git dir that its command names, so `sh ./scripts/clean.sh` protects the script as well. sbx enforces read-only mounts on the host, even against root in the sandbox. Sandboxes require a linked worktree. workmux refuses to sandbox the main worktree, whose admin files are the repository's own. Hooks in the main repository must be regular files, not symbolic or hard links.
@@ -244,7 +245,17 @@ Other agents get no config directory mount. workmux makes these mounts when it c
 
 `extra_mounts` entries are mounted at their `guest_path`, or at their host path without one. sbx mounts a single file only read-only, so a writable entry that is a file is an error. A `guest_path` inside the worktree or another mount appears on the workstation too: sbx creates the mount point there (an empty directory or file) if it's missing.
 
-`sandbox.container.excluded_files` works as on the [container backend](/guide/sandbox/container/), and is global-only here too. workmux hides each listed file that exists in the worktree behind an empty, read-only file it keeps in the sandbox's state directory. A symbolic link is masked at the file it points to in the worktree. workmux skips missing paths, directories, and links that point outside the worktree, with a warning in the log. The container backend also masks files in the main worktree, but the main worktree isn't mounted here, so links into it don't resolve in the sandbox.
+List the files to hide from the agent under `sandbox.docker_sbx.excluded_files`, with paths relative to the worktree root:
+
+```yaml
+sandbox:
+  docker_sbx:
+    excluded_files:
+      - .env
+      - config/.env.local
+```
+
+It's read only from your global config, so a repository can't unhide its own secrets. workmux ignores it in a project's `.workmux.yaml` and logs a warning. The container backend's `sandbox.container.excluded_files` has no effect here. workmux hides each listed file that exists in the worktree behind an empty, read-only file it keeps in the sandbox's state directory. A symbolic link is masked at the file it points to in the worktree. workmux skips missing paths, directories, and links that point outside the worktree, with a warning in the log, as the [container backend](/guide/sandbox/container/) does. The container backend also masks files in the main worktree, but the main worktree isn't mounted here, so links into it don't resolve in the sandbox.
 
 Like other mounts, masks are made when the sandbox is created, whereas the container backend masks on every launch. So a listed file the sandbox has no mask over, because it was listed or created after the sandbox, is an error at launch naming the file, since the agent could read it. The error stays until you recreate the sandbox with `workmux sandbox prune` (or `sbx rm -f <sandbox>`). A masked file that's deleted or no longer listed only gets a warning in the log. When a masked file was deleted, sbx puts an empty file back in its place the next time it starts the sandbox.
 
