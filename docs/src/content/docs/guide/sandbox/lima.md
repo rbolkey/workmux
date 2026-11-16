@@ -248,7 +248,7 @@ New VMs will now boot from the snapshot with everything pre-installed.
 
 ## Nix and Devbox toolchain
 
-The Lima backend has built-in support for [Nix](https://nixos.org/) and [Devbox](https://www.jetify.com/devbox) to provide declarative, cached toolchain management inside VMs ([Docker Sandboxes](/guide/sandbox/docker-sbx/#nix-and-devbox-toolchain) has the same). For the container backend, use a [custom Dockerfile](/guide/sandbox/container/#custom-images) to install project-specific tools, or use [`host_commands`](/guide/sandbox/features/#host-command-proxying) to proxy commands from the container to the host's toolchain environment.
+The Lima backend has built-in support for [Nix](https://nixos.org/) and [Devbox](https://www.jetify.com/devbox) to provide declarative, cached toolchain management inside VMs. For the container backend, use a [custom Dockerfile](/guide/sandbox/container/#custom-images) to install project-specific tools, or use [`host_commands`](/guide/sandbox/features/#host-command-proxying) to proxy commands from the container to the host's toolchain environment.
 
 By default (`toolchain: auto`), workmux checks for `devbox.json` or `flake.nix` in the project root and wraps agent commands in the appropriate environment:
 

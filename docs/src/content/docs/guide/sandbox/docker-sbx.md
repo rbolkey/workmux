@@ -117,7 +117,7 @@ When it creates the sandbox, workmux adds its [status hooks](/guide/status-track
 - Copilot: `~/.copilot/hooks/`
 - OpenCode: a plugin in `~/.config/opencode/plugins/`
 
-workmux's panes start Codex with `--dangerously-bypass-hook-trust` (see [Agent flags](/guide/sandbox/features/#agent-flags)), so Codex runs these hooks without asking you to review them. A Codex you start yourself in the sandbox, such as with `workmux sandbox shell -- codex`, asks once, and trusting the hooks records that in the sandbox's `~/.codex/config.toml`.
+workmux's panes start Codex with `--dangerously-bypass-hook-trust` (see [Agent flags](/guide/sandbox/features/#agent-flags)), so Codex runs these hooks without asking you to review them. Approvals given on your workstation wouldn't apply anyway, because the sandbox has a `~/.codex` of its own. Codex shows a startup warning that the flag is on. A Codex you start yourself in the sandbox, such as with `workmux sandbox shell -- codex`, asks once, and trusting the hooks records that in the sandbox's `~/.codex/config.toml`.
 
 The claude kit's own hooks and status line call `sbx-claude-hook`, and the codex kit's `notify` calls `sbx-codex-hook`. Both helpers come with sbx's own agent images, not workmux's template, so workmux drops those hooks when the template doesn't have the helpers. Your workstation's agent settings, hooks, plugins and sessions aren't in the sandbox. Configure sbx's own settings (secrets, MCP servers, skills) with sbx.
 
@@ -195,6 +195,10 @@ The guest reaches the RPC server through `host.docker.internal`. sbx names the w
 
 Everything that goes through the RPC server works as on the other backends: [host commands](/guide/sandbox/features/#host-command-proxying) (which run on your workstation, outside sbx's network policy and placeholders), [sound notifications](/guide/sandbox/features/#sound-notifications), [image paste](/guide/sandbox/features/#clipboard-proxy), status tracking, and [coordinator agents](/guide/sandbox/features/#coordinator-agents), whose `workmux add` gives each new worktree its own sandbox.
 
+Host commands reach whatever your workstation can reach. They see the real credentials your workstation holds rather than sbx's placeholders, within host-exec's [filesystem sandbox](/guide/sandbox/features/#security-model). Weigh each command you add with that in mind.
+
+workmux inside a sandbox never shows the first-run prompts (nerdfont, status tracking hooks, skills), which would otherwise install into the agent config directory mounted from your workstation.
+
 ### Lifecycle
 
 A sandbox belongs to the worktree and an agent, not to a pane:
@@ -223,7 +227,20 @@ sbx mounts the worktree, the git metadata and the shims at their host paths, and
 
 \* As on the [container backend](/guide/sandbox/container/#whats-mounted), git pointer files, per-worktree config, object information, submodules' hooks and config, and files the repository config includes or runs stay read-only within writable git mounts, so an agent can't plant hooks or change git config. For a filter, a diff or merge driver, or fsmonitor, the protected files include every file in the worktree or git dir that its command names, so `sh ./scripts/clean.sh` protects the script as well. sbx enforces read-only mounts on the host, even against root in the sandbox. Sandboxes require a linked worktree. workmux refuses to sandbox the main worktree, whose admin files are the repository's own. Hooks in the main repository must be regular files, not symbolic or hard links.
 
-Under `agent: shell`, see [Credentials](/guide/sandbox/features/#credentials) for each agent's config directory. workmux makes these mounts when it creates the sandbox. Each agent has its own sandbox, so each agent gets its own config directory. For Claude, workmux also writes the sandbox's own `~/.claude.json` with onboarding marked complete. Pi and OMP download Linux `fd` and `rg` binaries into their config directory. workmux binds a directory inside the sandbox over `~/.pi/agent/bin/` and `~/.omp/agent/tools/` each time a pane starts, so the workstation's binaries are never overwritten.
+Under `agent: shell`, workmux mounts each agent's config directory from your workstation at these paths (see [Credentials](/guide/sandbox/features/#credentials) for how each agent uses it):
+
+| Agent      | Host directory               | Sandbox mount                          |
+| ---------- | ---------------------------- | -------------------------------------- |
+| `claude`   | `~/.claude/`                 | `/home/agent/.claude/`                 |
+| `copilot`  | `~/.copilot/`                | `/home/agent/.copilot/`                |
+| `gemini`   | `~/.gemini/`                 | `/home/agent/.gemini/`                 |
+| `agy`      | `~/.gemini/antigravity-cli/` | `/home/agent/.gemini/antigravity-cli/` |
+| `codex`    | `~/.codex/`                  | `/home/agent/.codex/`                  |
+| `opencode` | `~/.local/share/opencode/`   | `/home/agent/.local/share/opencode/`   |
+| `pi`       | `~/.pi/agent/`               | `/home/agent/.pi/agent/`               |
+| `omp`      | `~/.omp/agent/`              | `/home/agent/.omp/agent/`              |
+
+Other agents get no config directory mount. workmux makes these mounts when it creates the sandbox. Each agent has its own sandbox, so each agent gets its own config directory. Switching a worktree to another agent needs no recreated sandbox. That agent's sandbox is created when a pane first runs it. For Claude, workmux also writes the sandbox's own `~/.claude.json` with onboarding marked complete. Pi and OMP download Linux `fd` and `rg` binaries into their config directory. workmux binds a directory inside the sandbox over `~/.pi/agent/bin/` and `~/.omp/agent/tools/` each time a pane starts, so the workstation's binaries are never overwritten.
 
 `extra_mounts` entries are mounted at their `guest_path`, or at their host path without one. sbx mounts a single file only read-only, so a writable entry that is a file is an error. A `guest_path` inside the worktree or another mount appears on the workstation too: sbx creates the mount point there (an empty directory or file) if it's missing.
 
@@ -248,7 +265,7 @@ The template follows the image in Docker's store. When the image changes (a pull
 The image commands handle the template too:
 
 ```bash
-# Pull the image and refresh the template
+# Pull the image, and refresh the template if the image changed
 workmux sandbox pull
 
 # Build the image locally (with Docker) and refresh the template
@@ -259,6 +276,8 @@ workmux sandbox init-dockerfile
 ```
 
 With `backend: docker_sbx` they use Docker, whatever `sandbox.container.runtime` says. The Dockerfile from `init-dockerfile` ends with the sbx layer so a custom image already has what sbx needs; add root steps before its `USER agent`. workmux applies the layer again when it builds the template, which changes nothing in an image that has it.
+
+`workmux sandbox install-dev` copies a local build into each running `wm-*` sbx sandbox, replacing `/usr/local/bin/workmux` as root. It also builds the overlay on the image in Docker's store and loads the sbx template again from it, so new sandboxes get the build too. Run `workmux sandbox pull` to go back to the released image.
 
 ### Authentication
 
@@ -391,4 +410,6 @@ workmux sandbox shell -- git status
 workmux sandbox shell --agent codex
 ```
 
-A stopped sandbox keeps its state and starts again when a pane needs it. A pruned sandbox is created again by the next `workmux open`. `workmux sandbox shell` has no RPC server, so host commands and status updates don't work in it. `--exec` makes no difference, since the sandbox is already persistent.
+`stop` and `prune` take the same arguments, prompts and confirmation as on Lima, and need `sbx` installed. `prune` lists workmux's sandboxes with their age and last use. It deletes them with `sbx rm`, which also removes their policy rules and the sbx secrets scoped to them. A stopped sandbox keeps its state and starts again when a pane needs it. A pruned sandbox is created again by the next `workmux open`.
+
+`workmux sandbox shell` runs the shell with `sbx exec` in the current worktree's sandbox for the selected agent, or for the agent `--agent` names (a named agent or an agent type). It creates the sandbox if needed and starts it if sbx stopped it. The shell gets the environment the agent's pane gets (`sandbox.env`, `sandbox.env_passthrough`, your git identity). It has no RPC server, so host commands and status updates don't work in it. A single argument after `--` runs as a shell command line (`-- 'git log | head'`). Several arguments are passed on as separate words, keeping their quoting (`-- bash -c 'set -x; make'`). The shell gets a terminal only when stdin is one, so it also works from scripts and pipes. `--exec` makes no difference, since the sandbox is already persistent.

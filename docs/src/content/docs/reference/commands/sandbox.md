@@ -3,7 +3,7 @@ title: "sandbox"
 description: Manage sandbox backends and tooling
 ---
 
-Commands for managing sandbox functionality across container (Docker/Podman/Apple Container), Lima and Docker Sandboxes (`docker_sbx`) backends.
+Commands for managing sandbox functionality across container (Docker/Podman/Apple Container), Lima and [Docker Sandboxes](/guide/sandbox/docker-sbx/) backends.
 
 ## Container commands
 
@@ -17,7 +17,7 @@ workmux sandbox build
 
 Builds the image locally for the configured agent. This is an alternative to using the pre-built image from `ghcr.io/raine/workmux-sandbox`. Most users should use `workmux sandbox pull` instead.
 
-With `backend: docker_sbx`, the image is built with Docker and the [sbx template](/guide/sandbox/docker-sbx/#template) is built and loaded from it.
+Supports [Docker Sandboxes](/guide/sandbox/docker-sbx/#template), where it also refreshes the sbx template.
 
 ### sandbox pull
 
@@ -29,7 +29,7 @@ workmux sandbox pull
 
 Pulls the pre-built image for the configured agent from `ghcr.io/raine/workmux-sandbox:{agent}`. This is the recommended way to get and update the sandbox image.
 
-With `backend: docker_sbx`, the image is pulled with Docker and the [sbx template](/guide/sandbox/docker-sbx/#template) is loaded again if the image changed.
+Supports [Docker Sandboxes](/guide/sandbox/docker-sbx/#template), where it also refreshes the sbx template.
 
 ### sandbox init-dockerfile
 
@@ -43,15 +43,15 @@ workmux sandbox init-dockerfile [--force]
 
 - `--force` - Overwrite existing Dockerfile
 
-Creates a `Dockerfile.sandbox` in the current directory with the base system setup (Debian, git, workmux) and agent-specific installation (e.g., Claude Code) combined into a single file. With `backend: docker_sbx`, it ends with the sbx layer (`docker/Dockerfile.sbx`) that sbx templates need.
+Creates a `Dockerfile.sandbox` in the current directory with the base system setup (Debian, git, workmux) and agent-specific installation (e.g., Claude Code) combined into a single file.
 
-## Lima and Docker Sandboxes commands
+Supports [Docker Sandboxes](/guide/sandbox/docker-sbx/#template), where the Dockerfile ends with the sbx layer.
 
-With `backend: docker_sbx`, `stop` and `prune` act on workmux's sbx sandboxes (`wm-*` in `sbx ls`) instead of Lima VMs, with the same arguments, prompts and confirmation.
+## Lima commands
 
 ### sandbox stop
 
-Stop Lima VMs (or sbx sandboxes) to free resources.
+Stop Lima VMs to free resources.
 
 ```bash
 # Interactive mode - show list and select VM
@@ -80,14 +80,14 @@ This command helps you stop running Lima VMs created by workmux to free up syste
 
 **Notes:**
 
-- This command works with the Lima backend (requires `limactl`) and the docker_sbx backend (requires `sbx`)
+- This command works with the Lima backend, where it requires `limactl`, and with [Docker Sandboxes](/guide/sandbox/docker-sbx/#sandbox-management), where it stops workmux's sbx sandboxes
 - Only running VMs are shown in interactive mode
 - If a specified VM is already stopped, the command reports this and exits successfully
 - Non-interactive environments (pipes, scripts) require `--all` or a specific VM name
 
 ### sandbox prune
 
-Delete unused Lima VMs (or sbx sandboxes) to reclaim disk space.
+Delete unused Lima VMs to reclaim disk space.
 
 ```bash
 # Interactive - show VMs and confirm deletion
@@ -103,7 +103,7 @@ workmux sandbox prune --force
 
 Lists all workmux Lima VMs (those starting with `wm-` prefix) with their size, age, and last accessed time, then prompts for confirmation before deleting them. Requires `limactl` to be installed.
 
-With the docker_sbx backend, lists workmux's sbx sandboxes with their age and last use, and deletes them with `sbx rm`, which also removes their policy rules and the sbx secrets scoped to them. Requires `sbx` to be installed.
+Supports [Docker Sandboxes](/guide/sandbox/docker-sbx/#sandbox-management), where it deletes workmux's sbx sandboxes.
 
 ## General commands
 
@@ -123,7 +123,9 @@ workmux sandbox agent -- claude -p "coordinate these tasks"
 
 - `<command...>` - Command to run instead of the configured agent
 
-This command runs a sandboxed agent in the current directory. It delegates to the same supervisor process used by `workmux sandbox run`, which handles RPC server setup, sandbox dispatch (Lima, container or Docker Sandboxes), environment variables, and cleanup.
+This command runs a sandboxed agent in the current directory. It delegates to the same supervisor process used by `workmux sandbox run`, which handles RPC server setup, sandbox dispatch (Lima or container), environment variables, and cleanup.
+
+Supports [Docker Sandboxes](/guide/sandbox/docker-sbx/).
 
 The key difference from `sandbox shell` is that this starts an RPC server, enabling the guest to call `workmux add` from inside the sandbox. Guest-side `workmux add` detects the sandbox environment and routes through SpawnAgent RPC to the host, where sub-agents are created normally (and sandboxed if the project config says so).
 
@@ -136,7 +138,7 @@ The key difference from `sandbox shell` is that this starts an RPC server, enabl
 
 ### sandbox shell
 
-Start an interactive shell in a sandbox. Uses the same mounts and environment as a normal worktree sandbox. Works with the container, Lima and docker_sbx backends.
+Start an interactive shell in a sandbox. Uses the same mounts and environment as a normal worktree sandbox. Works with both container and Lima backends.
 
 ```bash
 # Start a new shell (container backend starts a new container, Lima connects to existing VM)
@@ -151,7 +153,7 @@ workmux sandbox shell --exec
 
 **Options:**
 
-- `-e, --exec` - Exec into an existing container for this worktree instead of starting a new one (container backend; docker_sbx accepts it and behaves the same as without it)
+- `-e, --exec` - Exec into an existing container for this worktree instead of starting a new one (container backend only)
 - `-a, --agent <name>` - The agent whose sandbox to open: a named agent or an agent type (docker_sbx, where each agent of a worktree has its own sandbox; default: the selected agent)
 - `<command...>` - Command to run instead of bash
 
@@ -159,14 +161,14 @@ workmux sandbox shell --exec
 
 - **Container:** Starts a fresh container with the same mounts and environment as a normal worktree sandbox. With `--exec`, attaches to an existing container instead.
 - **Lima:** Connects to the Lima VM for the current worktree (creating it if needed). The `--exec` flag is not supported since Lima VMs are persistent and `shell` always connects to the existing VM.
-- **Docker Sandboxes:** Runs the shell with `sbx exec` in the current worktree's sbx sandbox for the selected agent (or the agent `--agent` names), creating the sandbox if needed and starting it if sbx stopped it. The shell gets the environment the agent's pane gets (`sandbox.env`, `sandbox.env_passthrough`, your git identity) but no RPC server. `--exec` makes no difference. A single argument after `--` runs as a shell command line (`-- 'git log | head'`). Several arguments are passed on as separate words, keeping their quoting (`-- bash -c 'set -x; make'`). It gets a terminal only when stdin is one, so it also works from scripts and pipes.
+- **Docker Sandboxes:** See [Docker Sandboxes](/guide/sandbox/docker-sbx/#sandbox-management).
 
 ### sandbox install-dev
 
-Cross-compile and install workmux into container images, running Lima VMs and running sbx sandboxes for local development.
+Cross-compile and install workmux into container images and running Lima VMs for local development.
 
 ```bash
-# Cross-compile and install into containers, running VMs and running sbx sandboxes
+# Cross-compile and install into containers and running VMs
 workmux sandbox install-dev
 
 # Use release profile (slower build, faster binary)
@@ -183,7 +185,9 @@ workmux sandbox install-dev --skip-build
 
 This is a developer-only command for getting local workmux builds into sandbox environments. The host macOS binary cannot run inside Linux containers or VMs, so this command cross-compiles for the correct Linux architecture.
 
-For container sandboxes, it builds a thin overlay image (`FROM <image>` + `COPY workmux`) on top of the configured sandbox image, replacing it in-place. For Lima VMs, it copies the binary into each running VM. For Docker Sandboxes, it copies the binary into each running `wm-*` sbx sandbox (`/usr/local/bin/workmux`, installed as root). With `backend: docker_sbx`, it also patches the image in Docker's store and loads the sbx template again from it.
+For container sandboxes, it builds a thin overlay image (`FROM <image>` + `COPY workmux`) on top of the configured sandbox image, replacing it in-place. For Lima VMs, it copies the binary into each running VM.
+
+Supports [Docker Sandboxes](/guide/sandbox/docker-sbx/#template), where it also installs into running sbx sandboxes.
 
 **Prerequisites:**
 
