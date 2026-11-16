@@ -92,15 +92,16 @@ sandbox:
       apt-get update && apt-get install -y ripgrep jq
 ```
 
-| Option                              | Default                       | Description                                                                                     |
-| ----------------------------------- | ----------------------------- | ----------------------------------------------------------------------------------------------- |
-| `docker_sbx.agent`                  | `kit`                         | `kit` or `shell` (see [Agent setup](#agent-setup-kit-or-shell)). **Global config only.**        |
-| `docker_sbx.cpus`                   | all host CPUs (sbx's default) | Number of CPUs for the sandbox (`0` means all)                                                  |
-| `docker_sbx.memory`                 | half the host's memory        | Memory for the sandbox in sbx's binary units (`512m`, `8g`); at least `512m`                    |
-| `docker_sbx.provision`              | -                             | Shell script run once, as root, when the sandbox is created (see [Provisioning](#provisioning)) |
-| `docker_sbx.skip_default_provision` | `false`                       | Skip workmux's built-in provisioning (see [Provisioning](#provisioning))                        |
-| `docker_sbx.kits`                   | `[]`                          | sbx mixin kits added when the sandbox is created (see [Kits](#kits)). **Global config only.**   |
-| `docker_sbx.excluded_files`         | `[]`                          | Files to hide from the agent (see [What's mounted](#whats-mounted)). **Global config only.**    |
+| Option                                   | Default                       | Description                                                                                                                                                                            |
+| ---------------------------------------- | ----------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `docker_sbx.agent`                       | `kit`                         | `kit` or `shell` (see [Agent setup](#agent-setup-kit-or-shell)). **Global config only.**                                                                                               |
+| `docker_sbx.cpus`                        | all host CPUs (sbx's default) | Number of CPUs for the sandbox (`0` means all)                                                                                                                                         |
+| `docker_sbx.memory`                      | half the host's memory        | Memory for the sandbox in sbx's binary units (`512m`, `8g`); at least `512m`                                                                                                           |
+| `docker_sbx.provision`                   | -                             | Shell script run once, as root, when the sandbox is created (see [Provisioning](#provisioning))                                                                                        |
+| `docker_sbx.skip_default_provision`      | `false`                       | Skip workmux's built-in provisioning (see [Provisioning](#provisioning))                                                                                                               |
+| `docker_sbx.kits`                        | `[]`                          | sbx mixin kits added when the sandbox is created (see [Kits](#kits)). **Global config only.**                                                                                          |
+| `docker_sbx.excluded_files`              | `[]`                          | Files to hide from the agent (see [What's mounted](#whats-mounted)). **Global config only.**                                                                                           |
+| `docker_sbx.accept_wider_network_policy` | `false`                       | Accept without asking that a new sandbox reaches more than `allowed_domains` under `policy: deny` (see [Accepting a wider policy](#accepting-a-wider-policy)). **Global config only.** |
 
 sbx has no per-sandbox disk setting, so there is no `disk` option. Resources, `provision` and `kits` apply when the sandbox is created, so recreate the sandbox with `workmux sandbox prune` after changing them. When a setting fixed at creation (`agent`, `agent_config_dir`, `extra_mounts`, `cpus`, `memory`, `kits`, `image`, the toolchain) differs from what the sandbox was created with, workmux logs a warning at launch naming the settings. Two changes are errors instead: one that would leave a file the agent shouldn't read unhidden (see [`excluded_files`](#whats-mounted)), and a change of `docker_sbx.agent` (see [Agent setup](#agent-setup-kit-or-shell)).
 
@@ -393,13 +394,32 @@ Every launch reconciles the rules: it adds missing ones and removes the ones wor
 
 Differences from the container backend:
 
-- **The global sbx policy still applies.** sbx allows a request when your global policy or a sandbox rule allows it, and a deny in either wins. Under `policy: allow`, what your global policy blocks stays blocked. Under `policy: deny`, the sandbox can also reach whatever your global policy allows (sbx's `balanced` policy allows package registries, code hosts and AI services), and a sandbox rule can't take that back. workmux logs a warning on every launch, saying how many destinations that is. For a sandbox that reaches only `allowed_domains`, as on the container backend, choose `deny-all` (`sbx policy reset`, then `sbx policy init deny-all`).
+- **The global sbx policy still applies.** sbx allows a request when your global policy or a sandbox rule allows it, and a deny in either wins. Under `policy: allow`, what your global policy blocks stays blocked. Under `policy: deny`, the sandbox can also reach whatever your global policy allows (sbx's `balanced` policy allows package registries, code hosts and AI services), and a sandbox rule can't take that back. workmux asks you to [accept](#accepting-a-wider-policy) it when it creates the sandbox and logs a warning on every launch, saying how many destinations that is. For a sandbox that reaches only `allowed_domains`, as on the container backend, choose `deny-all` (`sbx policy reset`, then `sbx policy init deny-all`).
 - **Kit rules.** A kit adds network rules scoped to the sandbox when sbx creates it. Under `agent: kit`, these include the agent kit's hosts for its vendor: the claude kit allows `api.anthropic.com`, `platform.claude.com`, `downloads.claude.ai`, `claude.com`, `mcp-proxy.anthropic.com` and `bridge.claudeusercontent.com` on port 443, and `deb.debian.org` and `dhi.io` on port 80. Any [mixin kit](#kits) adds its own. They're sbx's rules (`provisioned` in `sbx policy ls <sandbox> --json`), not yours or workmux's, and the kit needs them, so workmux never removes them. Under `policy: deny`, every launch logs a warning naming each kit host and port that `allowed_domains` doesn't cover, starting with the launch that creates the sandbox. List your agent's API domains in `allowed_domains` (for Claude, `api.anthropic.com`, `platform.claude.com`, `claude.com` and `downloads.claude.ai`), so the warning names only what the kit adds beyond them. `allowed_domains` covers port 443 only, so a kit's port-80 hosts always stay in the warning. A domain workmux denies itself (a wildcard's base) stays blocked, because sbx's deny wins over the kit's allow.
-- **A project can't choose `docker_sbx` for a wider policy.** When `backend: docker_sbx` comes from a repository's `.workmux.yaml`, your global config sets `policy: deny`, and your global sbx policy allows more than `deny-all`, workmux refuses to launch. A repository can't move a `deny` sandbox onto a wider policy. Set `backend: docker_sbx` in your global config to accept your global sbx policy (you then get the logged warning only), or choose `deny-all`.
+- **A project can't choose `docker_sbx` for a wider policy.** When `backend: docker_sbx` comes from a repository's `.workmux.yaml`, your global config sets `policy: deny`, and your global sbx policy allows more than `deny-all`, workmux refuses to launch. A repository can't move a `deny` sandbox onto a wider policy. Set `backend: docker_sbx` in your global config to accept your global sbx policy (you then get the [acknowledgement](#accepting-a-wider-policy) and the logged warnings), or choose `deny-all`.
 - **Private addresses.** sbx doesn't refuse private or loopback addresses an allowed domain resolves to, so `allow_private_ips: false` can't be enforced under `docker_sbx`. workmux logs a warning on every launch under `policy: deny`, unless every allowed domain sets `allow_private_ips: true` and the global policy allows nothing. A refusal would leave `deny` unusable, so this is a warning, not an error.
 - **`max_connections`** is ignored: sbx has no cap on concurrent connections. workmux logs a note when it's set.
 
-sbx logs requests it blocks: `sbx policy log <sandbox>` lists them with the rule or reason. They don't appear in workmux's log (`~/.local/state/workmux/workmux.log` by default). That log holds the warnings and notes described above, which workmux doesn't print to the terminal, so read this section to learn what `deny` leaves open.
+### Accepting a wider policy
+
+Under `policy: deny`, when workmux creates a sandbox that would reach more than `allowed_domains` (your global sbx policy allows more than `deny-all`, an allowed domain leaves `allow_private_ips` false, or the agent kit's hosts aren't all covered), it prints a `warning:` line for each of these to the terminal and asks `[y/N]` before going on. This happens in `workmux add` and `workmux open` before the window opens, and in the pane when a pane has to create its sandbox again. Under `agent: kit`, or with mixin `kits`, workmux asks right after `sbx create`, once the kits' rules exist, and deletes the sandbox if you answer no. Kits with port-80 hosts, such as the claude kit, are never fully covered, since `allowed_domains` covers port 443 only, so their sandboxes always ask.
+
+You're asked once per sandbox. workmux records your answer in `~/.local/state/workmux/docker-sbx-acknowledgements/wider-network-policy-v1/<sandbox>` (readable only by you), beside Lima's acknowledgements, and deletes it with the sandbox in `workmux remove` and `workmux sandbox prune`, so a new sandbox asks again. Later launches into the sandbox don't ask, and only log the warnings, so a change to your global sbx policy still shows up in workmux's log.
+
+To accept without asking, for scripts and coordinator agents, set it in your global config. workmux ignores it in a project's `.workmux.yaml`, so a repository can't accept for you:
+
+```yaml
+# ~/.config/workmux/config.yaml
+sandbox:
+  docker_sbx:
+    accept_wider_network_policy: true
+```
+
+Without a terminal to ask in and without the setting, creating the sandbox fails with an error naming the setting and `sbx policy init deny-all`, and no sandbox is left behind. Under `policy: allow` workmux never asks: `allow` makes no promise to narrow access.
+
+### Blocked requests
+
+sbx logs requests it blocks: `sbx policy log <sandbox>` lists them with the rule or reason. They don't appear in workmux's log (`~/.local/state/workmux/workmux.log` by default). That log holds the warnings and notes described above. Apart from the acknowledgement when a sandbox is created, workmux doesn't print them to the terminal.
 
 ## Sandbox management
 
