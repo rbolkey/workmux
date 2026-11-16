@@ -797,14 +797,24 @@ pub trait Multiplexer: Send + Sync {
 
                         // Choose backend based on config
                         let wrap_result = match config.sandbox.backend() {
-                            // docker_sbx runs the same `workmux sandbox run`
-                            // supervisor command, which dispatches on the
-                            // backend.
-                            crate::config::SandboxBackend::Container
-                            | crate::config::SandboxBackend::DockerSbx => {
+                            crate::config::SandboxBackend::Container => {
                                 crate::sandbox::wrap_for_container(
                                     &command_to_wrap,
                                     options.sandbox_supervisor,
+                                    wt_root,
+                                    working_dir,
+                                )
+                            }
+                            // Each agent runs in its own sbx sandbox.
+                            crate::config::SandboxBackend::DockerSbx => {
+                                crate::sandbox::wrap_for_docker_sbx(
+                                    &command_to_wrap,
+                                    options.sandbox_supervisor,
+                                    &crate::sandbox::docker_sbx::pane_agent(
+                                        config,
+                                        resolved.selected_agent.as_ref(),
+                                        task_agent,
+                                    ),
                                     wt_root,
                                     working_dir,
                                 )

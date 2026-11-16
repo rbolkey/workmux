@@ -243,16 +243,26 @@ pub struct SandboxRemoval {
     _lock: Flock<File>,
 }
 
-/// Prepare to delete a worktree's sbx sandbox, `name` (see
-/// [`super::sandbox_name_in`]), if workmux created one for it (its state
-/// directory exists): wait for a launch setting it up to finish, then hold
-/// its lock until [`SandboxRemoval::remove`], or until the removal is
-/// called off and the value dropped.
+/// Prepare to delete a worktree's sbx sandboxes, one per agent it ran and
+/// the one named before agents were part of the name, that workmux created
+/// (their state directories exist): wait for a launch setting each up to
+/// finish, then hold its lock until [`SandboxRemoval::remove`], or until
+/// the removal is called off and the values dropped.
 ///
 /// Called whenever a worktree is removed, before the worktree leaves its
-/// path, which a launch setting the sandbox up still needs. Best effort:
+/// path, which a launch setting a sandbox up still needs. Best effort:
 /// failures are logged, never fatal.
-pub fn prepare_sandbox_removal(name: &str) -> Option<SandboxRemoval> {
+pub fn prepare_sandbox_removal(project_root: &Path, worktree_root: &Path) -> Vec<SandboxRemoval> {
+    let Ok(state_root) = sbx_state_root() else {
+        return Vec::new();
+    };
+    worktree_sandboxes_in(&state_root, project_root, worktree_root)
+        .iter()
+        .filter_map(|name| prepare_one_removal(name))
+        .collect()
+}
+
+fn prepare_one_removal(name: &str) -> Option<SandboxRemoval> {
     let state_dir = sbx_state_dir_path(name).ok()?;
     if !state_dir.exists() {
         return None;
@@ -377,7 +387,82 @@ pub fn gather_state(name: &str) -> Result<SbxState> {
 
 /// Host-side state directory for a sandbox: `$XDG_STATE_HOME/workmux/docker-sbx/<name>/`.
 pub(crate) fn sbx_state_dir_path(name: &str) -> Result<PathBuf> {
-    Ok(crate::xdg::state_dir()?.join("docker-sbx").join(name))
+    Ok(sbx_state_root()?.join(name))
+}
+
+/// Directory holding every sbx sandbox's state directory.
+fn sbx_state_root() -> Result<PathBuf> {
+    Ok(crate::xdg::state_dir()?.join("docker-sbx"))
+}
+
+/// File in a sandbox's state directory recording the worktree and agent it
+/// was created for, written before anything else, so that removing the
+/// worktree finds the sandbox by its exact name.
+const SANDBOX_RECORD_FILE: &str = "sandbox.json";
+
+#[derive(Deserialize, Serialize)]
+struct SandboxRecord {
+    worktree: PathBuf,
+    agent: String,
+}
+
+/// Record the worktree and agent a sandbox is for.
+fn write_sandbox_record(state_dir: &Path, worktree_root: &Path, agent: &str) -> Result<()> {
+    let record = SandboxRecord {
+        worktree: worktree_root
+            .canonicalize()
+            .unwrap_or_else(|_| worktree_root.to_path_buf()),
+        agent: agent.to_string(),
+    };
+    let content = serde_json::to_string_pretty(&record)?;
+    crate::util::write_atomic(&state_dir.join(SANDBOX_RECORD_FILE), content.as_bytes())
+}
+
+/// The names of the worktree's sandboxes that have state directories under
+/// `state_root`: one per agent its launches recorded, named exactly as a
+/// launch names it (a name prefix could match another project's), and the
+/// sandbox named before agents were part of the name.
+fn worktree_sandboxes_in(
+    state_root: &Path,
+    project_root: &Path,
+    worktree_root: &Path,
+) -> Vec<String> {
+    let worktree = worktree_root
+        .canonicalize()
+        .unwrap_or_else(|_| worktree_root.to_path_buf());
+    let legacy = super::legacy_sandbox_name_in(project_root, &worktree);
+    let Ok(entries) = std::fs::read_dir(state_root) else {
+        return Vec::new();
+    };
+    let prefix = format!("{legacy}-");
+    let mut names = Vec::new();
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if name == legacy {
+            names.push(name);
+            continue;
+        }
+        if !name.starts_with(&prefix) {
+            continue;
+        }
+        let path = entry.path().join(SANDBOX_RECORD_FILE);
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        match serde_json::from_str::<SandboxRecord>(&content) {
+            Ok(record)
+                if record.worktree == worktree
+                    && super::sandbox_name_in(project_root, &worktree, &record.agent) == name =>
+            {
+                names.push(name)
+            }
+            Ok(_) => {}
+            Err(e) => warn!(?path, error = %e, "corrupted sbx sandbox record, ignoring"),
+        }
+    }
+    names
 }
 
 /// File in a sandbox's state directory holding the network rules workmux
@@ -508,12 +593,14 @@ fn run_sbx(command: &SbxCommand) -> Result<()> {
 /// policy rules, recording the ones workmux writes for `sandbox.network`
 /// and the toolchain, and provision a sandbox it created (built-in
 /// provisioning, then the `provision` script), removing it again if
-/// provisioning fails. Returns the plan, whose `exec` the caller runs.
+/// provisioning fails. `selected_agent` is the pane's agent (a named agent,
+/// or an agent type by its own name), whose own sandbox it is. Returns the
+/// plan, whose `exec` the caller runs.
 pub fn prepare_launch(
     config: &Config,
     worktree_root: &Path,
     pane_cwd: &Path,
-    agent: &str,
+    selected_agent: &str,
     exec: &ExecRequest,
 ) -> Result<LaunchPlan> {
     let worktree_root = worktree_root
@@ -522,10 +609,12 @@ pub fn prepare_launch(
     let pane_cwd = pane_cwd
         .canonicalize()
         .unwrap_or_else(|_| pane_cwd.to_path_buf());
-    let name = super::sandbox_name(&worktree_root)?;
+    let name = super::sandbox_name(&worktree_root, selected_agent)?;
+    let agent = super::agent_type(config, selected_agent);
     let state_dir = sbx_state_dir_path(&name)?;
     std::fs::create_dir_all(&state_dir)
         .with_context(|| format!("Failed to create {}", state_dir.display()))?;
+    write_sandbox_record(&state_dir, &worktree_root, selected_agent)?;
     // sbx mounts only directories that exist.
     if let Some(config_dir) = config.sandbox.resolved_agent_config_dir(agent) {
         let _ = std::fs::create_dir_all(&config_dir);
@@ -761,17 +850,13 @@ fn hang_up(plan: &LaunchPlan) {
     }
 }
 
-/// Ensure the worktree's sbx sandbox exists, creating it if necessary.
+/// Ensure the worktree's sbx sandbox for `agent` (a named agent, or an
+/// agent type by its own name) exists, creating it if necessary.
 ///
 /// Should be called from the main process BEFORE creating tmux panes, so
 /// setup errors and progress appear in the user's terminal. Returns the
 /// sandbox name.
-pub fn ensure_sandbox(config: &Config, worktree_root: &Path) -> Result<String> {
-    let agent = crate::multiplexer::agent::resolve_profile_with_type(
-        config.agent.as_deref(),
-        config.agent_type.as_deref(),
-    )
-    .name();
+pub fn ensure_sandbox(config: &Config, worktree_root: &Path, agent: &str) -> Result<String> {
     let plan = prepare_launch(
         config,
         worktree_root,
@@ -911,6 +996,56 @@ mod tests {
                 toolchain: "none".to_string(),
                 ..Default::default()
             })
+        );
+    }
+
+    #[test]
+    fn removal_finds_each_agents_sandbox_of_the_worktree_by_exact_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_root = temp.path().join("docker-sbx");
+        let project = temp.path().join("proj");
+        let worktree = temp.path().join("proj__worktrees/a");
+        let other = temp.path().join("proj-x__worktrees/b");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let launch = |worktree: &Path, project: &Path, agent: &str| {
+            let name = super::super::sandbox_name_in(project, worktree, agent);
+            let state_dir = state_root.join(&name);
+            std::fs::create_dir_all(&state_dir).unwrap();
+            write_sandbox_record(&state_dir, worktree, agent).unwrap();
+            name
+        };
+        let claude = launch(&worktree, &project, "claude");
+        let personal = launch(&worktree, &project, "cc-personal");
+        let legacy = super::super::legacy_sandbox_name_in(&project, &worktree);
+        // Another worktree's sandbox whose name starts with this worktree's,
+        // as one of a project named `proj-<hash8>` would.
+        let lookalike = format!("{legacy}-deadbeef-claude");
+        std::fs::create_dir_all(state_root.join(&lookalike)).unwrap();
+        write_sandbox_record(&state_root.join(&lookalike), &other, "claude").unwrap();
+        let unrecorded = format!("{legacy}-codex");
+        std::fs::create_dir_all(state_root.join(&unrecorded)).unwrap();
+        launch(&other, &project, "claude");
+
+        let mut found = worktree_sandboxes_in(&state_root, &project, &worktree);
+        found.sort();
+        let mut expected = vec![claude.clone(), personal.clone()];
+        expected.sort();
+        assert_eq!(found, expected);
+
+        // The sandbox named before agents were part of the name, once it exists.
+        std::fs::create_dir_all(state_root.join(&legacy)).unwrap();
+        let found = worktree_sandboxes_in(&state_root, &project, &worktree);
+        assert!(found.contains(&legacy), "{found:?}");
+        assert_eq!(found.len(), 3, "{found:?}");
+    }
+
+    #[test]
+    fn removal_finds_nothing_without_state() {
+        let temp = tempfile::tempdir().unwrap();
+        assert!(
+            worktree_sandboxes_in(&temp.path().join("missing"), temp.path(), temp.path())
+                .is_empty()
         );
     }
 

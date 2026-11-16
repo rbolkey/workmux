@@ -70,6 +70,10 @@ impl Drop for ContainerGuard {
 /// Detects the sandbox backend from config and dispatches to the
 /// appropriate handler (Lima VM, Docker/Podman container or sbx sandbox).
 ///
+/// `agent` is the pane's agent (a named agent, or an agent type by its own
+/// name); under docker_sbx it picks the agent's own sandbox, and defaults to
+/// the selected agent. The other backends run the configured agent's.
+///
 /// With `node` (root and workspace id), the supervisor runs on a remote node
 /// for an agent the laptop started: the config is the workspace's frozen
 /// snapshot, state lives under the node root, listeners bind only to
@@ -78,6 +82,7 @@ pub fn run(
     worktree: PathBuf,
     worktree_root: Option<PathBuf>,
     command: Vec<String>,
+    agent: Option<String>,
     node: Option<(PathBuf, String)>,
 ) -> Result<i32> {
     if command.is_empty() {
@@ -111,7 +116,15 @@ pub fn run(
             let wt_root = worktree_root
                 .map(|p| p.canonicalize().unwrap_or(p))
                 .unwrap_or_else(|| worktree.clone());
-            run_docker_sbx(&config, frozen_config.path(), &worktree, &wt_root, &command)
+            let agent = agent.unwrap_or_else(|| docker_sbx::selected_agent(&config, None));
+            run_docker_sbx(
+                &config,
+                frozen_config.path(),
+                &worktree,
+                &wt_root,
+                &agent,
+                &command,
+            )
         }
         SandboxBackend::Container => {
             let wt_root = worktree_root
@@ -377,11 +390,13 @@ fn run_docker_sbx(
     frozen_config_path: &Path,
     pane_cwd: &Path,
     worktree_root: &Path,
+    agent: &str,
     command: &[String],
 ) -> Result<i32> {
     info!(
         pane_cwd = %pane_cwd.display(),
         worktree_root = %worktree_root.display(),
+        agent,
         "sandbox supervisor starting (docker_sbx)"
     );
 
@@ -393,12 +408,6 @@ fn run_docker_sbx(
             worktree_root.display()
         );
     }
-
-    let agent = crate::multiplexer::agent::resolve_profile_with_type(
-        config.agent.as_deref(),
-        config.agent_type.as_deref(),
-    )
-    .name();
 
     // Resolve toolchain for host-exec command wrapping (runs on host, not in the sandbox)
     let detected = toolchain::resolve_toolchain(&config.sandbox.toolchain(), worktree_root);
@@ -415,7 +424,7 @@ fn run_docker_sbx(
         .filter(|cmd| !shims::is_clipboard_shim(cmd))
         .cloned()
         .collect();
-    let sandbox_name = docker_sbx::sandbox_name(worktree_root)?;
+    let sandbox_name = docker_sbx::sandbox_name(worktree_root, agent)?;
     let state_dir = docker_sbx::sbx_state_dir_path(&sandbox_name)?;
     shims::create_shim_directory(&state_dir, &host_commands)?;
     info!(commands = ?host_commands, "created host-exec shims");

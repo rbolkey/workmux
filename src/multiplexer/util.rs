@@ -621,6 +621,52 @@ mod tests {
     }
 
     #[test]
+    fn panes_name_their_agent_as_named_agent_or_agent_type() {
+        let mut config = config_with_agent("cc-personal");
+        for (name, command, kind) in [
+            ("cc-personal", "claude", "claude"),
+            ("codex-mini", "codex", "codex"),
+        ] {
+            config.agents.insert(
+                name.to_string(),
+                crate::config::AgentEntry {
+                    command: Some(command.to_string()),
+                    agent_type: Some(kind.to_string()),
+                    args: Vec::new(),
+                    env: std::collections::BTreeMap::new(),
+                },
+            );
+        }
+        let agent_name = |command: &str, task_agent: Option<&str>| {
+            resolve_pane_command_with_config(
+                Some(command),
+                true,
+                None,
+                Path::new("/tmp"),
+                &config,
+                task_agent,
+                "/bin/zsh",
+            )
+            .unwrap()
+            .selected_agent
+            .map(|agent| agent.name().to_string())
+        };
+        // The "design" layout: the default agent's command, and another agent type.
+        assert_eq!(agent_name("claude", None).as_deref(), Some("cc-personal"));
+        assert_eq!(agent_name("codex", None).as_deref(), Some("codex"));
+        assert_eq!(agent_name("<agent>", None).as_deref(), Some("cc-personal"));
+        assert_eq!(
+            agent_name("<agent>", Some("codex")).as_deref(),
+            Some("codex")
+        );
+        assert_eq!(
+            agent_name("<agent:codex-mini>", None).as_deref(),
+            Some("codex-mini")
+        );
+        assert_eq!(agent_name("vim", None), None);
+    }
+
+    #[test]
     fn resolve_structured_pane_command_applies_env_and_prompt() {
         let prompt = PathBuf::from("/tmp/worktree/PROMPT.md");
         let working_dir = PathBuf::from("/tmp/worktree");

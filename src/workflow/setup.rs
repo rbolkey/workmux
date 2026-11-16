@@ -414,14 +414,59 @@ fn pre_boot_lima_vm(
     }
 
     if config.sandbox.backend() == crate::config::SandboxBackend::DockerSbx {
-        info!("creating sbx sandbox before window creation");
-        crate::sandbox::ensure_docker_sbx_sandbox(config, worktree_path)?;
+        for sandbox_agent in docker_sbx_agents(config, panes, working_dir, options, agent, &shell) {
+            info!(agent = %sandbox_agent, "creating sbx sandbox before window creation");
+            crate::sandbox::ensure_docker_sbx_sandbox(config, worktree_path, &sandbox_agent)?;
+        }
         return Ok(None);
     }
 
     info!("pre-booting Lima VM before window creation");
     let vm_name = crate::sandbox::ensure_lima_vm(config, worktree_path)?;
     Ok(Some(vm_name))
+}
+
+/// The distinct agents whose sbx sandboxes the worktree's panes run in,
+/// resolving commands the same way setup_panes does: each sandboxed agent
+/// pane's own agent, and the selected agent for plain panes under
+/// `target: all`.
+fn docker_sbx_agents(
+    config: &config::Config,
+    panes: &[config::PaneConfig],
+    working_dir: &Path,
+    options: &super::types::SetupOptions,
+    agent: Option<&str>,
+    shell: &str,
+) -> Vec<String> {
+    let mut agents: Vec<String> = Vec::new();
+    for (i, pane_config) in panes.iter().enumerate() {
+        // setup_panes skips non-first panes that have no split direction.
+        if i > 0 && pane_config.split.is_none() {
+            continue;
+        }
+        let Some(resolved) = crate::multiplexer::util::resolve_pane_command_with_config(
+            pane_config.command.as_deref(),
+            options.run_pane_commands,
+            options.prompt_file_path.as_deref(),
+            working_dir,
+            config,
+            agent,
+            shell,
+        ) else {
+            continue;
+        };
+        if resolved.selected_agent.is_none()
+            && config.sandbox.target() == crate::config::SandboxTarget::Agent
+        {
+            continue;
+        }
+        let pane_agent =
+            crate::sandbox::docker_sbx::pane_agent(config, resolved.selected_agent.as_ref(), agent);
+        if !agents.contains(&pane_agent) {
+            agents.push(pane_agent);
+        }
+    }
+    agents
 }
 
 fn resolve_effective_agent(config: &config::Config, cli_agent: Option<&str>) -> Option<String> {
@@ -791,6 +836,70 @@ mod tests {
 
         let result = resolve_pane_configuration(&original_panes, &config, Some("cc-work"));
         assert_eq!(result[0].command, Some("nvim".to_string()));
+    }
+
+    // --- docker_sbx sandbox agents tests ---
+
+    fn sbx_agents(
+        panes: &[config::PaneConfig],
+        config: &config::Config,
+        cli_agent: Option<&str>,
+    ) -> Vec<String> {
+        let mut options = make_options_with_prompt(true);
+        options.prompt_file_path = None;
+        super::docker_sbx_agents(
+            config,
+            panes,
+            Path::new("/tmp/wt"),
+            &options,
+            cli_agent,
+            "/bin/zsh",
+        )
+    }
+
+    fn sbx_config(agent: &str, target: crate::config::SandboxTarget) -> config::Config {
+        let mut config = make_config_with_agent(Some(agent));
+        config.selected_agent = Some(agent.to_string());
+        config.sandbox.target = Some(target);
+        config
+    }
+
+    #[test]
+    fn design_layout_gets_a_sandbox_per_agent() {
+        use crate::config::SandboxTarget;
+        let panes = vec![prompt_pane("claude"), split_prompt_pane("codex")];
+        let config = sbx_config("claude", SandboxTarget::Agent);
+        assert_eq!(sbx_agents(&panes, &config, None), ["claude", "codex"]);
+
+        let mut config = sbx_config("cc-personal", SandboxTarget::Agent);
+        config.agents.insert(
+            "cc-personal".to_string(),
+            config::AgentEntry {
+                command: Some("claude".to_string()),
+                agent_type: Some("claude".to_string()),
+                args: Vec::new(),
+                env: std::collections::BTreeMap::new(),
+            },
+        );
+        config.agent = Some("claude".to_string());
+        config.agent_type = Some("claude".to_string());
+        assert_eq!(sbx_agents(&panes, &config, None), ["cc-personal", "codex"]);
+    }
+
+    #[test]
+    fn plain_panes_use_the_selected_agents_sandbox_under_target_all() {
+        use crate::config::SandboxTarget;
+        let panes = vec![prompt_pane("<agent>"), split_prompt_pane("vim")];
+        let config = sbx_config("claude", SandboxTarget::All);
+        assert_eq!(sbx_agents(&panes, &config, None), ["claude"]);
+        assert_eq!(sbx_agents(&panes, &config, Some("codex")), ["codex"]);
+        let config = sbx_config("claude", SandboxTarget::Agent);
+        assert_eq!(
+            sbx_agents(&[prompt_pane("vim")], &config, None),
+            Vec::<String>::new()
+        );
+        let config = sbx_config("claude", SandboxTarget::All);
+        assert_eq!(sbx_agents(&[prompt_pane("vim")], &config, None), ["claude"]);
     }
 
     // --- validate_prompt_consumption tests ---
