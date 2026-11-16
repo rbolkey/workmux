@@ -512,3 +512,101 @@ class TestSetupInstall:
         assert "UserPromptSubmit" in settings["hooks"]
         assert "Notification" in settings["hooks"]
         assert "PostToolUse" in settings["hooks"]
+
+
+# ---------------------------------------------------------------------------
+# One agent type into a given directory (hidden; run in sandbox guests)
+# ---------------------------------------------------------------------------
+
+
+class TestSetupOneAgent:
+    """`setup --agent <type> --config-dir <dir>` installs without prompting."""
+
+    def test_installs_claude_hooks_without_a_terminal(
+        self,
+        mux_server: MuxEnvironment,
+        workmux_exe_path: Path,
+        repo_path: Path,
+        tmp_path: Path,
+    ):
+        config_dir = tmp_path / "guest" / ".claude"
+
+        run_workmux_command(
+            mux_server,
+            workmux_exe_path,
+            repo_path,
+            f"setup --agent claude --config-dir {config_dir}",
+            stdin_input="",
+        )
+
+        settings = json.loads((config_dir / "settings.json").read_text())
+        stop_commands = [
+            hook["command"]
+            for group in settings["hooks"]["Stop"]
+            for hook in group["hooks"]
+        ]
+        assert "workmux set-window-status done" in stop_commands
+        # The user's own home is left alone.
+        assert not (mux_server.home_path / ".claude").exists()
+
+    def test_installs_the_opencode_plugin_for_the_installed_version(
+        self,
+        mux_server: MuxEnvironment,
+        workmux_exe_path: Path,
+        repo_path: Path,
+        tmp_path: Path,
+    ):
+        install_opencode_version(mux_server, "v2.0.18")
+        config_dir = tmp_path / "guest" / ".config" / "opencode"
+
+        run_workmux_command(
+            mux_server,
+            workmux_exe_path,
+            repo_path,
+            f"setup --agent opencode --config-dir {config_dir}",
+            stdin_input="",
+        )
+
+        plugin_dir = config_dir / "plugins" / "workmux-status"
+        bundled = (
+            Path(__file__).parent.parent / "resources" / "opencode" / "v2"
+        ) / "workmux-status"
+        for name in ("index.ts", "tui.ts", "status.ts"):
+            assert (plugin_dir / name).read_text() == (bundled / name).read_text()
+
+    def test_fails_when_the_hooks_cant_be_written(
+        self,
+        mux_server: MuxEnvironment,
+        workmux_exe_path: Path,
+        repo_path: Path,
+        tmp_path: Path,
+    ):
+        blocker = tmp_path / "not-a-dir"
+        blocker.write_text("")
+
+        result = run_workmux_command(
+            mux_server,
+            workmux_exe_path,
+            repo_path,
+            f"setup --agent codex --config-dir {blocker}",
+            stdin_input="",
+            expect_fail=True,
+        )
+        assert str(blocker) in result.stderr
+
+    def test_an_unknown_agent_type_fails(
+        self,
+        mux_server: MuxEnvironment,
+        workmux_exe_path: Path,
+        repo_path: Path,
+        tmp_path: Path,
+    ):
+        result = run_workmux_command(
+            mux_server,
+            workmux_exe_path,
+            repo_path,
+            f"setup --agent nope --config-dir {tmp_path}",
+            stdin_input="",
+            expect_fail=True,
+        )
+        assert "nope" in result.stderr

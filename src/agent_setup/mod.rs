@@ -408,15 +408,18 @@ pub fn check_in(agent: Agent, dir: &Path) -> Result<StatusCheck> {
     }
 }
 
-/// Install status tracking for `agent` in `dir`; see [`check_in`].
+/// Install status tracking for `agent` in `dir`; see [`check_in`]. OpenCode's
+/// plugin layout follows the version of the `opencode` on `PATH`.
 pub fn install_in(agent: Agent, dir: &Path) -> Result<String> {
     match agent {
         Agent::Claude => claude::install_dir(dir),
         Agent::Codex => codex::install_dir(dir),
+        Agent::Copilot => copilot::install_dir(dir),
         Agent::Gemini => gemini::install_dir(dir),
+        Agent::OpenCode => opencode::install_dir(dir),
         Agent::Pi => pi::install_dir(dir),
         Agent::Omp => omp::install_dir(dir),
-        Agent::Antigravity | Agent::Copilot | Agent::Grok | Agent::OpenCode => {
+        Agent::Antigravity | Agent::Grok => {
             anyhow::bail!("{} cannot be set up in a given directory", agent.name())
         }
     }
@@ -688,6 +691,133 @@ mod tests {
             Some(&extensions.join("workmux-status.ts")),
             Some(&alias.join("workmux-status.ts")),
         ));
+    }
+
+    /// Every hook command of `event` in a hooks object (`{event: [group]}`,
+    /// each group holding `hooks: [{command}]`).
+    fn commands_of(hooks: &serde_json::Value, event: &str) -> Vec<String> {
+        hooks[event]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|group| group["hooks"].as_array().into_iter().flatten())
+            .filter_map(|hook| hook["command"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    fn read_json(path: &Path) -> serde_json::Value {
+        serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn install_in_merges_claudes_hooks_into_the_settings_already_there() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("settings.json"),
+            r#"{"model": "opus", "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "notify-me"}]}]}}"#,
+        )
+        .unwrap();
+
+        install_in(Agent::Claude, dir.path()).unwrap();
+
+        let settings = read_json(&dir.path().join("settings.json"));
+        assert_eq!(settings["model"], "opus");
+        let stop = commands_of(&settings["hooks"], "Stop");
+        assert!(stop.contains(&"notify-me".to_string()), "{stop:?}");
+        assert!(
+            stop.iter()
+                .any(|c| c.contains("workmux set-window-status done")),
+            "{stop:?}"
+        );
+        assert!(
+            commands_of(&settings["hooks"], "UserPromptSubmit")
+                .iter()
+                .any(|c| c.contains("workmux set-window-status working")),
+            "{settings}"
+        );
+    }
+
+    #[test]
+    fn install_in_writes_codexs_hooks_and_turns_its_hooks_feature_on() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.toml"),
+            "model_provider = \"sandboxd\"\n\n[model_providers.sandboxd]\nname = \"Sandbox Proxy\"\n",
+        )
+        .unwrap();
+
+        install_in(Agent::Codex, dir.path()).unwrap();
+
+        let hooks = read_json(&dir.path().join("hooks.json"));
+        assert!(
+            commands_of(&hooks["hooks"], "Stop")
+                .iter()
+                .any(|c| c.contains("workmux set-window-status done")),
+            "{hooks}"
+        );
+        let config: toml_edit::DocumentMut = fs::read_to_string(dir.path().join("config.toml"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(config["features"]["hooks"].as_bool(), Some(true));
+        assert_eq!(config["model_provider"].as_str(), Some("sandboxd"));
+        assert_eq!(
+            config["model_providers"]["sandboxd"]["name"].as_str(),
+            Some("Sandbox Proxy")
+        );
+    }
+
+    #[test]
+    fn install_in_writes_geminis_hooks_into_its_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("settings.json"),
+            r#"{"security": {"auth": {"selectedType": "gemini-api-key"}}}"#,
+        )
+        .unwrap();
+
+        install_in(Agent::Gemini, dir.path()).unwrap();
+
+        let settings = read_json(&dir.path().join("settings.json"));
+        assert_eq!(
+            settings["security"]["auth"]["selectedType"],
+            "gemini-api-key"
+        );
+        assert!(
+            commands_of(&settings["hooks"], "AfterAgent")
+                .iter()
+                .any(|c| c.contains("workmux set-window-status done")),
+            "{settings}"
+        );
+    }
+
+    #[test]
+    fn install_in_writes_copilots_personal_hook_file() {
+        let dir = tempfile::tempdir().unwrap();
+
+        install_in(Agent::Copilot, dir.path()).unwrap();
+
+        let hooks = read_json(&dir.path().join("hooks/workmux-status.json"));
+        assert_eq!(hooks["version"], 1);
+        assert!(
+            hooks["hooks"]["agentStop"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|hook| hook["bash"] == "workmux set-window-status done"),
+            "{hooks}"
+        );
+    }
+
+    #[test]
+    fn install_in_fails_when_the_directory_cant_be_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("not-a-dir");
+        fs::write(&file, "").unwrap();
+
+        for agent in [Agent::Claude, Agent::Codex, Agent::Gemini, Agent::Copilot] {
+            assert!(install_in(agent, &file).is_err(), "{agent:?}");
+        }
     }
 
     #[test]

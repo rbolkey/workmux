@@ -204,6 +204,9 @@ pub struct LaunchPlan {
     pub masks: Vec<Mask>,
     /// Commands to run, in order, after `create` and before `exec`.
     pub setup: Vec<SbxCommand>,
+    /// Installs workmux's status hooks with the guest's `workmux setup`,
+    /// run after `setup` when the plan creates a sandbox under `agent: kit`.
+    pub status_hooks: Option<SbxCommand>,
     /// workmux's built-in provisioning, run after `setup` when the plan
     /// creates the sandbox, unless `skip_default_provision` is set: login
     /// shells keep the shims on `PATH`, and the toolchain is installed.
@@ -337,56 +340,44 @@ impl Kit {
         matches!(self, Self::Copilot)
     }
 
-    /// Installs workmux's status hooks for the kit's agent into the config
-    /// the kit wrote in sandbox `name`'s own home, as `workmux setup` would
-    /// into the workstation's.
-    fn status_hooks(self, name: &str) -> Result<Vec<SbxCommand>> {
-        use crate::agent_setup::{claude, codex, copilot, gemini, opencode};
-        Ok(match self {
-            Self::Claude => vec![agent_script(
+    /// Where the kit writes its agent's config, under the guest home.
+    fn config_subpath(self) -> &'static str {
+        match self {
+            Self::Claude => ".claude",
+            Self::Codex => ".codex",
+            Self::Copilot => ".copilot",
+            Self::Gemini => ".gemini",
+            Self::OpenCode => OPENCODE_CONFIG_SUBPATH,
+        }
+    }
+
+    /// Installs workmux's status hooks into the config the kit wrote in
+    /// sandbox `name`, with the guest's own `workmux setup`, as the agent.
+    fn status_hooks(self, name: &str) -> SbxCommand {
+        let config_dir = format!("{GUEST_HOME}/{}", self.config_subpath());
+        SbxCommand {
+            args: words(&[
+                "exec",
                 name,
-                CLAUDE_KIT_HOOKS_SCRIPT,
-                vec![serde_json::to_string(&claude::load_hooks_from_plugin()?)?],
-            )],
-            Self::Codex => vec![
-                agent_script(
-                    name,
-                    JSON_HOOKS_SCRIPT,
-                    vec![
-                        ".codex/hooks.json".to_string(),
-                        serde_json::to_string(&codex::load_hooks()?)?,
-                    ],
-                ),
-                agent_script(name, CODEX_KIT_CONFIG_SCRIPT, Vec::new()),
-            ],
-            Self::Gemini => vec![agent_script(
-                name,
-                JSON_HOOKS_SCRIPT,
-                vec![
-                    ".gemini/settings.json".to_string(),
-                    serde_json::to_string(&gemini::load_hooks()?)?,
-                ],
-            )],
-            Self::Copilot => vec![agent_script(
-                name,
-                WRITE_FILE_SCRIPT,
-                vec![
-                    ".copilot/hooks/workmux-status.json".to_string(),
-                    copilot::HOOKS_JSON.to_string(),
-                ],
-            )],
-            Self::OpenCode => {
-                let mut sources = vec![opencode::PLUGIN_SOURCE.to_string()];
-                for file in ["index.ts", "tui.ts", "status.ts"] {
-                    let (_, source) = opencode::V2_FILES
-                        .iter()
-                        .find(|(name, _)| *name == file)
-                        .context("OpenCode plugin file missing")?;
-                    sources.push(source.to_string());
-                }
-                vec![agent_script(name, OPENCODE_KIT_PLUGIN_SCRIPT, sources)]
-            }
-        })
+                "workmux",
+                "setup",
+                "--agent",
+                self.name(),
+                "--config-dir",
+                &config_dir,
+            ]),
+            env: Vec::new(),
+        }
+    }
+
+    /// Drops the kit's own hooks that call an sbx helper missing from the
+    /// template.
+    fn helper_removal(self, name: &str) -> Option<SbxCommand> {
+        match self {
+            Self::Claude => Some(agent_script(name, CLAUDE_KIT_HELPER_SCRIPT)),
+            Self::Codex => Some(agent_script(name, CODEX_KIT_HELPER_SCRIPT)),
+            Self::Copilot | Self::Gemini | Self::OpenCode => None,
+        }
     }
 }
 
@@ -418,77 +409,34 @@ fn ignored_config_dir_note(config: &SandboxConfig, kit: Kit) -> Option<String> {
     })
 }
 
-/// Merges workmux's status hook groups (`$1`) into the claude kit's
-/// `~/.claude/settings.json` in the guest, beside the kit's own. The kit's
-/// hooks and status line call `/usr/local/bin/sbx-claude-hook`, which comes
-/// with sbx's own claude image, not workmux's template; where it's missing
-/// they're dropped, as each would fail on every prompt.
-const CLAUDE_KIT_HOOKS_SCRIPT: &str = r#"f="$HOME/.claude/settings.json"
-helper=false
-[ -x /usr/local/bin/sbx-claude-hook ] && helper=true
-[ -s "$f" ] || { mkdir -p "${f%/*}" && echo '{}' > "$f"; }
-jq --argjson hooks "$1" --argjson helper "$helper" '
+/// Drops the claude kit's hooks and status line from
+/// `~/.claude/settings.json` when the guest lacks the helper they call,
+/// `/usr/local/bin/sbx-claude-hook`, which comes with sbx's own claude
+/// image, not workmux's template. Each would fail on every prompt.
+const CLAUDE_KIT_HELPER_SCRIPT: &str = r#"[ -x /usr/local/bin/sbx-claude-hook ] && exit 0
+f="$HOME/.claude/settings.json"
+[ -s "$f" ] || exit 0
+jq '
 def kit: (.command? // "") | contains("sbx-claude-hook");
-(if $helper then . else
-  (if (.statusLine | kit) then del(.statusLine) else . end)
-  | if .hooks then .hooks |= (map_values(map(.hooks |= map(select(kit | not))
-      | select(.hooks | length > 0))) | with_entries(select(.value | length > 0)))
-    else . end
-end)
-| .hooks = reduce ($hooks | to_entries[]) as $e (.hooks // {}; .[$e.key] += $e.value)
+(if (.statusLine | kit) then del(.statusLine) else . end)
+| if .hooks then .hooks |= (map_values(map(.hooks |= map(select(kit | not))
+    | select(.hooks | length > 0))) | with_entries(select(.value | length > 0)))
+  else . end
 ' "$f" > "$f.tmp" && mv "$f.tmp" "$f""#;
 
-/// Merges status hook groups (`$2`, by event) into the JSON config at
-/// `$HOME/$1` in the guest, after the groups already there.
-const JSON_HOOKS_SCRIPT: &str = r#"f="$HOME/$1"
-[ -s "$f" ] || { mkdir -p "${f%/*}" && echo '{}' > "$f"; }
-jq --argjson hooks "$2" '
-.hooks = reduce ($hooks | to_entries[]) as $e (.hooks // {}; .[$e.key] += $e.value)
-' "$f" > "$f.tmp" && mv "$f.tmp" "$f""#;
+/// Drops the codex kit's `notify` from `~/.codex/config.toml` when the guest
+/// lacks the helper it calls, `/usr/local/bin/sbx-codex-hook`, which comes
+/// with sbx's own codex image, not workmux's template. It would fail at the
+/// end of every turn.
+const CODEX_KIT_HELPER_SCRIPT: &str = r#"[ -x /usr/local/bin/sbx-codex-hook ] && exit 0
+f="$HOME/.codex/config.toml"
+[ -f "$f" ] || exit 0
+awk '!/^notify[ \t]*=.*sbx-codex-hook/' "$f" > "$f.tmp" && mv "$f.tmp" "$f""#;
 
-/// Turns Codex's hooks feature on in the codex kit's
-/// `~/.codex/config.toml`, without which it doesn't read `hooks.json`. The
-/// kit's `notify` calls `/usr/local/bin/sbx-codex-hook`, which comes with
-/// sbx's own codex image, not workmux's template; where it's missing it's
-/// dropped, as it would fail at the end of every turn.
-const CODEX_KIT_CONFIG_SCRIPT: &str = r#"f="$HOME/.codex/config.toml"
-mkdir -p "${f%/*}" && touch "$f"
-helper=0
-[ -x /usr/local/bin/sbx-codex-hook ] && helper=1
-awk -v helper="$helper" '
-/^\[/ { features = ($0 ~ /^\[features\][ \t]*$/) }
-/^\[features\][ \t]*$/ { print; print "hooks = true"; done = 1; next }
-features && /^[ \t]*hooks[ \t]*=/ { next }
-!helper && /^notify[ \t]*=.*sbx-codex-hook/ { next }
-{ print }
-END { if (!done) printf "\n[features]\nhooks = true\n" }
-' "$f" > "$f.tmp" && mv "$f.tmp" "$f""#;
-
-/// Writes `$2` to `$HOME/$1` in the guest.
-const WRITE_FILE_SCRIPT: &str = r#"f="$HOME/$1"
-mkdir -p "${f%/*}" && printf %s "$2" > "$f""#;
-
-/// Writes workmux's OpenCode plugin into the opencode kit's
-/// `~/.config/opencode/plugins` in the layout the guest's OpenCode reads:
-/// `$1` for OpenCode 1, `$2`–`$4` (`index.ts`, `tui.ts`, `status.ts`) for
-/// OpenCode 2.
-const OPENCODE_KIT_PLUGIN_SCRIPT: &str = r#"d="$HOME/.config/opencode/plugins"
-v=$(opencode --version 2>/dev/null | awk '{ print $NF }')
-case "${v#v}" in
-1.*) mkdir -p "$d" && printf %s "$1" > "$d/workmux-status.ts" ;;
-2.*) mkdir -p "$d/workmux-status" && printf %s "$2" > "$d/workmux-status/index.ts" \
-  && printf %s "$3" > "$d/workmux-status/tui.ts" \
-  && printf %s "$4" > "$d/workmux-status/status.ts" ;;
-*) echo "workmux can't install its status plugin for OpenCode version '$v'" >&2; exit 1 ;;
-esac"#;
-
-/// An agent-user `sh -c <script>` in the sandbox, with `script_args` as
-/// its `$1`….
-fn agent_script(name: &str, script: &str, script_args: Vec<String>) -> SbxCommand {
-    let mut args = words(&["exec", name, "sh", "-c", script, "sh"]);
-    args.extend(script_args);
+/// An agent-user `sh -c <script>` in the sandbox.
+fn agent_script(name: &str, script: &str) -> SbxCommand {
     SbxCommand {
-        args,
+        args: words(&["exec", name, "sh", "-c", script]),
         env: Vec::new(),
     }
 }
@@ -1304,6 +1252,7 @@ pub fn launch_plan(
     let name = target.sandbox_name;
     let mut setup = Vec::new();
     let mut create = None;
+    let mut status_hooks = None;
     let excluded = excluded_file_masks(config, target.worktree_root);
     let mut masks = Vec::new();
     let template = super::template::template_tag(&config.resolved_image(agent));
@@ -1435,11 +1384,13 @@ pub fn launch_plan(
             setup.push(root_exec(name, command));
         }
 
-        // The workstation's hooks aren't there under `kit`: install
-        // workmux's status hooks into the config the kit wrote, as the
-        // agent. The kit writes it only at create, so this lasts.
+        // The workstation's hooks aren't there under `kit`: workmux's go
+        // into the config the kit wrote (see `status_hooks`), after the
+        // kit's own that would fail are dropped. The kit writes its config
+        // only at create, so this lasts.
         if let Some(kit) = kit {
-            setup.extend(kit.status_hooks(name)?);
+            setup.extend(kit.helper_removal(name));
+            status_hooks = Some(kit.status_hooks(name));
         }
     }
 
@@ -1528,6 +1479,7 @@ pub fn launch_plan(
         create,
         masks,
         setup,
+        status_hooks,
         default_provision,
         provision,
         exec: exec_command(target, exec),
@@ -3210,150 +3162,43 @@ mod tests {
         }
     }
 
-    /// The setup commands that edit Claude's settings in the guest.
-    fn claude_settings_edits(plan: &LaunchPlan) -> Vec<Vec<String>> {
-        setup_args(plan)
-            .into_iter()
-            .filter(|a| a.iter().any(|w| w.contains(".claude/settings.json")))
-            .collect()
+    /// The arguments of the plan's status-hook step, if it has one.
+    fn status_hooks_args(plan: &LaunchPlan) -> Option<Vec<String>> {
+        plan.status_hooks.as_ref().map(|c| c.args.clone())
     }
 
     #[test]
-    fn under_kit_a_created_claude_sandbox_gets_workmuxs_status_hooks_and_keeps_the_kits_onboarding()
-    {
-        // The workstation's hooks aren't mounted under `kit`; workmux's
-        // status hooks go into the settings the kit wrote, as the agent.
-        // The kit already completes onboarding and trusts the workspace.
+    fn under_kit_a_created_sandbox_gets_workmuxs_status_hooks_from_the_guests_workmux_setup() {
+        // The workstation's hooks aren't mounted under `kit`: the guest's
+        // workmux installs its status hooks into the config the kit wrote,
+        // as the agent user.
         let p = paths();
-        let plan = launch_plan(&kit_config(), &target(&p), "claude", &missing(), &exec()).unwrap();
-
-        let edits = claude_settings_edits(&plan);
-        assert_eq!(edits.len(), 1, "{:?}", plan.setup);
-        let edit = &edits[0];
-        assert_eq!(edit[..4], args(&["exec", "wm-proj-12345678", "sh", "-c"]));
-        let plugin: serde_json::Value =
-            serde_json::from_str(include_str!("../../../.claude-plugin/plugin.json")).unwrap();
-        assert!(
-            edit.iter().any(
-                |w| serde_json::from_str::<serde_json::Value>(w).ok().as_ref()
-                    == Some(&plugin["hooks"])
-            ),
-            "{edit:?}"
-        );
-        assert!(
-            !setup_args(&plan)
-                .iter()
-                .any(|a| a.iter().any(|w| w.contains(".claude.json"))),
-            "{:?}",
-            plan.setup
-        );
-
-        // Only when the sandbox is created: the kit writes its settings then.
-        let mut existing = paths();
-        existing.created = CreateRecord::Recorded(Box::new(plan.create_settings.clone()));
-        let plan = launch_plan(
-            &kit_config(),
-            &target(&existing),
-            "claude",
-            &running_with(Vec::new()),
-            &exec(),
-        )
-        .unwrap();
-        assert!(claude_settings_edits(&plan).is_empty(), "{:?}", plan.setup);
-
-        // Under `shell`, Claude has the workstation's own settings.
-        let plan = launch_plan(&config(), &target(&p), "claude", &missing(), &exec()).unwrap();
-        assert!(claude_settings_edits(&plan).is_empty(), "{:?}", plan.setup);
-    }
-
-    /// The agent-user setup commands one of whose words contains `needle`.
-    fn agent_setup_with(plan: &LaunchPlan, needle: &str) -> Vec<Vec<String>> {
-        setup_args(plan)
-            .into_iter()
-            .filter(|a| a[..2] == args(&["exec", "wm-proj-12345678"]))
-            .filter(|a| a.iter().any(|w| w.contains(needle)))
-            .collect()
-    }
-
-    /// Whether some word of `command` is JSON equal to `value`.
-    fn passes_json(command: &[String], value: &serde_json::Value) -> bool {
-        command
-            .iter()
-            .any(|w| serde_json::from_str::<serde_json::Value>(w).ok().as_ref() == Some(value))
-    }
-
-    fn embedded_hooks(source: &str) -> serde_json::Value {
-        serde_json::from_str::<serde_json::Value>(source).unwrap()["hooks"].clone()
-    }
-
-    #[test]
-    fn under_kit_every_kit_agent_gets_workmuxs_status_hooks_in_the_config_its_kit_wrote() {
-        // As for Claude: the workstation's hooks aren't there, so workmux's
-        // go into the sandbox's own config, as the agent, on create.
-        let p = paths();
-        let plan_for = |agent: &str| {
-            launch_plan(&kit_config(), &target(&p), agent, &missing(), &exec()).unwrap()
-        };
-
-        let codex = plan_for("codex");
-        let hooks = agent_setup_with(&codex, ".codex/hooks.json");
-        assert_eq!(hooks.len(), 1, "{:?}", codex.setup);
-        assert!(
-            passes_json(
-                &hooks[0],
-                &embedded_hooks(include_str!(
-                    "../../../resources/codex/hooks/workmux-status.json"
-                ))
-            ),
-            "{hooks:?}"
-        );
-        // Codex reads hooks.json only with its hooks feature on.
-        assert_eq!(
-            agent_setup_with(&codex, ".codex/config.toml").len(),
-            1,
-            "{:?}",
-            codex.setup
-        );
-
-        let gemini = plan_for("gemini");
-        let hooks = agent_setup_with(&gemini, ".gemini/settings.json");
-        assert_eq!(hooks.len(), 1, "{:?}", gemini.setup);
-        assert!(
-            passes_json(
-                &hooks[0],
-                &embedded_hooks(include_str!("../../../resources/gemini/settings.json"))
-            ),
-            "{hooks:?}"
-        );
-
-        let copilot = plan_for("copilot");
-        let hooks = agent_setup_with(&copilot, ".copilot/hooks/workmux-status.json");
-        assert_eq!(hooks.len(), 1, "{:?}", copilot.setup);
-        assert!(
-            hooks[0].contains(
-                &include_str!("../../../resources/copilot/hooks/workmux-status/hooks.json")
-                    .to_string()
-            ),
-            "{hooks:?}"
-        );
-
-        // OpenCode's plugin layout follows its version, found in the guest.
-        let opencode = plan_for("opencode");
-        let plugin = agent_setup_with(&opencode, ".config/opencode/plugins");
-        assert_eq!(plugin.len(), 1, "{:?}", opencode.setup);
-        for source in [
-            include_str!("../../../resources/opencode/plugins/workmux-status.ts"),
-            include_str!("../../../resources/opencode/v2/workmux-status/index.ts"),
-            include_str!("../../../resources/opencode/v2/workmux-status/tui.ts"),
-            include_str!("../../../resources/opencode/v2/workmux-status/status.ts"),
+        for (agent, config_dir) in [
+            ("claude", "/home/agent/.claude"),
+            ("codex", "/home/agent/.codex"),
+            ("copilot", "/home/agent/.copilot"),
+            ("gemini", "/home/agent/.gemini"),
+            ("opencode", "/home/agent/.config/opencode"),
         ] {
-            assert!(plugin[0].contains(&source.to_string()), "{plugin:?}");
-        }
+            let plan = launch_plan(&kit_config(), &target(&p), agent, &missing(), &exec()).unwrap();
+            assert_eq!(
+                status_hooks_args(&plan),
+                Some(args(&[
+                    "exec",
+                    "wm-proj-12345678",
+                    "workmux",
+                    "setup",
+                    "--agent",
+                    agent,
+                    "--config-dir",
+                    config_dir,
+                ])),
+                "{agent}"
+            );
 
-        // Only on create: the kit writes its config then.
-        for agent in ["codex", "gemini", "copilot", "opencode"] {
+            // Only when the sandbox is created: the kit writes its config then.
             let mut existing = paths();
-            existing.created = CreateRecord::Recorded(Box::new(plan_for(agent).create_settings));
+            existing.created = CreateRecord::Recorded(Box::new(plan.create_settings.clone()));
             let plan = launch_plan(
                 &kit_config(),
                 &target(&existing),
@@ -3362,53 +3207,136 @@ mod tests {
                 &exec(),
             )
             .unwrap();
-            assert!(
-                agent_setup_with(&plan, "workmux").is_empty(),
-                "{agent}: {:?}",
-                plan.setup
-            );
+            assert_eq!(status_hooks_args(&plan), None, "{agent}");
         }
+
+        // Under `shell`, the agent has the workstation's own hooks.
+        let plan = launch_plan(&config(), &target(&p), "claude", &missing(), &exec()).unwrap();
+        assert_eq!(status_hooks_args(&plan), None);
     }
 
     #[test]
-    fn codex_kit_config_gets_hooks_on_and_loses_the_notify_helper_the_template_lacks() {
-        // Run the script as the guest would, on the config the codex kit
-        // writes (sbx v0.51), with a home of its own.
+    fn under_kit_a_created_claude_sandbox_keeps_the_kits_onboarding() {
+        // The kit already completes onboarding and trusts the workspace.
+        let p = paths();
+        let plan = launch_plan(&kit_config(), &target(&p), "claude", &missing(), &exec()).unwrap();
+        assert!(
+            !setup_args(&plan)
+                .iter()
+                .any(|a| a.iter().any(|w| w.contains(".claude.json"))),
+            "{:?}",
+            plan.setup
+        );
+    }
+
+    /// Run `script` with `sh -c` in a home of its own, after writing
+    /// `content` to `file` there, and return the file's new content.
+    fn run_in_home(script: &str, file: &str, content: &str) -> String {
         let home = tempfile::tempdir().unwrap();
-        let config = home.path().join(".codex/config.toml");
-        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        let path = home.path().join(file);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, content).unwrap();
+        let status = std::process::Command::new("sh")
+            .args(["-c", script])
+            .env("HOME", home.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        std::fs::read_to_string(&path).unwrap()
+    }
+
+    /// The agent-user setup commands that run `sh -c` on a script naming
+    /// `helper`.
+    fn helper_removals(plan: &LaunchPlan, helper: &str) -> Vec<String> {
+        plan.setup
+            .iter()
+            .filter(|c| c.args[..2] == args(&["exec", "wm-proj-12345678"]))
+            .filter_map(|c| c.args.iter().find(|w| w.contains(helper)).cloned())
+            .collect()
+    }
+
+    #[test]
+    fn the_codex_kits_notify_helper_the_template_lacks_is_removed_at_create() {
+        let p = paths();
+        let plan = launch_plan(&kit_config(), &target(&p), "codex", &missing(), &exec()).unwrap();
+        let scripts = helper_removals(&plan, "sbx-codex-hook");
+        assert_eq!(scripts.len(), 1, "{:?}", plan.setup);
+
+        // Run it as the guest would, on the config the codex kit writes
+        // (sbx v0.51).
         let kit = "approval_policy = \"never\"\n\
                    notify = [\"/usr/local/bin/sbx-codex-hook\", \"codex\"]\n\
                    model_provider = \"sandboxd\"\n\
                    \n\
                    [model_providers.sandboxd]\n\
                    name = \"Sandbox Proxy\"\n";
-        let run = |content: &str| {
-            std::fs::write(&config, content).unwrap();
-            let status = std::process::Command::new("sh")
-                .args(["-c", CODEX_KIT_CONFIG_SCRIPT])
-                .env("HOME", home.path())
-                .status()
-                .unwrap();
-            assert!(status.success());
-            std::fs::read_to_string(&config).unwrap()
-        };
-
-        let edited: toml_edit::DocumentMut = run(kit).parse().unwrap();
-        assert_eq!(edited["features"]["hooks"].as_bool(), Some(true));
+        let edited: toml_edit::DocumentMut = run_in_home(&scripts[0], ".codex/config.toml", kit)
+            .parse()
+            .unwrap();
         assert!(!edited.contains_key("notify"), "{edited}");
-        assert_eq!(edited["model_provider"].as_str(), Some("sandboxd"));
+        assert_eq!(edited["approval_policy"].as_str(), Some("never"));
         assert_eq!(
             edited["model_providers"]["sandboxd"]["name"].as_str(),
             Some("Sandbox Proxy")
         );
 
-        // A features table already there gets hooks on once.
-        let edited: toml_edit::DocumentMut = run("[features]\nhooks = false\nweb_search = true\n")
-            .parse()
-            .unwrap();
-        assert_eq!(edited["features"]["hooks"].as_bool(), Some(true));
-        assert_eq!(edited["features"]["web_search"].as_bool(), Some(true));
+        // Not on a launch into an existing sandbox.
+        let mut existing = paths();
+        existing.created = CreateRecord::Recorded(Box::new(plan.create_settings.clone()));
+        let plan = launch_plan(
+            &kit_config(),
+            &target(&existing),
+            "codex",
+            &running_with(Vec::new()),
+            &exec(),
+        )
+        .unwrap();
+        assert!(helper_removals(&plan, "sbx-codex-hook").is_empty());
+    }
+
+    #[test]
+    fn the_claude_kits_hooks_and_status_line_calling_a_missing_helper_are_removed_at_create() {
+        if std::process::Command::new("jq")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: jq is not installed");
+            return;
+        }
+        let p = paths();
+        let plan = launch_plan(&kit_config(), &target(&p), "claude", &missing(), &exec()).unwrap();
+        let scripts = helper_removals(&plan, "sbx-claude-hook");
+        assert_eq!(scripts.len(), 1, "{:?}", plan.setup);
+
+        let kit = serde_json::json!({
+            "permissions": {"defaultMode": "bypassPermissions"},
+            "statusLine": {"type": "command", "command": "/usr/local/bin/sbx-claude-hook status"},
+            "hooks": {
+                "Stop": [
+                    {"hooks": [{"type": "command", "command": "/usr/local/bin/sbx-claude-hook stop"}]},
+                    {"hooks": [{"type": "command", "command": "notify-me"}]}
+                ],
+                "SessionStart": [
+                    {"hooks": [{"type": "command", "command": "/usr/local/bin/sbx-claude-hook start"}]}
+                ]
+            }
+        });
+        let edited: serde_json::Value = serde_json::from_str(&run_in_home(
+            &scripts[0],
+            ".claude/settings.json",
+            &kit.to_string(),
+        ))
+        .unwrap();
+        assert_eq!(
+            edited,
+            serde_json::json!({
+                "permissions": {"defaultMode": "bypassPermissions"},
+                "hooks": {
+                    "Stop": [{"hooks": [{"type": "command", "command": "notify-me"}]}]
+                }
+            })
+        );
     }
 
     #[test]

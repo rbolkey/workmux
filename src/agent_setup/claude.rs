@@ -120,8 +120,7 @@ fn uninstall_at(path: PathBuf) -> Result<String> {
     )
 }
 
-/// workmux's status hook groups for Claude's `settings.json`.
-pub(crate) fn load_hooks_from_plugin() -> Result<Value> {
+fn load_hooks_from_plugin() -> Result<Value> {
     json_config::hooks_from_embedded(PLUGIN_JSON, "plugin.json missing hooks key")
 }
 

@@ -12,8 +12,7 @@ use std::path::{Path, PathBuf};
 use super::{StatusCheck, UpdatePreview};
 
 /// Hooks configuration embedded at compile time.
-pub(crate) const HOOKS_JSON: &str =
-    include_str!("../../resources/copilot/hooks/workmux-status/hooks.json");
+const HOOKS_JSON: &str = include_str!("../../resources/copilot/hooks/workmux-status/hooks.json");
 const HOOKS_FILE_NAME: &str = "workmux-status.json";
 
 fn copilot_dir() -> Option<PathBuf> {
@@ -144,6 +143,11 @@ pub(crate) fn update_preview() -> Result<Option<UpdatePreview>> {
 pub fn install() -> Result<String> {
     let path = hooks_file().context("Could not determine home directory")?;
     install_at(&path)
+}
+
+/// [`install`] into the Copilot home `dir`.
+pub(crate) fn install_dir(dir: &Path) -> Result<String> {
+    install_at(&hooks_file_at(dir))
 }
 
 fn install_at(path: &Path) -> Result<String> {

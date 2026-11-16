@@ -750,6 +750,19 @@ fn apply_plan_with(
     if plan.network_rules != pending {
         write_network_record(state_dir, &plan.network_rules)?;
     }
+    // The hooks come from the template's workmux, which may predate the
+    // setup mode this one runs.
+    if let Some(command) = &plan.status_hooks
+        && let Err(error) = run(command)
+    {
+        remove_unfinished(name, &mut run);
+        return Err(error.context(format!(
+            "Installing workmux's status hooks in sbx sandbox {name} failed; the sandbox was \
+             removed. If the sandbox image's workmux is older than this one, update it: \
+             `workmux sandbox pull` for the published image, or `workmux sandbox install-dev` \
+             for a local build"
+        )));
+    }
     let built_in_failed = format!(
         "workmux's built-in provisioning failed in sbx sandbox {name}; the sandbox was \
          removed. `sbx policy log` lists requests sbx blocked; launch again, or set \
@@ -1056,7 +1069,7 @@ mod tests {
     }
 
     /// A plan that creates the sandbox again, with one setup command, the
-    /// built-in provisioning and a provision script.
+    /// status hooks, the built-in provisioning and a provision script.
     fn creating_plan() -> LaunchPlan {
         LaunchPlan {
             sandbox_name: "wm-test".to_string(),
@@ -1069,6 +1082,7 @@ mod tests {
                 "/code/proj/.env",
             ))],
             setup: vec![command("setup")],
+            status_hooks: Some(command("exec status-hooks")),
             default_provision: vec![command("exec built-in")],
             provision: Some(command("exec custom")),
             exec: command("exec agent"),
@@ -1130,6 +1144,7 @@ mod tests {
                 "rm -f wm-test",
                 "create --name wm-test",
                 "setup",
+                "exec status-hooks",
                 "exec built-in",
                 "exec custom"
             ]
@@ -1180,6 +1195,7 @@ mod tests {
     fn a_failure_after_create_removes_the_sandbox_it_created() {
         for (fail, message) in [
             ("setup", "Setting up sbx sandbox wm-test failed"),
+            ("exec status-hooks", "workmux sandbox install-dev"),
             ("exec built-in", "built-in provisioning failed"),
             ("exec custom", "sandbox.docker_sbx.provision failed"),
         ] {
@@ -1222,6 +1238,7 @@ mod tests {
             remove: None,
             create: None,
             masks: Vec::new(),
+            status_hooks: None,
             default_provision: Vec::new(),
             provision: None,
             ..creating_plan()
