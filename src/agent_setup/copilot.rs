@@ -145,6 +145,9 @@ pub fn install() -> Result<String> {
     install_at(&path)
 }
 
+/// The file [`install_dir`] writes, relative to `dir`.
+pub(super) const DIR_FILES: &[&str] = &["hooks/workmux-status.json"];
+
 /// [`install`] into the Copilot home `dir`.
 pub(crate) fn install_dir(dir: &Path) -> Result<String> {
     install_at(&hooks_file_at(dir))

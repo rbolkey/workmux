@@ -348,27 +348,17 @@ impl Kit {
 
     /// Merge workmux's status hooks into the config the kit wrote.
     fn status_hooks(self) -> StatusHooks {
-        let (agent, files): (Agent, &'static [&'static str]) = match self {
-            Self::Claude => (Agent::Claude, &["settings.json"]),
-            Self::Codex => (Agent::Codex, &["hooks.json", "config.toml"]),
-            Self::Copilot => (Agent::Copilot, &["hooks/workmux-status.json"]),
-            Self::Gemini => (Agent::Gemini, &["settings.json"]),
-            Self::OpenCode => (
-                Agent::OpenCode,
-                &[
-                    ".workmux-status.json",
-                    "plugins/workmux-status.ts",
-                    "plugin/workmux-status.ts",
-                    "plugins/workmux-status/index.ts",
-                    "plugins/workmux-status/tui.ts",
-                    "plugins/workmux-status/status.ts",
-                ],
-            ),
+        let agent = match self {
+            Self::Claude => Agent::Claude,
+            Self::Codex => Agent::Codex,
+            Self::Copilot => Agent::Copilot,
+            Self::Gemini => Agent::Gemini,
+            Self::OpenCode => Agent::OpenCode,
         };
         StatusHooks {
             agent,
             config_dir: format!("{GUEST_HOME}/{}", self.config_subpath()),
-            files,
+            files: crate::agent_setup::dir_files(agent),
         }
     }
 

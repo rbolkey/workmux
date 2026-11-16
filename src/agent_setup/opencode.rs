@@ -452,6 +452,17 @@ pub fn install() -> Result<String> {
     install_version(&config_dir, installed_version()?)
 }
 
+/// The files [`install_dir_for`] reads, writes or removes, relative to
+/// `config_dir`.
+pub(super) const DIR_FILES: &[&str] = &[
+    MANIFEST_FILE,
+    "plugins/workmux-status.ts",
+    "plugin/workmux-status.ts",
+    "plugins/workmux-status/index.ts",
+    "plugins/workmux-status/tui.ts",
+    "plugins/workmux-status/status.ts",
+];
+
 /// [`install`] into `config_dir` for the OpenCode whose `--version` printed
 /// `version`.
 pub(crate) fn install_dir_for(config_dir: &Path, version: &str) -> Result<String> {

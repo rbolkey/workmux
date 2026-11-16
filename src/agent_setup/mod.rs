@@ -408,6 +408,21 @@ pub fn check_in(agent: Agent, dir: &Path) -> Result<StatusCheck> {
     }
 }
 
+/// List the files, relative to the dir, that installing `agent` in a dir
+/// reads or writes: [`install_in`], or [`opencode::install_dir_for`].
+pub fn dir_files(agent: Agent) -> &'static [&'static str] {
+    match agent {
+        Agent::Claude => claude::DIR_FILES,
+        Agent::Codex => codex::DIR_FILES,
+        Agent::Copilot => copilot::DIR_FILES,
+        Agent::Gemini => gemini::DIR_FILES,
+        Agent::OpenCode => opencode::DIR_FILES,
+        Agent::Pi => pi::DIR_FILES,
+        Agent::Omp => omp::DIR_FILES,
+        Agent::Antigravity | Agent::Grok => &[],
+    }
+}
+
 /// Install status tracking for `agent` in `dir`; see [`check_in`].
 pub fn install_in(agent: Agent, dir: &Path) -> Result<String> {
     match agent {
