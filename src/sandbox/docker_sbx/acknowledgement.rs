@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use tracing::warn;
 
 use crate::config::{Config, DockerSbxAgent};
-use crate::sandbox::acknowledgement::{Acknowledgement, ask_on_stdin, can_ask};
+use crate::sandbox::acknowledgement::{Acknowledgement, ask_on_stdin_interruptibly, can_ask};
 
 use super::plan::Widening;
 
@@ -29,7 +29,7 @@ pub(super) fn asks_after_create(config: &Config) -> bool {
 /// Have the user accept `widenings` for sandbox `name`, once per sandbox.
 ///
 /// Accepts by `accept_wider_network_policy` or by asking on a terminal, and
-/// fails otherwise.
+/// fails otherwise. Ctrl-C at the question declines.
 pub(super) fn acknowledge(config: &Config, name: &str, widenings: &[Widening]) -> Result<()> {
     if widenings.is_empty() {
         return Ok(());
@@ -51,8 +51,11 @@ pub(super) fn acknowledge(config: &Config, name: &str, widenings: &[Widening]) -
         accepted_by_config: config.sandbox.docker_sbx.accepts_wider_network_policy(),
         question: &question,
         refused: &refused,
+        declined: &format!(
+            "Creating sbx sandbox {name} with this wider network access was declined"
+        ),
     }
-    .acknowledge(can_ask().then_some(ask_on_stdin))
+    .acknowledge(can_ask().then_some(ask_on_stdin_interruptibly))
 }
 
 /// Forget sandbox `name`'s acceptance at `marker`. Best effort: a failure is

@@ -116,6 +116,7 @@ impl LimaInstance {
 fn acknowledge_reduced_git_isolation(config: &Config, vm_name: &str) -> Result<()> {
     use crate::sandbox::acknowledgement::{Acknowledgement, ask_on_stdin, can_ask};
 
+    let refused = "Lima requires explicit acceptance of reduced Git metadata isolation. Set sandbox.lima.accept_reduced_git_metadata_isolation: true for unattended use, or use Docker, Podman, or Apple Container.";
     let marker = crate::xdg::state_dir()?
         .join("lima-acknowledgements")
         .join("git-metadata-isolation-v1")
@@ -126,7 +127,8 @@ fn acknowledge_reduced_git_isolation(config: &Config, vm_name: &str) -> Result<(
         warnings: &["Lima exposes broad writable host mounts to a privileged guest. Git metadata control files cannot be isolated from ordinary writable Git data on this backend. A Lima guest can modify Git policy later consumed by host Git. Docker, Podman, and Apple Container provide the enforced Git metadata boundary.".to_string()],
         accepted_by_config: config.sandbox.lima.accepts_reduced_git_metadata_isolation(),
         question: "Continue with reduced Git metadata isolation?",
-        refused: "Lima requires explicit acceptance of reduced Git metadata isolation. Set sandbox.lima.accept_reduced_git_metadata_isolation: true for unattended use, or use Docker, Podman, or Apple Container.",
+        refused,
+        declined: refused,
     }
     .acknowledge(can_ask().then_some(ask_on_stdin))
 }
