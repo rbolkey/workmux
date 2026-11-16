@@ -81,23 +81,20 @@ pub fn wrap_for_docker_sbx(
     Ok(format!(" {}", parts))
 }
 
-/// Fails for `flag` (`--fork` or `--continue`) when the launch runs agents
-/// in sbx sandboxes under `sandbox.docker_sbx.agent: kit`: the agent's
-/// conversations are in the workstation's config directory, which the
-/// kit's sandbox doesn't have. `sandboxed` is whether `--sandbox` turns the
-/// sandbox on for this launch.
-pub fn check_resume_flag(
-    config: &crate::config::SandboxConfig,
-    sandboxed: bool,
-    flag: &str,
-) -> Result<()> {
+/// Fails for `--fork` when the launch runs agents in sbx sandboxes under
+/// `sandbox.docker_sbx.agent: kit`: it forks a conversation from the
+/// workstation's agent config, which the kit's sandbox doesn't have.
+/// `--continue` needs no check: it resumes the conversation in the
+/// sandbox's own home, which lasts as long as the sandbox. `sandboxed` is
+/// whether `--sandbox` turns the sandbox on for this launch.
+pub fn check_fork(config: &crate::config::SandboxConfig, sandboxed: bool) -> Result<()> {
     use crate::config::{DockerSbxAgent, SandboxBackend};
     if (config.is_enabled() || sandboxed)
         && config.backend() == SandboxBackend::DockerSbx
         && config.docker_sbx.agent() == DockerSbxAgent::Kit
     {
         anyhow::bail!(
-            "{flag} resumes a conversation from the workstation's agent config, which sbx \
+            "--fork forks a conversation from the workstation's agent config, which sbx \
              sandboxes under sandbox.docker_sbx.agent: kit don't have. Set \
              `sandbox.docker_sbx.agent: shell` in your global config to mount it."
         );
@@ -244,7 +241,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn under_kit_resuming_a_workstation_conversation_is_an_error_naming_agent_shell() {
+    fn under_kit_fork_is_an_error_naming_agent_shell() {
         use crate::config::{DockerSbxAgent, DockerSbxConfig, SandboxBackend, SandboxConfig};
         let sbx = |agent: DockerSbxAgent| SandboxConfig {
             enabled: Some(true),
@@ -256,29 +253,29 @@ mod tests {
             ..Default::default()
         };
 
-        for flag in ["--fork", "--continue"] {
-            let err = check_resume_flag(&sbx(DockerSbxAgent::Kit), false, flag)
-                .unwrap_err()
-                .to_string();
-            assert!(
-                err.contains(flag) && err.contains("sandbox.docker_sbx.agent: shell"),
-                "{err}"
-            );
-            // `--sandbox` turns the sandbox on for the one launch.
-            let off = SandboxConfig {
-                enabled: Some(false),
-                ..sbx(DockerSbxAgent::Kit)
-            };
-            assert!(check_resume_flag(&off, true, flag).is_err());
+        let err = check_fork(&sbx(DockerSbxAgent::Kit), false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("--fork")
+                && err.contains("workstation")
+                && err.contains("sandbox.docker_sbx.agent: shell"),
+            "{err}"
+        );
+        // `--sandbox` turns the sandbox on for the one launch.
+        let off = SandboxConfig {
+            enabled: Some(false),
+            ..sbx(DockerSbxAgent::Kit)
+        };
+        assert!(check_fork(&off, true).is_err());
 
-            assert!(check_resume_flag(&sbx(DockerSbxAgent::Shell), false, flag).is_ok());
-            assert!(check_resume_flag(&off, false, flag).is_ok());
-            let container = SandboxConfig {
-                backend: Some(SandboxBackend::Container),
-                ..sbx(DockerSbxAgent::Kit)
-            };
-            assert!(check_resume_flag(&container, false, flag).is_ok());
-        }
+        assert!(check_fork(&sbx(DockerSbxAgent::Shell), false).is_ok());
+        assert!(check_fork(&off, false).is_ok());
+        let container = SandboxConfig {
+            backend: Some(SandboxBackend::Container),
+            ..sbx(DockerSbxAgent::Kit)
+        };
+        assert!(check_fork(&container, false).is_ok());
     }
 
     fn within_sbx_rules(name: &str) -> bool {
