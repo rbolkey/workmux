@@ -64,7 +64,7 @@ The generic `sandbox` settings keep their meaning:
 | `backend`          | `container`                             | Set to `docker_sbx` for Docker Sandboxes                                                                                       |
 | `image`            | `ghcr.io/raine/workmux-sandbox:<agent>` | Agent image the sbx template is built from                                                                                     |
 | `rpc_host`         | `host.docker.internal`                  | Hostname the guest uses to reach workmux's RPC server. **Global config only.**                                                 |
-| `agent_config_dir` | agent's default (e.g. `~/.claude/`)     | Host directory mounted as the agent's config directory, under `agent: shell`. **Global config only.**                          |
+| `agent_config_dir` | agent's default (e.g. `~/.claude/`)     | Host directory mounted as the agent's config directory, under `agent: shell`; ignored under `kit`. **Global config only.**     |
 | `env_passthrough`  | `[]`                                    | Environment variables to pass through to the sandbox. **Global config only.**                                                  |
 | `env`              | `{}`                                    | Environment variables to set with explicit values. **Global config only.**                                                     |
 | `host_commands`    | `[]`                                    | Commands to proxy from the sandbox to the host via RPC (see [shared features](/guide/sandbox/features/#host-command-proxying)) |
@@ -105,8 +105,9 @@ sbx has no per-sandbox disk setting, so there is no `disk`. Resources, `provisio
 `kit` supports the agent types sbx has a kit for: Claude, Codex, Copilot, Gemini and OpenCode. workmux publishes no Copilot image, so Copilot needs `sandbox.image` set to an image that provides `copilot` (built `FROM ghcr.io/raine/workmux-sandbox:base`). Under `kit`, these are errors naming `agent: shell`, rather than a silent change of credential posture:
 
 - an agent type sbx has no kit for (agy, pi, OMP, or a custom agent);
-- `sandbox.agent_config_dir`, which `kit` doesn't mount;
 - `workmux add --fork`, which forks a conversation from your workstation's agent config.
+
+`sandbox.agent_config_dir` is ignored under `kit` (workmux logs that it is): it applies to `shell` and the other backends, where you may well have set it globally.
 
 `--continue` (`workmux add`, `workmux open`, and resuming after a restart) continues the agent's conversation in the sandbox's own home, which lasts as long as the sandbox: closing a window or stopping the sandbox keeps it, while `workmux remove` and `workmux sandbox prune` remove it, so a new sandbox has no conversation to continue.
 
