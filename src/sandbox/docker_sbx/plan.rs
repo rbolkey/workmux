@@ -311,38 +311,120 @@ fn config_dir_and_home_subpath(
     Some((config.resolved_agent_config_dir(agent)?, subpath))
 }
 
-/// The sbx agent kit `agent: kit` creates an agent's sandbox for. sbx has
-/// none for the other agent types.
-fn agent_kit(agent: &str) -> Result<&'static str> {
-    match agent {
-        "claude" => Ok("claude"),
-        "codex" => Ok("codex"),
-        "copilot" => Ok("copilot"),
-        "gemini" => Ok("gemini"),
-        "opencode" => Ok("opencode"),
-        _ => bail!(
-            "sbx has no agent kit for {agent}; sandbox.docker_sbx.agent: kit supports claude, \
-             codex, copilot, gemini and opencode. Set `sandbox.docker_sbx.agent: shell` in your \
-             global config to run {agent} with its config directory mounted instead."
-        ),
+/// An sbx agent kit, which `agent: kit` creates an agent's sandbox for.
+/// sbx has none for the other agent types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kit {
+    Claude,
+    Codex,
+    Copilot,
+    Gemini,
+    OpenCode,
+}
+
+impl Kit {
+    /// The kit for the agent type `agent`.
+    fn for_agent(agent: &str) -> Result<Self> {
+        Ok(match agent {
+            "claude" => Self::Claude,
+            "codex" => Self::Codex,
+            "copilot" => Self::Copilot,
+            "gemini" => Self::Gemini,
+            "opencode" => Self::OpenCode,
+            _ => bail!(
+                "sbx has no agent kit for {agent}; sandbox.docker_sbx.agent: kit supports \
+                 claude, codex, copilot, gemini and opencode. Set \
+                 `sandbox.docker_sbx.agent: shell` in your global config to run {agent} with \
+                 its config directory mounted instead."
+            ),
+        })
+    }
+
+    /// sbx's name for the kit, as `sbx create` takes it.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::Copilot => "copilot",
+            Self::Gemini => "gemini",
+            Self::OpenCode => "opencode",
+        }
+    }
+
+    /// Whether the agent's binary must come from a custom `sandbox.image`:
+    /// the copilot kit configures Copilot CLI, and workmux publishes no
+    /// Copilot image.
+    fn needs_custom_image(self) -> bool {
+        matches!(self, Self::Copilot)
+    }
+
+    /// Installs workmux's status hooks for the kit's agent into the config
+    /// the kit wrote in sandbox `name`'s own home, as `workmux setup` would
+    /// into the workstation's.
+    fn status_hooks(self, name: &str) -> Result<Vec<SbxCommand>> {
+        use crate::agent_setup::{claude, codex, copilot, gemini, opencode};
+        Ok(match self {
+            Self::Claude => vec![agent_script(
+                name,
+                CLAUDE_KIT_HOOKS_SCRIPT,
+                vec![serde_json::to_string(&claude::load_hooks_from_plugin()?)?],
+            )],
+            Self::Codex => vec![
+                agent_script(
+                    name,
+                    JSON_HOOKS_SCRIPT,
+                    vec![
+                        ".codex/hooks.json".to_string(),
+                        serde_json::to_string(&codex::load_hooks()?)?,
+                    ],
+                ),
+                agent_script(name, CODEX_KIT_CONFIG_SCRIPT, Vec::new()),
+            ],
+            Self::Gemini => vec![agent_script(
+                name,
+                JSON_HOOKS_SCRIPT,
+                vec![
+                    ".gemini/settings.json".to_string(),
+                    serde_json::to_string(&gemini::load_hooks()?)?,
+                ],
+            )],
+            Self::Copilot => vec![agent_script(
+                name,
+                WRITE_FILE_SCRIPT,
+                vec![
+                    ".copilot/hooks/workmux-status.json".to_string(),
+                    copilot::HOOKS_JSON.to_string(),
+                ],
+            )],
+            Self::OpenCode => {
+                let mut sources = vec![opencode::PLUGIN_SOURCE.to_string()];
+                for file in ["index.ts", "tui.ts", "status.ts"] {
+                    let (_, source) = opencode::V2_FILES
+                        .iter()
+                        .find(|(name, _)| *name == file)
+                        .context("OpenCode plugin file missing")?;
+                    sources.push(source.to_string());
+                }
+                vec![agent_script(name, OPENCODE_KIT_PLUGIN_SCRIPT, sources)]
+            }
+        })
     }
 }
 
 /// The kit an agent's sandbox is created for under `agent: kit`, failing
 /// for what the kit can't serve.
-fn kit_for(config: &SandboxConfig, agent: &str) -> Result<&'static str> {
-    let kit = agent_kit(agent)?;
+fn kit_for(config: &SandboxConfig, agent: &str) -> Result<Kit> {
+    let kit = Kit::for_agent(agent)?;
     if config.agent_config_dir.is_some() {
         bail!(
             "sandbox.agent_config_dir is set, but under sandbox.docker_sbx.agent: kit sbx's \
-             {kit} kit sets {agent} up in the sandbox's own home and no config directory is \
+             {} kit sets {agent} up in the sandbox's own home and no config directory is \
              mounted. Remove sandbox.agent_config_dir, or set \
-             `sandbox.docker_sbx.agent: shell` in your global config to mount it."
+             `sandbox.docker_sbx.agent: shell` in your global config to mount it.",
+            kit.name()
         );
     }
-    // The kit configures Copilot CLI; the binary comes from the template,
-    // and workmux publishes no Copilot image.
-    if kit == "copilot" && config.image.is_none() {
+    if kit.needs_custom_image() && config.image.is_none() {
         bail!(
             "workmux has no sandbox image with GitHub Copilot CLI. Set `sandbox.image` to an \
              image that provides `copilot` (built FROM {}:base) to use the copilot kit.",
@@ -356,7 +438,7 @@ fn kit_for(config: &SandboxConfig, agent: &str) -> Result<&'static str> {
 /// `env` whose value is a path on the workstation (absolute or `~`), such
 /// as `CLAUDE_CONFIG_DIR`: the sandbox has the kit's own config, not that
 /// directory, so the agent wouldn't run on the account the path selects.
-fn agent_env_warnings(target: &LaunchTarget, kit: &str) -> Vec<String> {
+fn agent_env_warnings(target: &LaunchTarget, kit: Kit) -> Vec<String> {
     target
         .agent_env
         .iter()
@@ -364,11 +446,13 @@ fn agent_env_warnings(target: &LaunchTarget, kit: &str) -> Vec<String> {
         .map(|(key, value)| {
             format!(
                 "the agent's env sets {key} to a workstation path ({value}), but under \
-                 sandbox.docker_sbx.agent: kit sbx sandbox {} runs the {kit} kit's own setup \
+                 sandbox.docker_sbx.agent: kit sbx sandbox {} runs the {} kit's own setup \
                  and login, not the workstation's. For another account, give the sandbox its \
                  own with `sbx secret set <service> --sandbox {}`, or set \
                  `sandbox.docker_sbx.agent: shell`.",
-                target.sandbox_name, target.sandbox_name
+                target.sandbox_name,
+                kit.name(),
+                target.sandbox_name
             )
         })
         .collect()
@@ -447,59 +531,6 @@ fn agent_script(name: &str, script: &str, script_args: Vec<String>) -> SbxComman
         args,
         env: Vec::new(),
     }
-}
-
-/// Installs workmux's status hooks for the agent of `kit` into the config
-/// the kit wrote in the sandbox's own home, as `workmux setup` would into
-/// the workstation's.
-fn kit_status_hooks(name: &str, kit: &str) -> Result<Vec<SbxCommand>> {
-    use crate::agent_setup::{claude, codex, copilot, gemini, opencode};
-    Ok(match kit {
-        "claude" => vec![agent_script(
-            name,
-            CLAUDE_KIT_HOOKS_SCRIPT,
-            vec![serde_json::to_string(&claude::load_hooks_from_plugin()?)?],
-        )],
-        "codex" => vec![
-            agent_script(
-                name,
-                JSON_HOOKS_SCRIPT,
-                vec![
-                    ".codex/hooks.json".to_string(),
-                    serde_json::to_string(&codex::load_hooks()?)?,
-                ],
-            ),
-            agent_script(name, CODEX_KIT_CONFIG_SCRIPT, Vec::new()),
-        ],
-        "gemini" => vec![agent_script(
-            name,
-            JSON_HOOKS_SCRIPT,
-            vec![
-                ".gemini/settings.json".to_string(),
-                serde_json::to_string(&gemini::load_hooks()?)?,
-            ],
-        )],
-        "copilot" => vec![agent_script(
-            name,
-            WRITE_FILE_SCRIPT,
-            vec![
-                ".copilot/hooks/workmux-status.json".to_string(),
-                copilot::HOOKS_JSON.to_string(),
-            ],
-        )],
-        "opencode" => {
-            let mut sources = vec![opencode::PLUGIN_SOURCE.to_string()];
-            for file in ["index.ts", "tui.ts", "status.ts"] {
-                let (_, source) = opencode::V2_FILES
-                    .iter()
-                    .find(|(name, _)| *name == file)
-                    .context("OpenCode plugin file missing")?;
-                sources.push(source.to_string());
-            }
-            vec![agent_script(name, OPENCODE_KIT_PLUGIN_SCRIPT, sources)]
-        }
-        _ => Vec::new(),
-    })
 }
 
 /// A command run as root in the sandbox.
@@ -1482,7 +1513,7 @@ pub fn launch_plan(
         for kit in sbx.kits() {
             args.extend(["--kit".to_string(), kit.clone()]);
         }
-        args.push(kit.unwrap_or("shell").to_string());
+        args.push(kit.map_or("shell", Kit::name).to_string());
         let mut workspaces = vec![target.worktree_root.to_string_lossy().into_owned()];
         workspaces.extend(git_workspaces(git));
         workspaces.extend(excluded.iter().map(|mask| mask.workspace(target.state_dir)));
@@ -1538,7 +1569,7 @@ pub fn launch_plan(
         // workmux's status hooks into the config the kit wrote, as the
         // agent. The kit writes it only at create, so this lasts.
         if let Some(kit) = kit {
-            setup.extend(kit_status_hooks(name, kit)?);
+            setup.extend(kit.status_hooks(name)?);
         }
     }
 
