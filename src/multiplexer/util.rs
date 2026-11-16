@@ -217,6 +217,44 @@ impl ResolvedCommand {
     }
 }
 
+/// The panes `setup_panes` lays out, in order, each with its index and its
+/// command resolved by [`resolve_pane_command_with_config`] (`None` when it
+/// runs none). A pane after the first without a split direction isn't laid
+/// out.
+#[allow(clippy::too_many_arguments)]
+pub fn laid_out_panes<'a>(
+    panes: &'a [crate::config::PaneConfig],
+    run_commands: bool,
+    prompt_file_path: Option<&'a Path>,
+    working_dir: &'a Path,
+    config: &'a Config,
+    task_agent: Option<&'a str>,
+    shell: &'a str,
+) -> impl Iterator<
+    Item = (
+        usize,
+        &'a crate::config::PaneConfig,
+        Option<ResolvedCommand>,
+    ),
+> + 'a {
+    panes
+        .iter()
+        .enumerate()
+        .filter(|(i, pane)| *i == 0 || pane.split.is_some())
+        .map(move |(i, pane)| {
+            let command = resolve_pane_command_with_config(
+                pane.command.as_deref(),
+                run_commands,
+                prompt_file_path,
+                working_dir,
+                config,
+                task_agent,
+                shell,
+            );
+            (i, pane, command)
+        })
+}
+
 pub fn resolve_pane_command_with_config(
     pane_command: Option<&str>,
     run_commands: bool,

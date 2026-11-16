@@ -427,7 +427,7 @@ fn pre_boot_lima_vm(
 }
 
 /// The distinct agents whose sbx sandboxes the worktree's panes run in,
-/// resolving commands the same way setup_panes does: each sandboxed agent
+/// from the panes setup_panes lays out: each sandboxed agent
 /// pane's own agent, and the selected agent for plain panes under
 /// `target: all`.
 fn docker_sbx_agents(
@@ -439,20 +439,16 @@ fn docker_sbx_agents(
     shell: &str,
 ) -> Vec<String> {
     let mut agents: Vec<String> = Vec::new();
-    for (i, pane_config) in panes.iter().enumerate() {
-        // setup_panes skips non-first panes that have no split direction.
-        if i > 0 && pane_config.split.is_none() {
-            continue;
-        }
-        let Some(resolved) = crate::multiplexer::util::resolve_pane_command_with_config(
-            pane_config.command.as_deref(),
-            options.run_pane_commands,
-            options.prompt_file_path.as_deref(),
-            working_dir,
-            config,
-            agent,
-            shell,
-        ) else {
+    for (_, _, resolved) in crate::multiplexer::util::laid_out_panes(
+        panes,
+        options.run_pane_commands,
+        options.prompt_file_path.as_deref(),
+        working_dir,
+        config,
+        agent,
+        shell,
+    ) {
+        let Some(resolved) = resolved else {
             continue;
         };
         if resolved.selected_agent.is_none()
