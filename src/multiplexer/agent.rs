@@ -633,11 +633,19 @@ pub fn shell_quote(s: &str) -> String {
 pub struct SelectedAgent {
     pub command: AgentCommand,
     pub profile: &'static dyn AgentProfile,
+    /// The named agent (a key of `agents`) it was selected as, if any.
+    pub named: Option<String>,
 }
 
 impl SelectedAgent {
     pub fn kind(&self) -> &'static str {
         self.profile.name()
+    }
+
+    /// The agent's name: the named agent it was selected as, or its agent
+    /// type.
+    pub fn name(&self) -> &str {
+        self.named.as_deref().unwrap_or(self.kind())
     }
 
     /// Add the flags every launch in a workmux pane needs, skipping any the
@@ -672,7 +680,11 @@ impl SelectedAgent {
     pub fn from_raw(command: &str) -> Option<Self> {
         let command = AgentCommand::parse(command)?;
         let profile = resolve_profile(Some(&command.shell_string()));
-        Some(Self { command, profile })
+        Some(Self {
+            command,
+            profile,
+            named: None,
+        })
     }
 }
 
@@ -685,7 +697,11 @@ pub fn resolve_selected_agent(config: &Config, selector: Option<&str>) -> Option
         let command = AgentCommand::from_entry(selector, entry);
         let profile =
             resolve_profile_with_type(Some(&command.shell_string()), entry.agent_type.as_deref());
-        return Some(SelectedAgent { command, profile });
+        return Some(SelectedAgent {
+            command,
+            profile,
+            named: Some(selector.to_string()),
+        });
     }
 
     SelectedAgent::from_raw(selector)
@@ -843,6 +859,7 @@ mod tests {
         let mut agent = SelectedAgent {
             command: AgentCommand::parse(command).unwrap(),
             profile,
+            named: None,
         };
         agent.add_launch_flags();
         if sandbox {

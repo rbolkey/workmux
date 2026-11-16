@@ -77,6 +77,11 @@ pub enum SandboxCommand {
         /// Workspace id on that node
         #[arg(long, hide = true, requires = "node_root")]
         node_workspace: Option<String>,
+        /// The pane's agent (a named agent or an agent type), whose own
+        /// sandbox the command runs in (docker_sbx; default: the selected
+        /// agent)
+        #[arg(long)]
+        agent: Option<String>,
         /// Command and arguments to run inside the sandbox
         #[arg(last = true, required = true)]
         command: Vec<String>,
@@ -119,6 +124,10 @@ pub enum SandboxCommand {
         /// (container backend; Lima and docker_sbx always use the worktree's VM or sandbox)
         #[arg(long, short)]
         exec: bool,
+        /// The agent (a named agent or an agent type) whose sandbox to open
+        /// (docker_sbx; default: the selected agent)
+        #[arg(long)]
+        agent: Option<String>,
         /// Command to run instead of bash
         #[arg(last = true)]
         command: Vec<String>,
@@ -156,7 +165,7 @@ fn run_agent(command: Vec<String>) -> Result<()> {
         command
     };
 
-    let exit_code = super::sandbox_run::run(cwd, Some(worktree_root), agent_command, None)?;
+    let exit_code = super::sandbox_run::run(cwd, Some(worktree_root), agent_command, None, None)?;
     std::process::exit(exit_code);
 }
 
@@ -170,11 +179,12 @@ pub fn run(args: SandboxArgs) -> Result<()> {
             worktree_root,
             node_root,
             node_workspace,
+            agent,
             command,
         } => {
-            debug!(worktree = %worktree.display(), ?worktree_root, ?command, "sandbox run");
+            debug!(worktree = %worktree.display(), ?worktree_root, ?agent, ?command, "sandbox run");
             let node = node_root.zip(node_workspace);
-            let exit_code = super::sandbox_run::run(worktree, worktree_root, command, node)?;
+            let exit_code = super::sandbox_run::run(worktree, worktree_root, command, agent, node)?;
             std::process::exit(exit_code);
         }
         SandboxCommand::InstallDev {
@@ -184,7 +194,11 @@ pub fn run(args: SandboxArgs) -> Result<()> {
         SandboxCommand::Agent { command } => run_agent(command),
         SandboxCommand::Prune { force } => run_prune(force),
         SandboxCommand::Stop { name, all, yes } => run_stop(name, all, yes),
-        SandboxCommand::Shell { exec, command } => run_shell(exec, command),
+        SandboxCommand::Shell {
+            exec,
+            agent,
+            command,
+        } => run_shell(exec, agent, command),
     }
 }
 
@@ -1272,14 +1286,14 @@ fn run_stop_docker_sbx(name: Option<String>, all: bool, skip_confirm: bool) -> R
     Ok(())
 }
 
-fn run_shell(exec: bool, command: Vec<String>) -> Result<()> {
+fn run_shell(exec: bool, agent: Option<String>, command: Vec<String>) -> Result<()> {
     let config = Config::load(None)?;
     sandbox::notice::show_once();
 
     match config.sandbox.backend() {
         SandboxBackend::Container => run_shell_container(exec, command, &config),
         SandboxBackend::Lima => run_shell_lima(exec, command, &config),
-        SandboxBackend::DockerSbx => run_shell_docker_sbx(command, &config),
+        SandboxBackend::DockerSbx => run_shell_docker_sbx(command, agent.as_deref(), &config),
     }
 }
 
@@ -1461,9 +1475,10 @@ fn run_shell_lima(exec: bool, command: Vec<String>, config: &Config) -> Result<(
     std::process::exit(status.code().unwrap_or(1));
 }
 
-/// Exec a shell into the current worktree's sbx sandbox (creating it if
-/// needed). sbx sandboxes persist, so `--exec` means the same.
-fn run_shell_docker_sbx(command: Vec<String>, config: &Config) -> Result<()> {
+/// Exec a shell into the current worktree's sbx sandbox for `agent` (the
+/// selected agent by default), creating it if needed. sbx sandboxes
+/// persist, so `--exec` means the same.
+fn run_shell_docker_sbx(command: Vec<String>, agent: Option<&str>, config: &Config) -> Result<()> {
     let cwd = std::env::current_dir().context("Failed to get current directory")?;
     let cwd = cwd.canonicalize().unwrap_or(cwd);
     let worktree_root = crate::git::get_repo_root()
@@ -1491,8 +1506,14 @@ fn run_shell_docker_sbx(command: Vec<String>, config: &Config) -> Result<()> {
         tty: io::stdin().is_terminal(),
         in_toolchain: false,
     };
-    let plan =
-        docker_sbx::prepare_launch(config, &worktree_root, &cwd, resolve_agent(config), &exec)?;
+    if let Some(agent) = agent
+        && !config.agents.contains_key(agent)
+        && !crate::multiplexer::agent::is_known_agent(agent)
+    {
+        bail!("Unknown agent '{agent}': name a named agent from `agents` or an agent type");
+    }
+    let agent = docker_sbx::selected_agent(config, agent);
+    let plan = docker_sbx::prepare_launch(config, &worktree_root, &cwd, &agent, &exec)?;
 
     debug!(sandbox = %plan.sandbox_name, cmd = ?exec.command, "starting sbx shell");
     std::process::exit(docker_sbx::run_exec(&plan)?);
