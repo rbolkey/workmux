@@ -77,16 +77,6 @@ pub struct SbxRuleProvenance {
     pub created_via: String,
 }
 
-/// A secret from `sbx secret ls --json`: its service and scope, never its
-/// value.
-#[derive(Debug, Clone, Deserialize)]
-pub struct SbxSecret {
-    /// `global`, or the name of the sandbox it's scoped to.
-    pub scope: String,
-    /// The service, such as `github`.
-    pub name: String,
-}
-
 /// A check from `sbx diagnose --json`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SbxCheck {
@@ -107,12 +97,6 @@ struct SbxRules {
 }
 
 #[derive(Deserialize)]
-struct SbxSecrets {
-    #[serde(default)]
-    secrets: Vec<SbxSecret>,
-}
-
-#[derive(Deserialize)]
 struct SbxDiagnose {
     #[serde(default)]
     checks: Vec<SbxCheck>,
@@ -128,13 +112,6 @@ pub fn parse_sbx_rules(stdout: &[u8]) -> Result<Vec<SbxRule>> {
     Ok(serde_json::from_slice::<SbxRules>(stdout)
         .context("Failed to parse sbx policy ls output")?
         .rules)
-}
-
-/// Parse `sbx secret ls --json`. It lists services and scopes, never values.
-pub fn parse_sbx_secrets(stdout: &[u8]) -> Result<Vec<SbxSecret>> {
-    Ok(serde_json::from_slice::<SbxSecrets>(stdout)
-        .context("Failed to parse sbx secret ls output")?
-        .secrets)
 }
 
 /// Parse `sbx diagnose --json`.
@@ -287,7 +264,6 @@ fn prepare_one_removal(name: &str) -> Option<SandboxRemoval> {
         }),
         Err(e) => {
             warn!(sandbox = %name, error = %e, "failed to lock sbx state dir");
-            eprintln!("Warning: failed to remove sbx sandbox {name}: {e:#}");
             None
         }
     }
@@ -302,7 +278,6 @@ impl SandboxRemoval {
         info!(sandbox = %name, "removing sbx sandbox");
         if let Err(e) = SbxInstance::remove_by_name(name) {
             warn!(sandbox = %name, error = %e, "failed to remove sbx sandbox");
-            eprintln!("Warning: failed to remove sbx sandbox {name}: {e}");
             return;
         }
         if let Err(e) = std::fs::remove_dir_all(&self.state_dir) {
@@ -351,18 +326,6 @@ fn list_sandbox_and_rules(name: &str) -> Result<(Option<SbxSandboxInfo>, Vec<Sbx
     Ok((sandbox, rules))
 }
 
-/// Secret names and scopes from `sbx secret ls`, never values. Advisory
-/// only: a listing failure leaves the credential warnings out.
-fn list_secrets() -> Result<Vec<SbxSecret>> {
-    match sbx_json(&["secret", "ls"]) {
-        Ok(stdout) => parse_sbx_secrets(&stdout),
-        Err(e) => {
-            debug!(error = %e, "failed to list sbx secrets");
-            Ok(Vec::new())
-        }
-    }
-}
-
 /// Gather what sbx reports about the sandbox `name`.
 pub fn gather_state(name: &str) -> Result<SbxState> {
     if !SbxInstance::is_sbx_available() {
@@ -375,25 +338,21 @@ pub fn gather_state(name: &str) -> Result<SbxState> {
     let platform = current_platform();
     // The listings are independent but for the rules, which depend on
     // whether the sandbox exists; run them side by side.
-    let (checks, sandbox_and_rules, secrets) = std::thread::scope(|scope| {
+    let (checks, sandbox_and_rules) = std::thread::scope(|scope| {
         let checks = scope.spawn(sbx_diagnose);
-        let secrets = scope.spawn(list_secrets);
         let sandbox_and_rules = list_sandbox_and_rules(name);
         (
             checks.join().expect("sbx diagnose thread panicked"),
             sandbox_and_rules,
-            secrets.join().expect("sbx secret ls thread panicked"),
         )
     });
     let checks = checks?;
     let (sandbox, rules) = sandbox_and_rules?;
-    let secrets = secrets?;
     Ok(SbxState {
         platform,
         checks,
         sandbox,
         rules,
-        secrets,
     })
 }
 
@@ -666,7 +625,6 @@ pub fn prepare_launch(
 
     let toolchain =
         crate::sandbox::toolchain::resolve_toolchain(&config.sandbox.toolchain(), &worktree_root);
-    let agent_env = config.named_agent_env(selected_agent);
 
     let _lock = lock_state_dir(&state_dir)?;
     // Removing the worktree removed the sandbox while this launch waited.
@@ -695,16 +653,13 @@ pub fn prepare_launch(
         toolchain: &toolchain,
         created_with: created_with.as_ref(),
         unfinished,
-        agent_env: &agent_env,
     };
     let plan = super::launch_plan(&config.sandbox, &target, agent, &state, exec)?;
     for note in &plan.notes {
-        info!(sandbox = %name, note, "sbx network note");
-        eprintln!("note: {note}");
+        info!(sandbox = %name, note, "sbx launch note");
     }
     for warning in &plan.warnings {
         warn!(sandbox = %name, warning, "sbx launch warning");
-        eprintln!("warning: {warning}");
     }
 
     let image = config.sandbox.resolved_image(agent);
@@ -721,7 +676,6 @@ pub fn prepare_launch(
     let notices = apply_plan_with(&plan, &state_dir, unfinished, &network_record, run_sbx)?;
     for notice in &notices {
         warn!(sandbox = %name, notice, "sbx create notice");
-        eprintln!("sbx: {notice}");
     }
     // The plan saw the rules from before the sandbox existed; its kits add
     // theirs at create.
@@ -736,7 +690,6 @@ pub fn prepare_launch(
                 );
                 for warning in &warnings {
                     warn!(sandbox = %name, warning, "sbx launch warning");
-                    eprintln!("warning: {warning}");
                 }
             }
             Err(e) => debug!(sandbox = %name, error = %e, "failed to list sbx rules after create"),
@@ -985,24 +938,6 @@ mod tests {
         // How it came to be tells a kit's rule from the user's and workmux's.
         assert_eq!(rules[0].provenance.created_via, "default");
         assert_eq!(rules[1].provenance.created_via, "");
-    }
-
-    #[test]
-    fn parses_sbx_secret_ls_json_as_services_and_scopes() {
-        let secrets = parse_sbx_secrets(
-            br#"{"secrets":[{"scope":"global","type":"service","name":"anthropic","secret":"(oauth configured)"},
-                            {"scope":"wm-proj-1","type":"service","name":"github","secret":"(stored)"}],
-                 "custom_secrets":[],"shadowed_services":[],"env_only_count":0}"#,
-        )
-        .unwrap();
-        let services: Vec<(&str, &str)> = secrets
-            .iter()
-            .map(|s| (s.scope.as_str(), s.name.as_str()))
-            .collect();
-        assert_eq!(
-            services,
-            vec![("global", "anthropic"), ("wm-proj-1", "github")]
-        );
     }
 
     #[test]

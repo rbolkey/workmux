@@ -13,7 +13,7 @@ use crate::config::{DockerSbxAgent, SandboxConfig};
 use crate::sandbox::toolchain::{self, DetectedToolchain};
 use crate::shell::shell_quote;
 
-use super::instance::{SbxCheck, SbxRule, SbxSandboxInfo, SbxSecret};
+use super::instance::{SbxCheck, SbxRule, SbxSandboxInfo};
 use super::mask::Mask;
 
 /// The host sbx runs on.
@@ -38,8 +38,6 @@ pub struct SbxState {
     /// Rules from `sbx policy ls <name> --json`, or the global ones from
     /// `sbx policy ls --json` when the sandbox is missing.
     pub rules: Vec<SbxRule>,
-    /// Secrets from `sbx secret ls --json`: names and scopes, never values.
-    pub secrets: Vec<SbxSecret>,
 }
 
 /// The worktree a launch is for, with the host paths the plan mounts.
@@ -75,9 +73,6 @@ pub struct LaunchTarget<'a> {
     /// Whether a launch began creating the sandbox and didn't finish (it
     /// failed or was killed partway), as its state directory records.
     pub unfinished: bool,
-    /// The named agent's `env`, with values as the workstation resolves
-    /// them; empty for an agent type.
-    pub agent_env: &'a [(String, String)],
 }
 
 /// The mode of a sandbox recorded before the mode was: `shell`, the only
@@ -228,15 +223,13 @@ pub struct LaunchPlan {
     pub hangup: SbxCommand,
     /// Commands to run after `exec` ends: removing the RPC rule.
     pub teardown: Vec<SbxCommand>,
-    /// Notes for the user: settings sbx can't enforce that only limit
-    /// access, and toolchain endpoints `deny` leaves blocked.
+    /// Notes for the log: settings ignored or that sbx can't enforce that
+    /// only limit access, and toolchain endpoints `deny` leaves blocked.
     pub notes: Vec<String>,
-    /// Warnings for the user: checks `sbx diagnose` fails that don't stop
+    /// Warnings for the log: checks `sbx diagnose` fails that don't stop
     /// the launch, what sbx lets a `deny` sandbox reach beyond
-    /// `allowed_domains`, variables in `sandbox.env` or
-    /// `sandbox.env_passthrough` that hand the agent a credential sbx holds
-    /// a secret for, and create-time settings changed since the sandbox
-    /// was created.
+    /// `allowed_domains`, and create-time settings changed since the
+    /// sandbox was created.
     pub warnings: Vec<String>,
     /// The `sandbox.network` and toolchain rules workmux has written for the
     /// sandbox once `setup` has run; the record the next launch reconciles
@@ -444,30 +437,6 @@ fn ignored_config_dir_note(config: &SandboxConfig, kit: Kit) -> Option<String> {
             kit.name()
         )
     })
-}
-
-/// Under `agent: kit`, a warning for each variable of the named agent's
-/// `env` whose value is a path on the workstation (absolute or `~`), such
-/// as `CLAUDE_CONFIG_DIR`: the sandbox has the kit's own config, not that
-/// directory, so the agent wouldn't run on the account the path selects.
-fn agent_env_warnings(target: &LaunchTarget, kit: Kit) -> Vec<String> {
-    target
-        .agent_env
-        .iter()
-        .filter(|(_, value)| value.starts_with('/') || value.starts_with('~'))
-        .map(|(key, value)| {
-            format!(
-                "the agent's env sets {key} to a workstation path ({value}), but under \
-                 sandbox.docker_sbx.agent: kit sbx sandbox {} runs the {} kit's own setup \
-                 and login, not the workstation's. For another account, give the sandbox its \
-                 own with `sbx secret set <service> --sandbox {}`, or set \
-                 `sandbox.docker_sbx.agent: shell`.",
-                target.sandbox_name,
-                kit.name(),
-                target.sandbox_name
-            )
-        })
-        .collect()
 }
 
 /// Merges workmux's status hook groups (`$1`) into the claude kit's
@@ -1112,77 +1081,6 @@ fn check_backend_choice(config: &SandboxConfig, state: &SbxState) -> Result<()> 
     Ok(())
 }
 
-/// The sbx service whose credential an environment variable holds, as
-/// `sbx secret import` detects them.
-fn credential_service(var: &str) -> Option<&'static str> {
-    match var {
-        "ANTHROPIC_API_KEY" => Some("anthropic"),
-        "COPILOT_GITHUB_TOKEN" => Some("copilot"),
-        "CURSOR_API_KEY" => Some("cursor"),
-        "FACTORY_API_KEY" => Some("droid"),
-        "GH_TOKEN" | "GITHUB_TOKEN" => Some("github"),
-        "GEMINI_API_KEY" | "GOOGLE_API_KEY" | "GOOGLE_GENERATIVE_AI_API_KEY" => Some("google"),
-        "GROQ_API_KEY" => Some("groq"),
-        "MISTRAL_API_KEY" => Some("mistral"),
-        "NEBIUS_API_KEY" => Some("nebius"),
-        "OPENAI_API_KEY" => Some("openai"),
-        "OPENROUTER_API_KEY" => Some("openrouter"),
-        "XAI_API_KEY" => Some("xai"),
-        _ => None,
-    }
-}
-
-/// The value an agent sends in place of a credential sbx's proxy supplies,
-/// as sbx's own agent kits write it. A variable holding it carries no
-/// credential.
-const PROXY_MANAGED: &str = "proxy-managed";
-
-/// Variables from `sandbox.env` and `sandbox.env_passthrough` the exec
-/// passes that hold a credential sbx already holds a secret for, globally
-/// or for this sandbox. sbx's proxy would inject it with the agent holding
-/// only a placeholder; passed in, the agent holds the real value. A
-/// variable passing sbx's own placeholder holds no credential: tools that
-/// require the variable can be given it that way.
-fn credential_warnings(
-    config: &SandboxConfig,
-    state: &SbxState,
-    name: &str,
-    exec: &ExecRequest,
-) -> Vec<String> {
-    let passed = |var: &str| {
-        exec.env
-            .iter()
-            .any(|(key, value)| key == var && value != PROXY_MANAGED)
-    };
-    let configured = config
-        .env_vars()
-        .into_iter()
-        .map(|(var, _)| ("sandbox.env", var))
-        .chain(
-            config
-                .env_passthrough()
-                .into_iter()
-                .map(|var| ("sandbox.env_passthrough", var)),
-        );
-    let mut warnings = Vec::new();
-    for (setting, var) in configured {
-        let Some(service) = credential_service(var) else {
-            continue;
-        };
-        let held = state.secrets.iter().any(|secret| {
-            secret.name == service && (secret.scope == "global" || secret.scope == name)
-        });
-        if held && passed(var) {
-            warnings.push(format!(
-                "{setting} passes {var} into sbx sandbox {name}, replacing sbx's placeholder \
-                 for its {service} secret: the agent can read the real credential. Remove \
-                 {var} from {setting}; sbx supplies it from `sbx secret set {service}`."
-            ));
-        }
-    }
-    warnings
-}
-
 /// The `sbx policy` command adding or removing a rule scoped to the sandbox.
 fn policy_command(name: &str, verb: &str, resource: &str) -> SbxCommand {
     let mut args = words(&["policy", verb, "network", "--sandbox", name]);
@@ -1689,8 +1587,6 @@ pub fn launch_plan(
                 name,
                 &network_rules,
             ))
-            .chain(credential_warnings(config, state, name, exec))
-            .chain(kit.map_or_else(Vec::new, |kit| agent_env_warnings(target, kit)))
             .chain(predates_record)
             .chain(if exists {
                 create_settings_warnings(&create_settings, target.created_with, name)
@@ -1768,7 +1664,6 @@ mod tests {
             checks: passing_checks(),
             sandbox: None,
             rules: Vec::new(),
-            secrets: Vec::new(),
         }
     }
 
@@ -1838,7 +1733,6 @@ mod tests {
             toolchain: &p.toolchain,
             created_with: p.created.as_ref(),
             unfinished: p.unfinished,
-            agent_env: &[],
         }
     }
 
@@ -2814,20 +2708,6 @@ mod tests {
         assert!(!plan.warnings.is_empty());
     }
 
-    fn secret(scope: &str, service: &str) -> SbxSecret {
-        SbxSecret {
-            scope: scope.to_string(),
-            name: service.to_string(),
-        }
-    }
-
-    fn with_secrets(secrets: Vec<SbxSecret>) -> SbxState {
-        SbxState {
-            secrets,
-            ..missing()
-        }
-    }
-
     fn passing(vars: &[(&str, &str)]) -> ExecRequest {
         let mut exec = exec();
         exec.env.extend(
@@ -2835,26 +2715,6 @@ mod tests {
                 .map(|(key, value)| (key.to_string(), value.to_string())),
         );
         exec
-    }
-
-    #[test]
-    fn passing_a_credential_sbx_holds_a_secret_for_warns_naming_sbx_secret_set() {
-        let p = paths();
-        let config = SandboxConfig {
-            env_passthrough: Some(vec!["GH_TOKEN".to_string()]),
-            ..config()
-        };
-        let state = with_secrets(vec![secret("global", "github")]);
-        let exec = passing(&[("GH_TOKEN", "gho_real")]);
-
-        let plan = launch_plan(&config, &target(&p), "claude", &state, &exec).unwrap();
-
-        assert_eq!(plan.warnings.len(), 1, "{:?}", plan.warnings);
-        let warning = &plan.warnings[0];
-        assert!(warning.contains("sandbox.env_passthrough"), "{warning}");
-        assert!(warning.contains("GH_TOKEN"), "{warning}");
-        assert!(warning.contains("`sbx secret set github`"), "{warning}");
-        assert!(!warning.contains("gho_real"), "{warning}");
     }
 
     #[test]
@@ -2908,89 +2768,6 @@ mod tests {
             "{:?}",
             plan.exec.env
         );
-    }
-
-    #[test]
-    fn a_secret_scoped_to_the_sandbox_counts_for_variables_in_env() {
-        let p = paths();
-        let config = SandboxConfig {
-            env: Some([("OPENAI_API_KEY".to_string(), "sk-real".to_string())].into()),
-            ..config()
-        };
-        let state = with_secrets(vec![secret("wm-proj-12345678", "openai")]);
-        let exec = passing(&[("OPENAI_API_KEY", "sk-real")]);
-
-        let plan = launch_plan(&config, &target(&p), "claude", &state, &exec).unwrap();
-
-        assert_eq!(plan.warnings.len(), 1, "{:?}", plan.warnings);
-        assert!(plan.warnings[0].starts_with("sandbox.env passes OPENAI_API_KEY"));
-        assert!(plan.warnings[0].contains("`sbx secret set openai`"));
-    }
-
-    #[test]
-    fn no_warning_unless_sbx_holds_a_secret_for_a_variable_actually_passed() {
-        let p = paths();
-        let config = SandboxConfig {
-            env_passthrough: Some(vec![
-                "GH_TOKEN".to_string(),
-                "GEMINI_API_KEY".to_string(),
-                "NPM_TOKEN".to_string(),
-            ]),
-            ..config()
-        };
-        let passed = passing(&[
-            ("GH_TOKEN", "gho_real"),
-            ("GEMINI_API_KEY", "key"),
-            ("NPM_TOKEN", "npm"),
-        ]);
-        let cases = [
-            ("no secrets", with_secrets(Vec::new()), passed.clone()),
-            (
-                "secrets for other services",
-                with_secrets(vec![secret("global", "anthropic")]),
-                passed.clone(),
-            ),
-            (
-                "a secret scoped to another sandbox",
-                with_secrets(vec![secret("wm-other-87654321", "github")]),
-                passed.clone(),
-            ),
-            (
-                "passthrough variables unset on the workstation",
-                with_secrets(vec![secret("global", "github"), secret("global", "google")]),
-                exec(),
-            ),
-        ];
-        for (case, state, exec) in cases {
-            let plan = launch_plan(&config, &target(&p), "claude", &state, &exec).unwrap();
-            assert!(plan.warnings.is_empty(), "{case}: {:?}", plan.warnings);
-        }
-    }
-
-    #[test]
-    fn sbxs_proxy_managed_placeholder_is_no_credential_so_gets_no_warning() {
-        let p = paths();
-        let config = SandboxConfig {
-            env: Some([("OPENAI_API_KEY".to_string(), "proxy-managed".to_string())].into()),
-            env_passthrough: Some(vec!["GH_TOKEN".to_string()]),
-            ..config()
-        };
-        let state = with_secrets(vec![secret("global", "openai"), secret("global", "github")]);
-
-        let exec = passing(&[
-            ("OPENAI_API_KEY", "proxy-managed"),
-            ("GH_TOKEN", "proxy-managed"),
-        ]);
-        let plan = launch_plan(&config, &target(&p), "claude", &state, &exec).unwrap();
-        assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
-
-        // Only sbx's exact value: anything else may be a real credential.
-        let exec = passing(&[
-            ("OPENAI_API_KEY", "proxy-managed "),
-            ("GH_TOKEN", "Proxy-Managed"),
-        ]);
-        let plan = launch_plan(&config, &target(&p), "claude", &state, &exec).unwrap();
-        assert_eq!(plan.warnings.len(), 2, "{:?}", plan.warnings);
     }
 
     #[test]
@@ -3455,49 +3232,6 @@ mod tests {
             "{:?}",
             plan.notes
         );
-    }
-
-    #[test]
-    fn under_kit_a_named_agents_env_naming_a_workstation_path_warns() {
-        // A profile that picks its account through a config directory on
-        // the workstation would run on the kit's login instead.
-        let p = paths();
-        let env = vec![
-            (
-                "CLAUDE_CONFIG_DIR".to_string(),
-                "~/.claude-work".to_string(),
-            ),
-            (
-                "CODEX_HOME".to_string(),
-                "/Users/me/.codex-work".to_string(),
-            ),
-            ("MODEL".to_string(), "opus".to_string()),
-        ];
-        let target = LaunchTarget {
-            agent_env: &env,
-            ..target(&p)
-        };
-        let path_warnings = |plan: &LaunchPlan| -> Vec<String> {
-            plan.warnings
-                .iter()
-                .filter(|w| w.contains("workstation path"))
-                .cloned()
-                .collect()
-        };
-
-        let plan = launch_plan(&kit_config(), &target, "claude", &missing(), &exec()).unwrap();
-        let warnings = path_warnings(&plan);
-        assert_eq!(warnings.len(), 2, "{:?}", plan.warnings);
-        assert!(warnings[0].contains("CLAUDE_CONFIG_DIR"), "{warnings:?}");
-        assert!(warnings[1].contains("CODEX_HOME"), "{warnings:?}");
-        assert!(
-            !warnings.iter().any(|w| w.contains("MODEL")),
-            "{warnings:?}"
-        );
-
-        // Under `shell` the workstation's config directory is what's meant.
-        let plan = launch_plan(&config(), &target, "claude", &missing(), &exec()).unwrap();
-        assert!(path_warnings(&plan).is_empty(), "{:?}", plan.warnings);
     }
 
     #[test]
