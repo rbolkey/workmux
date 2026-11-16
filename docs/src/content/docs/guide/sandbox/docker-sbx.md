@@ -72,16 +72,15 @@ sandbox:
       apt-get update && apt-get install -y ripgrep jq
 ```
 
-| Option                              | Default                       | Description                                                                                                             |
-| ----------------------------------- | ----------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
-| `docker_sbx.cpus`                   | all host CPUs (sbx's default) | Number of CPUs for the sandbox (`0` means all)                                                                          |
-| `docker_sbx.memory`                 | half the host's memory        | Memory for the sandbox in sbx's binary units (`512m`, `8g`); at least `512m`                                            |
-| `docker_sbx.provision`              | -                             | Shell script run once, as root, when the sandbox is created (see [Provisioning](#provisioning))                         |
-| `docker_sbx.skip_default_provision` | `false`                       | Skip workmux's built-in provisioning (see [Provisioning](#provisioning))                                                |
-| `docker_sbx.kits`                   | `[]`                          | sbx mixin kits added when the sandbox is created (see [Kits](#kits)). **Global config only.**                           |
-| `docker_sbx.agent_credentials`      | `mount`                       | `mount` or `placeholder` (see [Placeholder agent credentials](#placeholder-agent-credentials)). **Global config only.** |
+| Option                              | Default                       | Description                                                                                     |
+| ----------------------------------- | ----------------------------- | ----------------------------------------------------------------------------------------------- |
+| `docker_sbx.cpus`                   | all host CPUs (sbx's default) | Number of CPUs for the sandbox (`0` means all)                                                  |
+| `docker_sbx.memory`                 | half the host's memory        | Memory for the sandbox in sbx's binary units (`512m`, `8g`); at least `512m`                    |
+| `docker_sbx.provision`              | -                             | Shell script run once, as root, when the sandbox is created (see [Provisioning](#provisioning)) |
+| `docker_sbx.skip_default_provision` | `false`                       | Skip workmux's built-in provisioning (see [Provisioning](#provisioning))                        |
+| `docker_sbx.kits`                   | `[]`                          | sbx mixin kits added when the sandbox is created (see [Kits](#kits)). **Global config only.**   |
 
-sbx has no per-sandbox disk setting, so there is no `disk`. Resources, `provision` and `kits` apply when the sandbox is created; recreate it with `workmux sandbox prune` after changing them. workmux warns at launch when a setting fixed at creation (`agent`, `agent_config_dir`, `extra_mounts`, `cpus`, `memory`, `kits`, `image`, the toolchain) differs from what the sandbox was created with, naming the settings; so does `agent_credentials`, or a placeholder that changed since (see [below](#placeholder-agent-credentials)). A change that would leave a file the agent shouldn't read unhidden is an error instead (see [`excluded_files`](#whats-mounted) and [placeholders](#placeholder-agent-credentials)).
+sbx has no per-sandbox disk setting, so there is no `disk`. Resources, `provision` and `kits` apply when the sandbox is created; recreate it with `workmux sandbox prune` after changing them. workmux warns at launch when a setting fixed at creation (`agent`, `agent_config_dir`, `extra_mounts`, `cpus`, `memory`, `kits`, `image`, the toolchain) differs from what the sandbox was created with, naming the settings. A change that would leave a file the agent shouldn't read unhidden is an error instead (see [`excluded_files`](#whats-mounted)).
 
 ## How it works
 
@@ -164,34 +163,7 @@ With `backend: docker_sbx` they use Docker, whatever `sandbox.container.runtime`
 
 ### Authentication
 
-Agents use the login in their mounted config directory, as on the container backend: Codex, Gemini, OpenCode, pi and OMP start logged in if you've logged in on the workstation. Claude stores its login in the macOS Keychain, which the sandbox can't reach. Sign in to Claude once inside a sandbox; the login is written to the mounted config directory and persists across sandboxes. See [Credentials](/guide/sandbox/features/#credentials). This is the default, `agent_credentials: mount`; with `placeholder` the agent never holds its login.
-
-### Placeholder agent credentials
-
-With `agent_credentials: placeholder` in your global config, the agent's config directory is still mounted, so its settings, MCP servers and workmux's status hooks keep working, but each of its credential files is hidden behind a read-only placeholder when the sandbox is created, and sbx's proxy supplies the real credential from your sbx secret for the agent's service. The placeholders are what sbx's own agent kits write, kept in the sandbox's state directory; workmux never writes into your config directory.
-
-```yaml
-# ~/.config/workmux/config.yaml
-sandbox:
-  backend: docker_sbx
-  docker_sbx:
-    agent_credentials: placeholder
-```
-
-| Agent    | sbx secret                                                             | What the agent sees                                                                                                                                  |
-| -------- | ---------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Claude   | `anthropic`: a Claude login or an API key                              | A login: `~/.claude/.credentials.json` holding sbx's sentinel tokens. An API key: `ANTHROPIC_API_KEY=proxy-managed`, with `.credentials.json` hidden |
-| Codex    | `openai`: an API key                                                   | `~/.codex/auth.json` holding `{"OPENAI_API_KEY": "proxy-managed"}`                                                                                   |
-| Gemini   | `google`: an API key                                                   | `GEMINI_API_KEY=proxy-managed`, with `~/.gemini/oauth_creds.json` hidden                                                                             |
-| OpenCode | `anthropic`, `openai`, `google`, `groq`, `openrouter`, `xai`: API keys | `<PROVIDER>_API_KEY=proxy-managed` for each provider sbx holds a key for (`GOOGLE_GENERATIVE_AI_API_KEY` for Google), with `auth.json` hidden        |
-
-Store the secret with `sbx secret set <service>` (globally, or `--sandbox <name>` for one sandbox, which takes precedence); `sbx secret ls` shows whether a secret is a login (`(oauth configured)`) or a key (`(stored)`). workmux fails with an error naming `sbx secret set` when sbx holds none for the agent (and with sbx's own error when `sbx secret ls` fails), and when `env` or `env_passthrough` lists a variable carrying the agent's own credential (such as `ANTHROPIC_API_KEY` for Claude), which would hand the agent the real value. For OpenCode that's the key of each provider sbx holds a key for; another provider's key is your own and is passed as under `mount`.
-
-Other agents can't be served, and are an error naming `agent_credentials: mount`: sbx serves Copilot's secret only in sandboxes made with its own copilot kit, which workmux doesn't use; agy, pi and OMP have no sbx service for their login. Neither can Codex with a ChatGPT login (sbx serves it through a model provider in `config.toml`, which is your own here: store an OpenAI API key instead) or Gemini with a Google login (sbx's `google` service holds API keys only; set Gemini to use an API key).
-
-A credential file that doesn't exist on your workstation is left alone, since sbx would create it in your config directory, unless the agent needs its placeholder (Claude with a login, Codex): then workmux fails, naming the file. Log the agent in once with `agent_credentials: mount`, or create the file.
-
-Placeholders are fixed when the sandbox is created. A credential file the sandbox has no placeholder over, because it appeared on your workstation after the sandbox was created or the sandbox was created under `mount`, is an error at launch naming the file and how to recreate the sandbox: the agent could read it. Otherwise workmux warns at launch when `agent_credentials` or a placeholder differs (for example, the sbx secret changed from a login to an API key) and tells you how to recreate the sandbox. The agent can read the placeholders (the state directory is mounted read-only), which hold no secret, but not the files behind them; as with `excluded_files`, root in the sandbox could, and workmux's template gives the agent no `sudo`. An agent that tries to log in again or rewrite its credential file gets a read-only file error.
+Agents use the login in their mounted config directory, as on the container backend: Codex, Gemini, OpenCode, pi and OMP start logged in if you've logged in on the workstation. Claude stores its login in the macOS Keychain, which the sandbox can't reach. Sign in to Claude once inside a sandbox; the login is written to the mounted config directory and persists across sandboxes. See [Credentials](/guide/sandbox/features/#credentials).
 
 ### Tool credentials
 
@@ -206,13 +178,13 @@ sbx secret set github --sandbox wm-myproject-a1b2c3d4 --command 'gh auth token'
 
 sbx keeps the secret on the workstation and its proxy adds it to requests for the service's domains, so the agent only ever holds a placeholder (such as `GH_TOKEN=gho_sbxproxy…`). `git` over HTTPS to GitHub needs no credential helper: the proxy authenticates it too. Services are `anthropic`, `copilot`, `cursor`, `devin`, `droid`, `github`, `google`, `groq`, `mistral`, `nebius`, `openai`, `openrouter` and `xai`; `sbx secret ls` lists the ones you've set. workmux never sets, reads or passes a secret: it reads only their names, with `sbx secret ls`.
 
-A variable in `env` or `env_passthrough` that holds one of these credentials (`GH_TOKEN`, `GITHUB_TOKEN`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY` and the like, as `sbx secret import` recognises them) replaces sbx's placeholder with the real value, which the agent can then read and send anywhere it can reach. When sbx holds a secret for that service, globally or for the sandbox, workmux warns at launch, naming the variable and `sbx secret set`; remove the variable from your config. When sbx holds no such secret, workmux says nothing. Under `agent_credentials: placeholder`, a variable carrying the agent's own credential is an error instead.
+A variable in `env` or `env_passthrough` that holds one of these credentials (`GH_TOKEN`, `GITHUB_TOKEN`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY` and the like, as `sbx secret import` recognises them) replaces sbx's placeholder with the real value, which the agent can then read and send anywhere it can reach. When sbx holds a secret for that service, globally or for the sandbox, workmux warns at launch, naming the variable and `sbx secret set`; remove the variable from your config. When sbx holds no such secret, workmux says nothing. A variable set to sbx's own placeholder, `proxy-managed`, holds no credential and gets no warning: a tool that requires a key variable can be given one with `env` (for example `OPENAI_API_KEY: proxy-managed`), and sbx's proxy supplies the real key in its requests.
 
 sbx also sets git config of its own in the sandbox (keeping its `.sbx` directories out of `git status`); workmux keeps it alongside your [git identity](/guide/sandbox/features/#git-identity).
 
 ## Provisioning
 
-The `provision` script runs once, after workmux creates the sandbox, sets it up (config directory parents, Claude's onboarding state, network rules) and runs its [built-in provisioning](#built-in-provisioning), never on later launches. It runs as root with `bash -c`, in the worktree; the template has no `sudo`, so don't use it. Its downloads go through sbx's proxy and network policy like any other request in the sandbox; sbx's `balanced` policy reaches package mirrors over HTTPS only, which is why the [template](#template) switches the image's Debian sources to HTTPS. A changed script applies the next time the sandbox is created (`workmux sandbox prune`, or `workmux remove`). If the script fails, workmux deletes the sandbox and stops with its error, so the next launch creates and provisions it again. The same holds for every step after `sbx create`: workmux records a sandbox's settings in its state directory only once it's fully set up, and a launch that finds a sandbox a launch began creating without finishing (say, after workmux was killed while provisioning) deletes it and creates it again. A sandbox without the record that no launch began creating predates the record: when it's stopped, workmux deletes it and creates it again; while it's running, panes may be in it, so workmux warns and launches into it as it is, or fails if it would have to hide a file (`excluded_files`, a credential placeholder) the sandbox has no mask over. Close the worktree's panes, and the first launch once sbx has stopped it recreates it.
+The `provision` script runs once, after workmux creates the sandbox, sets it up (config directory parents, Claude's onboarding state, network rules) and runs its [built-in provisioning](#built-in-provisioning), never on later launches. It runs as root with `bash -c`, in the worktree; the template has no `sudo`, so don't use it. Its downloads go through sbx's proxy and network policy like any other request in the sandbox; sbx's `balanced` policy reaches package mirrors over HTTPS only, which is why the [template](#template) switches the image's Debian sources to HTTPS. A changed script applies the next time the sandbox is created (`workmux sandbox prune`, or `workmux remove`). If the script fails, workmux deletes the sandbox and stops with its error, so the next launch creates and provisions it again. The same holds for every step after `sbx create`: workmux records a sandbox's settings in its state directory only once it's fully set up, and a launch that finds a sandbox a launch began creating without finishing (say, after workmux was killed while provisioning) deletes it and creates it again. A sandbox without the record that no launch began creating predates the record: when it's stopped, workmux deletes it and creates it again; while it's running, panes may be in it, so workmux warns and launches into it as it is, or fails if it would have to hide a file (`excluded_files`) the sandbox has no mask over. Close the worktree's panes, and the first launch once sbx has stopped it recreates it.
 
 ```yaml
 sandbox:
