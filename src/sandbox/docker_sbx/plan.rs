@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::path::{Component, Path, PathBuf};
 
-use crate::config::SandboxConfig;
+use crate::config::{DockerSbxAgent, SandboxConfig};
 use crate::sandbox::toolchain::{self, DetectedToolchain};
 use crate::shell::shell_quote;
 
@@ -85,6 +85,9 @@ pub struct LaunchTarget<'a> {
 #[serde(default)]
 pub struct CreateSettings {
     pub agent: String,
+    /// `sandbox.docker_sbx.agent`. A record from before it was kept is a
+    /// `shell` one.
+    pub agent_mode: DockerSbxAgent,
     /// The agent's config directory, mounted at its usual place.
     pub agent_config_dir: Option<PathBuf>,
     /// OpenCode's global config directory, mounted read-only.
@@ -304,6 +307,38 @@ fn config_dir_and_home_subpath(
     let subpath = agent_home_subpath(agent)?;
     Some((config.resolved_agent_config_dir(agent)?, subpath))
 }
+
+/// The sbx agent kit `agent: kit` creates an agent's sandbox for.
+fn agent_kit(agent: &str) -> Result<&'static str> {
+    match agent {
+        "claude" => Ok("claude"),
+        _ => bail!(
+            "sandbox.docker_sbx.agent: kit doesn't support {agent} yet. Set \
+             `sandbox.docker_sbx.agent: shell` in your global config to mount its config \
+             directory instead."
+        ),
+    }
+}
+
+/// Merges workmux's status hook groups (`$1`) into the claude kit's
+/// `~/.claude/settings.json` in the guest, beside the kit's own. The kit's
+/// hooks and status line call `/usr/local/bin/sbx-claude-hook`, which comes
+/// with sbx's own claude image, not workmux's template; where it's missing
+/// they're dropped, as each would fail on every prompt.
+const CLAUDE_KIT_HOOKS_SCRIPT: &str = r#"f="$HOME/.claude/settings.json"
+helper=false
+[ -x /usr/local/bin/sbx-claude-hook ] && helper=true
+[ -s "$f" ] || { mkdir -p "${f%/*}" && echo '{}' > "$f"; }
+jq --argjson hooks "$1" --argjson helper "$helper" '
+def kit: (.command? // "") | contains("sbx-claude-hook");
+(if $helper then . else
+  (if (.statusLine | kit) then del(.statusLine) else . end)
+  | if .hooks then .hooks |= (map_values(map(.hooks |= map(select(kit | not))
+      | select(.hooks | length > 0))) | with_entries(select(.value | length > 0)))
+    else . end
+end)
+| .hooks = reduce ($hooks | to_entries[]) as $e (.hooks // {}; .[$e.key] += $e.value)
+' "$f" > "$f.tmp" && mv "$f.tmp" "$f""#;
 
 /// A command run as root in the sandbox.
 fn root_exec(name: &str, command: Vec<String>) -> SbxCommand {
@@ -1036,6 +1071,28 @@ fn check_masked_since_create(
     Ok(())
 }
 
+/// Fail closed when the existing sandbox was created under the other
+/// `sandbox.docker_sbx.agent` mode: a `shell` sandbox has the agent's real
+/// credential mounted, which switching to `kit` must not keep, and a `kit`
+/// sandbox lacks the workstation's agent config `shell` promises.
+fn check_agent_mode_since_create(
+    mode: DockerSbxAgent,
+    created: DockerSbxAgent,
+    name: &str,
+) -> Result<()> {
+    if mode != created {
+        bail!(
+            "sbx sandbox {name} was created under sandbox.docker_sbx.agent: {}, but the \
+             config now says agent: {}, which applies only when the sandbox is created. \
+             Recreate it with `workmux sandbox prune` or `sbx rm -f {name}` (close the \
+             worktree's panes first).",
+            created.as_str(),
+            mode.as_str()
+        );
+    }
+    Ok(())
+}
+
 /// Whether the launch creates the sandbox: it's missing, a launch began
 /// creating it and didn't finish, or it predates the record of the settings
 /// it was created with and isn't running. A running sandbox may have panes
@@ -1079,14 +1136,18 @@ fn predates_record_warnings(excluded: &[Mask], name: &str) -> Result<Vec<String>
 ///
 /// When the sandbox is missing, or no launch finished setting it up, or it
 /// predates the record of its settings and isn't running (it's removed
-/// first): create it from the template with sbx's
-/// generic `shell` agent (agent kits would write into the mounted config
-/// directory), the configured resources and mixin kits, mounting the
-/// worktree, the main repository's git dir (read-only but for what commits
-/// write) and the shims at their host paths, an empty file over each of
-/// `excluded_files`, the agent's config directory where the agent looks for
-/// it, and `extra_mounts`; then, as root, give the agent the config
-/// directory's parents and seed Claude's onboarding state.
+/// first): create it from the template, with the configured resources and
+/// mixin kits, mounting the worktree, the main repository's git dir
+/// (read-only but for what commits write) and the shims at their host
+/// paths, an empty file over each of `excluded_files`, and `extra_mounts`.
+/// Under `agent: kit` it's created for sbx's agent kit, which sets the agent
+/// up in the sandbox's own home; then workmux's status hooks are added to
+/// the kit's settings. Under `agent: shell` it's created with sbx's generic
+/// `shell` agent (a kit would write into the mounted config directory) and
+/// the agent's config directory is mounted where the agent looks for it;
+/// then, as root, the agent gets the config directory's parents and
+/// Claude's onboarding state is seeded. A sandbox created under the other
+/// mode fails to launch.
 /// On every launch: bind pi's and OMP's binaries directory to a guest-local
 /// one, reconcile the sandbox's rules with `sandbox.network` and the
 /// toolchain's endpoints, and allow the supervisor's RPC port until the exec
@@ -1116,11 +1177,22 @@ pub fn launch_plan(
     let excluded = excluded_file_masks(config, target.worktree_root);
     let mut masks = Vec::new();
     let template = super::template::template_tag(&config.resolved_image(agent));
-    let config_dir = config_dir_and_home_subpath(config, agent);
+    let mode = config.docker_sbx.agent();
+    // Under `kit`, sbx's agent kit sets the agent up in the sandbox's own
+    // home, so its config directory isn't mounted.
+    let kit = match mode {
+        DockerSbxAgent::Kit => Some(agent_kit(agent)?),
+        DockerSbxAgent::Shell => None,
+    };
+    let config_dir = kit
+        .is_none()
+        .then(|| config_dir_and_home_subpath(config, agent))
+        .flatten();
     let opencode_config_dir = target.opencode_config_dir.filter(|_| agent == "opencode");
     let sbx = &config.docker_sbx;
     let create_settings = CreateSettings {
         agent: agent.to_string(),
+        agent_mode: mode,
         agent_config_dir: config_dir.as_ref().map(|(dir, _)| dir.clone()),
         opencode_config_dir: opencode_config_dir.map(Path::to_path_buf),
         extra_mounts: extra_mount_settings(config)?,
@@ -1147,10 +1219,14 @@ pub fn launch_plan(
 
     let predates_record = match target.created_with {
         Some(created) if exists => {
+            check_agent_mode_since_create(mode, created.agent_mode, name)?;
             check_masked_since_create(&excluded, created, name)?;
             Vec::new()
         }
-        None if exists => predates_record_warnings(&excluded, name)?,
+        None if exists => {
+            check_agent_mode_since_create(mode, DockerSbxAgent::Shell, name)?;
+            predates_record_warnings(&excluded, name)?
+        }
         _ => Vec::new(),
     };
 
@@ -1178,7 +1254,7 @@ pub fn launch_plan(
         for kit in sbx.kits() {
             args.extend(["--kit".to_string(), kit.clone()]);
         }
-        args.push("shell".to_string());
+        args.push(kit.unwrap_or("shell").to_string());
         let mut workspaces = vec![target.worktree_root.to_string_lossy().into_owned()];
         workspaces.extend(git_workspaces(git));
         workspaces.extend(excluded.iter().map(|mask| mask.workspace(target.state_dir)));
@@ -1217,7 +1293,8 @@ pub fn launch_plan(
         // Claude keeps its onboarding state in ~/.claude.json, outside the
         // config directory. Seed the sandbox's own copy, as Lima seeds each
         // VM's, so Claude doesn't run onboarding in every sandbox.
-        if agent == "claude" {
+        // The claude kit does so itself.
+        if agent == "claude" && kit.is_none() {
             let mut command = words(&[
                 "sh",
                 "-c",
@@ -1227,6 +1304,19 @@ pub fn launch_plan(
             command.push(format!("{GUEST_HOME}/.claude.json"));
             command.push(crate::sandbox::CLAUDE_ONBOARDING_JSON.to_string());
             setup.push(root_exec(name, command));
+        }
+
+        // The workstation's hooks aren't there under `kit`: install
+        // workmux's status hooks into the settings the kit wrote, as the
+        // agent. The kit writes them only at create, so this lasts.
+        if agent == "claude" && kit.is_some() {
+            let hooks = crate::agent_setup::claude::load_hooks_from_plugin()?;
+            let mut args = words(&["exec", name, "sh", "-c", CLAUDE_KIT_HOOKS_SCRIPT, "sh"]);
+            args.push(serde_json::to_string(&hooks)?);
+            setup.push(SbxCommand {
+                args,
+                env: Vec::new(),
+            });
         }
     }
 
@@ -1341,8 +1431,8 @@ pub fn launch_plan(
 mod tests {
     use super::*;
     use crate::config::{
-        AllowedDomainDetails, AllowedDomainEntry, DockerSbxConfig, ExtraMount, NetworkConfig,
-        NetworkPolicy,
+        AllowedDomainDetails, AllowedDomainEntry, DockerSbxAgent, DockerSbxConfig, ExtraMount,
+        NetworkConfig, NetworkPolicy,
     };
     use std::path::PathBuf;
 
@@ -1350,12 +1440,28 @@ mod tests {
         words.iter().map(|w| w.to_string()).collect()
     }
 
+    /// A config under `agent: shell`, which mounts the agent's config
+    /// directory.
     fn config() -> SandboxConfig {
         SandboxConfig {
             enabled: Some(true),
             backend: Some(crate::config::SandboxBackend::DockerSbx),
             image: Some("test-image:latest".to_string()),
             agent_config_dir: Some("/home/me/.{agent}".to_string()),
+            docker_sbx: DockerSbxConfig {
+                agent: Some(DockerSbxAgent::Shell),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// A config under `agent: kit`, the default.
+    fn kit_config() -> SandboxConfig {
+        SandboxConfig {
+            enabled: Some(true),
+            backend: Some(crate::config::SandboxBackend::DockerSbx),
+            image: Some("test-image:latest".to_string()),
             ..Default::default()
         }
     }
@@ -1629,7 +1735,7 @@ mod tests {
                 cpus: Some(4),
                 memory: Some("8g".to_string()),
                 kits: Some(vec!["docker.io/sbx/task:latest".to_string()]),
-                ..Default::default()
+                ..config().docker_sbx
             },
             ..config()
         };
@@ -1639,6 +1745,7 @@ mod tests {
             plan.create_settings,
             CreateSettings {
                 agent: "claude".to_string(),
+                agent_mode: DockerSbxAgent::Shell,
                 agent_config_dir: Some(PathBuf::from("/home/me/.claude")),
                 opencode_config_dir: None,
                 extra_mounts: Vec::new(),
@@ -1650,6 +1757,76 @@ mod tests {
                 toolchain: "none".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn a_sandbox_created_under_the_other_agent_mode_fails_naming_how_to_recreate_it() {
+        // Switching to `kit` must never keep running a sandbox that has the
+        // agent's real credential mounted; a record from before the mode was
+        // recorded is a `shell` one.
+        let kit_record = CreateSettings {
+            agent_mode: DockerSbxAgent::Kit,
+            agent_config_dir: None,
+            ..created_settings()
+        };
+        for (config, created, mode) in [
+            (kit_config(), created_settings(), "shell"),
+            (config(), kit_record, "kit"),
+        ] {
+            let mut p = paths();
+            p.created = Some(created);
+            for state in [
+                running_with(Vec::new()),
+                SbxState {
+                    sandbox: Some(sandbox("stopped")),
+                    ..missing()
+                },
+            ] {
+                let err = launch_plan(&config, &target(&p), "claude", &state, &exec())
+                    .unwrap_err()
+                    .to_string();
+                let created_under = format!("agent: {mode}");
+                for expected in [
+                    created_under.as_str(),
+                    "wm-proj-12345678",
+                    "workmux sandbox prune",
+                    "sbx rm -f wm-proj-12345678",
+                ] {
+                    assert!(err.contains(expected), "{expected}: {err}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn under_kit_a_running_sandbox_from_before_the_record_is_an_error() {
+        // It was created with the agent's config mounted.
+        let mut p = paths();
+        p.created = None;
+        let err = launch_plan(
+            &kit_config(),
+            &target(&p),
+            "claude",
+            &running_with(Vec::new()),
+            &exec(),
+        )
+        .unwrap_err()
+        .to_string();
+        for expected in ["agent: shell", "sbx rm -f wm-proj-12345678"] {
+            assert!(err.contains(expected), "{expected}: {err}");
+        }
+    }
+
+    #[test]
+    fn the_create_record_holds_the_agent_mode() {
+        let p = paths();
+        for (config, mode) in [
+            (kit_config(), DockerSbxAgent::Kit),
+            (config(), DockerSbxAgent::Shell),
+        ] {
+            let plan = launch_plan(&config, &target(&p), "claude", &missing(), &exec()).unwrap();
+            assert_eq!(plan.create_settings.agent_mode, mode);
+        }
     }
 
     #[test]
@@ -1666,7 +1843,7 @@ mod tests {
         let config = SandboxConfig {
             docker_sbx: DockerSbxConfig {
                 memory: Some("8g".to_string()),
-                ..Default::default()
+                ..config().docker_sbx
             },
             ..config()
         };
@@ -2766,6 +2943,115 @@ mod tests {
     }
 
     #[test]
+    fn under_kit_a_claude_sandbox_is_created_for_sbxs_claude_kit_without_its_config_dir() {
+        // The kit installs Claude in the sandbox's own home and sbx holds the
+        // credential; mounting the workstation's config would hand it over.
+        let p = paths();
+        let plan = launch_plan(&kit_config(), &target(&p), "claude", &missing(), &exec()).unwrap();
+
+        let tag = super::super::template::template_tag("test-image:latest");
+        assert_eq!(
+            create_args(&plan)[..10],
+            args(&[
+                "create",
+                "--name",
+                "wm-proj-12345678",
+                "--no-progress",
+                "--template",
+                &tag,
+                "--pull",
+                "never",
+                "claude",
+                "/code/proj__worktrees/feat",
+            ])
+        );
+        assert!(
+            !workspaces(&plan).iter().any(|w| w.contains("/home/agent")),
+            "{:?}",
+            plan.create
+        );
+        assert!(
+            !setup_args(&plan)
+                .iter()
+                .any(|a| a.contains(&"root".to_string())),
+            "{:?}",
+            plan.setup
+        );
+        assert_eq!(plan.create_settings.agent_config_dir, None);
+    }
+
+    #[test]
+    fn under_kit_agents_without_kit_support_yet_fail_naming_agent_shell() {
+        // Fail closed rather than mount the config under `kit`.
+        let p = paths();
+        for agent in ["codex", "pi"] {
+            let err = launch_plan(&kit_config(), &target(&p), agent, &missing(), &exec())
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(agent) && err.contains("sandbox.docker_sbx.agent: shell"),
+                "{err}"
+            );
+        }
+    }
+
+    /// The setup commands that edit Claude's settings in the guest.
+    fn claude_settings_edits(plan: &LaunchPlan) -> Vec<Vec<String>> {
+        setup_args(plan)
+            .into_iter()
+            .filter(|a| a.iter().any(|w| w.contains(".claude/settings.json")))
+            .collect()
+    }
+
+    #[test]
+    fn under_kit_a_created_claude_sandbox_gets_workmuxs_status_hooks_and_keeps_the_kits_onboarding()
+    {
+        // The workstation's hooks aren't mounted under `kit`; workmux's
+        // status hooks go into the settings the kit wrote, as the agent.
+        // The kit already completes onboarding and trusts the workspace.
+        let p = paths();
+        let plan = launch_plan(&kit_config(), &target(&p), "claude", &missing(), &exec()).unwrap();
+
+        let edits = claude_settings_edits(&plan);
+        assert_eq!(edits.len(), 1, "{:?}", plan.setup);
+        let edit = &edits[0];
+        assert_eq!(edit[..4], args(&["exec", "wm-proj-12345678", "sh", "-c"]));
+        let plugin: serde_json::Value =
+            serde_json::from_str(include_str!("../../../.claude-plugin/plugin.json")).unwrap();
+        assert!(
+            edit.iter().any(
+                |w| serde_json::from_str::<serde_json::Value>(w).ok().as_ref()
+                    == Some(&plugin["hooks"])
+            ),
+            "{edit:?}"
+        );
+        assert!(
+            !setup_args(&plan)
+                .iter()
+                .any(|a| a.iter().any(|w| w.contains(".claude.json"))),
+            "{:?}",
+            plan.setup
+        );
+
+        // Only when the sandbox is created: the kit writes its settings then.
+        let mut existing = paths();
+        existing.created = Some(plan.create_settings.clone());
+        let plan = launch_plan(
+            &kit_config(),
+            &target(&existing),
+            "claude",
+            &running_with(Vec::new()),
+            &exec(),
+        )
+        .unwrap();
+        assert!(claude_settings_edits(&plan).is_empty(), "{:?}", plan.setup);
+
+        // Under `shell`, Claude has the workstation's own settings.
+        let plan = launch_plan(&config(), &target(&p), "claude", &missing(), &exec()).unwrap();
+        assert!(claude_settings_edits(&plan).is_empty(), "{:?}", plan.setup);
+    }
+
+    #[test]
     fn opencode_global_config_dir_is_mounted_read_only_at_its_usual_place() {
         let p = paths();
         let opencode_config = PathBuf::from("/home/me/.config/opencode");
@@ -3355,7 +3641,7 @@ mod tests {
         let config = SandboxConfig {
             docker_sbx: DockerSbxConfig {
                 provision: Some("apt-get install -y ripgrep".to_string()),
-                ..Default::default()
+                ..config().docker_sbx
             },
             ..with_network(NetworkPolicy::Deny, domains(&["deb.debian.org"]))
         };
