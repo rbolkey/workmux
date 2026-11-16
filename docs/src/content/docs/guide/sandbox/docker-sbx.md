@@ -3,7 +3,7 @@ title: "Docker Sandboxes backend"
 description: Run agents in Docker Sandboxes (sbx) microVMs
 ---
 
-workmux can run agents in [Docker Sandboxes](https://docs.docker.com/ai/sandboxes/) (the `sbx` CLI). Each worktree gets its own sbx sandbox, a microVM with its own kernel, and sbx's host-side proxy enforces its network policy.
+workmux can run agents in [Docker Sandboxes](https://docs.docker.com/ai/sandboxes/) (the `sbx` CLI). Each worktree gets its own sbx sandbox for each agent it runs, a microVM with its own kernel, and sbx's host-side proxy enforces its network policy.
 
 ## Setup
 
@@ -99,12 +99,13 @@ Everything that goes through the RPC server works as on the other backends: [hos
 
 ### Lifecycle
 
-The sandbox belongs to the worktree, not to a pane:
+A sandbox belongs to the worktree and an agent, not to a pane:
 
-- With `target: all`, every pane of the worktree runs in the worktree's one sandbox, so shells and agents see the same environment.
+- Each agent pane runs in the sandbox of its own agent: the named agent or agent type it runs (see [Sandbox naming](#sandbox-naming)). With the default `<agent>` pane, that's the worktree's selected agent, so `workmux add -a codex` runs in a Codex sandbox even when your default agent is Claude. A layout with Claude and Codex panes in one worktree, such as the `design` layout in [Named layouts with agents](/guide/agents/#named-layouts-with-agents), gets two sandboxes, and workmux creates both before the window opens.
+- With `target: all`, plain panes (shells, editors, dev servers) run in the sandbox of the worktree's selected agent, so they see the same environment as that agent.
 - Closing a pane or window, or the agent exiting, ends only that pane's session. sbx keeps a session's processes running when its `sbx exec` goes away, so the supervisor hangs them up itself; other panes' sessions keep running.
 - sbx stops an idle sandbox about 30 seconds after its last session ends. The next pane, `workmux open` or `workmux sandbox shell` starts it again in about a second; there's no separate start step.
-- Removing the worktree deletes its sandbox, with its policy rules and any sbx secrets scoped to it: `workmux remove`, `workmux merge`, and a `workmux add` that rolls back a worktree it couldn't finish. The sandbox goes only once the removal can no longer fail: a failing `pre_remove` hook leaves both the worktree and its sandbox. A pane still setting the sandbox up finishes first.
+- Removing the worktree deletes its sandboxes, with their policy rules and any sbx secrets scoped to them: `workmux remove`, `workmux merge`, and a `workmux add` that rolls back a worktree it couldn't finish. The sandboxes go only once the removal can no longer fail: a failing `pre_remove` hook leaves both the worktree and its sandboxes. A pane still setting a sandbox up finishes first.
 
 ### What's mounted
 
@@ -124,7 +125,7 @@ sbx mounts the worktree, the git metadata and the shims at their host paths, and
 
 \* As on the [container backend](/guide/sandbox/container/#whats-mounted), git pointer files, per-worktree config, object information, submodules' hooks and config, and files the repository config includes or runs stay read-only within writable git mounts, so an agent can't plant hooks or change git config. For a filter, diff or merge driver or fsmonitor, that's every file in the worktree or git dir its command names, so `sh ./scripts/clean.sh` protects the script as well. sbx enforces read-only mounts on the host, even against root in the sandbox. Sandboxes require a linked worktree: workmux refuses to sandbox the main worktree, whose admin files are the repository's own. Hooks in the main repository must be regular files, not symbolic or hard links.
 
-See [Credentials](/guide/sandbox/features/#credentials) for each agent's config directory. These mounts are made when the sandbox is created, so switching `agent` needs a new sandbox (`workmux sandbox prune`). For Claude, workmux also writes the sandbox's own `~/.claude.json` with onboarding marked complete. Pi and OMP download Linux `fd` and `rg` binaries into their config directory; workmux binds a directory inside the sandbox over `~/.pi/agent/bin/` and `~/.omp/agent/tools/` each time a pane starts, so the workstation's binaries are never overwritten.
+See [Credentials](/guide/sandbox/features/#credentials) for each agent's config directory. These mounts are made when the sandbox is created; each agent has its own sandbox, so another agent gets its own config directory. For Claude, workmux also writes the sandbox's own `~/.claude.json` with onboarding marked complete. Pi and OMP download Linux `fd` and `rg` binaries into their config directory; workmux binds a directory inside the sandbox over `~/.pi/agent/bin/` and `~/.omp/agent/tools/` each time a pane starts, so the workstation's binaries are never overwritten.
 
 `extra_mounts` entries are mounted at their `guest_path`, or at their host path without one. sbx mounts a single file only read-only, so a writable entry that is a file is an error. A `guest_path` inside the worktree or another mount appears on the workstation too: sbx creates the mount point there (an empty directory or file) if it's missing.
 
@@ -138,7 +139,9 @@ Your `~/.gitconfig` isn't mounted; workmux passes your git identity instead (see
 
 ### Sandbox naming
 
-Sandboxes are named `wm-<project>-<hash>` (e.g. `wm-myproject-a1b2c3d4`), where the hash is of the worktree path, so every worktree gets its own sandbox. List them with `sbx ls`.
+Sandboxes are named `wm-<project>-<hash>-<agent>` (e.g. `wm-myproject-a1b2c3d4-claude`), where the hash is of the worktree path and the agent is the pane's agent: a [named agent](/guide/agents/) such as `cc-personal`, or an agent type by its own name such as `claude` or `codex`. So every worktree gets its own sandbox for each agent it runs. An agent name sbx wouldn't accept (anything but lowercase letters, digits and single `-`) or one longer than 24 characters is shortened and slugified, with a short hash of the name so that two agents never share a sandbox. List them with `sbx ls`.
+
+Sandboxes named `wm-<project>-<hash>`, from before the agent was part of the name, aren't used any more: removing their worktree deletes them, and the next pane creates the agent's own sandbox.
 
 ### Template
 
@@ -274,16 +277,19 @@ sbx logs requests it blocks: `sbx policy log <sandbox>` lists them with the rule
 ```bash
 # Stop running workmux sandboxes (interactive list, a name, or --all; -y skips the prompt)
 workmux sandbox stop
-workmux sandbox stop wm-myproject-abc12345
+workmux sandbox stop wm-myproject-abc12345-claude
 workmux sandbox stop --all --yes
 
 # Delete all workmux sandboxes (wm-* in `sbx ls`), after confirmation
 workmux sandbox prune
 workmux sandbox prune --force
 
-# Open a shell in the current worktree's sandbox (creating it if needed)
+# Open a shell in the current worktree's sandbox for the selected agent (creating it if needed)
 workmux sandbox shell
 workmux sandbox shell -- git status
+
+# Open a shell in another agent's sandbox of the worktree
+workmux sandbox shell --agent codex
 ```
 
 A stopped sandbox keeps its state and starts again when a pane needs it. A pruned sandbox is created again by the next `workmux open`. `workmux sandbox shell` has no RPC server, so host commands and status updates don't work in it; `--exec` means the same as without it, since the sandbox is already persistent.

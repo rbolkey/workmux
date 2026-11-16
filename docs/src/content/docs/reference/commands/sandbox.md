@@ -152,13 +152,14 @@ workmux sandbox shell --exec
 **Options:**
 
 - `-e, --exec` - Exec into an existing container for this worktree instead of starting a new one (container backend; docker_sbx accepts it with the same meaning as without it)
+- `--agent <name>` - The agent whose sandbox to open: a named agent or an agent type (docker_sbx, where each agent of a worktree has its own sandbox; default: the selected agent)
 - `<command...>` - Command to run instead of bash
 
 **Backend behavior:**
 
 - **Container:** Starts a fresh container with the same mounts and environment as a normal worktree sandbox. With `--exec`, attaches to an existing container instead.
 - **Lima:** Connects to the Lima VM for the current worktree (creating it if needed). The `--exec` flag is not supported since Lima VMs are persistent and `shell` always connects to the existing VM.
-- **Docker Sandboxes:** Runs the shell with `sbx exec` in the current worktree's sbx sandbox, creating it if needed and starting it if sbx stopped it. `--exec` means the same. A single argument after `--` runs as a shell command line (`-- 'git log | head'`); several are passed on as separate words, keeping their quoting (`-- bash -c 'set -x; make'`). It gets a terminal only when stdin is one, so it also works from scripts and pipes.
+- **Docker Sandboxes:** Runs the shell with `sbx exec` in the current worktree's sbx sandbox for the selected agent (or `--agent`'s), creating it if needed and starting it if sbx stopped it. `--exec` means the same. A single argument after `--` runs as a shell command line (`-- 'git log | head'`); several are passed on as separate words, keeping their quoting (`-- bash -c 'set -x; make'`). It gets a terminal only when stdin is one, so it also works from scripts and pipes.
 
 ### sandbox install-dev
 
