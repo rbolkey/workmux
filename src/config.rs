@@ -1952,13 +1952,11 @@ pub struct DockerSbxConfig {
 #[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum DockerSbxAgent {
-    /// sbx's agent kit sets the agent up and holds its credential (the
-    /// config default).
+    /// sbx's agent kit sets the agent up and holds its credential.
+    #[default]
     Kit,
     /// sbx's generic `shell` agent, with the agent's config directory
-    /// mounted from the workstation. The default of this type only because
-    /// sandboxes recorded before the mode was are `shell` ones.
-    #[default]
+    /// mounted from the workstation.
     Shell,
 }
 
@@ -2028,7 +2026,7 @@ impl DockerSbxConfig {
 
     /// How the agent is set up in its sandbox. Defaults to `kit`.
     pub fn agent(&self) -> DockerSbxAgent {
-        self.agent.unwrap_or(DockerSbxAgent::Kit)
+        self.agent.unwrap_or_default()
     }
 
     /// Check `memory` is a size sbx accepts. Called at config load.

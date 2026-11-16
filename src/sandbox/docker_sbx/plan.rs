@@ -80,6 +80,12 @@ pub struct LaunchTarget<'a> {
     pub agent_env: &'a [(String, String)],
 }
 
+/// The mode of a sandbox recorded before the mode was: `shell`, the only
+/// one there was.
+fn shell_mode() -> DockerSbxAgent {
+    DockerSbxAgent::Shell
+}
+
 /// What a sandbox is created with and later launches can't change, as
 /// recorded in its state directory once it's fully set up. Fields an older
 /// record holds that are no longer kept, such as `agent_credentials`, are
@@ -90,6 +96,7 @@ pub struct CreateSettings {
     pub agent: String,
     /// `sandbox.docker_sbx.agent`. A record from before it was kept is a
     /// `shell` one.
+    #[serde(default = "shell_mode")]
     pub agent_mode: DockerSbxAgent,
     /// The agent's config directory, mounted at its usual place.
     pub agent_config_dir: Option<PathBuf>,
@@ -1789,6 +1796,7 @@ mod tests {
     fn created_settings() -> CreateSettings {
         CreateSettings {
             agent: "claude".to_string(),
+            agent_mode: DockerSbxAgent::Shell,
             agent_config_dir: Some(PathBuf::from("/home/me/.claude")),
             template: super::super::template::template_tag("test-image:latest"),
             toolchain: "none".to_string(),

@@ -1103,6 +1103,7 @@ mod tests {
             read_created_record(dir.path()),
             Some(CreateSettings {
                 agent: "claude".to_string(),
+                agent_mode: DockerSbxAgent::Shell,
                 agent_config_dir: Some(PathBuf::from("/home/me/.claude")),
                 excluded_files: vec![PathBuf::from("/code/wt/.env")],
                 template: "t".to_string(),
