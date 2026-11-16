@@ -956,19 +956,10 @@ fn run_prune_docker_sbx(force: bool) -> Result<()> {
         print!("  Deleting {}... ", sandbox.name);
         io::stdout().flush().ok();
 
-        match SbxInstance::remove_by_name(&sandbox.name) {
+        match docker_sbx::remove_sandbox(&sandbox.name) {
             Ok(()) => {
                 println!("done");
                 deleted_count += 1;
-
-                // Clean up per-sandbox state directory
-                if let Ok(state_dir) = docker_sbx::sbx_state_dir_path(&sandbox.name)
-                    && state_dir.exists()
-                    && let Err(e) = std::fs::remove_dir_all(&state_dir)
-                {
-                    tracing::warn!(sandbox = %sandbox.name, error = %e, "failed to clean up state dir");
-                }
-                docker_sbx::remove_acknowledgement(&sandbox.name);
             }
             Err(e) => {
                 println!("failed");
