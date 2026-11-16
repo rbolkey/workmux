@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 use tracing::{debug, info, warn};
 
-use crate::config::{AgentEnvValue, Config, DockerSbxAgent};
+use crate::config::{Config, DockerSbxAgent};
 
 use super::plan::{
     CreateSettings, ExecRequest, LaunchPlan, LaunchTarget, NetworkRule, Platform, SbxCommand,
@@ -666,7 +666,7 @@ pub fn prepare_launch(
 
     let toolchain =
         crate::sandbox::toolchain::resolve_toolchain(&config.sandbox.toolchain(), &worktree_root);
-    let agent_env = named_agent_env(config, selected_agent);
+    let agent_env = config.named_agent_env(selected_agent);
 
     let _lock = lock_state_dir(&state_dir)?;
     // Removing the worktree removed the sandbox while this launch waited.
@@ -743,25 +743,6 @@ pub fn prepare_launch(
         }
     }
     Ok(plan)
-}
-
-/// A named agent's `env`, with `from_env` values read from the
-/// workstation's environment; empty for an agent type.
-fn named_agent_env(config: &Config, selected_agent: &str) -> Vec<(String, String)> {
-    let Some(entry) = config.agents.get(selected_agent) else {
-        return Vec::new();
-    };
-    entry
-        .env
-        .iter()
-        .filter_map(|(key, value)| {
-            let value = match value {
-                AgentEnvValue::Literal(value) => value.clone(),
-                AgentEnvValue::FromEnv { from_env } => std::env::var(from_env).ok()?,
-            };
-            Some((key.clone(), value))
-        })
-        .collect()
 }
 
 /// Run a plan's commands up to its exec, keeping the sandbox's state

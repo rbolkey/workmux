@@ -1088,6 +1088,28 @@ impl AgentEnvValue {
     }
 }
 
+impl Config {
+    /// A named agent's `env`, with `from_env` values read from the
+    /// workstation's environment (variables it doesn't set are left out);
+    /// empty for an agent type.
+    pub fn named_agent_env(&self, agent: &str) -> Vec<(String, String)> {
+        let Some(entry) = self.agents.get(agent) else {
+            return Vec::new();
+        };
+        entry
+            .env
+            .iter()
+            .filter_map(|(key, value)| {
+                let value = match value {
+                    AgentEnvValue::Literal(value) => value.clone(),
+                    AgentEnvValue::FromEnv { from_env } => std::env::var(from_env).ok()?,
+                };
+                Some((key.clone(), value))
+            })
+            .collect()
+    }
+}
+
 pub(crate) fn is_valid_env_name(name: &str) -> bool {
     let mut chars = name.chars();
     let Some(first) = chars.next() else {
