@@ -15,6 +15,13 @@ RUN { id -u agent >/dev/null 2>&1 || useradd -m -u 1000 -s /bin/bash agent; } \
 RUN if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
         sed -i 's|http://|https://|' /etc/apt/sources.list.d/debian.sources; \
     fi
+# Codex records its background app-server with `ps`, which the published codex
+# image lacks; without it Codex fails to start in a sandbox that persists.
+RUN if ! command -v ps >/dev/null 2>&1; then \
+        apt-get update \
+        && apt-get install -y --no-install-recommends procps \
+        && rm -rf /var/lib/apt/lists/*; \
+    fi
 ENV BASH_ENV=/etc/sandbox-persistent.sh
 USER agent
 WORKDIR /home/agent
