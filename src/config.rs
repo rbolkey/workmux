@@ -1945,11 +1945,6 @@ pub struct DockerSbxConfig {
     /// project config.
     #[serde(default)]
     pub agent: Option<DockerSbxAgent>,
-
-    /// Withdrawn: placeholder agent credentials (`mount | placeholder`).
-    /// Read only so a leftover value warns that it's no longer read.
-    #[serde(default, skip_serializing)]
-    pub agent_credentials: Option<serde_yaml::Value>,
 }
 
 /// How the agent is set up in a `docker_sbx` sandbox
@@ -2036,17 +2031,6 @@ impl DockerSbxConfig {
         self.agent.unwrap_or(DockerSbxAgent::Kit)
     }
 
-    /// The warning for a withdrawn key set in the config file `file`.
-    pub fn withdrawn_warning(&self, file: &str) -> Option<String> {
-        self.agent_credentials.as_ref().map(|_| {
-            format!(
-                "sandbox.docker_sbx.agent_credentials in {file} is no longer read -- \
-                 placeholder agent credentials were withdrawn and agents keep their \
-                 credential mounts; remove it"
-            )
-        })
-    }
-
     /// Check `memory` is a size sbx accepts. Called at config load.
     pub fn validate(&self) -> anyhow::Result<()> {
         if let Some(memory) = self.memory() {
@@ -2085,14 +2069,6 @@ impl DockerSbxConfig {
                 move it to your global config (~/.config/workmux/config.yaml)"
             );
         }
-        for (config, file) in [
-            (&global, "~/.config/workmux/config.yaml"),
-            (&project, ".workmux.yaml"),
-        ] {
-            if let Some(warning) = config.withdrawn_warning(file) {
-                tracing::warn!("{warning}");
-            }
-        }
         Self {
             cpus: project.cpus.or(global.cpus),
             memory: project.memory.or(global.memory),
@@ -2102,7 +2078,6 @@ impl DockerSbxConfig {
                 .or(global.skip_default_provision),
             kits: global.kits,
             agent: global.agent,
-            agent_credentials: None,
         }
     }
 }
@@ -6870,30 +6845,6 @@ docker_sbx:
             shell.merge(Config::default()).sandbox.docker_sbx.agent(),
             DockerSbxAgent::Shell
         );
-    }
-
-    #[test]
-    fn docker_sbx_leftover_agent_credentials_warns_its_no_longer_read() {
-        for value in ["placeholder", "mount"] {
-            let config: SandboxConfig = serde_yaml::from_str(&format!(
-                "backend: docker_sbx\ndocker_sbx:\n  agent_credentials: {value}\n"
-            ))
-            .unwrap();
-            let warning = config
-                .docker_sbx
-                .withdrawn_warning("~/.config/workmux/config.yaml")
-                .expect("a leftover agent_credentials warns");
-            assert!(
-                warning.contains("sandbox.docker_sbx.agent_credentials"),
-                "{warning}"
-            );
-            assert!(warning.contains("no longer read"), "{warning}");
-            assert!(
-                warning.contains("~/.config/workmux/config.yaml"),
-                "{warning}"
-            );
-        }
-        assert_eq!(DockerSbxConfig::default().withdrawn_warning("x"), None);
     }
 
     #[test]
