@@ -94,7 +94,7 @@ pub struct CreateSettings {
     pub opencode_config_dir: Option<PathBuf>,
     /// `sandbox.extra_mounts`, as workspaces.
     pub extra_mounts: Vec<String>,
-    /// The files `sandbox.container.excluded_files` masked.
+    /// The files `sandbox.docker_sbx.excluded_files` masked.
     pub excluded_files: Vec<PathBuf>,
     pub cpus: Option<u32>,
     pub memory: Option<String>,
@@ -705,14 +705,14 @@ fn git_workspaces(git: &GitMetadata) -> Vec<String> {
     workspaces
 }
 
-/// Masks hiding `sandbox.container.excluded_files` from the agent, by the
+/// Masks hiding `sandbox.docker_sbx.excluded_files` from the agent, by the
 /// container backend's rules: only existing regular files inside the
 /// worktree are masked; missing paths, directories and paths outside the
 /// worktree are skipped with a warning. A mask over a missing path would
 /// make sbx create it in the worktree on the workstation.
 fn excluded_file_masks(config: &SandboxConfig, worktree_root: &Path) -> Vec<Mask> {
     let mut masks = Vec::new();
-    for rel in config.container.excluded_files() {
+    for rel in config.docker_sbx.excluded_files() {
         let rel_path = Path::new(rel);
         if rel_path.is_absolute()
             || rel_path
@@ -721,7 +721,7 @@ fn excluded_file_masks(config: &SandboxConfig, worktree_root: &Path) -> Vec<Mask
         {
             tracing::warn!(
                 path = %rel,
-                "sandbox.container.excluded_files entry must be a relative path inside the worktree; skipping"
+                "sandbox.docker_sbx.excluded_files entry must be a relative path inside the worktree; skipping"
             );
             continue;
         }
@@ -734,7 +734,7 @@ fn excluded_file_masks(config: &SandboxConfig, worktree_root: &Path) -> Vec<Mask
             if !file.starts_with(worktree_root) {
                 tracing::warn!(
                     path = %rel,
-                    "sandbox.container.excluded_files entry resolves outside the worktree; skipping"
+                    "sandbox.docker_sbx.excluded_files entry resolves outside the worktree; skipping"
                 );
             } else if !masks.iter().any(|mask: &Mask| mask.target == file) {
                 masks.push(Mask::empty(file));
@@ -742,12 +742,12 @@ fn excluded_file_masks(config: &SandboxConfig, worktree_root: &Path) -> Vec<Mask
         } else if host_path.is_dir() {
             tracing::warn!(
                 path = %rel,
-                "sandbox.container.excluded_files entry is a directory; only regular files can be masked. Skipping."
+                "sandbox.docker_sbx.excluded_files entry is a directory; only regular files can be masked. Skipping."
             );
         } else {
             tracing::warn!(
                 path = %rel,
-                "sandbox.container.excluded_files entry does not exist on disk; skipping"
+                "sandbox.docker_sbx.excluded_files entry does not exist on disk; skipping"
             );
         }
     }
@@ -1158,7 +1158,7 @@ fn create_settings_warnings(
         ),
         ("extra_mounts", current.extra_mounts != created.extra_mounts),
         (
-            "container.excluded_files",
+            "docker_sbx.excluded_files",
             current.excluded_files != created.excluded_files,
         ),
         ("docker_sbx.cpus", current.cpus != created.cpus),
@@ -1198,7 +1198,7 @@ fn check_masked_since_create(
         .find(|mask| !created.excluded_files.contains(&mask.target))
     {
         bail!(
-            "sandbox.container.excluded_files lists {}, but sbx sandbox {name} was created \
+            "sandbox.docker_sbx.excluded_files lists {}, but sbx sandbox {name} was created \
              without a mask over it, so the agent could read it. Masks are fixed when the \
              sandbox is created; recreate it with `workmux sandbox prune` or `sbx rm -f {name}`.",
             mask.target.display()
@@ -3674,8 +3674,20 @@ mod tests {
 
     fn excluding(files: &[&str]) -> SandboxConfig {
         let mut config = config();
-        config.container.excluded_files = Some(files.iter().map(|f| f.to_string()).collect());
+        config.docker_sbx.excluded_files = Some(files.iter().map(|f| f.to_string()).collect());
         config
+    }
+
+    #[test]
+    fn container_excluded_files_have_no_effect_under_docker_sbx() {
+        // `sandbox.container.*` is the container backend's namespace.
+        let (_dir, p) = worktree_with(&[".env"]);
+        let mut config = config();
+        config.container.excluded_files = Some(vec![".env".to_string()]);
+        let plan = launch_plan(&config, &target(&p), "claude", &missing(), &exec()).unwrap();
+
+        assert!(plan.masks.is_empty(), "{:?}", plan.masks);
+        assert!(plan.create_settings.excluded_files.is_empty());
     }
 
     #[test]
@@ -3770,7 +3782,7 @@ mod tests {
             .to_string();
         for expected in [
             local.display().to_string().as_str(),
-            "container.excluded_files",
+            "sandbox.docker_sbx.excluded_files",
             "sbx rm -f wm-proj-12345678",
         ] {
             assert!(error.contains(expected), "{expected}: {error}");
@@ -3794,7 +3806,7 @@ mod tests {
 
         assert_eq!(plan.warnings.len(), 1, "{:?}", plan.warnings);
         let warning = &plan.warnings[0];
-        assert!(warning.contains("(container.excluded_files)"), "{warning}");
+        assert!(warning.contains("(docker_sbx.excluded_files)"), "{warning}");
         assert!(warning.contains("workmux sandbox prune"), "{warning}");
     }
 
