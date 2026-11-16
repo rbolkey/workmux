@@ -75,6 +75,9 @@ pub struct LaunchTarget<'a> {
     /// Whether a launch began creating the sandbox and didn't finish (it
     /// failed or was killed partway), as its state directory records.
     pub unfinished: bool,
+    /// The named agent's `env`, with values as the workstation resolves
+    /// them; empty for an agent type.
+    pub agent_env: &'a [(String, String)],
 }
 
 /// What a sandbox is created with and later launches can't change, as
@@ -308,16 +311,67 @@ fn config_dir_and_home_subpath(
     Some((config.resolved_agent_config_dir(agent)?, subpath))
 }
 
-/// The sbx agent kit `agent: kit` creates an agent's sandbox for.
+/// The sbx agent kit `agent: kit` creates an agent's sandbox for. sbx has
+/// none for the other agent types.
 fn agent_kit(agent: &str) -> Result<&'static str> {
     match agent {
         "claude" => Ok("claude"),
+        "codex" => Ok("codex"),
+        "copilot" => Ok("copilot"),
+        "gemini" => Ok("gemini"),
+        "opencode" => Ok("opencode"),
         _ => bail!(
-            "sandbox.docker_sbx.agent: kit doesn't support {agent} yet. Set \
-             `sandbox.docker_sbx.agent: shell` in your global config to mount its config \
-             directory instead."
+            "sbx has no agent kit for {agent}; sandbox.docker_sbx.agent: kit supports claude, \
+             codex, copilot, gemini and opencode. Set `sandbox.docker_sbx.agent: shell` in your \
+             global config to run {agent} with its config directory mounted instead."
         ),
     }
+}
+
+/// The kit an agent's sandbox is created for under `agent: kit`, failing
+/// for what the kit can't serve.
+fn kit_for(config: &SandboxConfig, agent: &str) -> Result<&'static str> {
+    let kit = agent_kit(agent)?;
+    if config.agent_config_dir.is_some() {
+        bail!(
+            "sandbox.agent_config_dir is set, but under sandbox.docker_sbx.agent: kit sbx's \
+             {kit} kit sets {agent} up in the sandbox's own home and no config directory is \
+             mounted. Remove sandbox.agent_config_dir, or set \
+             `sandbox.docker_sbx.agent: shell` in your global config to mount it."
+        );
+    }
+    // The kit configures Copilot CLI; the binary comes from the template,
+    // and workmux publishes no Copilot image.
+    if kit == "copilot" && config.image.is_none() {
+        bail!(
+            "workmux has no sandbox image with GitHub Copilot CLI. Set `sandbox.image` to an \
+             image that provides `copilot` (built FROM {}:base) to use the copilot kit.",
+            crate::sandbox::DEFAULT_IMAGE_REGISTRY
+        );
+    }
+    Ok(kit)
+}
+
+/// Under `agent: kit`, a warning for each variable of the named agent's
+/// `env` whose value is a path on the workstation (absolute or `~`), such
+/// as `CLAUDE_CONFIG_DIR`: the sandbox has the kit's own config, not that
+/// directory, so the agent wouldn't run on the account the path selects.
+fn agent_env_warnings(target: &LaunchTarget, kit: &str) -> Vec<String> {
+    target
+        .agent_env
+        .iter()
+        .filter(|(_, value)| value.starts_with('/') || value.starts_with('~'))
+        .map(|(key, value)| {
+            format!(
+                "the agent's env sets {key} to a workstation path ({value}), but under \
+                 sandbox.docker_sbx.agent: kit sbx sandbox {} runs the {kit} kit's own setup \
+                 and login, not the workstation's. For another account, give the sandbox its \
+                 own with `sbx secret set <service> --sandbox {}`, or set \
+                 `sandbox.docker_sbx.agent: shell`.",
+                target.sandbox_name, target.sandbox_name
+            )
+        })
+        .collect()
 }
 
 /// Merges workmux's status hook groups (`$1`) into the claude kit's
@@ -339,6 +393,114 @@ def kit: (.command? // "") | contains("sbx-claude-hook");
 end)
 | .hooks = reduce ($hooks | to_entries[]) as $e (.hooks // {}; .[$e.key] += $e.value)
 ' "$f" > "$f.tmp" && mv "$f.tmp" "$f""#;
+
+/// Merges status hook groups (`$2`, by event) into the JSON config at
+/// `$HOME/$1` in the guest, after the groups already there.
+const JSON_HOOKS_SCRIPT: &str = r#"f="$HOME/$1"
+[ -s "$f" ] || { mkdir -p "${f%/*}" && echo '{}' > "$f"; }
+jq --argjson hooks "$2" '
+.hooks = reduce ($hooks | to_entries[]) as $e (.hooks // {}; .[$e.key] += $e.value)
+' "$f" > "$f.tmp" && mv "$f.tmp" "$f""#;
+
+/// Turns Codex's hooks feature on in the codex kit's
+/// `~/.codex/config.toml`, without which it doesn't read `hooks.json`. The
+/// kit's `notify` calls `/usr/local/bin/sbx-codex-hook`, which comes with
+/// sbx's own codex image, not workmux's template; where it's missing it's
+/// dropped, as it would fail at the end of every turn.
+const CODEX_KIT_CONFIG_SCRIPT: &str = r#"f="$HOME/.codex/config.toml"
+mkdir -p "${f%/*}" && touch "$f"
+helper=0
+[ -x /usr/local/bin/sbx-codex-hook ] && helper=1
+awk -v helper="$helper" '
+/^\[/ { features = ($0 ~ /^\[features\][ \t]*$/) }
+/^\[features\][ \t]*$/ { print; print "hooks = true"; done = 1; next }
+features && /^[ \t]*hooks[ \t]*=/ { next }
+!helper && /^notify[ \t]*=.*sbx-codex-hook/ { next }
+{ print }
+END { if (!done) printf "\n[features]\nhooks = true\n" }
+' "$f" > "$f.tmp" && mv "$f.tmp" "$f""#;
+
+/// Writes `$2` to `$HOME/$1` in the guest.
+const WRITE_FILE_SCRIPT: &str = r#"f="$HOME/$1"
+mkdir -p "${f%/*}" && printf %s "$2" > "$f""#;
+
+/// Writes workmux's OpenCode plugin into the opencode kit's
+/// `~/.config/opencode/plugins` in the layout the guest's OpenCode reads:
+/// `$1` for OpenCode 1, `$2`–`$4` (`index.ts`, `tui.ts`, `status.ts`) for
+/// OpenCode 2.
+const OPENCODE_KIT_PLUGIN_SCRIPT: &str = r#"d="$HOME/.config/opencode/plugins"
+v=$(opencode --version 2>/dev/null | awk '{ print $NF }')
+case "${v#v}" in
+1.*) mkdir -p "$d" && printf %s "$1" > "$d/workmux-status.ts" ;;
+2.*) mkdir -p "$d/workmux-status" && printf %s "$2" > "$d/workmux-status/index.ts" \
+  && printf %s "$3" > "$d/workmux-status/tui.ts" \
+  && printf %s "$4" > "$d/workmux-status/status.ts" ;;
+*) echo "workmux can't install its status plugin for OpenCode version '$v'" >&2; exit 1 ;;
+esac"#;
+
+/// An agent-user `sh -c <script>` in the sandbox, with `script_args` as
+/// its `$1`….
+fn agent_script(name: &str, script: &str, script_args: Vec<String>) -> SbxCommand {
+    let mut args = words(&["exec", name, "sh", "-c", script, "sh"]);
+    args.extend(script_args);
+    SbxCommand {
+        args,
+        env: Vec::new(),
+    }
+}
+
+/// Installs workmux's status hooks for the agent of `kit` into the config
+/// the kit wrote in the sandbox's own home, as `workmux setup` would into
+/// the workstation's.
+fn kit_status_hooks(name: &str, kit: &str) -> Result<Vec<SbxCommand>> {
+    use crate::agent_setup::{claude, codex, copilot, gemini, opencode};
+    Ok(match kit {
+        "claude" => vec![agent_script(
+            name,
+            CLAUDE_KIT_HOOKS_SCRIPT,
+            vec![serde_json::to_string(&claude::load_hooks_from_plugin()?)?],
+        )],
+        "codex" => vec![
+            agent_script(
+                name,
+                JSON_HOOKS_SCRIPT,
+                vec![
+                    ".codex/hooks.json".to_string(),
+                    serde_json::to_string(&codex::load_hooks()?)?,
+                ],
+            ),
+            agent_script(name, CODEX_KIT_CONFIG_SCRIPT, Vec::new()),
+        ],
+        "gemini" => vec![agent_script(
+            name,
+            JSON_HOOKS_SCRIPT,
+            vec![
+                ".gemini/settings.json".to_string(),
+                serde_json::to_string(&gemini::load_hooks()?)?,
+            ],
+        )],
+        "copilot" => vec![agent_script(
+            name,
+            WRITE_FILE_SCRIPT,
+            vec![
+                ".copilot/hooks/workmux-status.json".to_string(),
+                copilot::HOOKS_JSON.to_string(),
+            ],
+        )],
+        "opencode" => {
+            let mut sources = vec![opencode::PLUGIN_SOURCE.to_string()];
+            for file in ["index.ts", "tui.ts", "status.ts"] {
+                let (_, source) = opencode::V2_FILES
+                    .iter()
+                    .find(|(name, _)| *name == file)
+                    .context("OpenCode plugin file missing")?;
+                sources.push(source.to_string());
+            }
+            vec![agent_script(name, OPENCODE_KIT_PLUGIN_SCRIPT, sources)]
+        }
+        _ => Vec::new(),
+    })
+}
 
 /// A command run as root in the sandbox.
 fn root_exec(name: &str, command: Vec<String>) -> SbxCommand {
@@ -1181,14 +1343,17 @@ pub fn launch_plan(
     // Under `kit`, sbx's agent kit sets the agent up in the sandbox's own
     // home, so its config directory isn't mounted.
     let kit = match mode {
-        DockerSbxAgent::Kit => Some(agent_kit(agent)?),
+        DockerSbxAgent::Kit => Some(kit_for(config, agent)?),
         DockerSbxAgent::Shell => None,
     };
     let config_dir = kit
         .is_none()
         .then(|| config_dir_and_home_subpath(config, agent))
         .flatten();
-    let opencode_config_dir = target.opencode_config_dir.filter(|_| agent == "opencode");
+    // The opencode kit writes its own ~/.config/opencode.
+    let opencode_config_dir = target
+        .opencode_config_dir
+        .filter(|_| agent == "opencode" && kit.is_none());
     let sbx = &config.docker_sbx;
     let create_settings = CreateSettings {
         agent: agent.to_string(),
@@ -1307,16 +1472,10 @@ pub fn launch_plan(
         }
 
         // The workstation's hooks aren't there under `kit`: install
-        // workmux's status hooks into the settings the kit wrote, as the
-        // agent. The kit writes them only at create, so this lasts.
-        if agent == "claude" && kit.is_some() {
-            let hooks = crate::agent_setup::claude::load_hooks_from_plugin()?;
-            let mut args = words(&["exec", name, "sh", "-c", CLAUDE_KIT_HOOKS_SCRIPT, "sh"]);
-            args.push(serde_json::to_string(&hooks)?);
-            setup.push(SbxCommand {
-                args,
-                env: Vec::new(),
-            });
+        // workmux's status hooks into the config the kit wrote, as the
+        // agent. The kit writes it only at create, so this lasts.
+        if let Some(kit) = kit {
+            setup.extend(kit_status_hooks(name, kit)?);
         }
     }
 
@@ -1415,6 +1574,7 @@ pub fn launch_plan(
             .into_iter()
             .chain(network_warnings(config, state, name))
             .chain(credential_warnings(config, state, name, exec))
+            .chain(kit.map_or_else(Vec::new, |kit| agent_env_warnings(target, kit)))
             .chain(predates_record)
             .chain(if exists {
                 create_settings_warnings(&create_settings, target.created_with, name)
@@ -1560,6 +1720,7 @@ mod tests {
             toolchain: &p.toolchain,
             created_with: p.created.as_ref(),
             unfinished: p.unfinished,
+            agent_env: &[],
         }
     }
 
@@ -2981,10 +3142,129 @@ mod tests {
     }
 
     #[test]
-    fn under_kit_agents_without_kit_support_yet_fail_naming_agent_shell() {
+    fn under_kit_each_agent_sbx_has_a_kit_for_is_created_for_its_kit_without_workstation_config() {
+        // Each kit writes its agent's config into the sandbox's own home
+        // (OpenCode's into ~/.config/opencode), so nothing of the
+        // workstation's is mounted there.
+        let p = paths();
+        let opencode_config = PathBuf::from("/home/me/.config/opencode");
+        let target = LaunchTarget {
+            opencode_config_dir: Some(&opencode_config),
+            ..target(&p)
+        };
+        for agent in ["codex", "gemini", "opencode"] {
+            let plan = launch_plan(&kit_config(), &target, agent, &missing(), &exec()).unwrap();
+
+            assert_eq!(create_args(&plan)[8], agent, "{agent}");
+            assert!(
+                !workspaces(&plan).iter().any(|w| w.contains("/home/")),
+                "{agent}: {:?}",
+                plan.create
+            );
+            assert!(
+                !setup_args(&plan)
+                    .iter()
+                    .any(|a| a.contains(&"root".to_string())),
+                "{agent}: {:?}",
+                plan.setup
+            );
+            assert_eq!(plan.create_settings.agent_config_dir, None, "{agent}");
+            assert_eq!(plan.create_settings.opencode_config_dir, None, "{agent}");
+        }
+    }
+
+    #[test]
+    fn under_kit_copilot_needs_an_image_that_provides_it() {
+        // The copilot kit configures Copilot CLI but the binary comes from
+        // the template, and workmux publishes no Copilot image.
+        let p = paths();
+        let default_image = SandboxConfig {
+            image: None,
+            ..kit_config()
+        };
+        let err = launch_plan(&default_image, &target(&p), "copilot", &missing(), &exec())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("sandbox.image") && err.contains("copilot"),
+            "{err}"
+        );
+
+        let plan = launch_plan(&kit_config(), &target(&p), "copilot", &missing(), &exec()).unwrap();
+        assert_eq!(create_args(&plan)[8], "copilot");
+        assert!(
+            !workspaces(&plan).iter().any(|w| w.contains("/home/")),
+            "{:?}",
+            plan.create
+        );
+    }
+
+    #[test]
+    fn under_kit_agent_config_dir_is_an_error_naming_agent_shell() {
+        // The kit's sandbox has its own config; silently ignoring the
+        // setting would run the agent on other settings than meant.
+        let p = paths();
+        let config = SandboxConfig {
+            agent_config_dir: Some("/home/me/.{agent}".to_string()),
+            ..kit_config()
+        };
+        let err = launch_plan(&config, &target(&p), "claude", &missing(), &exec())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("agent_config_dir") && err.contains("sandbox.docker_sbx.agent: shell"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn under_kit_a_named_agents_env_naming_a_workstation_path_warns() {
+        // A profile that picks its account through a config directory on
+        // the workstation would run on the kit's login instead.
+        let p = paths();
+        let env = vec![
+            (
+                "CLAUDE_CONFIG_DIR".to_string(),
+                "~/.claude-work".to_string(),
+            ),
+            (
+                "CODEX_HOME".to_string(),
+                "/Users/me/.codex-work".to_string(),
+            ),
+            ("MODEL".to_string(), "opus".to_string()),
+        ];
+        let target = LaunchTarget {
+            agent_env: &env,
+            ..target(&p)
+        };
+        let path_warnings = |plan: &LaunchPlan| -> Vec<String> {
+            plan.warnings
+                .iter()
+                .filter(|w| w.contains("workstation path"))
+                .cloned()
+                .collect()
+        };
+
+        let plan = launch_plan(&kit_config(), &target, "claude", &missing(), &exec()).unwrap();
+        let warnings = path_warnings(&plan);
+        assert_eq!(warnings.len(), 2, "{:?}", plan.warnings);
+        assert!(warnings[0].contains("CLAUDE_CONFIG_DIR"), "{warnings:?}");
+        assert!(warnings[1].contains("CODEX_HOME"), "{warnings:?}");
+        assert!(
+            !warnings.iter().any(|w| w.contains("MODEL")),
+            "{warnings:?}"
+        );
+
+        // Under `shell` the workstation's config directory is what's meant.
+        let plan = launch_plan(&config(), &target, "claude", &missing(), &exec()).unwrap();
+        assert!(path_warnings(&plan).is_empty(), "{:?}", plan.warnings);
+    }
+
+    #[test]
+    fn under_kit_agents_sbx_has_no_kit_for_fail_naming_agent_shell() {
         // Fail closed rather than mount the config under `kit`.
         let p = paths();
-        for agent in ["codex", "pi"] {
+        for agent in ["pi", "omp", "agy", "default"] {
             let err = launch_plan(&kit_config(), &target(&p), agent, &missing(), &exec())
                 .unwrap_err()
                 .to_string();
@@ -3049,6 +3329,151 @@ mod tests {
         // Under `shell`, Claude has the workstation's own settings.
         let plan = launch_plan(&config(), &target(&p), "claude", &missing(), &exec()).unwrap();
         assert!(claude_settings_edits(&plan).is_empty(), "{:?}", plan.setup);
+    }
+
+    /// The agent-user setup commands one of whose words contains `needle`.
+    fn agent_setup_with(plan: &LaunchPlan, needle: &str) -> Vec<Vec<String>> {
+        setup_args(plan)
+            .into_iter()
+            .filter(|a| a[..2] == args(&["exec", "wm-proj-12345678"]))
+            .filter(|a| a.iter().any(|w| w.contains(needle)))
+            .collect()
+    }
+
+    /// Whether some word of `command` is JSON equal to `value`.
+    fn passes_json(command: &[String], value: &serde_json::Value) -> bool {
+        command
+            .iter()
+            .any(|w| serde_json::from_str::<serde_json::Value>(w).ok().as_ref() == Some(value))
+    }
+
+    fn embedded_hooks(source: &str) -> serde_json::Value {
+        serde_json::from_str::<serde_json::Value>(source).unwrap()["hooks"].clone()
+    }
+
+    #[test]
+    fn under_kit_every_kit_agent_gets_workmuxs_status_hooks_in_the_config_its_kit_wrote() {
+        // As for Claude: the workstation's hooks aren't there, so workmux's
+        // go into the sandbox's own config, as the agent, on create.
+        let p = paths();
+        let plan_for = |agent: &str| {
+            launch_plan(&kit_config(), &target(&p), agent, &missing(), &exec()).unwrap()
+        };
+
+        let codex = plan_for("codex");
+        let hooks = agent_setup_with(&codex, ".codex/hooks.json");
+        assert_eq!(hooks.len(), 1, "{:?}", codex.setup);
+        assert!(
+            passes_json(
+                &hooks[0],
+                &embedded_hooks(include_str!(
+                    "../../../resources/codex/hooks/workmux-status.json"
+                ))
+            ),
+            "{hooks:?}"
+        );
+        // Codex reads hooks.json only with its hooks feature on.
+        assert_eq!(
+            agent_setup_with(&codex, ".codex/config.toml").len(),
+            1,
+            "{:?}",
+            codex.setup
+        );
+
+        let gemini = plan_for("gemini");
+        let hooks = agent_setup_with(&gemini, ".gemini/settings.json");
+        assert_eq!(hooks.len(), 1, "{:?}", gemini.setup);
+        assert!(
+            passes_json(
+                &hooks[0],
+                &embedded_hooks(include_str!("../../../resources/gemini/settings.json"))
+            ),
+            "{hooks:?}"
+        );
+
+        let copilot = plan_for("copilot");
+        let hooks = agent_setup_with(&copilot, ".copilot/hooks/workmux-status.json");
+        assert_eq!(hooks.len(), 1, "{:?}", copilot.setup);
+        assert!(
+            hooks[0].contains(
+                &include_str!("../../../resources/copilot/hooks/workmux-status/hooks.json")
+                    .to_string()
+            ),
+            "{hooks:?}"
+        );
+
+        // OpenCode's plugin layout follows its version, found in the guest.
+        let opencode = plan_for("opencode");
+        let plugin = agent_setup_with(&opencode, ".config/opencode/plugins");
+        assert_eq!(plugin.len(), 1, "{:?}", opencode.setup);
+        for source in [
+            include_str!("../../../resources/opencode/plugins/workmux-status.ts"),
+            include_str!("../../../resources/opencode/v2/workmux-status/index.ts"),
+            include_str!("../../../resources/opencode/v2/workmux-status/tui.ts"),
+            include_str!("../../../resources/opencode/v2/workmux-status/status.ts"),
+        ] {
+            assert!(plugin[0].contains(&source.to_string()), "{plugin:?}");
+        }
+
+        // Only on create: the kit writes its config then.
+        for agent in ["codex", "gemini", "copilot", "opencode"] {
+            let mut existing = paths();
+            existing.created = Some(plan_for(agent).create_settings);
+            let plan = launch_plan(
+                &kit_config(),
+                &target(&existing),
+                agent,
+                &running_with(Vec::new()),
+                &exec(),
+            )
+            .unwrap();
+            assert!(
+                agent_setup_with(&plan, "workmux").is_empty(),
+                "{agent}: {:?}",
+                plan.setup
+            );
+        }
+    }
+
+    #[test]
+    fn codex_kit_config_gets_hooks_on_and_loses_the_notify_helper_the_template_lacks() {
+        // Run the script as the guest would, on the config the codex kit
+        // writes (sbx v0.51), with a home of its own.
+        let home = tempfile::tempdir().unwrap();
+        let config = home.path().join(".codex/config.toml");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        let kit = "approval_policy = \"never\"\n\
+                   notify = [\"/usr/local/bin/sbx-codex-hook\", \"codex\"]\n\
+                   model_provider = \"sandboxd\"\n\
+                   \n\
+                   [model_providers.sandboxd]\n\
+                   name = \"Sandbox Proxy\"\n";
+        let run = |content: &str| {
+            std::fs::write(&config, content).unwrap();
+            let status = std::process::Command::new("sh")
+                .args(["-c", CODEX_KIT_CONFIG_SCRIPT])
+                .env("HOME", home.path())
+                .status()
+                .unwrap();
+            assert!(status.success());
+            std::fs::read_to_string(&config).unwrap()
+        };
+
+        let edited: toml_edit::DocumentMut = run(kit).parse().unwrap();
+        assert_eq!(edited["features"]["hooks"].as_bool(), Some(true));
+        assert!(!edited.contains_key("notify"), "{edited}");
+        assert_eq!(edited["model_provider"].as_str(), Some("sandboxd"));
+        assert_eq!(
+            edited["model_providers"]["sandboxd"]["name"].as_str(),
+            Some("Sandbox Proxy")
+        );
+
+        // A features table already there gets hooks on once.
+        let edited: toml_edit::DocumentMut = run("[features]\nhooks = false\nweb_search = true\n")
+            .parse()
+            .unwrap();
+        assert_eq!(edited["features"]["hooks"].as_bool(), Some(true));
+        assert_eq!(edited["features"]["web_search"].as_bool(), Some(true));
     }
 
     #[test]

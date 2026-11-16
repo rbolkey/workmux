@@ -19,7 +19,8 @@ use std::process::Command;
 use super::{StatusCheck, UpdatePreview};
 
 /// OpenCode distribution files, embedded at compile time.
-const PLUGIN_SOURCE: &str = include_str!("../../resources/opencode/plugins/workmux-status.ts");
+pub(crate) const PLUGIN_SOURCE: &str =
+    include_str!("../../resources/opencode/plugins/workmux-status.ts");
 const PACKAGE_JSON: &str = include_str!("../../resources/opencode/package.json");
 const MANIFEST_FILE: &str = ".workmux-status.json";
 // SHA-256 of shipped sources before installation manifests were introduced.
@@ -31,7 +32,7 @@ const V1_FINGERPRINTS: &[&str] = &[
     "2ae703841563b7c2c3e90c17bee122c232c63bd55e4f355a79e93f8382964f37", // 6ed495cf
     "26c18a9f20deb3b8f1216ec6e57c62a24ed870c2afd2dc594504f951df55194c", // 3aa7705e
 ];
-const V2_FILES: &[(&str, &str)] = &[
+pub(crate) const V2_FILES: &[(&str, &str)] = &[
     (
         "index.ts",
         include_str!("../../resources/opencode/v2/workmux-status/index.ts"),

@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 use tracing::{debug, info, warn};
 
-use crate::config::{Config, DockerSbxAgent};
+use crate::config::{AgentEnvValue, Config, DockerSbxAgent};
 
 use super::plan::{
     CreateSettings, ExecRequest, LaunchPlan, LaunchTarget, NetworkRule, Platform, SbxCommand,
@@ -563,8 +563,9 @@ fn lock_state_dir(state_dir: &Path) -> Result<Flock<File>> {
         .with_context(|| format!("Failed to acquire lock: {}", lock_path.display()))
 }
 
-/// Run one sbx command from a plan, failing with sbx's error.
-fn run_sbx(command: &SbxCommand) -> Result<()> {
+/// Run one sbx command from a plan, failing with sbx's error. Returns what
+/// it printed on stderr.
+fn run_sbx(command: &SbxCommand) -> Result<String> {
     debug!(args = ?command.args, "running sbx");
     let output = Command::new("sbx")
         .args(&command.args)
@@ -580,11 +581,37 @@ fn run_sbx(command: &SbxCommand) -> Result<()> {
             && stderr.contains(RULE_NOT_FOUND)
         {
             debug!(args = ?command.args, "sbx rule already removed");
-            return Ok(());
+            return Ok(String::new());
         }
         bail!("sbx {} failed: {}", command.args[0], sbx_error(&stderr));
     }
-    Ok(())
+    Ok(String::from_utf8_lossy(&output.stderr).into_owned())
+}
+
+/// The warnings and notes sbx printed on stderr while creating a sandbox,
+/// each with its indented continuation lines, such as that it withheld a
+/// kit's credential. Its progress lines (`○`, `✓`) are left out.
+fn create_notices(stderr: &str) -> Vec<String> {
+    let mut notices: Vec<String> = Vec::new();
+    let mut continuing = false;
+    for line in stderr.lines() {
+        let trimmed = line.trim_start();
+        if line.starts_with("warning:") || line.starts_with("Note:") {
+            notices.push(line.trim_end().to_string());
+            continuing = true;
+        } else if continuing
+            && line.starts_with(char::is_whitespace)
+            && !trimmed.is_empty()
+            && !trimmed.starts_with(['\u{25cb}', '\u{2713}'])
+            && let Some(notice) = notices.last_mut()
+        {
+            notice.push('\n');
+            notice.push_str(line.trim_end());
+        } else {
+            continuing = false;
+        }
+    }
+    notices
 }
 
 /// Gather sbx's state, compute the launch plan and run its setup commands:
@@ -627,6 +654,7 @@ pub fn prepare_launch(
 
     let toolchain =
         crate::sandbox::toolchain::resolve_toolchain(&config.sandbox.toolchain(), &worktree_root);
+    let agent_env = named_agent_env(config, selected_agent);
 
     let _lock = lock_state_dir(&state_dir)?;
     // Removing the worktree removed the sandbox while this launch waited.
@@ -655,6 +683,7 @@ pub fn prepare_launch(
         toolchain: &toolchain,
         created_with: created_with.as_ref(),
         unfinished,
+        agent_env: &agent_env,
     };
     let plan = super::launch_plan(&config.sandbox, &target, agent, &state, exec)?;
     for note in &plan.notes {
@@ -677,8 +706,31 @@ pub fn prepare_launch(
             info!(sandbox = %name, "custom provision script only runs on sandbox creation; recreate sandbox to apply changes");
         }
     }
-    apply_plan_with(&plan, &state_dir, unfinished, &network_record, run_sbx)?;
+    let notices = apply_plan_with(&plan, &state_dir, unfinished, &network_record, run_sbx)?;
+    for notice in &notices {
+        warn!(sandbox = %name, notice, "sbx create notice");
+        eprintln!("sbx: {notice}");
+    }
     Ok(plan)
+}
+
+/// A named agent's `env`, with `from_env` values read from the
+/// workstation's environment; empty for an agent type.
+fn named_agent_env(config: &Config, selected_agent: &str) -> Vec<(String, String)> {
+    let Some(entry) = config.agents.get(selected_agent) else {
+        return Vec::new();
+    };
+    entry
+        .env
+        .iter()
+        .filter_map(|(key, value)| {
+            let value = match value {
+                AgentEnvValue::Literal(value) => value.clone(),
+                AgentEnvValue::FromEnv { from_env } => std::env::var(from_env).ok()?,
+            };
+            Some((key.clone(), value))
+        })
+        .collect()
 }
 
 /// Run a plan's commands up to its exec, keeping the sandbox's state
@@ -688,14 +740,16 @@ pub fn prepare_launch(
 /// written are recorded before they're written, and the create record is
 /// written only once the sandbox is fully set up and provisioned. A
 /// sandbox this launch creates is removed again when anything after
-/// `sbx create` fails. `run` runs one sbx command.
+/// `sbx create` fails. `run` runs one sbx command, returning its stderr.
+/// Returns the warnings and notes sbx printed creating the sandbox (see
+/// [`create_notices`]).
 fn apply_plan_with(
     plan: &LaunchPlan,
     state_dir: &Path,
     unfinished: bool,
     network_record: &[NetworkRule],
-    mut run: impl FnMut(&SbxCommand) -> Result<()>,
-) -> Result<()> {
+    mut run: impl FnMut(&SbxCommand) -> Result<String>,
+) -> Result<Vec<String>> {
     let name = &plan.sandbox_name;
     if let Some(create) = &plan.create {
         if let Some(remove) = &plan.remove {
@@ -730,9 +784,11 @@ fn apply_plan_with(
     if pending != network_record {
         write_network_record(state_dir, &pending)?;
     }
+    let mut notices = Vec::new();
     if let Some(create) = &plan.create {
         let msg = format!("Creating sbx sandbox {name}");
-        crate::spinner::with_spinner(&msg, || run(&create.command))?;
+        let stderr = crate::spinner::with_spinner(&msg, || run(&create.command))?;
+        notices = create_notices(&stderr);
     }
     // Everything after `sbx create` finishes a sandbox this launch creates:
     // when any of it fails, remove the sandbox so the next launch creates
@@ -781,12 +837,12 @@ fn apply_plan_with(
         write_created_record(state_dir, &plan.create_settings)?;
         remove_state_file(state_dir, CREATING_MARKER_FILE)?;
     }
-    Ok(())
+    Ok(notices)
 }
 
 /// Remove a sandbox this launch created but couldn't finish setting up.
 /// Best effort: a failure is logged.
-fn remove_unfinished(name: &str, run: &mut impl FnMut(&SbxCommand) -> Result<()>) {
+fn remove_unfinished(name: &str, run: &mut impl FnMut(&SbxCommand) -> Result<String>) {
     let remove = SbxCommand {
         args: vec!["rm".to_string(), "-f".to_string(), name.to_string()],
         env: Vec::new(),
@@ -1135,7 +1191,11 @@ mod tests {
 
     /// Apply `plan` with a fake sbx that fails the command `fail`, returning
     /// the commands run and the result.
-    fn apply(plan: &LaunchPlan, state_dir: &Path, fail: &str) -> (Vec<String>, Result<()>) {
+    fn apply(
+        plan: &LaunchPlan,
+        state_dir: &Path,
+        fail: &str,
+    ) -> (Vec<String>, Result<Vec<String>>) {
         let mut ran = Vec::new();
         let result = apply_plan_with(plan, state_dir, true, &[], |command| {
             let line = command.args.join(" ");
@@ -1143,7 +1203,7 @@ mod tests {
             if line == fail {
                 bail!("sbx {line} failed");
             }
-            Ok(())
+            Ok(String::new())
         });
         (ran, result)
     }
@@ -1166,7 +1226,7 @@ mod tests {
                 assert_eq!(read_network_record(state_dir), vec![rule()]);
             }
             ran.push(line);
-            Ok(())
+            Ok(String::new())
         })
         .unwrap();
 
@@ -1183,6 +1243,41 @@ mod tests {
         assert_eq!(read_created_record(state_dir), Some(plan.create_settings));
         assert!(!state_dir.join(CREATING_MARKER_FILE).exists());
         assert_eq!(read_network_record(state_dir), vec![rule()]);
+    }
+
+    #[test]
+    fn sbxs_warnings_from_a_successful_create_are_passed_on_without_its_progress() {
+        // As sbx v0.51 prints them creating an opencode sandbox with no
+        // OpenAI secret and no credential binding.
+        let stderr = "  \u{25cb} opencode \u{2014} now ships as a kit; resolving docker.io/sbx/opencode:latest\n\
+                      \x20 \u{2713} OpenAI \u{2014} using stored OAuth credentials\n\
+                      warning: no OpenAI credentials available; opencode will start logged-out.\n\
+                      \x20 try: sbx secret set openai --oauth\n\
+                      \x20 or:  sbx secret set openai\n\
+                      Note: no binding authorizes anthropic, github \u{2014} the credential was not injected. Create a binding (re-run interactively, or edit ~/.config/sbx/credentials.yaml) to use it.\n";
+        let dir = tempfile::tempdir().unwrap();
+        let plan = creating_plan();
+
+        let notices = apply_plan_with(&plan, dir.path(), true, &[], |command| {
+            Ok(if command.args[0] == "create" {
+                stderr.to_string()
+            } else {
+                String::new()
+            })
+        })
+        .unwrap();
+
+        assert_eq!(
+            notices,
+            [
+                "warning: no OpenAI credentials available; opencode will start logged-out.\n\
+                 \x20 try: sbx secret set openai --oauth\n\
+                 \x20 or:  sbx secret set openai",
+                "Note: no binding authorizes anthropic, github \u{2014} the credential was not \
+                 injected. Create a binding (re-run interactively, or edit \
+                 ~/.config/sbx/credentials.yaml) to use it.",
+            ]
+        );
     }
 
     #[test]

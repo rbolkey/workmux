@@ -75,6 +75,30 @@ pub fn wrap_for_docker_sbx(
     Ok(format!(" {}", parts))
 }
 
+/// Fails for `flag` (`--fork` or `--continue`) when the launch runs agents
+/// in sbx sandboxes under `sandbox.docker_sbx.agent: kit`: the agent's
+/// conversations are in the workstation's config directory, which the
+/// kit's sandbox doesn't have. `sandboxed` is whether `--sandbox` turns the
+/// sandbox on for this launch.
+pub fn check_resume_flag(
+    config: &crate::config::SandboxConfig,
+    sandboxed: bool,
+    flag: &str,
+) -> Result<()> {
+    use crate::config::{DockerSbxAgent, SandboxBackend};
+    if (config.is_enabled() || sandboxed)
+        && config.backend() == SandboxBackend::DockerSbx
+        && config.docker_sbx.agent() == DockerSbxAgent::Kit
+    {
+        anyhow::bail!(
+            "{flag} resumes a conversation from the workstation's agent config, which sbx \
+             sandboxes under sandbox.docker_sbx.agent: kit don't have. Set \
+             `sandbox.docker_sbx.agent: shell` in your global config to mount it."
+        );
+    }
+    Ok(())
+}
+
 /// The worktree's selected agent (a named agent, or an agent type by its
 /// own name), from `selector` (`-a`) or the config's default: the agent
 /// whose sandbox a pane runs in when it names none.
@@ -212,6 +236,44 @@ fn agent_slug(agent: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn under_kit_resuming_a_workstation_conversation_is_an_error_naming_agent_shell() {
+        use crate::config::{DockerSbxAgent, DockerSbxConfig, SandboxBackend, SandboxConfig};
+        let sbx = |agent: DockerSbxAgent| SandboxConfig {
+            enabled: Some(true),
+            backend: Some(SandboxBackend::DockerSbx),
+            docker_sbx: DockerSbxConfig {
+                agent: Some(agent),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        for flag in ["--fork", "--continue"] {
+            let err = check_resume_flag(&sbx(DockerSbxAgent::Kit), false, flag)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(flag) && err.contains("sandbox.docker_sbx.agent: shell"),
+                "{err}"
+            );
+            // `--sandbox` turns the sandbox on for the one launch.
+            let off = SandboxConfig {
+                enabled: Some(false),
+                ..sbx(DockerSbxAgent::Kit)
+            };
+            assert!(check_resume_flag(&off, true, flag).is_err());
+
+            assert!(check_resume_flag(&sbx(DockerSbxAgent::Shell), false, flag).is_ok());
+            assert!(check_resume_flag(&off, false, flag).is_ok());
+            let container = SandboxConfig {
+                backend: Some(SandboxBackend::Container),
+                ..sbx(DockerSbxAgent::Kit)
+            };
+            assert!(check_resume_flag(&container, false, flag).is_ok());
+        }
+    }
 
     fn within_sbx_rules(name: &str) -> bool {
         name.len() <= MAX_NAME_LEN
