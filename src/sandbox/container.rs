@@ -7,8 +7,8 @@ use anyhow::{Context, Result};
 
 use crate::config::{SandboxConfig, SandboxRuntime};
 use crate::sandbox::git_boundary::{
-    ProgramPaths, collect_worktree_git_pointers, config_include_paths, ensure_policy_dir,
-    ensure_policy_file, module_git_roots, validate_git_hooks,
+    POLICY_DIRS, ProgramPaths, collect_worktree_git_pointers, config_include_paths,
+    ensure_policy_dir, ensure_policy_file, module_git_roots, validate_git_hooks,
 };
 use crate::state::StateStore;
 
@@ -357,7 +357,7 @@ fn protect_writable_git_root(
     config_index: &mut usize,
 ) -> Result<()> {
     if full_git_dir {
-        for directory in ["hooks", "info", "objects/info", "modules", "worktrees"] {
+        for directory in POLICY_DIRS {
             let path = root.join(directory);
             ensure_policy_dir(&path)?;
             push_read_only_path(args, runtime, &path);

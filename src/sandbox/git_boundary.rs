@@ -7,6 +7,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
+/// Directories of a writable git dir that hold git policy, mounted read-only.
+pub(super) const POLICY_DIRS: [&str; 5] = ["hooks", "info", "objects/info", "modules", "worktrees"];
+
 /// Reject hook layouts whose executable policy can be changed outside the protected directory.
 pub(super) fn validate_git_hooks(common_dir: &Path) -> Result<()> {
     let hooks = common_dir.join("hooks");
