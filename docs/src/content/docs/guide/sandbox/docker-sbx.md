@@ -134,7 +134,7 @@ A [named agent](/guide/agents/) whose `env` sets a variable to a workstation pat
 
 **`shell`.** workmux creates the sandbox with sbx's generic `shell` agent and mounts the agent's config directory from your workstation where the agent looks for it (see [What's mounted](#whats-mounted)), as on the container and Lima backends. The agent keeps your settings, hooks and login, and holds its real credential itself. sbx's kits can't share that home, because they write the agent's settings and credentials into it.
 
-Under both modes, workmux runs the agent command itself with `sbx exec`, never `sbx run`. The mode is fixed when the sandbox is created, and workmux records it. A sandbox created under the other mode fails to launch, with an error naming how to recreate it (`workmux sandbox prune`, or `sbx rm -f <sandbox>`). So switching to `kit` never keeps running a sandbox with your real credential mounted. Sandboxes from before workmux recorded the mode count as `shell`.
+Under both modes, workmux runs the agent command itself with `sbx exec`, never `sbx run`. The mode is fixed when the sandbox is created, and workmux records it. A sandbox created under the other mode fails to launch, with an error naming how to recreate it (`workmux sandbox prune`, or `sbx rm -f <sandbox>`). So switching to `kit` never keeps running a sandbox with your real credential mounted.
 
 ### Accounts per named agent
 
@@ -231,15 +231,13 @@ Under `agent: shell`, see [Credentials](/guide/sandbox/features/#credentials) fo
 
 Like other mounts, masks are made when the sandbox is created, whereas the container backend masks on every launch. So a listed file the sandbox has no mask over, because it was listed or created after the sandbox, is an error at launch naming the file, since the agent could read it. The error stays until you recreate the sandbox with `workmux sandbox prune` (or `sbx rm -f <sandbox>`). A masked file that's deleted or no longer listed only gets a warning in the log. When a masked file was deleted, sbx puts an empty file back in its place the next time it starts the sandbox.
 
-Mounts are fixed when the sandbox is created. After changing `extra_mounts` or `excluded_files`, recreate the sandbox with `workmux sandbox prune`. Sandboxes created before workmux protected the git metadata need recreating too.
+Mounts are fixed when the sandbox is created. After changing `extra_mounts` or `excluded_files`, recreate the sandbox with `workmux sandbox prune`.
 
 Your `~/.gitconfig` isn't mounted; workmux passes your git identity instead (see [Git identity](/guide/sandbox/features/#git-identity)).
 
 ### Sandbox naming
 
 Sandboxes are named `wm-<project>-<hash>-<agent>` (e.g. `wm-myproject-a1b2c3d4-claude`), where the hash is of the worktree path and the agent is the pane's agent: a [named agent](/guide/agents/) such as `cc-personal`, or an agent type by its own name such as `claude` or `codex`. So every worktree gets its own sandbox for each agent it runs. workmux shortens and slugifies an agent name that sbx wouldn't accept (anything but lowercase letters, digits and single `-`) or that is longer than 24 characters, and adds a short hash of the name, so two agents never share a sandbox. List them with `sbx ls`.
-
-Sandboxes named `wm-<project>-<hash>`, from before the agent was part of the name, aren't used any more: removing their worktree deletes them, and the next pane creates the agent's own sandbox.
 
 ### Template
 
@@ -287,9 +285,7 @@ sbx also sets git config of its own in the sandbox (keeping its `.sbx` directori
 
 The `provision` script runs once, never on later launches. It runs after workmux creates the sandbox, sets it up (network rules; under `agent: kit`, workmux's status hooks; under `agent: shell`, config directory parents and Claude's onboarding state) and runs its [built-in provisioning](#built-in-provisioning). The script runs as root with `bash -c`, in the worktree. The template has no `sudo`, so don't use it in the script. Its downloads go through sbx's proxy and network policy like any other request in the sandbox. sbx's `balanced` policy reaches package mirrors over HTTPS only, which is why the [template](#template) switches the image's Debian sources to HTTPS. A changed script applies the next time the sandbox is created (`workmux sandbox prune`, or `workmux remove`).
 
-If the script fails, workmux deletes the sandbox and stops with its error, so the next launch creates and provisions it again. The same holds for every step after `sbx create`. workmux records a sandbox's settings in its state directory only once the sandbox is fully set up. A launch that finds a sandbox an earlier launch began creating without finishing (say, after workmux was killed while provisioning) deletes it and creates it again.
-
-A sandbox with no record, which no launch began creating, predates the record. When it's stopped, workmux deletes it and creates it again. While it's running, panes may be in it, so workmux logs a warning and launches into it as it is, or fails if it would have to hide a file (`excluded_files`) the sandbox has no mask over. Close the worktree's panes; once sbx has stopped the sandbox, the first launch recreates it.
+If the script fails, workmux deletes the sandbox and stops with its error, so the next launch creates and provisions it again. The same holds for every step after `sbx create`. workmux records a sandbox's settings in its state directory only once the sandbox is fully set up. A sandbox without that record is unfinished, say because workmux was killed while provisioning it. When it's stopped, the next launch deletes it and creates it again. While it's running, panes may be in it, so the launch fails with an error naming `workmux sandbox prune` (or `sbx rm -f <sandbox>`) to remove it. A record that doesn't parse is the same error.
 
 ```yaml
 sandbox:
