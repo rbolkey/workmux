@@ -175,12 +175,6 @@ pub fn sandbox_name_in(project_root: &Path, worktree_root: &Path, agent: &str) -
     name
 }
 
-/// The name a worktree's sandbox had before agents were part of the name:
-/// `wm-<project>-<hash8>`. Removing the worktree removes it too.
-pub(crate) fn legacy_sandbox_name_in(project_root: &Path, worktree_root: &Path) -> String {
-    legacy_sandbox_name_for(project_root, &canonical(worktree_root))
-}
-
 fn canonical(path: &Path) -> std::path::PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
@@ -190,10 +184,6 @@ fn sandbox_name_for(project_root: &Path, worktree_root: &Path, agent: &str) -> S
     // Budget: "-" (1) + agent
     let base = worktree_name_for(project_root, worktree_root, MAX_NAME_LEN - 1 - agent.len());
     format!("{base}-{agent}")
-}
-
-fn legacy_sandbox_name_for(project_root: &Path, worktree_root: &Path) -> String {
-    worktree_name_for(project_root, worktree_root, MAX_NAME_LEN)
 }
 
 /// `wm-<project>-<hash8>`, at most `max_len` characters.
@@ -356,14 +346,14 @@ mod tests {
     fn each_agent_of_a_worktree_gets_its_own_sandbox() {
         let project = Path::new("/code/proj");
         let worktree = Path::new("/code/proj__worktrees/a");
-        let legacy = legacy_sandbox_name_for(project, worktree);
+        let base = worktree_name_for(project, worktree, MAX_NAME_LEN);
         assert_eq!(
             sandbox_name_for(project, worktree, "claude"),
-            format!("{legacy}-claude")
+            format!("{base}-claude")
         );
         assert_eq!(
             sandbox_name_for(project, worktree, "cc-personal"),
-            format!("{legacy}-cc-personal")
+            format!("{base}-cc-personal")
         );
         assert_ne!(
             sandbox_name_for(project, worktree, "claude"),
@@ -375,10 +365,10 @@ mod tests {
     fn agent_names_sbx_would_reject_are_slugified_with_a_hash() {
         let project = Path::new("/code/proj");
         let worktree = Path::new("/code/proj__worktrees/a");
-        let legacy = legacy_sandbox_name_for(project, worktree);
+        let base = worktree_name_for(project, worktree, MAX_NAME_LEN);
         let slugged = sandbox_name_for(project, worktree, "CC_Personal");
         assert!(
-            slugged.starts_with(&format!("{legacy}-cc-personal-")),
+            slugged.starts_with(&format!("{base}-cc-personal-")),
             "{slugged}"
         );
         assert!(within_sbx_rules(&slugged), "{slugged}");

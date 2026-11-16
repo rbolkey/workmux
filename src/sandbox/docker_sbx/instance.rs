@@ -14,8 +14,8 @@ use tracing::{debug, info, warn};
 use crate::config::{Config, DockerSbxAgent};
 
 use super::plan::{
-    CreateSettings, ExecRequest, LaunchPlan, LaunchTarget, NetworkRule, Platform, SbxCommand,
-    SbxState,
+    CreateRecord, CreateSettings, ExecRequest, LaunchPlan, LaunchTarget, NetworkRule, Platform,
+    SbxCommand, SbxState,
 };
 
 /// A sandbox from `sbx ls --json`.
@@ -232,9 +232,8 @@ pub struct SandboxRemoval {
     _lock: Flock<File>,
 }
 
-/// Prepare to delete a worktree's sbx sandboxes, one per agent it ran and
-/// the one named before agents were part of the name, that workmux created
-/// (their state directories exist): wait for a launch setting each up to
+/// Prepare to delete a worktree's sbx sandboxes, one per agent it ran, that
+/// workmux created (their state directories exist): wait for a launch setting each up to
 /// finish, then hold its lock until [`SandboxRemoval::remove`], or until
 /// the removal is called off and the values dropped.
 ///
@@ -391,8 +390,7 @@ fn write_sandbox_record(state_dir: &Path, worktree_root: &Path, agent: &str) -> 
 
 /// The names of the worktree's sandboxes that have state directories under
 /// `state_root`: one per agent its launches recorded, named exactly as a
-/// launch names it (a name prefix could match another project's), and the
-/// sandbox named before agents were part of the name.
+/// launch names it (a name prefix could match another project's).
 fn worktree_sandboxes_in(
     state_root: &Path,
     project_root: &Path,
@@ -401,23 +399,14 @@ fn worktree_sandboxes_in(
     let worktree = worktree_root
         .canonicalize()
         .unwrap_or_else(|_| worktree_root.to_path_buf());
-    let legacy = super::legacy_sandbox_name_in(project_root, &worktree);
     let Ok(entries) = std::fs::read_dir(state_root) else {
         return Vec::new();
     };
-    let prefix = format!("{legacy}-");
     let mut names = Vec::new();
     for entry in entries.flatten() {
         let Some(name) = entry.file_name().to_str().map(str::to_string) else {
             continue;
         };
-        if name == legacy {
-            names.push(name);
-            continue;
-        }
-        if !name.starts_with(&prefix) {
-            continue;
-        }
         let path = entry.path().join(SANDBOX_RECORD_FILE);
         let Ok(content) = std::fs::read_to_string(&path) else {
             continue;
@@ -476,17 +465,17 @@ fn write_network_record(state_dir: &Path, rules: &[NetworkRule]) -> Result<()> {
 /// without it was left half set up by a launch that failed or was killed.
 const CREATED_RECORD_FILE: &str = "created.json";
 
-/// The settings a sandbox was created with, or `None` if no launch
-/// finished setting it up (or the record is corrupted).
-fn read_created_record(state_dir: &Path) -> Option<CreateSettings> {
+/// The settings a sandbox was created with, as its create record holds.
+fn read_created_record(state_dir: &Path) -> CreateRecord {
     let path = state_dir.join(CREATED_RECORD_FILE);
-    let content = std::fs::read_to_string(&path).ok()?;
+    let content = match std::fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return CreateRecord::Missing,
+        Err(e) => return CreateRecord::Unreadable(e.to_string()),
+    };
     match serde_json::from_str(&content) {
-        Ok(settings) => Some(settings),
-        Err(e) => {
-            warn!(?path, error = %e, "corrupted sbx create record, ignoring");
-            None
-        }
+        Ok(settings) => CreateRecord::Recorded(Box::new(settings)),
+        Err(e) => CreateRecord::Unreadable(e.to_string()),
     }
 }
 
@@ -500,11 +489,6 @@ fn write_created_record(state_dir: &Path, settings: &CreateSettings) -> Result<(
 fn remove_created_record(state_dir: &Path) -> Result<()> {
     remove_state_file(state_dir, CREATED_RECORD_FILE)
 }
-
-/// File in a sandbox's state directory marking it as being created, from
-/// just before `sbx create` until the create record is written. A sandbox
-/// with neither predates the record.
-const CREATING_MARKER_FILE: &str = "creating";
 
 fn remove_state_file(state_dir: &Path, file: &str) -> Result<()> {
     match std::fs::remove_file(state_dir.join(file)) {
@@ -634,10 +618,9 @@ pub fn prepare_launch(
     let state = gather_state(&name)?;
     let network_record = read_network_record(&state_dir);
     let created_with = read_created_record(&state_dir);
-    let unfinished = state_dir.join(CREATING_MARKER_FILE).exists();
     // Only creating the sandbox mounts the git metadata; finding it walks
     // the worktree.
-    let git = if super::plan::creates_sandbox(&state, created_with.as_ref(), unfinished) {
+    let git = if super::plan::creates_sandbox(&state, &created_with) {
         Some(super::git::git_metadata(&worktree_root)?)
     } else {
         None
@@ -651,8 +634,7 @@ pub fn prepare_launch(
         state_dir: &state_dir,
         network_record: &network_record,
         toolchain: &toolchain,
-        created_with: created_with.as_ref(),
-        unfinished,
+        created_with: &created_with,
     };
     let plan = super::launch_plan(&config.sandbox, &target, agent, &state, exec)?;
     for note in &plan.notes {
@@ -673,7 +655,7 @@ pub fn prepare_launch(
             info!(sandbox = %name, "custom provision script only runs on sandbox creation; recreate sandbox to apply changes");
         }
     }
-    let notices = apply_plan_with(&plan, &state_dir, unfinished, &network_record, run_sbx)?;
+    let notices = apply_plan_with(&plan, &state_dir, &network_record, run_sbx)?;
     for notice in &notices {
         warn!(sandbox = %name, notice, "sbx create notice");
     }
@@ -700,8 +682,8 @@ pub fn prepare_launch(
 
 /// Run a plan's commands up to its exec, keeping the sandbox's state
 /// directory in step so that a launch that fails or is killed partway is
-/// recovered by the next one: the `creating` marker and the masks' sources
-/// are written before the sandbox is created, the network rules about to be
+/// recovered by the next one: the create record is removed and the masks'
+/// sources written before the sandbox is created, the network rules about to be
 /// written are recorded before they're written, and the create record is
 /// written only once the sandbox is fully set up and provisioned. A
 /// sandbox this launch creates is removed again when anything after
@@ -711,25 +693,20 @@ pub fn prepare_launch(
 fn apply_plan_with(
     plan: &LaunchPlan,
     state_dir: &Path,
-    unfinished: bool,
     network_record: &[NetworkRule],
     mut run: impl FnMut(&SbxCommand) -> Result<String>,
 ) -> Result<Vec<String>> {
     let name = &plan.sandbox_name;
     if let Some(create) = &plan.create {
         if let Some(remove) = &plan.remove {
-            let why = if unfinished {
-                "an earlier launch didn't finish setting it up"
-            } else {
-                "it predates workmux's record of how it was created"
-            };
-            info!(sandbox = %name, why, "removing sbx sandbox to create it again");
-            eprintln!("Removing sbx sandbox {name}, as {why}; creating it again");
+            info!(sandbox = %name, "removing unfinished sbx sandbox to create it again");
+            eprintln!(
+                "Removing sbx sandbox {name}, as an earlier launch didn't finish setting it up; \
+                 creating it again"
+            );
             run(remove)?;
         }
         remove_created_record(state_dir)?;
-        std::fs::write(state_dir.join(CREATING_MARKER_FILE), b"")
-            .context("Failed to mark the sbx sandbox as being created")?;
         super::mask::write_masks(state_dir, &plan.masks)?;
         info!(sandbox = %name, "creating sbx sandbox");
         eprintln!("  Workspaces:");
@@ -800,7 +777,6 @@ fn apply_plan_with(
     }
     if creating {
         write_created_record(state_dir, &plan.create_settings)?;
-        remove_state_file(state_dir, CREATING_MARKER_FILE)?;
     }
     Ok(notices)
 }
@@ -967,66 +943,38 @@ mod tests {
     #[test]
     fn created_record_round_trips_and_is_missing_until_written() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(read_created_record(dir.path()), None);
+        assert_eq!(read_created_record(dir.path()), CreateRecord::Missing);
 
         let settings = CreateSettings {
             agent: "claude".to_string(),
+            agent_mode: DockerSbxAgent::Kit,
             memory: Some("8g".to_string()),
             ..Default::default()
         };
         write_created_record(dir.path(), &settings).unwrap();
-        assert_eq!(read_created_record(dir.path()), Some(settings));
-
-        remove_created_record(dir.path()).unwrap();
-        assert_eq!(read_created_record(dir.path()), None);
-        remove_created_record(dir.path()).unwrap();
-    }
-
-    #[test]
-    fn records_from_before_the_agent_mode_are_shell_ones() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join(CREATED_RECORD_FILE),
-            r#"{"agent":"claude","agent_config_dir":"/home/me/.claude","template":"t"}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            read_created_record(dir.path()).map(|record| record.agent_mode),
-            Some(DockerSbxAgent::Shell)
-        );
-
-        let kit = CreateSettings {
-            agent_mode: DockerSbxAgent::Kit,
-            ..Default::default()
-        };
-        write_created_record(dir.path(), &kit).unwrap();
-        assert_eq!(read_created_record(dir.path()), Some(kit));
-    }
-
-    #[test]
-    fn records_from_placeholder_credentials_still_load() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join(CREATED_RECORD_FILE),
-            r#"{"agent":"claude","agent_config_dir":"/home/me/.claude",
-                "excluded_files":["/code/wt/.env"],
-                "agent_credentials":"placeholder",
-                "credential_placeholders":[{"target":"/home/agent/.claude/.credentials.json","contents":"{}"}],
-                "template":"t","toolchain":"none"}"#,
-        )
-        .unwrap();
         assert_eq!(
             read_created_record(dir.path()),
-            Some(CreateSettings {
-                agent: "claude".to_string(),
-                agent_mode: DockerSbxAgent::Shell,
-                agent_config_dir: Some(PathBuf::from("/home/me/.claude")),
-                excluded_files: vec![PathBuf::from("/code/wt/.env")],
-                template: "t".to_string(),
-                toolchain: "none".to_string(),
-                ..Default::default()
-            })
+            CreateRecord::Recorded(Box::new(settings))
         );
+
+        remove_created_record(dir.path()).unwrap();
+        assert_eq!(read_created_record(dir.path()), CreateRecord::Missing);
+        remove_created_record(dir.path()).unwrap();
+    }
+
+    #[test]
+    fn a_created_record_missing_a_field_is_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        for content in [
+            "not json",
+            r#"{"agent":"claude","agent_config_dir":"/home/me/.claude","template":"t"}"#,
+        ] {
+            std::fs::write(dir.path().join(CREATED_RECORD_FILE), content).unwrap();
+            assert!(
+                matches!(read_created_record(dir.path()), CreateRecord::Unreadable(_)),
+                "{content}"
+            );
+        }
     }
 
     #[test]
@@ -1047,14 +995,16 @@ mod tests {
         };
         let claude = launch(&worktree, &project, "claude");
         let personal = launch(&worktree, &project, "cc-personal");
-        let legacy = super::super::legacy_sandbox_name_in(&project, &worktree);
+        let base = claude.strip_suffix("-claude").unwrap();
         // Another worktree's sandbox whose name starts with this worktree's,
         // as one of a project named `proj-<hash8>` would.
-        let lookalike = format!("{legacy}-deadbeef-claude");
+        let lookalike = format!("{base}-deadbeef-claude");
         std::fs::create_dir_all(state_root.join(&lookalike)).unwrap();
         write_sandbox_record(&state_root.join(&lookalike), &other, "claude").unwrap();
-        let unrecorded = format!("{legacy}-codex");
+        let unrecorded = format!("{base}-codex");
         std::fs::create_dir_all(state_root.join(&unrecorded)).unwrap();
+        // A state directory named without an agent isn't a sandbox's.
+        std::fs::create_dir_all(state_root.join(base)).unwrap();
         launch(&other, &project, "claude");
 
         let mut found = worktree_sandboxes_in(&state_root, &project, &worktree);
@@ -1062,12 +1012,6 @@ mod tests {
         let mut expected = vec![claude.clone(), personal.clone()];
         expected.sort();
         assert_eq!(found, expected);
-
-        // The sandbox named before agents were part of the name, once it exists.
-        std::fs::create_dir_all(state_root.join(&legacy)).unwrap();
-        let found = worktree_sandboxes_in(&state_root, &project, &worktree);
-        assert!(found.contains(&legacy), "{found:?}");
-        assert_eq!(found.len(), 3, "{found:?}");
     }
 
     #[test]
@@ -1148,7 +1092,7 @@ mod tests {
         fail: &str,
     ) -> (Vec<String>, Result<Vec<String>>) {
         let mut ran = Vec::new();
-        let result = apply_plan_with(plan, state_dir, true, &[], |command| {
+        let result = apply_plan_with(plan, state_dir, &[], |command| {
             let line = command.args.join(" ");
             ran.push(line.clone());
             if line == fail {
@@ -1167,12 +1111,11 @@ mod tests {
         let plan = creating_plan();
 
         let mut ran = Vec::new();
-        apply_plan_with(&plan, state_dir, true, &[], |command| {
+        apply_plan_with(&plan, state_dir, &[], |command| {
             let line = command.args.join(" ");
             if line.starts_with("create") {
                 // A launch killed from here on is recovered by the next.
-                assert!(state_dir.join(CREATING_MARKER_FILE).exists());
-                assert!(read_created_record(state_dir).is_none());
+                assert_eq!(read_created_record(state_dir), CreateRecord::Missing);
                 assert!(state_dir.join("masks").is_dir());
                 assert_eq!(read_network_record(state_dir), vec![rule()]);
             }
@@ -1191,8 +1134,10 @@ mod tests {
                 "exec custom"
             ]
         );
-        assert_eq!(read_created_record(state_dir), Some(plan.create_settings));
-        assert!(!state_dir.join(CREATING_MARKER_FILE).exists());
+        assert_eq!(
+            read_created_record(state_dir),
+            CreateRecord::Recorded(Box::new(plan.create_settings))
+        );
         assert_eq!(read_network_record(state_dir), vec![rule()]);
     }
 
@@ -1209,7 +1154,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let plan = creating_plan();
 
-        let notices = apply_plan_with(&plan, dir.path(), true, &[], |command| {
+        let notices = apply_plan_with(&plan, dir.path(), &[], |command| {
             Ok(if command.args[0] == "create" {
                 stderr.to_string()
             } else {
@@ -1246,8 +1191,11 @@ mod tests {
             let error = format!("{:#}", result.unwrap_err());
             assert!(error.contains(message), "{fail}: {error}");
             assert_eq!(ran.last().unwrap(), "rm -f wm-test", "{fail}: {ran:?}");
-            assert!(read_created_record(state_dir).is_none(), "{fail}");
-            assert!(state_dir.join(CREATING_MARKER_FILE).exists(), "{fail}");
+            assert_eq!(
+                read_created_record(state_dir),
+                CreateRecord::Missing,
+                "{fail}"
+            );
             // The rules recorded before the failure stay workmux's.
             assert_eq!(read_network_record(state_dir), vec![rule()], "{fail}");
         }
@@ -1262,8 +1210,7 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(ran, ["rm -f wm-test", "create --name wm-test"]);
-        assert!(state_dir.join(CREATING_MARKER_FILE).exists());
-        assert!(read_created_record(state_dir).is_none());
+        assert_eq!(read_created_record(state_dir), CreateRecord::Missing);
     }
 
     #[test]
@@ -1284,10 +1231,9 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(ran, ["setup"]);
-        assert!(!state_dir.join(CREATING_MARKER_FILE).exists());
         assert_eq!(
             read_created_record(state_dir),
-            Some(CreateSettings::default())
+            CreateRecord::Recorded(Box::default())
         );
     }
 }

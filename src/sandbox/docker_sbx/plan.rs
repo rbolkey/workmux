@@ -65,33 +65,27 @@ pub struct LaunchTarget<'a> {
     /// allowed (under `deny`, only those `allowed_domains` lists), and the
     /// agent command run in it.
     pub toolchain: &'a DetectedToolchain,
-    /// The settings the sandbox was created with, recorded once creating
-    /// it fully succeeded; `None` when no launch has finished setting it
-    /// up (it's missing, or a launch failed or was killed partway), or the
-    /// sandbox predates the record.
-    pub created_with: Option<&'a CreateSettings>,
-    /// Whether a launch began creating the sandbox and didn't finish (it
-    /// failed or was killed partway), as its state directory records.
-    pub unfinished: bool,
+    /// What the sandbox's state directory records of how it was created.
+    pub created_with: &'a CreateRecord,
 }
 
-/// The mode of a sandbox recorded before the mode was: `shell`, the only
-/// one there was.
-fn shell_mode() -> DockerSbxAgent {
-    DockerSbxAgent::Shell
+/// A sandbox's create record, as read from its state directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CreateRecord {
+    /// No launch finished creating the sandbox: it's missing, or a launch
+    /// failed or was killed partway.
+    Missing,
+    Recorded(Box<CreateSettings>),
+    /// The record doesn't parse; holds why.
+    Unreadable(String),
 }
 
 /// What a sandbox is created with and later launches can't change, as
-/// recorded in its state directory once it's fully set up. Fields an older
-/// record holds that are no longer kept, such as `agent_credentials`, are
-/// ignored when it's read.
+/// recorded in its state directory once it's fully set up.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
 pub struct CreateSettings {
     pub agent: String,
-    /// `sandbox.docker_sbx.agent`. A record from before it was kept is a
-    /// `shell` one.
-    #[serde(default = "shell_mode")]
+    /// `sandbox.docker_sbx.agent`.
     pub agent_mode: DockerSbxAgent,
     /// The agent's config directory, mounted at its usual place.
     pub agent_config_dir: Option<PathBuf>,
@@ -1170,12 +1164,9 @@ fn check_prerequisites(state: &SbxState) -> Result<()> {
 /// recreate it, as Lima says for `provision`.
 fn create_settings_warnings(
     current: &CreateSettings,
-    created_with: Option<&CreateSettings>,
+    created: &CreateSettings,
     name: &str,
 ) -> Vec<String> {
-    let Some(created) = created_with else {
-        return Vec::new();
-    };
     let changed: Vec<&str> = [
         ("agent", current.agent != created.agent),
         (
@@ -1259,53 +1250,46 @@ fn check_agent_mode_since_create(
     Ok(())
 }
 
-/// Whether the launch creates the sandbox: it's missing, a launch began
-/// creating it and didn't finish, or it predates the record of the settings
-/// it was created with and isn't running. A running sandbox may have panes
-/// in it, which removing it would kill.
-pub fn creates_sandbox(
-    state: &SbxState,
-    created_with: Option<&CreateSettings>,
-    unfinished: bool,
-) -> bool {
+/// Whether the launch creates the sandbox: it's missing, or it has no
+/// create record and isn't running. A running sandbox may have panes in it,
+/// which removing it would kill.
+pub fn creates_sandbox(state: &SbxState, created_with: &CreateRecord) -> bool {
     match (&state.sandbox, created_with) {
         (None, _) => true,
-        (Some(_), Some(_)) => false,
-        (Some(sandbox), None) => unfinished || !sandbox.is_running(),
+        (Some(sandbox), CreateRecord::Missing) => !sandbox.is_running(),
+        (Some(_), _) => false,
     }
 }
 
-/// A running sandbox that predates the record of the settings it was
-/// created with is launched into as it is, but for the files workmux hides,
-/// which it has no mask over: the agent could read them.
-fn predates_record_warnings(excluded: &[Mask], name: &str) -> Result<Vec<String>> {
+/// The settings an existing sandbox was created with. Fails when workmux
+/// can't vouch for them: the sandbox is running without a create record,
+/// or the record doesn't parse.
+fn existing_settings<'a>(created_with: &'a CreateRecord, name: &str) -> Result<&'a CreateSettings> {
     let recreate = format!(
-        "Close the worktree's panes: the first launch once sbx has stopped the sandbox \
-         (about 30 seconds later) recreates it. Or remove it with `sbx rm -f {name}`."
+        "Close the worktree's panes and remove it with `workmux sandbox prune` or \
+         `sbx rm -f {name}`; the next launch creates it again."
     );
-    if let Some(mask) = excluded.first() {
-        bail!(
-            "sbx sandbox {name} was created before workmux recorded how it creates sandboxes, \
-             so it has no mask over {}, which the agent could read. It's running, so workmux \
-             won't remove it. {recreate}",
-            mask.target.display()
-        );
+    match created_with {
+        CreateRecord::Recorded(created) => Ok(created.as_ref()),
+        CreateRecord::Missing => bail!(
+            "sbx sandbox {name} is running, but workmux has no record of creating it, so it \
+             can't vouch for how it was set up. {recreate}"
+        ),
+        CreateRecord::Unreadable(error) => bail!(
+            "workmux's record of how sbx sandbox {name} was created doesn't parse \
+             ({error}). {recreate}"
+        ),
     }
-    Ok(vec![format!(
-        "sbx sandbox {name} was created before workmux recorded how it creates sandboxes; \
-         it's running, so workmux launches into it as it is, without the settings later \
-         workmux applies at create. {recreate}"
-    )])
 }
 
 /// Compute the sbx commands a launch needs.
 ///
-/// When the sandbox is missing, or no launch finished setting it up, or it
-/// predates the record of its settings and isn't running (it's removed
-/// first): create it from the template, with the configured resources and
-/// mixin kits, mounting the worktree, the main repository's git dir
-/// (read-only but for what commits write) and the shims at their host
-/// paths, an empty file over each of `excluded_files`, and `extra_mounts`.
+/// When the sandbox is missing, or it's stopped and no launch finished
+/// setting it up (it's removed first): create it from the template, with
+/// the configured resources and mixin kits, mounting the worktree, the main
+/// repository's git dir (read-only but for what commits write) and the
+/// shims at their host paths, an empty file over each of `excluded_files`,
+/// and `extra_mounts`.
 /// Under `agent: kit` it's created for sbx's agent kit, which sets the agent
 /// up in the sandbox's own home; then workmux's status hooks are added to
 /// the kit's settings. Under `agent: shell` it's created with sbx's generic
@@ -1313,7 +1297,8 @@ fn predates_record_warnings(excluded: &[Mask], name: &str) -> Result<Vec<String>
 /// the agent's config directory is mounted where the agent looks for it;
 /// then, as root, the agent gets the config directory's parents and
 /// Claude's onboarding state is seeded. A sandbox created under the other
-/// mode fails to launch.
+/// mode fails to launch, as does a running one with no create record or one
+/// whose record doesn't parse.
 /// On every launch: bind pi's and OMP's binaries directory to a guest-local
 /// one, reconcile the sandbox's rules with `sandbox.network` and the
 /// toolchain's endpoints, and allow the supervisor's RPC port until the exec
@@ -1378,25 +1363,21 @@ pub fn launch_plan(
         .to_string(),
     };
 
-    // A sandbox no launch finished setting up is removed and created again,
-    // as is one from before the record that isn't running.
-    let exists = !creates_sandbox(state, target.created_with, target.unfinished);
+    // A stopped sandbox no launch finished setting up is removed and
+    // created again.
+    let exists = !creates_sandbox(state, target.created_with);
     let remove = (state.sandbox.is_some() && !exists).then(|| SbxCommand {
         args: words(&["rm", "-f", name]),
         env: Vec::new(),
     });
 
-    let predates_record = match target.created_with {
-        Some(created) if exists => {
-            check_agent_mode_since_create(mode, created.agent_mode, name)?;
-            check_masked_since_create(&excluded, created, name)?;
-            Vec::new()
-        }
-        None if exists => {
-            check_agent_mode_since_create(mode, DockerSbxAgent::Shell, name)?;
-            predates_record_warnings(&excluded, name)?
-        }
-        _ => Vec::new(),
+    let created_with = if exists {
+        let created = existing_settings(target.created_with, name)?;
+        check_agent_mode_since_create(mode, created.agent_mode, name)?;
+        check_masked_since_create(&excluded, created, name)?;
+        Some(created)
+    } else {
+        None
     };
 
     if !exists {
@@ -1587,12 +1568,11 @@ pub fn launch_plan(
                 name,
                 &network_rules,
             ))
-            .chain(predates_record)
-            .chain(if exists {
-                create_settings_warnings(&create_settings, target.created_with, name)
-            } else {
-                Vec::new()
-            })
+            .chain(
+                created_with
+                    .into_iter()
+                    .flat_map(|created| create_settings_warnings(&create_settings, created, name)),
+            )
             .collect(),
         network_rules,
         create_settings,
@@ -1683,8 +1663,7 @@ mod tests {
         state: PathBuf,
         record: Vec<NetworkRule>,
         toolchain: DetectedToolchain,
-        created: Option<CreateSettings>,
-        unfinished: bool,
+        created: CreateRecord,
     }
 
     fn git_metadata() -> GitMetadata {
@@ -1716,8 +1695,7 @@ mod tests {
             state: PathBuf::from("/state/docker-sbx/wm-proj-12345678"),
             record: Vec::new(),
             toolchain: DetectedToolchain::None,
-            created: Some(created_settings()),
-            unfinished: false,
+            created: CreateRecord::Recorded(Box::new(created_settings())),
         }
     }
 
@@ -1731,8 +1709,7 @@ mod tests {
             state_dir: &p.state,
             network_record: &p.record,
             toolchain: &p.toolchain,
-            created_with: p.created.as_ref(),
-            unfinished: p.unfinished,
+            created_with: &p.created,
         }
     }
 
@@ -1799,16 +1776,18 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_an_earlier_launch_didnt_finish_is_removed_and_created_again() {
+    fn a_stopped_sandbox_without_a_create_record_is_removed_and_created_again() {
         // A launch that failed or was killed between `sbx create` and the
         // end of provisioning leaves a sandbox with no record of its
         // settings, which would otherwise be used half set up.
         let mut p = paths();
-        p.created = None;
-        p.unfinished = true;
+        p.created = CreateRecord::Missing;
         p.record = vec![recorded(RuleDecision::Allow, "kept.com:443")];
         let config = with_network(NetworkPolicy::Deny, domains(&["kept.com"]));
-        let state = running_with(vec![rule(SCOPE, "kept.com:443")]);
+        let state = SbxState {
+            sandbox: Some(sandbox("stopped")),
+            ..running_with(vec![rule(SCOPE, "kept.com:443")])
+        };
         let plan = launch_plan(&config, &target(&p), "claude", &state, &exec()).unwrap();
 
         assert_eq!(
@@ -1826,63 +1805,69 @@ mod tests {
     }
 
     #[test]
-    fn a_running_sandbox_from_before_the_record_is_launched_into_with_a_warning() {
-        // Panes may be running in it: removing it would kill them.
-        let mut p = paths();
-        p.created = None;
-        let plan = launch_plan(
-            &config(),
-            &target(&p),
-            "claude",
-            &running_with(Vec::new()),
-            &exec(),
-        )
-        .unwrap();
-
-        assert!(plan.remove.is_none(), "{:?}", plan.remove);
-        assert!(plan.create.is_none(), "{:?}", plan.create);
-        assert_eq!(plan.exec.args[0], "exec");
-        assert_eq!(plan.warnings.len(), 1, "{:?}", plan.warnings);
-        let warning = &plan.warnings[0];
-        for expected in ["wm-proj-12345678", "recreate", "sbx rm -f wm-proj-12345678"] {
-            assert!(warning.contains(expected), "{expected}: {warning}");
+    fn a_running_sandbox_without_a_create_record_fails_naming_workmux_sandbox_prune() {
+        // Panes may be running in it, which removing it would kill, and
+        // workmux can't vouch for how it was set up.
+        for config in [config(), kit_config()] {
+            let mut p = paths();
+            p.created = CreateRecord::Missing;
+            let err = launch_plan(
+                &config,
+                &target(&p),
+                "claude",
+                &running_with(Vec::new()),
+                &exec(),
+            )
+            .unwrap_err()
+            .to_string();
+            for expected in [
+                "wm-proj-12345678",
+                "workmux sandbox prune",
+                "sbx rm -f wm-proj-12345678",
+            ] {
+                assert!(err.contains(expected), "{expected}: {err}");
+            }
         }
     }
 
     #[test]
-    fn a_stopped_sandbox_from_before_the_record_is_removed_and_created_again() {
+    fn an_unparsable_create_record_fails_naming_workmux_sandbox_prune() {
         let mut p = paths();
-        p.created = None;
-        let state = SbxState {
-            sandbox: Some(sandbox("stopped")),
-            ..missing()
-        };
-        let plan = launch_plan(&config(), &target(&p), "claude", &state, &exec()).unwrap();
-
-        assert!(plan.remove.is_some());
-        assert!(plan.create.is_some());
-        assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
+        p.created = CreateRecord::Unreadable("expected value at line 1".to_string());
+        for state in [
+            running_with(Vec::new()),
+            SbxState {
+                sandbox: Some(sandbox("stopped")),
+                ..missing()
+            },
+        ] {
+            let err = launch_plan(&config(), &target(&p), "claude", &state, &exec())
+                .unwrap_err()
+                .to_string();
+            for expected in [
+                "wm-proj-12345678",
+                "expected value at line 1",
+                "workmux sandbox prune",
+                "sbx rm -f wm-proj-12345678",
+            ] {
+                assert!(err.contains(expected), "{expected}: {err}");
+            }
+        }
     }
 
     #[test]
-    fn a_running_sandbox_from_before_the_record_is_an_error_when_files_need_hiding() {
-        // It was created before workmux masked anything.
-        let (_dir, mut p) = worktree_with(&[".env"]);
-        p.created = None;
-        let error = launch_plan(
-            &excluding(&[".env"]),
-            &target(&p),
-            "claude",
-            &running_with(Vec::new()),
-            &exec(),
-        )
-        .unwrap_err()
-        .to_string();
-        for expected in [
-            p.worktree.join(".env").display().to_string().as_str(),
-            "sbx rm -f wm-proj-12345678",
+    fn a_missing_sandbox_is_created_whatever_its_stale_record_says() {
+        // `workmux sandbox prune` only acts on sandboxes sbx lists, so a
+        // record left behind by a removed sandbox mustn't block creating it.
+        for created in [
+            CreateRecord::Missing,
+            CreateRecord::Unreadable("expected value at line 1".to_string()),
         ] {
-            assert!(error.contains(expected), "{expected}: {error}");
+            let mut p = paths();
+            p.created = created;
+            let plan = launch_plan(&config(), &target(&p), "claude", &missing(), &exec()).unwrap();
+            assert!(plan.create.is_some());
+            assert!(plan.remove.is_none(), "{:?}", plan.remove);
         }
     }
 
@@ -1894,10 +1879,6 @@ mod tests {
             let plan = launch_plan(&config(), &target(&p), "claude", &state, &exec()).unwrap();
             assert!(plan.remove.is_none(), "{:?}", plan.remove);
         }
-        let mut p = paths();
-        p.created = None;
-        let plan = launch_plan(&config(), &target(&p), "claude", &missing(), &exec()).unwrap();
-        assert!(plan.remove.is_none(), "{:?}", plan.remove);
     }
 
     #[test]
@@ -1935,8 +1916,7 @@ mod tests {
     #[test]
     fn a_sandbox_created_under_the_other_agent_mode_fails_naming_how_to_recreate_it() {
         // Switching to `kit` must never keep running a sandbox that has the
-        // agent's real credential mounted; a record from before the mode was
-        // recorded is a `shell` one.
+        // agent's real credential mounted.
         let kit_record = CreateSettings {
             agent_mode: DockerSbxAgent::Kit,
             agent_config_dir: None,
@@ -1947,7 +1927,7 @@ mod tests {
             (config(), kit_record, "kit"),
         ] {
             let mut p = paths();
-            p.created = Some(created);
+            p.created = CreateRecord::Recorded(Box::new(created));
             for state in [
                 running_with(Vec::new()),
                 SbxState {
@@ -1972,25 +1952,6 @@ mod tests {
     }
 
     #[test]
-    fn under_kit_a_running_sandbox_from_before_the_record_is_an_error() {
-        // It was created with the agent's config mounted.
-        let mut p = paths();
-        p.created = None;
-        let err = launch_plan(
-            &kit_config(),
-            &target(&p),
-            "claude",
-            &running_with(Vec::new()),
-            &exec(),
-        )
-        .unwrap_err()
-        .to_string();
-        for expected in ["agent: shell", "sbx rm -f wm-proj-12345678"] {
-            assert!(err.contains(expected), "{expected}: {err}");
-        }
-    }
-
-    #[test]
     fn the_create_record_holds_the_agent_mode() {
         let p = paths();
         for (config, mode) in [
@@ -2007,12 +1968,12 @@ mod tests {
         // Mounts, resources, kits, the template and the toolchain are fixed
         // when sbx creates the sandbox.
         let mut p = paths();
-        p.created = Some(CreateSettings {
+        p.created = CreateRecord::Recorded(Box::new(CreateSettings {
             agent: "codex".to_string(),
             agent_config_dir: Some(PathBuf::from("/home/me/.codex")),
             memory: Some("4g".to_string()),
             ..created_settings()
-        });
+        }));
         let config = SandboxConfig {
             docker_sbx: DockerSbxConfig {
                 memory: Some("8g".to_string()),
@@ -2597,11 +2558,11 @@ mod tests {
     /// An existing sandbox created under `agent: kit`.
     fn kit_paths() -> Paths {
         Paths {
-            created: Some(CreateSettings {
+            created: CreateRecord::Recorded(Box::new(CreateSettings {
                 agent_mode: DockerSbxAgent::Kit,
                 agent_config_dir: None,
                 ..created_settings()
-            }),
+            })),
             ..paths()
         }
     }
@@ -3289,7 +3250,7 @@ mod tests {
 
         // Only when the sandbox is created: the kit writes its settings then.
         let mut existing = paths();
-        existing.created = Some(plan.create_settings.clone());
+        existing.created = CreateRecord::Recorded(Box::new(plan.create_settings.clone()));
         let plan = launch_plan(
             &kit_config(),
             &target(&existing),
@@ -3392,7 +3353,7 @@ mod tests {
         // Only on create: the kit writes its config then.
         for agent in ["codex", "gemini", "copilot", "opencode"] {
             let mut existing = paths();
-            existing.created = Some(plan_for(agent).create_settings);
+            existing.created = CreateRecord::Recorded(Box::new(plan_for(agent).create_settings));
             let plan = launch_plan(
                 &kit_config(),
                 &target(&existing),
@@ -3787,10 +3748,10 @@ mod tests {
         let (_dir, mut p) = worktree_with(&[".env", ".env.local"]);
         let env = p.worktree.join(".env");
         let local = p.worktree.join(".env.local");
-        p.created = Some(CreateSettings {
+        p.created = CreateRecord::Recorded(Box::new(CreateSettings {
             excluded_files: vec![env.clone()],
             ..created_settings()
-        });
+        }));
         let state = running_with(Vec::new());
 
         let plan = launch_plan(
@@ -3823,10 +3784,10 @@ mod tests {
     fn an_excluded_file_masked_at_create_and_deleted_since_warns_how_to_recreate() {
         // sbx puts an empty file back where it was; nothing is readable.
         let (_dir, mut p) = worktree_with(&[".env"]);
-        p.created = Some(CreateSettings {
+        p.created = CreateRecord::Recorded(Box::new(CreateSettings {
             excluded_files: vec![p.worktree.join(".env"), p.worktree.join(".env.old")],
             ..created_settings()
-        });
+        }));
         let config = excluding(&[".env", ".env.old"]);
         let state = running_with(Vec::new());
         let plan = launch_plan(&config, &target(&p), "claude", &state, &exec()).unwrap();
@@ -3840,10 +3801,10 @@ mod tests {
     #[test]
     fn excluded_files_are_masked_only_when_the_sandbox_is_created() {
         let (_dir, mut p) = worktree_with(&[".env"]);
-        p.created = Some(CreateSettings {
+        p.created = CreateRecord::Recorded(Box::new(CreateSettings {
             excluded_files: vec![p.worktree.join(".env")],
             ..created_settings()
-        });
+        }));
         let plan = launch_plan(
             &excluding(&[".env"]),
             &target(&p),
