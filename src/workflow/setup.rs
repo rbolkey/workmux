@@ -168,10 +168,20 @@ pub fn setup_environment(
         validate_prompt_consumption(&all_resolved_panes, agent, config, options)?;
     }
 
-    // Pre-boot Lima VM (or create the sbx sandbox) if needed BEFORE creating the tmux window.
+    // Pre-boot Lima VM if needed BEFORE creating the tmux window.
     // This ensures the user sees VM boot progress in their terminal
     // and the window only appears once the VM is ready.
     let lima_vm_name = pre_boot_lima_vm(
+        mux,
+        config,
+        &all_resolved_panes,
+        effective_working_dir,
+        worktree_path,
+        options,
+        agent,
+    )?;
+    // Likewise create docker_sbx sandboxes before the window opens.
+    pre_create_docker_sbx_sandboxes(
         mux,
         config,
         &all_resolved_panes,
@@ -374,12 +384,11 @@ pub fn setup_environment(
     })
 }
 
-/// Pre-boot a Lima VM (or create the worktree's sbx sandbox) if sandbox is
-/// enabled with the Lima or docker_sbx backend and any pane requires
-/// sandboxing. Must be called BEFORE creating the tmux window so the user
-/// sees boot progress and setup errors in their terminal.
+/// Pre-boot a Lima VM if sandbox is enabled with the Lima backend and any
+/// pane requires sandboxing. Must be called BEFORE creating the tmux window
+/// so the user sees VM boot progress in their terminal.
 ///
-/// Returns the VM name if a Lima VM was booted, None otherwise.
+/// Returns the VM name if booted, None otherwise.
 #[allow(clippy::too_many_arguments)]
 fn pre_boot_lima_vm(
     mux: &dyn crate::multiplexer::Multiplexer,
@@ -390,20 +399,78 @@ fn pre_boot_lima_vm(
     options: &super::types::SetupOptions,
     agent: Option<&str>,
 ) -> Result<Option<String>> {
-    if !config.sandbox.is_enabled()
-        || !matches!(
-            config.sandbox.backend(),
-            crate::config::SandboxBackend::Lima | crate::config::SandboxBackend::DockerSbx
-        )
-    {
+    let sandboxed = sandboxed_panes_shell(
+        mux,
+        config,
+        crate::config::SandboxBackend::Lima,
+        panes,
+        working_dir,
+        options,
+        agent,
+    )?;
+    if sandboxed.is_none() {
+        return Ok(None);
+    }
+
+    info!("pre-booting Lima VM before window creation");
+    let vm_name = crate::sandbox::ensure_lima_vm(config, worktree_path)?;
+    Ok(Some(vm_name))
+}
+
+/// Create the worktree's sbx sandboxes, one per sandboxed agent, if sandbox
+/// is enabled with the docker_sbx backend and any pane requires sandboxing.
+/// Must be called BEFORE creating the tmux window so the user sees creation
+/// progress and setup errors in their terminal.
+#[allow(clippy::too_many_arguments)]
+fn pre_create_docker_sbx_sandboxes(
+    mux: &dyn crate::multiplexer::Multiplexer,
+    config: &config::Config,
+    panes: &[config::PaneConfig],
+    working_dir: &Path,
+    worktree_path: &Path,
+    options: &super::types::SetupOptions,
+    agent: Option<&str>,
+) -> Result<()> {
+    let Some(shell) = sandboxed_panes_shell(
+        mux,
+        config,
+        crate::config::SandboxBackend::DockerSbx,
+        panes,
+        working_dir,
+        options,
+        agent,
+    )?
+    else {
+        return Ok(());
+    };
+
+    for sandbox_agent in docker_sbx_agents(config, panes, working_dir, options, agent, &shell) {
+        info!(agent = %sandbox_agent, "creating sbx sandbox before window creation");
+        crate::sandbox::ensure_docker_sbx_sandbox(config, worktree_path, &sandbox_agent)?;
+    }
+    Ok(())
+}
+
+/// The default shell, if sandbox is enabled with `backend` and any pane
+/// requires sandboxing; None otherwise.
+fn sandboxed_panes_shell(
+    mux: &dyn crate::multiplexer::Multiplexer,
+    config: &config::Config,
+    backend: crate::config::SandboxBackend,
+    panes: &[config::PaneConfig],
+    working_dir: &Path,
+    options: &super::types::SetupOptions,
+    agent: Option<&str>,
+) -> Result<Option<String>> {
+    if !config.sandbox.is_enabled() || config.sandbox.backend() != backend {
         return Ok(None);
     }
 
     let shell = mux.get_default_shell()?;
 
-    // Check if any pane will actually need Lima wrapping by resolving
+    // Check if any pane will actually need sandbox wrapping by resolving
     // commands the same way setup_panes does (respects run_commands flag).
-    let any_pane_needs_lima = panes.iter().any(|pane_config| {
+    let any_pane_sandboxed = panes.iter().any(|pane_config| {
         let resolved = crate::multiplexer::util::resolve_pane_command_with_config(
             pane_config.command.as_deref(),
             options.run_pane_commands,
@@ -425,21 +492,7 @@ fn pre_boot_lima_vm(
         }
     });
 
-    if !any_pane_needs_lima {
-        return Ok(None);
-    }
-
-    if config.sandbox.backend() == crate::config::SandboxBackend::DockerSbx {
-        for sandbox_agent in docker_sbx_agents(config, panes, working_dir, options, agent, &shell) {
-            info!(agent = %sandbox_agent, "creating sbx sandbox before window creation");
-            crate::sandbox::ensure_docker_sbx_sandbox(config, worktree_path, &sandbox_agent)?;
-        }
-        return Ok(None);
-    }
-
-    info!("pre-booting Lima VM before window creation");
-    let vm_name = crate::sandbox::ensure_lima_vm(config, worktree_path)?;
-    Ok(Some(vm_name))
+    Ok(any_pane_sandboxed.then_some(shell))
 }
 
 /// The distinct agents whose sbx sandboxes the worktree's panes run in,
