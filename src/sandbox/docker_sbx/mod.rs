@@ -1,9 +1,9 @@
 //! Docker Sandboxes (`sbx`) backend for sandbox.
 //!
-//! Runs each agent of each worktree in its own sbx microVM sandbox. The worktree,
-//! the main repository's git dir (read-only but for what commits write) and
-//! the agent's config directory are mounted at their workstation paths; the agent command runs through
-//! `sbx exec`, as on the container backend.
+//! Runs each agent of each worktree in its own sbx microVM sandbox. The
+//! worktree, the main repository's git dir (read-only except for what commits
+//! write) and the agent's config directory are mounted at their workstation
+//! paths, and commands run through `sbx exec`.
 
 mod acknowledgement;
 mod git;
@@ -33,13 +33,10 @@ use tracing::debug;
 /// Longest sandbox name sbx accepts.
 const MAX_NAME_LEN: usize = 63;
 
-/// Wrap a pane's command to run in the worktree's sbx sandbox for `agent`
-/// (the pane's agent: a named agent, or an agent type by its own name).
+/// Wrap a pane's command to run in the sbx sandbox of `agent`, the pane agent.
 ///
-/// Generates a `workmux sandbox run --agent <agent>` command, which starts
-/// an RPC server and runs the command through `sbx exec` in that agent's
-/// sandbox. `supervisor` replaces the default `workmux sandbox run` words,
-/// already shell-quoted, for callers that must pin a specific binary.
+/// `supervisor` replaces the default `workmux sandbox run` words, already
+/// shell-quoted, for callers that must pin a specific binary.
 pub fn wrap_for_docker_sbx(
     command: &str,
     supervisor: Option<&str>,
@@ -50,12 +47,10 @@ pub fn wrap_for_docker_sbx(
     super::container::wrap_for_supervisor(command, supervisor, worktree_root, pane_cwd, Some(agent))
 }
 
-/// Fails for `--fork` when the launch runs agents in sbx sandboxes under
-/// `sandbox.docker_sbx.agent: kit`: it forks a conversation from the
-/// workstation's agent config, which the kit's sandbox doesn't have.
-/// `--continue` needs no check: it resumes the conversation in the
-/// sandbox's own home, which lasts as long as the sandbox. `sandboxed` is
-/// whether `--sandbox` turns the sandbox on for this launch.
+/// Reject `--fork` for sbx sandboxes under `agent: kit`.
+///
+/// The fork reads the workstation's agent config, which a kit sandbox doesn't
+/// mount. `sandboxed` is whether `--sandbox` turns the sandbox on.
 pub fn check_fork(config: &crate::config::SandboxConfig, sandboxed: bool) -> Result<()> {
     use crate::config::{DockerSbxAgent, SandboxBackend};
     if (config.is_enabled() || sandboxed)
@@ -71,17 +66,17 @@ pub fn check_fork(config: &crate::config::SandboxConfig, sandboxed: bool) -> Res
     Ok(())
 }
 
-/// The worktree's selected agent (a named agent, or an agent type by its
-/// own name), from `selector` (`-a`) or the config's default: the agent
-/// whose sandbox a pane runs in when it names none.
+/// Resolve the worktree's selected agent from `selector` (`-a`) or the config.
 pub fn selected_agent(config: &Config, selector: Option<&str>) -> String {
     crate::multiplexer::agent::resolve_selected_agent(config, selector)
         .map(|agent| agent.name().to_string())
         .unwrap_or_else(|| default_agent_type(config).to_string())
 }
 
-/// The agent whose sandbox a pane runs in: the pane's own agent, or for a
-/// plain pane the worktree's selected agent (from `selector`, `-a`).
+/// Resolve the pane agent, whose sandbox a pane runs in.
+///
+/// An agent is a named agent, or an agent type by its own name. A plain pane
+/// uses the worktree's selected agent.
 pub fn pane_agent(
     config: &Config,
     pane_agent: Option<&crate::multiplexer::agent::SelectedAgent>,
@@ -93,7 +88,7 @@ pub fn pane_agent(
     }
 }
 
-/// The agent type of `agent`, a named agent or an agent type.
+/// Resolve the agent type of `agent`.
 fn agent_type(config: &Config, agent: &str) -> &'static str {
     crate::multiplexer::agent::resolve_selected_agent(config, Some(agent))
         .map(|agent| agent.kind())
@@ -114,15 +109,11 @@ const MAX_AGENT_LEN: usize = 24;
 /// Length of the hash added to an agent name that had to be changed to fit.
 const AGENT_HASH_LEN: usize = 6;
 
-/// Generate the sandbox name for a worktree and agent:
-/// `wm-<project>-<hash8>-<agent>`.
+/// Generate the sandbox name `wm-<project>-<hash8>-<agent>` for a worktree.
 ///
-/// Each worktree gets its own sandbox for each agent it runs, so the hash is
-/// of the worktree path and the agent (a named agent, or an agent type by
-/// its own name) ends the name; the project directory name is there for
-/// recognising sandboxes in `sbx ls`. Names stay within sbx's rules:
-/// lowercase letters, digits and `-`, at most 63 characters. The project is
-/// found from the worktree's `.git` pointer files, without running git.
+/// The hash is of the worktree path; the project name is only there to make
+/// `sbx ls` readable. Names stay within sbx's rules: lowercase letters, digits
+/// and `-`, at most 63 characters.
 pub fn sandbox_name(worktree_root: &Path, agent: &str) -> Result<String> {
     let identity = crate::git::RepositoryIdentity::discover(worktree_root)
         .context("Failed to find the worktree's repository")?;
@@ -134,10 +125,9 @@ pub fn sandbox_name(worktree_root: &Path, agent: &str) -> Result<String> {
     Ok(sandbox_name_in(&project_root, worktree_root, agent))
 }
 
-/// The sandbox name for an agent of a worktree of the project at
-/// `project_root` (the parent of its git common dir), without looking at
-/// the worktree's git metadata, which may already be gone when it's being
-/// removed.
+/// Generate the sandbox name without reading the worktree's git metadata.
+///
+/// Removal needs this, since the metadata may already be gone.
 pub fn sandbox_name_in(project_root: &Path, worktree_root: &Path, agent: &str) -> String {
     let name = sandbox_name_for(project_root, &canonical(worktree_root), agent);
     debug!(sandbox = %name, agent, "resolved sbx sandbox name");
@@ -155,7 +145,7 @@ fn sandbox_name_for(project_root: &Path, worktree_root: &Path, agent: &str) -> S
     format!("{base}-{agent}")
 }
 
-/// `wm-<project>-<hash8>`, at most `max_len` characters.
+/// Generate `wm-<project>-<hash8>`, at most `max_len` characters.
 fn worktree_name_for(project_root: &Path, worktree_root: &Path, max_len: usize) -> String {
     use crate::sandbox::{hash_key, sanitize_name};
 
@@ -175,10 +165,10 @@ fn worktree_name_for(project_root: &Path, worktree_root: &Path, max_len: usize) 
     }
 }
 
-/// The agent's part of a sandbox name: the agent name itself when sbx
-/// accepts it and it fits; otherwise slugified and shortened, with a hash
-/// of the name so that agents whose names slugify alike keep their own
-/// sandboxes.
+/// Build the agent part of a sandbox name.
+///
+/// A name sbx rejects is slugified and gets a hash, so agents whose names
+/// slugify alike keep separate sandboxes.
 fn agent_slug(agent: &str) -> String {
     use crate::sandbox::{hash_key, sanitize_name};
 

@@ -417,10 +417,8 @@ fn pre_boot_lima_vm(
     Ok(Some(vm_name))
 }
 
-/// Create the worktree's sbx sandboxes, one per sandboxed agent, if sandbox
-/// is enabled with the docker_sbx backend and any pane requires sandboxing.
-/// Must be called BEFORE creating the tmux window so the user sees creation
-/// progress and setup errors in their terminal.
+/// Create the worktree's sbx sandboxes, one per sandboxed agent. Must be called
+/// BEFORE creating the tmux window so the user sees progress and errors.
 #[allow(clippy::too_many_arguments)]
 fn pre_create_docker_sbx_sandboxes(
     mux: &dyn crate::multiplexer::Multiplexer,
@@ -451,8 +449,7 @@ fn pre_create_docker_sbx_sandboxes(
     Ok(())
 }
 
-/// The default shell, if sandbox is enabled with `backend` and any pane
-/// requires sandboxing; None otherwise.
+/// Return the default shell if any pane runs sandboxed under `backend`.
 fn sandboxed_panes_shell(
     mux: &dyn crate::multiplexer::Multiplexer,
     config: &config::Config,
@@ -495,10 +492,8 @@ fn sandboxed_panes_shell(
     Ok(any_pane_sandboxed.then_some(shell))
 }
 
-/// The distinct agents whose sbx sandboxes the worktree's panes run in,
-/// from the panes setup_panes lays out: each sandboxed agent
-/// pane's own agent, and the selected agent for plain panes under
-/// `target: all`.
+/// List the distinct pane agents whose sbx sandboxes the worktree's panes run
+/// in.
 fn docker_sbx_agents(
     config: &config::Config,
     panes: &[config::PaneConfig],

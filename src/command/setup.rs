@@ -43,9 +43,8 @@ pub fn run(hooks_only: bool, skills_only: bool) -> Result<()> {
     Ok(())
 }
 
-/// Install status hooks for the agent type `agent` into its config directory
-/// `config_dir`, without prompting. Sandbox guests run this as the agent
-/// user.
+/// Install status hooks for the agent type `agent` into `config_dir` without
+/// prompting, as sandbox guests do.
 pub fn run_for_agent(agent: &str, config_dir: &Path) -> Result<()> {
     let agent: Agent = serde_json::from_value(serde_json::Value::String(agent.to_string()))
         .map_err(|_| anyhow::anyhow!("Unknown agent type '{agent}'"))?;

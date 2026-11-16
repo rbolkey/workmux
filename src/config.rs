@@ -1899,66 +1899,43 @@ impl LimaConfig {
 
 /// Docker Sandboxes (`sbx`) specific sandbox configuration.
 /// Nested under `sandbox.docker_sbx` in YAML.
-///
-/// Each worktree gets its own sbx sandbox, created from a template built on
-/// `sandbox.image` with a thin layer for sbx's requirements. The generic
-/// `sandbox.*` keys keep their meaning under this backend.
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub struct DockerSbxConfig {
     /// Number of CPUs for the sandbox (sbx `--cpus`; 0 means all host CPUs).
-    /// Only passed when explicitly set: sbx's default is all host CPUs.
     #[serde(default)]
     pub cpus: Option<u32>,
 
     /// Memory for the sandbox in sbx's binary units (e.g. "512m", "8g").
-    /// Minimum 512 MiB. Only passed when explicitly set: sbx defaults to half
-    /// the host's memory, clamped to 512 MiB-32 GiB.
+    /// Minimum 512 MiB.
     #[serde(default)]
     pub memory: Option<String>,
 
-    /// Custom provision script run once when the sandbox is created, after
-    /// workmux's own setup steps. Runs as root in the template's bash, which
-    /// has no `sudo`.
+    /// Custom provision script run as root once, when the sandbox is created.
     #[serde(default)]
     pub provision: Option<String>,
 
-    /// Skip built-in provisioning: keeping the host-command shims on login
-    /// shells' PATH, and installing Nix and Devbox when the project uses a
-    /// toolchain. Use when `image` already provides these. Custom
-    /// `provision` script still runs if specified.
+    /// Skip built-in provisioning (shims on login shells' PATH, Nix and
+    /// Devbox). Custom `provision` script still runs if specified.
     #[serde(default)]
     pub skip_default_provision: Option<bool>,
 
-    /// sbx mixin kits added to the sandbox at creation (sbx `--kit`): OCI
-    /// references, git URLs, directories or ZIP files. A kit can add network
-    /// rules, credentials and install steps to the sandbox, so this field is
-    /// global-only: ignored in project config.
+    /// sbx mixin kits added to the sandbox at creation (sbx `--kit`).
+    /// Global-only, since a kit can add network rules and credentials.
     #[serde(default)]
     pub kits: Option<Vec<String>>,
 
-    /// How the agent is set up in its sandbox: `kit` (default) creates the
-    /// sandbox for sbx's agent kit, which installs the agent in the
-    /// sandbox's own home and holds its credential as an sbx secret, so the
-    /// agent sees only placeholders; `shell` creates it with sbx's generic
-    /// `shell` agent and mounts the agent's config directory from the
-    /// workstation, as the other backends do. Global-only: ignored in
-    /// project config.
+    /// How the agent is set up in its sandbox (default `kit`). Global-only,
+    /// since under `shell` the agent holds its real credential.
     #[serde(default)]
     pub agent: Option<DockerSbxAgent>,
 
-    /// Files (relative to the worktree root) to hide from the agent. An
-    /// empty read-only file is mounted over each existing regular file when
-    /// the sandbox is created; missing paths, directories and paths outside
-    /// the worktree are skipped with a warning. Global-only: ignored in
-    /// project config, so a repository can't unhide its own secrets.
+    /// Files (relative to the worktree root) to hide from the agent.
+    /// Global-only, so a repository can't unhide its own secrets.
     #[serde(default)]
     pub excluded_files: Option<Vec<String>>,
 
-    /// Accept, without asking, that a sandbox created under
-    /// `sandbox.network.policy: deny` reaches more than `allowed_domains`
-    /// (what sbx's global policy allows, private addresses, the agent kit's
-    /// hosts). Global-only: ignored in project config, so a repository
-    /// can't accept it for the user.
+    /// Accept without asking that a `deny` sandbox reaches more than
+    /// `allowed_domains`. Global-only.
     #[serde(default)]
     pub accept_wider_network_policy: Option<bool>,
 }
@@ -1971,13 +1948,12 @@ pub enum DockerSbxAgent {
     /// sbx's agent kit sets the agent up and holds its credential.
     #[default]
     Kit,
-    /// sbx's generic `shell` agent, with the agent's config directory
-    /// mounted from the workstation.
+    /// sbx's generic `shell` agent, with the agent's config directory mounted.
     Shell,
 }
 
 impl DockerSbxAgent {
-    /// The config's name for the mode.
+    /// Return the config's name for the mode.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Kit => "kit",
@@ -1989,9 +1965,8 @@ impl DockerSbxAgent {
 /// sbx's smallest sandbox memory (`--memory`).
 const DOCKER_SBX_MIN_MEMORY: f64 = 512.0 * 1024.0 * 1024.0;
 
-/// Bytes in a memory size as sbx reads `--memory`: a number with an
-/// optional binary unit (`k`, `m`, `g`, `t`, `p`), optionally followed by
-/// `i` and/or `b`, any case (`512m`, `8G`, `1GiB`, `1gb`, `536870912`).
+/// Parse a memory size as sbx reads `--memory` (`512m`, `8G`, `1GiB`) to
+/// bytes.
 fn parse_docker_sbx_memory(memory: &str) -> Option<f64> {
     let digits = memory
         .find(|c: char| !c.is_ascii_digit() && c != '.')
@@ -2045,14 +2020,12 @@ impl DockerSbxConfig {
         self.agent.unwrap_or_default()
     }
 
-    /// Files to hide from the agent (relative to the worktree root).
-    /// Returns empty slice when unset.
+    /// Files to hide from the agent. Returns empty slice when unset.
     pub fn excluded_files(&self) -> &[String] {
         self.excluded_files.as_deref().unwrap_or(&[])
     }
 
-    /// Whether a wider network policy under `deny` is accepted without
-    /// asking. Defaults to false.
+    /// Whether a wider network policy is accepted without asking.
     pub fn accepts_wider_network_policy(&self) -> bool {
         self.accept_wider_network_policy.unwrap_or(false)
     }
@@ -2079,33 +2052,28 @@ impl DockerSbxConfig {
     /// `agent`, `excluded_files` and `accept_wider_network_policy`, which
     /// are global-only.
     fn merge(global: Self, project: Self) -> Self {
-        // Security: kits is global-only. A kit can add network rules,
-        // credentials and install steps, so a repo's .workmux.yaml must not
-        // be able to widen its sandbox's access through one.
+        // Security: a repo must not widen its sandbox's access through a kit.
         if project.kits.is_some() {
             tracing::warn!(
                 "sandbox.docker_sbx.kits in project config (.workmux.yaml) is ignored -- \
                 move it to your global config (~/.config/workmux/config.yaml)"
             );
         }
-        // Security: agent is global-only. Under `shell` the agent holds its
-        // real credential, so a repo must not be able to choose it.
+        // Security: under `shell` the agent holds its real credential.
         if project.agent.is_some() {
             tracing::warn!(
                 "sandbox.docker_sbx.agent in project config (.workmux.yaml) is ignored -- \
                 move it to your global config (~/.config/workmux/config.yaml)"
             );
         }
-        // Security: excluded_files is global-only, so a repo's .workmux.yaml
-        // can't unhide its own secrets.
+        // Security: a repo must not unhide its own secrets.
         if project.excluded_files.is_some() {
             tracing::warn!(
                 "sandbox.docker_sbx.excluded_files in project config (.workmux.yaml) is ignored -- \
                 move it to your global config (~/.config/workmux/config.yaml)"
             );
         }
-        // Security: a repo must not accept a wider network policy for the
-        // user.
+        // Security: a repo must not accept a wider network policy for the user.
         if project.accept_wider_network_policy.is_some() {
             tracing::warn!(
                 "sandbox.docker_sbx.accept_wider_network_policy in project config (.workmux.yaml) is ignored -- \
@@ -2475,8 +2443,7 @@ pub const MAX_NETWORK_MAX_CONNECTIONS: usize = 1024;
 /// to whitelisted domains via an HTTP CONNECT proxy. An iptables firewall
 /// inside the container enforces that only the proxy and RPC ports are
 /// reachable, preventing bypass via direct connections. Under docker_sbx,
-/// sbx enforces the same allow list as rules scoped to the sandbox, on top
-/// of the user's global sbx policy.
+/// sbx enforces the allow list on top of the user's global sbx policy.
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub struct NetworkConfig {
     /// Network restriction policy. Default: allow (no restrictions).
@@ -2582,9 +2549,7 @@ pub struct SandboxConfig {
     #[serde(default)]
     pub backend: Option<SandboxBackend>,
 
-    /// Whether the project config (.workmux.yaml) chose `backend` over the
-    /// global config's. Set internally during config loading, not
-    /// deserialized.
+    /// Whether `.workmux.yaml` chose `backend`. Set during config loading.
     #[serde(skip)]
     pub backend_from_project: bool,
 

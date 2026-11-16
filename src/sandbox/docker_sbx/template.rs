@@ -1,11 +1,9 @@
 //! sbx templates built from workmux's agent images.
 //!
-//! A template is the agent image plus the thin layer in `docker/Dockerfile.sbx`.
-//! sbx keeps templates in its own image store, so the layer is built with
-//! Docker, saved to a tarball and loaded with `sbx template load`. The
-//! template follows the agent image: when Docker's image changes (a pulled
-//! update, a local build, `install-dev`), the template is built and loaded
-//! again.
+//! A template is the agent image plus the layer in `docker/Dockerfile.sbx`.
+//! sbx keeps its own image store, so the layer is built with Docker, saved to
+//! a tarball and loaded with `sbx template load`, again whenever the agent
+//! image changes.
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -20,9 +18,8 @@ use crate::sandbox::freshness;
 /// The sbx layer added on top of the agent image.
 pub const DOCKERFILE_SBX: &str = include_str!("../../../docker/Dockerfile.sbx");
 
-/// The sbx layer for appending to a combined Dockerfile
-/// (`workmux sandbox init-dockerfile`): `Dockerfile.sbx` without its
-/// `ARG BASE`/`FROM` lines.
+/// Return `Dockerfile.sbx` without its `ARG BASE`/`FROM` lines, for
+/// `workmux sandbox init-dockerfile`.
 pub fn dockerfile_layer() -> String {
     DOCKERFILE_SBX
         .lines()
@@ -37,11 +34,10 @@ pub fn dockerfile_layer() -> String {
 /// Repository name of workmux's sbx templates.
 const TEMPLATE_REPOSITORY: &str = "workmux-sbx";
 
-/// Template tag for an agent image.
+/// Generate the template tag for an agent image.
 ///
-/// Readable from the image's last path segment, and keyed by a hash of the
-/// image and the layer, so a different image or a changed layer gets its
-/// own template.
+/// The hash covers the image and the layer, so changing either gets a new
+/// template.
 pub fn template_tag(image: &str) -> String {
     let readable = image.rsplit('/').next().unwrap_or(image);
     let hash = crate::sandbox::hash_key(&format!("{image}\n{DOCKERFILE_SBX}"), 8);
@@ -61,8 +57,8 @@ pub struct SbxTemplateInfo {
 }
 
 impl SbxTemplateInfo {
-    /// Whether this is the template `tag` (as given to `sbx create -t`).
-    /// sbx lists local images under `docker.io/library/`.
+    /// Check whether this is the template `tag`. sbx lists local images
+    /// under `docker.io/library/`.
     fn is(&self, tag: &str) -> bool {
         let Some((repository, tag)) = tag.split_once(':') else {
             return false;
@@ -105,8 +101,7 @@ fn run_docker(args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-/// Docker's ID for a local image (`sha256:...`), which changes whenever
-/// the image does: a pull of a newer image, a local build, `install-dev`.
+/// Read Docker's ID for a local image, which changes whenever the image does.
 fn local_image_id(image: &str) -> Result<String> {
     let output = Command::new("docker")
         .args(["image", "inspect", "--format", "{{.Id}}", image])
@@ -121,21 +116,17 @@ fn local_image_id(image: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-/// Refresh the freshness cache for the agent image in the background, so
-/// the next sandbox created from it pulls an update first. Only workmux's
-/// official images are checked.
+/// Refresh the agent image's freshness cache in the background.
 pub fn check_freshness_in_background(image: &str) {
     freshness::check_in_background(image.to_string(), SandboxRuntime::Docker);
 }
 
-/// Whether a template is current: loaded into sbx, from the agent image
-/// Docker has now.
+/// Check whether a template is loaded and built from Docker's current image.
 fn template_is_current(loaded: bool, recorded: Option<&str>, source_image_id: &str) -> bool {
     loaded && recorded == Some(source_image_id)
 }
 
-/// The image ID a loaded template was built from, recorded in
-/// `$XDG_STATE_HOME/workmux/docker-sbx/templates/<tag>.json`.
+/// The image ID a loaded template was built from.
 #[derive(Deserialize, Serialize)]
 struct TemplateRecord {
     source_image_id: String,
@@ -148,7 +139,7 @@ fn template_record_path(tag: &str) -> Result<PathBuf> {
         .join(format!("{}.json", tag.replace([':', '/'], "-"))))
 }
 
-/// The image ID recorded for a template. None if missing or corrupted.
+/// Read the image ID recorded for a template. None if missing or corrupted.
 fn read_template_record(path: &Path) -> Option<String> {
     let content = std::fs::read_to_string(path).ok()?;
     match serde_json::from_str::<TemplateRecord>(&content) {
@@ -172,15 +163,13 @@ fn write_template_record(path: &Path, source_image_id: &str) -> Result<()> {
     crate::util::write_atomic(path, content.as_bytes())
 }
 
-/// Whether the template for `image` is loaded into sbx.
+/// Check whether the template for `image` is loaded into sbx.
 pub fn template_loaded_for(image: &str) -> Result<bool> {
     template_loaded(&template_tag(image))
 }
 
-/// Make sure the template for `image` is loaded into sbx and built from
-/// the agent image Docker has now, readying the image as the container
-/// backend does. Builds and reloads the template when the image changed
-/// since it was loaded. Returns the template tag.
+/// Ensure the template for `image` is loaded and built from Docker's current
+/// image, rebuilding it if needed. Returns the template tag.
 pub fn ensure_template(image: &str) -> Result<String> {
     crate::sandbox::ensure_image_ready(SandboxRuntime::Docker, image)?;
     let tag = template_tag(image);

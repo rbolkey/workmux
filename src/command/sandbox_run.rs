@@ -70,9 +70,7 @@ impl Drop for ContainerGuard {
 /// Detects the sandbox backend from config and dispatches to the
 /// appropriate handler (Lima VM, Docker/Podman container or sbx sandbox).
 ///
-/// `agent` is the pane's agent (a named agent, or an agent type by its own
-/// name); under docker_sbx it picks the agent's own sandbox, and defaults to
-/// the selected agent. The other backends run the configured agent's.
+/// `agent` is the pane agent, which picks the sandbox under docker_sbx.
 ///
 /// With `node` (root and workspace id), the supervisor runs on a remote node
 /// for an agent the laptop started: the config is the workspace's frozen
@@ -466,10 +464,8 @@ fn run_docker_sbx(
     Ok(exit_code)
 }
 
-/// The environment a command in a docker_sbx sandbox gets from the
-/// workstation, in the pane supervisor and `workmux sandbox shell` alike:
-/// the terminal's `TERM` and `COLORTERM`, `sandbox.env_passthrough` and
-/// `sandbox.env`, and the git identity of the repository at `repo`.
+/// Build the workstation environment a command in a docker_sbx sandbox gets,
+/// for both the pane supervisor and `workmux sandbox shell`.
 pub(crate) fn docker_sbx_guest_env(config: &Config, repo: &Path) -> Vec<(String, String)> {
     let mut env = Vec::new();
     for term_var in ["TERM", "COLORTERM"] {

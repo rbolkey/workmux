@@ -642,8 +642,7 @@ impl SelectedAgent {
         self.profile.name()
     }
 
-    /// The agent's name: the named agent it was selected as, or its agent
-    /// type.
+    /// Return the named agent it was selected as, or its agent type.
     pub fn name(&self) -> &str {
         self.named.as_deref().unwrap_or(self.kind())
     }

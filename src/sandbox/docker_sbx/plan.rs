@@ -1,9 +1,7 @@
 //! The launch plan: what a pane launch asks of sbx.
 //!
-//! [`launch_plan`] is pure, but for checking whether a writable extra mount
-//! is a file and which excluded files exist. Callers gather sbx's state (see
-//! [`super::instance::gather_state`]), compute the plan, run its setup
-//! commands, then run its exec in the foreground.
+//! Callers gather sbx's state with [`super::instance::gather_state`], compute
+//! the plan with [`launch_plan`], run its setup commands, then run its exec.
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -49,22 +47,16 @@ pub struct LaunchTarget<'a> {
     pub worktree_root: &'a Path,
     /// The pane's working directory, under `worktree_root`.
     pub pane_cwd: &'a Path,
-    /// The git metadata the worktree uses. Finding it walks the worktree,
-    /// so it's gathered only when the launch creates the sandbox (see
-    /// [`creates_sandbox`]), which is all that mounts it.
+    /// The worktree's git metadata, gathered only when the launch creates
+    /// the sandbox, since finding it walks the worktree.
     pub git: Option<&'a GitMetadata>,
-    /// OpenCode's global config directory (`~/.config/opencode/`), when it
-    /// exists; mounted read-only for the opencode agent.
+    /// OpenCode's global config directory, mounted read-only for opencode.
     pub opencode_config_dir: Option<&'a Path>,
     /// Host-side state directory for the sandbox (shims live under it).
     pub state_dir: &'a Path,
-    /// The network rules workmux last wrote for the sandbox (see
-    /// [`LaunchPlan::network_rules`]).
+    /// The network rules workmux last wrote for the sandbox.
     pub network_record: &'a [NetworkRule],
-    /// The toolchain the worktree uses (see
-    /// [`toolchain::resolve_toolchain`]): installed on create, its endpoints
-    /// allowed (under `deny`, only those `allowed_domains` lists), and the
-    /// agent command run in it.
+    /// The worktree's toolchain, installed on create.
     pub toolchain: &'a DetectedToolchain,
     /// What the sandbox's state directory records of how it was created.
     pub created_with: &'a CreateRecord,
@@ -73,16 +65,14 @@ pub struct LaunchTarget<'a> {
 /// A sandbox's create record, as read from its state directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CreateRecord {
-    /// No launch finished creating the sandbox: it's missing, or a launch
-    /// failed or was killed partway.
+    /// No launch finished creating the sandbox.
     Missing,
     Recorded(Box<CreateSettings>),
     /// The record doesn't parse; holds why.
     Unreadable(String),
 }
 
-/// What a sandbox is created with and later launches can't change, as
-/// recorded in its state directory once it's fully set up.
+/// Settings a sandbox is created with, which later launches can't change.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateSettings {
     pub agent: String,
@@ -101,8 +91,7 @@ pub struct CreateSettings {
     pub kits: Vec<String>,
     /// The template tag, which follows `sandbox.image`.
     pub template: String,
-    /// The toolchain installed by built-in provisioning: `devbox`, `flake`
-    /// or `none`.
+    /// The toolchain built-in provisioning installed: `devbox`, `flake` or `none`.
     pub toolchain: String,
 }
 
@@ -115,7 +104,7 @@ pub enum RuleDecision {
 }
 
 impl RuleDecision {
-    /// sbx's name for the decision, as in `sbx policy allow|deny`.
+    /// Return sbx's name for the decision, as in `sbx policy allow|deny`.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Allow => "allow",
@@ -124,16 +113,14 @@ impl RuleDecision {
     }
 }
 
-/// A network rule workmux keeps on a sandbox for `sandbox.network`:
-/// `sbx policy <decision> network --sandbox <name> <resource>`.
+/// A network rule workmux keeps on a sandbox for `sandbox.network`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetworkRule {
     pub decision: RuleDecision,
     pub resource: String,
 }
 
-/// A linked worktree's git metadata, as found on the host (see
-/// [`super::git::git_metadata`]).
+/// A linked worktree's git metadata, as found on the host.
 #[derive(Debug, Clone, Default)]
 pub struct GitMetadata {
     /// The main repository's git dir.
@@ -144,8 +131,7 @@ pub struct GitMetadata {
     pub pointer_files: Vec<PathBuf>,
     /// Submodule git dirs under `<common_dir>/modules`.
     pub module_roots: Vec<PathBuf>,
-    /// Files the repository config includes or runs, inside the worktree or
-    /// the git dir.
+    /// Files the repository config includes or runs.
     pub config_paths: Vec<PathBuf>,
     /// Whether `<common_dir>/rr-cache` exists.
     pub rr_cache: bool,
@@ -154,25 +140,23 @@ pub struct GitMetadata {
 /// The command and environment to run in the sandbox.
 #[derive(Debug, Clone, Default)]
 pub struct ExecRequest {
-    /// The command: one argument is a shell command line, as a pane's is;
-    /// several are its words, each passed on as is.
+    /// A single shell command line, or several words passed on as is.
     pub command: Vec<String>,
     pub env: Vec<(String, String)>,
     /// Identifies the exec's processes in the guest, so they can be hung up.
     pub session: String,
-    /// The port of the supervisor's RPC server on the workstation's
-    /// loopback, when it runs one.
+    /// The port of the supervisor's RPC server on the workstation's loopback.
     pub rpc_port: Option<u16>,
     /// Whether stdin is a terminal. sbx's `exec -t` fails without one.
     pub tty: bool,
-    /// Whether the command runs in the worktree's toolchain environment, as
-    /// the supervisor runs the agent command (on Lima too); `sandbox shell`
-    /// runs its command without it.
+    /// Whether the command runs in the worktree's toolchain environment.
     pub in_toolchain: bool,
 }
 
-/// One `sbx` invocation. Environment values are passed through the process
-/// environment and named with a bare `-e KEY`, so they never appear in argv.
+/// One `sbx` invocation.
+///
+/// Environment values are named with a bare `-e KEY` and passed through the
+/// process environment, so they never appear in argv.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SbxCommand {
     /// Arguments after `sbx`.
@@ -193,53 +177,40 @@ pub struct CreateStep {
 #[derive(Debug, Clone)]
 pub struct LaunchPlan {
     pub sandbox_name: String,
-    /// Deletes a sandbox no launch finished setting up, before `create`
-    /// creates it again.
+    /// Deletes a sandbox no launch finished setting up.
     pub remove: Option<SbxCommand>,
     /// Creates the sandbox, when it's missing.
     pub create: Option<CreateStep>,
-    /// Files mounted over others when the plan creates the sandbox
-    /// (`excluded_files`), whose sources must be written (see
-    /// [`super::mask::write_masks`]) before `create` runs.
+    /// `excluded_files` masks, written before `create` runs.
     pub masks: Vec<Mask>,
     /// Commands to run, in order, after `create` and before `exec`.
     pub setup: Vec<SbxCommand>,
-    /// Installs workmux's status hooks with the guest's `workmux setup`,
-    /// run after `setup` when the plan creates a sandbox under `agent: kit`.
+    /// Installs workmux's status hooks in a new `agent: kit` sandbox.
     pub status_hooks: Option<SbxCommand>,
-    /// workmux's built-in provisioning, run after `setup` when the plan
-    /// creates the sandbox, unless `skip_default_provision` is set: login
-    /// shells keep the shims on `PATH`, and the toolchain is installed.
+    /// Built-in provisioning for a new sandbox: shims on `PATH` and the
+    /// toolchain.
     pub default_provision: Vec<SbxCommand>,
-    /// The custom provision script, run as root after `setup` when the plan
-    /// creates the sandbox, so the sandbox's network rules apply to it.
+    /// The custom provision script, run as root after `setup` so the
+    /// sandbox's network rules apply to it.
     pub provision: Option<SbxCommand>,
     /// The interactive exec that runs the command.
     pub exec: SbxCommand,
-    /// Hangs up the exec's processes in the guest. sbx leaves them running
-    /// when the `sbx exec` client goes away, as it does when a pane closes.
+    /// Hangs up the exec's processes in the guest, which sbx leaves running
+    /// when the `sbx exec` client goes away.
     pub hangup: SbxCommand,
-    /// Commands to run after `exec` ends: removing the RPC rule.
+    /// Commands to run after `exec` ends.
     pub teardown: Vec<SbxCommand>,
-    /// Notes for the log: settings ignored or that sbx can't enforce that
-    /// only limit access, and toolchain endpoints `deny` leaves blocked.
+    /// Notes for the log, about settings that only limit access.
     pub notes: Vec<String>,
-    /// Warnings for the log: checks `sbx diagnose` fails that don't stop
-    /// the launch, what sbx lets a `deny` sandbox reach beyond
-    /// `allowed_domains`, and create-time settings changed since the
-    /// sandbox was created.
+    /// Warnings for the log.
     pub warnings: Vec<String>,
-    /// What the sandbox the plan creates would reach under `policy: deny`
-    /// beyond `allowed_domains`, which the user accepts before it's created.
-    /// Empty when the plan launches into an existing sandbox, or under
-    /// `allow`.
+    /// What a new sandbox would reach under `policy: deny` beyond
+    /// `allowed_domains`, which the user must accept first.
     pub widenings: Vec<Widening>,
-    /// The `sandbox.network` and toolchain rules workmux has written for the
-    /// sandbox once `setup` has run; the record the next launch reconciles
-    /// against.
+    /// The network rules written once `setup` has run, which the next launch
+    /// reconciles against.
     pub network_rules: Vec<NetworkRule>,
-    /// The settings to record once a sandbox the plan creates is fully set
-    /// up and provisioned.
+    /// The settings to record once a new sandbox is fully provisioned.
     pub create_settings: CreateSettings,
 }
 
@@ -255,9 +226,7 @@ const SESSION_ENV: &str = "WM_SBX_SESSION";
 /// Git config sbx includes at command scope in the guest.
 const SBX_GIT_CONFIG: &str = "/home/agent/.gitconfig_ignore_scope";
 
-/// Hosts installing and using Nix and Devbox reach: the Nix installer and
-/// binary caches, Devbox's installer, binary (a GitHub release) and package
-/// search, and GitHub, which serves nixpkgs.
+/// Hosts that installing and using Nix and Devbox reach.
 const TOOLCHAIN_HOSTS: &[&str] = &[
     "install.determinate.systems",
     "cache.nixos.org",
@@ -278,8 +247,7 @@ const WORKSTATION_HOST: &str = "localhost";
 /// Where OpenCode's global config directory goes under the guest home.
 const OPENCODE_CONFIG_SUBPATH: &str = ".config/opencode";
 
-/// The subdirectory of an agent's config directory it downloads binaries
-/// into, and the guest-local directory that takes its place.
+/// Map an agent's binaries subdirectory to the guest-local one replacing it.
 fn guest_binaries_dir(agent: &str) -> Option<(&'static str, &'static str)> {
     match agent {
         "pi" => Some(("bin", "/var/lib/workmux/pi-agent-bin")),
@@ -288,8 +256,7 @@ fn guest_binaries_dir(agent: &str) -> Option<(&'static str, &'static str)> {
     }
 }
 
-/// The agent's host config directory and where it's linked under the guest
-/// home, for agents whose config directory workmux mounts.
+/// Resolve the agent's host config directory and its guest home subpath.
 fn config_dir_and_home_subpath(
     config: &SandboxConfig,
     agent: &str,
@@ -298,8 +265,7 @@ fn config_dir_and_home_subpath(
     Some((config.resolved_agent_config_dir(agent)?, subpath))
 }
 
-/// An sbx agent kit, which `agent: kit` creates an agent's sandbox for.
-/// sbx has none for the other agent types.
+/// An sbx agent kit, which `agent: kit` creates an agent's sandbox from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kit {
     Claude,
@@ -310,7 +276,7 @@ enum Kit {
 }
 
 impl Kit {
-    /// The kit for the agent type `agent`.
+    /// Find the kit for the agent type `agent`.
     fn for_agent(agent: &str) -> Result<Self> {
         Ok(match agent {
             "claude" => Self::Claude,
@@ -327,7 +293,7 @@ impl Kit {
         })
     }
 
-    /// sbx's name for the kit, as `sbx create` takes it.
+    /// Return sbx's name for the kit, as `sbx create` takes it.
     fn name(self) -> &'static str {
         match self {
             Self::Claude => "claude",
@@ -338,14 +304,13 @@ impl Kit {
         }
     }
 
-    /// Whether the agent's binary must come from a custom `sandbox.image`:
-    /// the copilot kit configures Copilot CLI, and workmux publishes no
-    /// Copilot image.
+    /// Check whether the agent's binary must come from a custom
+    /// `sandbox.image`, as workmux publishes no Copilot image.
     fn needs_custom_image(self) -> bool {
         matches!(self, Self::Copilot)
     }
 
-    /// Where the kit writes its agent's config, under the guest home.
+    /// Return where the kit writes its agent's config, under the guest home.
     fn config_subpath(self) -> &'static str {
         match self {
             Self::Claude => ".claude",
@@ -356,8 +321,7 @@ impl Kit {
         }
     }
 
-    /// Installs workmux's status hooks into the config the kit wrote in
-    /// sandbox `name`, with the guest's own `workmux setup`, as the agent.
+    /// Install workmux's status hooks with the guest's own `workmux setup`.
     fn status_hooks(self, name: &str) -> SbxCommand {
         let config_dir = format!("{GUEST_HOME}/{}", self.config_subpath());
         SbxCommand {
@@ -375,7 +339,7 @@ impl Kit {
         }
     }
 
-    /// Drops the kit's own hooks that call an sbx helper missing from the
+    /// Drop the kit's own hooks that call an sbx helper missing from the
     /// template.
     fn helper_removal(self, name: &str) -> Option<SbxCommand> {
         match self {
@@ -386,8 +350,7 @@ impl Kit {
     }
 }
 
-/// The kit an agent's sandbox is created for under `agent: kit`, failing
-/// for what the kit can't serve.
+/// Find the kit for an agent under `agent: kit`.
 fn kit_for(config: &SandboxConfig, agent: &str) -> Result<Kit> {
     let kit = Kit::for_agent(agent)?;
     if kit.needs_custom_image() && config.image.is_none() {
@@ -400,10 +363,7 @@ fn kit_for(config: &SandboxConfig, agent: &str) -> Result<Kit> {
     Ok(kit)
 }
 
-/// Under `agent: kit`, a note that `sandbox.agent_config_dir` is ignored:
-/// it applies to `agent: shell` and the other backends, which is why it's
-/// often set globally, while the kit sets the agent up in the sandbox's own
-/// home.
+/// Note that `sandbox.agent_config_dir` is ignored under `agent: kit`.
 fn ignored_config_dir_note(config: &SandboxConfig, kit: Kit) -> Option<String> {
     config.agent_config_dir.as_ref().map(|_| {
         format!(
@@ -414,10 +374,9 @@ fn ignored_config_dir_note(config: &SandboxConfig, kit: Kit) -> Option<String> {
     })
 }
 
-/// Drops the claude kit's hooks and status line from
-/// `~/.claude/settings.json` when the guest lacks the helper they call,
-/// `/usr/local/bin/sbx-claude-hook`, which comes with sbx's own claude
-/// image, not workmux's template. Each would fail on every prompt.
+/// Drops the claude kit's hooks and status line, which call
+/// `sbx-claude-hook`. Only sbx's own claude image has the helper, so they
+/// would fail on every prompt in workmux's template.
 const CLAUDE_KIT_HELPER_SCRIPT: &str = r#"[ -x /usr/local/bin/sbx-claude-hook ] && exit 0
 f="$HOME/.claude/settings.json"
 [ -s "$f" ] || exit 0
@@ -429,16 +388,14 @@ def kit: (.command? // "") | contains("sbx-claude-hook");
   else . end
 ' "$f" > "$f.tmp" && mv "$f.tmp" "$f""#;
 
-/// Drops the codex kit's `notify` from `~/.codex/config.toml` when the guest
-/// lacks the helper it calls, `/usr/local/bin/sbx-codex-hook`, which comes
-/// with sbx's own codex image, not workmux's template. It would fail at the
-/// end of every turn.
+/// Drops the codex kit's `notify`, which calls `sbx-codex-hook`. Only sbx's
+/// own codex image has the helper, so it would fail at the end of every turn.
 const CODEX_KIT_HELPER_SCRIPT: &str = r#"[ -x /usr/local/bin/sbx-codex-hook ] && exit 0
 f="$HOME/.codex/config.toml"
 [ -f "$f" ] || exit 0
 awk '!/^notify[ \t]*=.*sbx-codex-hook/' "$f" > "$f.tmp" && mv "$f.tmp" "$f""#;
 
-/// An agent-user `sh -c <script>` in the sandbox.
+/// Run `script` with `sh -c` as the agent user.
 fn agent_script(name: &str, script: &str) -> SbxCommand {
     SbxCommand {
         args: words(&["exec", name, "sh", "-c", script]),
@@ -446,7 +403,7 @@ fn agent_script(name: &str, script: &str) -> SbxCommand {
     }
 }
 
-/// A command run as root in the sandbox.
+/// Run `command` as root in the sandbox.
 fn root_exec(name: &str, command: Vec<String>) -> SbxCommand {
     let mut args = words(&["exec", "-u", "root", name]);
     args.extend(command);
@@ -485,9 +442,7 @@ fn words(words: &[&str]) -> Vec<String> {
     words.iter().map(|w| w.to_string()).collect()
 }
 
-/// The interactive `sbx exec` that runs the command in the pane's working
-/// directory, with a terminal when stdin is one. Values travel in the
-/// process environment; argv names them only.
+/// Build the interactive `sbx exec` that runs the command in the pane's cwd.
 fn exec_command(target: &LaunchTarget, exec: &ExecRequest) -> SbxCommand {
     let mut env = exec.env.clone();
     keep_sbx_git_config(&mut env);
@@ -515,9 +470,8 @@ fn exec_command(target: &LaunchTarget, exec: &ExecRequest) -> SbxCommand {
     } else {
         command
     };
-    // Put the shims first, extending the image's PATH in the guest rather
-    // than passing one with `-e`, which would replace it (and, in sbx's own
-    // environment, change where sbx itself is looked up).
+    // Extend PATH in the guest: `-e PATH` would replace the image's PATH and
+    // change where sbx itself is looked up.
     let shims = target.state_dir.join("shims/bin");
     let command = format!(
         "export PATH={}:{GUEST_HOME}/.local/bin:{NIX_PROFILE_BIN}:\"$PATH\"; {command}",
@@ -527,10 +481,11 @@ fn exec_command(target: &LaunchTarget, exec: &ExecRequest) -> SbxCommand {
     SbxCommand { args, env }
 }
 
-/// sbx sets `GIT_CONFIG_COUNT=1` in the guest, including
-/// [`SBX_GIT_CONFIG`] at command scope so its `.sbx` ignore holds over the
-/// repository's own `core.excludesFile`. The git identity entries replace
-/// it; append it to them again.
+/// Keep sbx's command-scope git config when passing git identity entries.
+///
+/// sbx sets `GIT_CONFIG_COUNT=1` to include [`SBX_GIT_CONFIG`], so its `.sbx`
+/// ignore holds over the repository's `core.excludesFile`. Our entries
+/// replace it, so append it again.
 fn keep_sbx_git_config(env: &mut Vec<(String, String)>) {
     let Some(count) = env
         .iter_mut()
@@ -547,11 +502,10 @@ fn keep_sbx_git_config(env: &mut Vec<(String, String)>) {
     env.push((format!("GIT_CONFIG_VALUE_{n}"), SBX_GIT_CONFIG.to_string()));
 }
 
-/// workmux's built-in provisioning of a new sandbox, as Lima's: as root,
-/// keep the shims on `PATH` for login shells (agents like Codex run commands
-/// with `bash -lc`, whose /etc/profile resets `PATH`) and install Nix and
-/// Devbox when the worktree uses a toolchain; then, as the agent, put Nix
-/// on login shells' `PATH` and fetch Devbox's binary.
+/// Build workmux's built-in provisioning of a new sandbox, as on Lima.
+///
+/// Login shells get the shims on `PATH`, since agents like Codex run
+/// `bash -lc`, whose /etc/profile resets it.
 fn default_provision(target: &LaunchTarget) -> Vec<SbxCommand> {
     let shims = shell_quote(&target.state_dir.join("shims/bin").to_string_lossy());
     let mut script = format!(
@@ -566,8 +520,8 @@ PROFILESCRIPT
     );
     let needs_nix = *target.toolchain != DetectedToolchain::None;
     if needs_nix {
-        // Single-user sandbox: the agent owns the store, as on Lima. The
-        // launcher Devbox installs is execute-only; bash needs to read it.
+        // Single-user sandbox: the agent owns the store, as on Lima. Devbox
+        // installs an execute-only launcher, which bash needs to read.
         script.push_str(
             r#"
 if ! command -v nix >/dev/null 2>&1; then
@@ -601,8 +555,7 @@ devbox version
     commands
 }
 
-/// Send SIGHUP to every guest process that carries the exec's session
-/// marker, as a closing terminal would: the command and what it started.
+/// Send SIGHUP to every guest process carrying the exec's session marker.
 fn hangup_command(target: &LaunchTarget, exec: &ExecRequest) -> SbxCommand {
     let script = format!(
         "for p in /proc/[0-9]*; do \
@@ -616,11 +569,11 @@ fn hangup_command(target: &LaunchTarget, exec: &ExecRequest) -> SbxCommand {
     }
 }
 
-/// Workspaces that keep the main repository's git metadata read-only, as the
-/// container backend does: the git dir is read-only, the parts commits write
-/// (objects, refs, logs, the worktree's admin dir, submodule git dirs) are
-/// writable inside it, and their control files are read-only again. sbx
-/// mounts parents before children, and read-only mounts hold even for root.
+/// Build workspaces that keep the main repository's git metadata read-only.
+///
+/// As on the container backend, the git dir is read-only, the parts commits
+/// write are writable inside it, and their control files are read-only again.
+/// sbx mounts parents before children, and read-only mounts hold even for root.
 fn git_workspaces(git: &GitMetadata) -> Vec<String> {
     let rw = |path: PathBuf| path.to_string_lossy().into_owned();
     let ro = |path: PathBuf| format!("{}:ro", path.display());
@@ -658,11 +611,10 @@ fn git_workspaces(git: &GitMetadata) -> Vec<String> {
     workspaces
 }
 
-/// Masks hiding `sandbox.docker_sbx.excluded_files` from the agent, by the
-/// container backend's rules: only existing regular files inside the
-/// worktree are masked; missing paths, directories and paths outside the
-/// worktree are skipped with a warning. A mask over a missing path would
-/// make sbx create it in the worktree on the workstation.
+/// Build masks hiding `sandbox.docker_sbx.excluded_files` from the agent.
+///
+/// Only existing regular files inside the worktree are masked: a mask over a
+/// missing path would make sbx create it on the workstation.
 fn excluded_file_masks(config: &SandboxConfig, worktree_root: &Path) -> Vec<Mask> {
     let mut masks = Vec::new();
     for rel in config.docker_sbx.excluded_files() {
@@ -681,8 +633,6 @@ fn excluded_file_masks(config: &SandboxConfig, worktree_root: &Path) -> Vec<Mask
         let host_path = worktree_root.join(rel_path);
         if host_path.is_file() {
             // The guest follows a link itself, so mask the file it reads.
-            // The main worktree, which the container backend also masks,
-            // isn't mounted: a link into it doesn't resolve in the sandbox.
             let file = host_path.canonicalize().unwrap_or(host_path);
             if !file.starts_with(worktree_root) {
                 tracing::warn!(
@@ -707,7 +657,7 @@ fn excluded_file_masks(config: &SandboxConfig, worktree_root: &Path) -> Vec<Mask
     masks
 }
 
-/// An `extra_mounts` entry as a workspace: `HOST[:GUEST][:ro]`.
+/// Format an `extra_mounts` entry as a workspace: `HOST[:GUEST][:ro]`.
 fn extra_mount_workspace(host: &Path, guest: &Path, read_only: bool) -> String {
     let workspace = if guest == host {
         host.to_string_lossy().into_owned()
@@ -721,8 +671,7 @@ fn extra_mount_workspace(host: &Path, guest: &Path, read_only: bool) -> String {
     }
 }
 
-/// `sandbox.extra_mounts` as the workspaces they become, unchecked: what a
-/// sandbox's create-time settings record.
+/// Format `sandbox.extra_mounts` as unchecked workspaces, for the create record.
 fn extra_mount_settings(config: &SandboxConfig) -> Result<Vec<String>> {
     config
         .extra_mounts()
@@ -734,8 +683,7 @@ fn extra_mount_settings(config: &SandboxConfig) -> Result<Vec<String>> {
         .collect()
 }
 
-/// `sandbox.extra_mounts` as workspaces (`HOST[:GUEST]`), read-only unless
-/// writable. sbx mounts a file only read-only.
+/// Build workspaces for `sandbox.extra_mounts`, read-only unless writable.
 fn extra_mount_workspaces(
     config: &SandboxConfig,
     target: &LaunchTarget,
@@ -753,7 +701,7 @@ fn extra_mount_workspaces(
             workspaces.push(extra_mount_workspace(&host, &guest, read_only));
             continue;
         }
-        // Checking the host is the plan's only look at the filesystem.
+        // sbx mounts a file only read-only.
         if host.is_file() {
             bail!(
                 "sandbox.extra_mounts entry {} is a writable file but the docker_sbx \
@@ -776,13 +724,12 @@ fn extra_mount_workspaces(
     Ok(workspaces)
 }
 
-/// Whether `host` matches one of `patterns`, as the network proxy matches
-/// allowed domains.
+/// Check `host` against `patterns`, as the network proxy matches domains.
 fn host_allowed(patterns: &[String], host: &str) -> bool {
     patterns.iter().any(|pattern| domain_matches(host, pattern))
 }
 
-/// `sandbox.allowed_domains` hosts, lowercased.
+/// List `sandbox.allowed_domains` hosts, lowercased.
 fn allowed_hosts(config: &SandboxConfig) -> Vec<String> {
     config
         .network
@@ -792,8 +739,7 @@ fn allowed_hosts(config: &SandboxConfig) -> Vec<String> {
         .collect()
 }
 
-/// The toolchain's endpoints `sandbox.network.allowed_domains` doesn't
-/// allow under `deny`, which workmux leaves blocked.
+/// List the toolchain endpoints that `allowed_domains` leaves blocked.
 fn blocked_toolchain_hosts(
     config: &SandboxConfig,
     toolchain: &DetectedToolchain,
@@ -809,17 +755,16 @@ fn blocked_toolchain_hosts(
         .collect()
 }
 
-/// `sandbox.network` as rules scoped to the sandbox. Under `deny`, port 443
-/// to each allowed domain, as workmux's CONNECT proxy allows on the
-/// container backend: the toolchain's endpoints only when
-/// `allowed_domains` lists them, since a repository can add a toolchain
-/// and `sandbox.network` is the user's own. Under `allow`, port 443 to the
-/// toolchain's endpoints when the worktree uses one: the global sbx policy
-/// may block them (`balanced` does).
+/// Translate `sandbox.network` into rules scoped to the sandbox.
 ///
-/// workmux's `*.d` matches subdomains at any depth but not `d`; sbx's `*.d`
-/// matches one label and its `**.d` any depth and `d` too. So `*.d` becomes
-/// `**.d` with a deny for `d`, unless `d` is itself allowed.
+/// Under `deny`, allow port 443 to each allowed domain only; a repository can
+/// add a toolchain, so its endpoints aren't allowed unless listed. Under
+/// `allow`, allow the toolchain's endpoints, which the global sbx policy may
+/// block.
+///
+/// workmux's `*.d` matches subdomains at any depth but not `d`; sbx's `**.d`
+/// also matches `d`. So `*.d` becomes `**.d` with a deny for `d`, unless `d`
+/// is itself allowed.
 fn network_rules(config: &SandboxConfig, toolchain: &DetectedToolchain) -> Vec<NetworkRule> {
     let hosts: Vec<String> = if config.network_policy_is_deny() {
         allowed_hosts(config)
@@ -852,9 +797,7 @@ fn network_rules(config: &SandboxConfig, toolchain: &DetectedToolchain) -> Vec<N
     rules
 }
 
-/// What sbx enforces differently from `sandbox.network` without widening
-/// it: settings it has no equivalent for, and the toolchain's endpoints
-/// `allowed_domains` leaves blocked.
+/// Note where sbx enforces `sandbox.network` more narrowly than configured.
 fn network_notes(config: &SandboxConfig, toolchain: &DetectedToolchain) -> Vec<String> {
     if !config.network_policy_is_deny() {
         return Vec::new();
@@ -879,8 +822,8 @@ fn network_notes(config: &SandboxConfig, toolchain: &DetectedToolchain) -> Vec<S
     notes
 }
 
-/// How many destinations the user's global sbx policy allows. Every
-/// sandbox can reach them, whatever its own rules say.
+/// Count the destinations the global sbx policy allows, which every sandbox
+/// can reach whatever its own rules say.
 fn global_network_allows(rules: &[SbxRule]) -> usize {
     rules
         .iter()
@@ -891,21 +834,19 @@ fn global_network_allows(rules: &[SbxRule]) -> usize {
         .sum()
 }
 
-/// Something sbx lets a sandbox under `policy: deny` reach beyond
-/// `allowed_domains`, which workmux can't take back per sandbox.
+/// Something sbx lets a `deny` sandbox reach beyond `allowed_domains`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Widening {
     /// The global sbx policy allows this many destinations.
     GlobalPolicy { destinations: usize },
-    /// sbx reaches private or loopback addresses an allowed domain
-    /// resolves to: it has no `allow_private_ips: false`.
+    /// sbx has no `allow_private_ips: false`.
     PrivateAddresses,
     /// The rules sbx's kits added allow these resources (`host:port`).
     KitHosts(Vec<String>),
 }
 
 impl Widening {
-    /// The warning naming the widening of sandbox `name`.
+    /// Describe the widening of sandbox `name`.
     pub fn warning(&self, name: &str) -> String {
         match self {
             Self::GlobalPolicy { destinations } => format!(
@@ -931,16 +872,12 @@ impl Widening {
     }
 }
 
-/// Under `deny`, what sbx gives the sandbox `name` beyond workmux's CONNECT
-/// proxy on the container backend, from its `rules` (`sbx policy ls`): what
-/// the global sbx policy allows, private or loopback addresses an allowed
-/// domain resolves to, and what the rules sbx's kits added (the agent
-/// kit's and any mixin kit's) allow that `allowed_domains` doesn't cover.
-/// A kit adds its rules at create, scoped to the sandbox and `provisioned`;
-/// the user's rules and workmux's are `added`. A resource workmux's own
-/// rules (`network_rules`) name isn't counted: workmux's allow is its own,
-/// and its deny (a wildcard's base) wins over the kit's allow. workmux
-/// never removes a kit's rules: the kit needs them.
+/// List what sbx lets sandbox `name` reach under `deny` beyond the container
+/// backend's proxy.
+///
+/// Kits add their rules at create with provenance `provisioned`. workmux
+/// never removes them, since the kit needs them. Resources workmux's own
+/// rules name aren't counted: its deny wins over the kit's allow.
 pub fn widenings(
     config: &SandboxConfig,
     rules: &[SbxRule],
@@ -988,9 +925,7 @@ pub fn widenings(
     widenings
 }
 
-/// Whether `allowed` (`allowed_domains` hosts) covers an sbx resource
-/// (`host:port`, `*.d` for one label, `**.d` for `d` and any depth). Only
-/// port 443, the only port `allowed_domains` allows.
+/// Check whether `allowed_domains` hosts cover an sbx `host:port` resource.
 fn resource_covered(allowed: &[String], resource: &str) -> bool {
     let Some((host, "443")) = resource.rsplit_once(':') else {
         return false;
@@ -1001,9 +936,8 @@ fn resource_covered(allowed: &[String], resource: &str) -> bool {
     }
 }
 
-/// Fail closed when a project's `.workmux.yaml` chose docker_sbx for a
-/// global `deny` that sbx's global policy would widen: a repository can
-/// lower its own sandbox's protection only with the user's say-so.
+/// Fail closed when `.workmux.yaml` picks docker_sbx under a `deny` that
+/// sbx's global policy widens. A repository mustn't lower its own protection.
 fn check_backend_choice(config: &SandboxConfig, state: &SbxState) -> Result<()> {
     let global_allows = global_network_allows(&state.rules);
     if config.backend_from_project && config.network_policy_is_deny() && global_allows > 0 {
@@ -1019,7 +953,7 @@ fn check_backend_choice(config: &SandboxConfig, state: &SbxState) -> Result<()> 
     Ok(())
 }
 
-/// The `sbx policy` command adding or removing a rule scoped to the sandbox.
+/// Build the `sbx policy` command adding or removing a sandbox rule.
 fn policy_command(name: &str, verb: &str, resource: &str) -> SbxCommand {
     let mut args = words(&["policy", verb, "network", "--sandbox", name]);
     if verb == "rm" {
@@ -1033,7 +967,7 @@ fn policy_command(name: &str, verb: &str, resource: &str) -> SbxCommand {
     }
 }
 
-/// Whether sbx's diagnostics report `name` as failed.
+/// Check whether sbx's diagnostics report `name` as failed.
 fn check_failed(state: &SbxState, name: &str) -> bool {
     state
         .checks
@@ -1041,9 +975,7 @@ fn check_failed(state: &SbxState, name: &str) -> bool {
         .any(|check| check.name == name && check.status == "fail")
 }
 
-/// Checks sbx's diagnostics fail that [`check_prerequisites`] doesn't stop
-/// for, such as disk space. sbx decides for itself whether it can still run
-/// the sandbox, and reports its own error if not.
+/// Warn about failed diagnostics that [`check_prerequisites`] lets through.
 fn check_warnings(state: &SbxState) -> Vec<String> {
     state
         .checks
@@ -1103,9 +1035,7 @@ fn check_prerequisites(state: &SbxState) -> Result<()> {
     Ok(())
 }
 
-/// Settings that differ from what an existing sandbox was created with,
-/// which apply only to a new one: a warning naming them and how to
-/// recreate it, as Lima says for `provision`.
+/// Warn about create-time settings changed since the sandbox was created.
 fn create_settings_warnings(
     current: &CreateSettings,
     created: &CreateSettings,
@@ -1147,12 +1077,10 @@ fn create_settings_warnings(
     )]
 }
 
-/// Fail closed when the agent could read a file workmux hides: one of
-/// `excluded_files` that exists now but the existing sandbox wasn't created
-/// masking, listed or created since. Masks are fixed when sbx creates the
-/// sandbox, where the container backend masks on every launch. A masked
-/// file deleted since only gets the settings warning: sbx puts an empty
-/// file back over it.
+/// Fail closed when an `excluded_files` entry isn't masked in the sandbox.
+///
+/// sbx fixes masks at create, unlike the container backend's per-launch
+/// masks, so a file listed or created since would be readable.
 fn check_masked_since_create(
     excluded: &[Mask],
     created: &CreateSettings,
@@ -1172,10 +1100,10 @@ fn check_masked_since_create(
     Ok(())
 }
 
-/// Fail closed when the existing sandbox was created under the other
-/// `sandbox.docker_sbx.agent` mode: a `shell` sandbox has the agent's real
-/// credential mounted, which switching to `kit` must not keep, and a `kit`
-/// sandbox lacks the workstation's agent config `shell` promises.
+/// Fail closed when the sandbox was created under the other agent mode.
+///
+/// A `shell` sandbox has the agent's real credential mounted, which switching
+/// to `kit` must not keep.
 fn check_agent_mode_since_create(
     mode: DockerSbxAgent,
     created: DockerSbxAgent,
@@ -1194,9 +1122,10 @@ fn check_agent_mode_since_create(
     Ok(())
 }
 
-/// Whether the launch creates the sandbox: it's missing, or it has no
-/// create record and isn't running. A running sandbox may have panes in it,
-/// which removing it would kill.
+/// Check whether the launch creates the sandbox.
+///
+/// A stopped sandbox without a create record is recreated; a running one
+/// isn't, since removing it would kill its panes.
 pub fn creates_sandbox(state: &SbxState, created_with: &CreateRecord) -> bool {
     match (&state.sandbox, created_with) {
         (None, _) => true,
@@ -1205,9 +1134,8 @@ pub fn creates_sandbox(state: &SbxState, created_with: &CreateRecord) -> bool {
     }
 }
 
-/// The settings an existing sandbox was created with. Fails when workmux
-/// can't vouch for them: the sandbox is running without a create record,
-/// or the record doesn't parse.
+/// Read an existing sandbox's create settings, failing when there is no
+/// usable record.
 fn existing_settings<'a>(created_with: &'a CreateRecord, name: &str) -> Result<&'a CreateSettings> {
     let recreate = format!(
         "Close the worktree's panes and remove it with `workmux sandbox prune` or \
@@ -1228,30 +1156,9 @@ fn existing_settings<'a>(created_with: &'a CreateRecord, name: &str) -> Result<&
 
 /// Compute the sbx commands a launch needs.
 ///
-/// When the sandbox is missing, or it's stopped and no launch finished
-/// setting it up (it's removed first): create it from the template, with
-/// the configured resources and mixin kits, mounting the worktree, the main
-/// repository's git dir (read-only but for what commits write) and the
-/// shims at their host paths, an empty file over each of `excluded_files`,
-/// and `extra_mounts`.
-/// Under `agent: kit` it's created for sbx's agent kit, which sets the agent
-/// up in the sandbox's own home; then workmux's status hooks are added to
-/// the kit's settings. Under `agent: shell` it's created with sbx's generic
-/// `shell` agent (a kit would write into the mounted config directory) and
-/// the agent's config directory is mounted where the agent looks for it;
-/// then, as root, the agent gets the config directory's parents and
-/// Claude's onboarding state is seeded. A sandbox created under the other
-/// mode fails to launch, as does a running one with no create record or one
-/// whose record doesn't parse.
-/// On every launch: bind pi's and OMP's binaries directory to a guest-local
-/// one, reconcile the sandbox's rules with `sandbox.network` and the
-/// toolchain's endpoints, and allow the supervisor's RPC port until the exec
-/// ends. Launching into an existing sandbox fails when the agent could read
-/// a file workmux hides that the sandbox has no mask over. Last, when the
-/// sandbox was just created, workmux's built-in
-/// provisioning (shims on login shells' `PATH`, Nix and Devbox for a
-/// toolchain) and the `provision` script. The exec runs the agent command in the toolchain's
-/// environment.
+/// A missing sandbox is created from the template with its mounts, then
+/// provisioned. Every launch reconciles the sandbox's network rules and
+/// allows the supervisor's RPC port until the exec ends.
 pub fn launch_plan(
     config: &SandboxConfig,
     target: &LaunchTarget,
@@ -1274,8 +1181,7 @@ pub fn launch_plan(
     let mut masks = Vec::new();
     let template = super::template::template_tag(&config.resolved_image(agent));
     let mode = config.docker_sbx.agent();
-    // Under `kit`, sbx's agent kit sets the agent up in the sandbox's own
-    // home, so its config directory isn't mounted.
+    // Under `kit`, the agent's config directory isn't mounted.
     let kit = match mode {
         DockerSbxAgent::Kit => Some(kit_for(config, agent)?),
         DockerSbxAgent::Shell => None,
@@ -1308,8 +1214,6 @@ pub fn launch_plan(
         .to_string(),
     };
 
-    // A stopped sandbox no launch finished setting up is removed and
-    // created again.
     let exists = !creates_sandbox(state, target.created_with);
     let remove = (state.sandbox.is_some() && !exists).then(|| SbxCommand {
         args: words(&["rm", "-f", name]),
@@ -1354,8 +1258,6 @@ pub fn launch_plan(
         workspaces.extend(git_workspaces(git));
         workspaces.extend(excluded.iter().map(|mask| mask.workspace(target.state_dir)));
         masks.extend(excluded);
-        // The agent's config directory where the agent looks for it, as on
-        // the other backends.
         if let Some((config_dir, subpath)) = &config_dir {
             workspaces.push(format!("{}:{GUEST_HOME}/{subpath}", config_dir.display()));
         }
@@ -1376,19 +1278,16 @@ pub fn launch_plan(
             workspaces,
         });
 
-        // sbx creates the missing parents of a mount's guest path as root;
-        // hand them to the agent, so it can still write beside the mount
-        // (`~/.local/state`).
+        // sbx creates a mount's missing parents as root; hand them to the
+        // agent so it can write beside the mount.
         let mut subpaths: Vec<&str> = config_dir.iter().map(|(_, subpath)| *subpath).collect();
         if opencode_config_dir.is_some() {
             subpaths.push(OPENCODE_CONFIG_SUBPATH);
         }
         setup.extend(own_home_parents(name, &subpaths));
 
-        // Claude keeps its onboarding state in ~/.claude.json, outside the
-        // config directory. Seed the sandbox's own copy, as Lima seeds each
-        // VM's, so Claude doesn't run onboarding in every sandbox.
-        // The claude kit does so itself.
+        // Seed Claude's onboarding state in ~/.claude.json, outside the
+        // config directory, as Lima does. The claude kit does so itself.
         if agent == "claude" && kit.is_none() {
             let mut command = words(&[
                 "sh",
@@ -1401,21 +1300,16 @@ pub fn launch_plan(
             setup.push(root_exec(name, command));
         }
 
-        // The workstation's hooks aren't there under `kit`: workmux's go
-        // into the config the kit wrote (see `status_hooks`), after the
-        // kit's own that would fail are dropped. The kit writes its config
-        // only at create, so this lasts.
+        // The kit writes its config only at create, so hooks added now last.
         if let Some(kit) = kit {
             setup.extend(kit.helper_removal(name));
             status_hooks = Some(kit.status_hooks(name));
         }
     }
 
-    // Pi and OMP download platform-specific fd/rg binaries into their config
-    // directory, which would overwrite the workstation's own through the
-    // mount. Bind a guest-local directory over it, as the container backend
-    // overlays pi's bin/. A guest mount ends when sbx stops the sandbox, so
-    // every launch makes it.
+    // Pi and OMP download fd/rg binaries into their config directory, which
+    // would overwrite the workstation's through the mount. The bind mount
+    // ends when sbx stops the sandbox, so every launch makes it.
     if let Some((subdir, guest_dir)) = guest_binaries_dir(agent)
         && let Some((_, subpath)) = config_dir_and_home_subpath(config, agent)
     {
@@ -1431,10 +1325,8 @@ pub fn launch_plan(
         setup.push(root_exec(name, command));
     }
 
-    // Reconcile `sandbox.network` with the sandbox's rules. Only rules
-    // workmux wrote (its record) are ever removed; stale ones go first, as
-    // sbx refuses a rule while its scope holds the opposite decision for
-    // the same resource. A rule the user already had stays theirs.
+    // Only rules workmux wrote are ever removed. Stale ones go first, as sbx
+    // refuses a rule while the opposite decision holds for the resource.
     let sandbox_scope = format!("sandbox:{name}");
     let present = |rule: &NetworkRule| {
         exists
@@ -1460,18 +1352,14 @@ pub fn launch_plan(
         }
     }
 
-    // Provisioning runs once, when the sandbox is created: workmux's own
-    // (unless skip_default_provision), then the custom script, as root.
     let provision = config
         .docker_sbx
         .provision_script()
         .filter(|_| !exists)
         .map(|script| root_exec(name, words(&["bash", "-c", script])));
 
-    // A rule scoped to the sandbox lets the guest reach the supervisor's RPC
-    // server through host.docker.internal; sbx names the workstation
-    // `localhost`. Only its port, and only while the supervisor runs: the
-    // rule is removed when the exec ends, unless it was already there.
+    // Let the guest reach the RPC server through host.docker.internal, only
+    // while the supervisor runs. sbx names the workstation `localhost`.
     let mut teardown = Vec::new();
     if let Some(port) = exec.rpc_port {
         let rpc_rule = NetworkRule {
