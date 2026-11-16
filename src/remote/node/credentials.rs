@@ -115,7 +115,7 @@ fn login_in_container(
         ..SandboxConfig::default()
     };
     crate::sandbox::ensure_sandbox_config_dirs()?;
-    crate::sandbox::ensure_image_ready(&sandbox, image)?;
+    crate::sandbox::ensure_image_ready(sandbox.runtime(), image)?;
 
     let name = format!("workmux-login-{}", crate::remote::cache::new_id('l'));
     let uid = unsafe { libc::getuid() };

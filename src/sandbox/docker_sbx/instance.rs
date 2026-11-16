@@ -48,7 +48,7 @@ impl SbxSandboxInfo {
 
 /// Parse sbx's UTC timestamps (`2026-11-14T03:26:22.21548Z`).
 fn parse_timestamp(timestamp: &str) -> Option<SystemTime> {
-    crate::github::parse_github_timestamp(timestamp)
+    crate::util::parse_utc_timestamp(timestamp)
         .map(|secs| SystemTime::UNIX_EPOCH + Duration::from_secs(secs))
 }
 

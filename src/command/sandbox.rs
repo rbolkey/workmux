@@ -202,15 +202,15 @@ pub fn run(args: SandboxArgs) -> Result<()> {
     }
 }
 
-/// Load config for the image commands. Under docker_sbx the agent image
-/// lives in Docker's store, whatever `sandbox.container.runtime` says,
-/// since workmux builds sbx templates from it with Docker.
-fn load_image_config() -> Result<Config> {
-    let mut config = Config::load(None)?;
+/// The runtime whose image store holds the agent image. Under docker_sbx
+/// that's Docker, whatever `sandbox.container.runtime` says, since workmux
+/// builds sbx templates from it with Docker.
+fn image_runtime(config: &Config) -> SandboxRuntime {
     if config.sandbox.backend() == SandboxBackend::DockerSbx {
-        config.sandbox.container.runtime = Some(SandboxRuntime::Docker);
+        SandboxRuntime::Docker
+    } else {
+        config.sandbox.runtime()
     }
-    Ok(config)
 }
 
 /// Under docker_sbx, build and load the sbx template for `image` if it
@@ -224,7 +224,7 @@ fn ensure_docker_sbx_template(config: &Config, image: &str) -> Result<()> {
 }
 
 fn run_build() -> Result<()> {
-    let config = load_image_config()?;
+    let config = Config::load(None)?;
     let agent = resolve_agent(&config);
 
     println!(
@@ -232,7 +232,7 @@ fn run_build() -> Result<()> {
         config.sandbox.resolved_image(agent),
         agent,
     );
-    sandbox::build_image(&config.sandbox, agent)?;
+    sandbox::build_image(&config.sandbox, image_runtime(&config), agent)?;
     println!("\nSandbox image built successfully!");
     ensure_docker_sbx_template(&config, &config.sandbox.resolved_image(agent))?;
     println!();
@@ -247,13 +247,14 @@ fn run_build() -> Result<()> {
 }
 
 fn run_pull() -> Result<()> {
-    let config = load_image_config()?;
+    let config = Config::load(None)?;
     let agent = resolve_agent(&config);
     let image = config.sandbox.resolved_image(agent);
+    let runtime = image_runtime(&config);
 
     println!("Pulling image '{}'...", image);
-    sandbox::pull_image(&config.sandbox, &image)?;
-    sandbox::freshness::mark_fresh(&image, config.sandbox.runtime());
+    sandbox::pull_image(runtime, &image)?;
+    sandbox::freshness::mark_fresh(&image, runtime);
 
     println!("Image '{}' is up to date.", image);
     ensure_docker_sbx_template(&config, &image)?;
@@ -544,7 +545,7 @@ fn install_to_sbx_sandbox(binary_path: &Path, name: &str) -> Result<()> {
 fn run_install_dev(skip_build: bool, release: bool) -> Result<()> {
     use crate::sandbox::lima::VM_PREFIX;
 
-    let config = load_image_config()?;
+    let config = Config::load(None)?;
     let native = is_native_linux();
 
     // Build (or locate existing binary)
@@ -700,7 +701,7 @@ fn run_install_dev(skip_build: bool, release: bool) -> Result<()> {
 /// Returns Ok(true) if the image was patched, Ok(false) if the base image
 /// doesn't exist.
 fn install_dev_container(binary_path: &Path, image_name: &str, config: &Config) -> Result<bool> {
-    let runtime = config.sandbox.runtime().binary_name();
+    let runtime = image_runtime(config).binary_name();
 
     // Check if the base image exists
     let inspect = Command::new(runtime)
@@ -1422,7 +1423,7 @@ fn run_shell_container(exec: bool, command: Vec<String>, config: &Config) -> Res
         eprintln!("sandbox: image={} runtime={}", image, runtime_display);
 
         // Ensure image is present and up-to-date (pulls if missing or stale)
-        sandbox::ensure_image_ready(&config.sandbox, &image)?;
+        sandbox::ensure_image_ready(runtime, &image)?;
 
         debug!(runtime = runtime_bin, %image, args = ?redacted_args, "starting shell container");
 

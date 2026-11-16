@@ -316,9 +316,71 @@ pub fn format_elapsed_duration(d: Duration) -> String {
     }
 }
 
+/// Parse an ISO 8601 UTC timestamp (e.g., "2026-03-24T14:02:00Z") to Unix seconds.
+/// Fractional seconds are ignored.
+pub(crate) fn parse_utc_timestamp(s: &str) -> Option<u64> {
+    // Format: YYYY-MM-DDTHH:MM:SSZ, as GitHub and sbx return them
+    let s = s.trim();
+    if s.len() < 20 || !s.ends_with('Z') {
+        return None;
+    }
+    let b = s.as_bytes();
+    if b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' {
+        return None;
+    }
+    let year: u64 = s[0..4].parse().ok()?;
+    let month: u64 = s[5..7].parse().ok()?;
+    let day: u64 = s[8..10].parse().ok()?;
+    let hour: u64 = s[11..13].parse().ok()?;
+    let min: u64 = s[14..16].parse().ok()?;
+    let sec: u64 = s[17..19].parse().ok()?;
+
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || min > 59 || sec > 59 {
+        return None;
+    }
+
+    // Days from year 0 to Unix epoch (1970-01-01)
+    // Using a simplified days-since-epoch calculation
+    let mut days: u64 = 0;
+    for y in 1970..year {
+        days += if is_leap_year(y) { 366 } else { 365 };
+    }
+    let month_days = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    for m in 1..month {
+        days += month_days[(m - 1) as usize] as u64;
+        if m == 2 && is_leap_year(year) {
+            days += 1;
+        }
+    }
+    days += day - 1;
+
+    Some(days * 86400 + hour * 3600 + min * 60 + sec)
+}
+
+fn is_leap_year(y: u64) -> bool {
+    (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_utc_timestamp_valid() {
+        assert_eq!(
+            parse_utc_timestamp("2026-03-24T14:02:00Z"),
+            Some(1774360920)
+        );
+        // Unix epoch
+        assert_eq!(parse_utc_timestamp("1970-01-01T00:00:00Z"), Some(0));
+    }
+
+    #[test]
+    fn parse_utc_timestamp_invalid() {
+        assert_eq!(parse_utc_timestamp(""), None);
+        assert_eq!(parse_utc_timestamp("not a date"), None);
+        assert_eq!(parse_utc_timestamp("2026-13-01T00:00:00Z"), None);
+    }
 
     #[test]
     fn worktree_ownership_uses_components_and_ignores_order() {

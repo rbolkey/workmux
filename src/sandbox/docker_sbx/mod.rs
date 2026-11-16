@@ -31,9 +31,6 @@ use tracing::debug;
 /// Longest sandbox name sbx accepts.
 const MAX_NAME_LEN: usize = 63;
 
-/// Words that run the sandbox supervisor.
-const DEFAULT_SUPERVISOR: &str = "workmux sandbox run";
-
 /// Wrap a pane's command to run in the worktree's sbx sandbox for `agent`
 /// (the pane's agent: a named agent, or an agent type by its own name).
 ///
@@ -41,9 +38,6 @@ const DEFAULT_SUPERVISOR: &str = "workmux sandbox run";
 /// an RPC server and runs the command through `sbx exec` in that agent's
 /// sandbox. `supervisor` replaces the default `workmux sandbox run` words,
 /// already shell-quoted, for callers that must pin a specific binary.
-///
-/// The twin of the container backend's `wrap_for_container` (with its own
-/// `DEFAULT_SUPERVISOR`), plus `--agent`.
 pub fn wrap_for_docker_sbx(
     command: &str,
     supervisor: Option<&str>,
@@ -51,31 +45,7 @@ pub fn wrap_for_docker_sbx(
     worktree_root: &Path,
     pane_cwd: &Path,
 ) -> Result<String> {
-    use crate::shell::shell_escape;
-
-    // Strip the leading history-prevention space before passing the command to
-    // the sandbox supervisor.
-    let command = command.strip_prefix(' ').unwrap_or(command);
-
-    let mut parts = format!(
-        "{} '{}'",
-        supervisor.unwrap_or(DEFAULT_SUPERVISOR),
-        shell_escape(&pane_cwd.to_string_lossy()),
-    );
-
-    // Only add --worktree-root when it differs from pane_cwd
-    if worktree_root != pane_cwd {
-        parts.push_str(&format!(
-            " --worktree-root '{}'",
-            shell_escape(&worktree_root.to_string_lossy()),
-        ));
-    }
-
-    parts.push_str(&format!(" --agent '{}'", shell_escape(agent)));
-    parts.push_str(&format!(" -- '{}'", shell_escape(command)));
-
-    // Prefix with space to prevent shell history entry.
-    Ok(format!(" {}", parts))
+    super::container::wrap_for_supervisor(command, supervisor, worktree_root, pane_cwd, Some(agent))
 }
 
 /// Fails for `--fork` when the launch runs agents in sbx sandboxes under
@@ -185,7 +155,7 @@ fn sandbox_name_for(project_root: &Path, worktree_root: &Path, agent: &str) -> S
 
 /// `wm-<project>-<hash8>`, at most `max_len` characters.
 fn worktree_name_for(project_root: &Path, worktree_root: &Path, max_len: usize) -> String {
-    use crate::sandbox::lima::{hash_key, sanitize_name};
+    use crate::sandbox::{hash_key, sanitize_name};
 
     let hash = hash_key(&worktree_root.to_string_lossy(), 8);
     let project_dir_name = project_root
@@ -208,7 +178,7 @@ fn worktree_name_for(project_root: &Path, worktree_root: &Path, max_len: usize) 
 /// of the name so that agents whose names slugify alike keep their own
 /// sandboxes.
 fn agent_slug(agent: &str) -> String {
-    use crate::sandbox::lima::{hash_key, sanitize_name};
+    use crate::sandbox::{hash_key, sanitize_name};
 
     let slug = sanitize_name(agent, MAX_AGENT_LEN);
     if !slug.is_empty() && slug == agent {

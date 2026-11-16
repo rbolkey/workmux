@@ -89,8 +89,8 @@ pub fn ensure_sandbox_config_dirs() -> Result<SandboxPaths> {
 }
 
 /// Build the sandbox Docker image locally (two-stage: base + agent).
-pub fn build_image(config: &SandboxConfig, agent: &str) -> Result<()> {
-    let runtime = config.runtime().binary_name();
+pub fn build_image(config: &SandboxConfig, runtime: SandboxRuntime, agent: &str) -> Result<()> {
+    let runtime = runtime.binary_name();
 
     let agent_dockerfile = dockerfile_for_agent(agent).ok_or_else(|| {
         anyhow::anyhow!(
@@ -151,9 +151,7 @@ pub fn build_image(config: &SandboxConfig, agent: &str) -> Result<()> {
 }
 
 /// Pull the sandbox image from the registry.
-pub fn pull_image(config: &SandboxConfig, image: &str) -> Result<()> {
-    let runtime = config.runtime();
-
+pub fn pull_image(runtime: SandboxRuntime, image: &str) -> Result<()> {
     let status = Command::new(runtime.binary_name())
         .args(runtime.pull_args(image))
         .status()
@@ -166,15 +164,14 @@ pub fn pull_image(config: &SandboxConfig, image: &str) -> Result<()> {
     Ok(())
 }
 
-/// Ensure the container image is ready to run.
+/// Ensure the container image is ready to run in `runtime`'s image store.
 ///
 /// - If the image is missing and it's an official image, pull it automatically.
 /// - If the image exists but is stale (per freshness cache), pull the update.
 ///   If the update pull fails, warn and continue with the local image.
 /// - For custom (non-official) images, only check existence.
 /// - Kicks off a background freshness cache update for the next run.
-pub fn ensure_image_ready(config: &SandboxConfig, image: &str) -> Result<()> {
-    let runtime = config.runtime();
+pub fn ensure_image_ready(runtime: SandboxRuntime, image: &str) -> Result<()> {
     let runtime_bin = runtime.binary_name();
     let runtime_display = runtime.display_name();
     let is_official = crate::sandbox::freshness::is_official_image(image);
@@ -191,7 +188,7 @@ pub fn ensure_image_ready(config: &SandboxConfig, image: &str) -> Result<()> {
     if !exists {
         if is_official {
             eprintln!("Image '{}' not found locally, pulling...", image);
-            pull_image(config, image)?;
+            pull_image(runtime, image)?;
             crate::sandbox::freshness::mark_fresh(image, runtime);
             return Ok(());
         } else {
@@ -210,7 +207,7 @@ pub fn ensure_image_ready(config: &SandboxConfig, image: &str) -> Result<()> {
         let stale = crate::sandbox::freshness::cached_is_stale(image, runtime);
         if stale == Some(true) {
             eprintln!("Updating sandbox image '{}'...", image);
-            match pull_image(config, image) {
+            match pull_image(runtime, image) {
                 Ok(()) => {
                     crate::sandbox::freshness::mark_fresh(image, runtime);
                 }
@@ -1091,6 +1088,17 @@ pub fn wrap_for_container(
     worktree_root: &Path,
     pane_cwd: &Path,
 ) -> Result<String> {
+    wrap_for_supervisor(command, supervisor, worktree_root, pane_cwd, None)
+}
+
+/// Wrap a command for the sandbox supervisor, passing `--agent` when given.
+pub(super) fn wrap_for_supervisor(
+    command: &str,
+    supervisor: Option<&str>,
+    worktree_root: &Path,
+    pane_cwd: &Path,
+    agent: Option<&str>,
+) -> Result<String> {
     // Strip the leading history-prevention space before passing the command to
     // the sandbox supervisor.
     let command = command.strip_prefix(' ').unwrap_or(command);
@@ -1109,6 +1117,9 @@ pub fn wrap_for_container(
         ));
     }
 
+    if let Some(agent) = agent {
+        parts.push_str(&format!(" --agent '{}'", shell_escape(agent)));
+    }
     parts.push_str(&format!(" -- '{}'", shell_escape(command)));
 
     // Prefix with space to prevent shell history entry.
