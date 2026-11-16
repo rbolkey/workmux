@@ -422,15 +422,6 @@ impl Kit {
 /// for what the kit can't serve.
 fn kit_for(config: &SandboxConfig, agent: &str) -> Result<Kit> {
     let kit = Kit::for_agent(agent)?;
-    if config.agent_config_dir.is_some() {
-        bail!(
-            "sandbox.agent_config_dir is set, but under sandbox.docker_sbx.agent: kit sbx's \
-             {} kit sets {agent} up in the sandbox's own home and no config directory is \
-             mounted. Remove sandbox.agent_config_dir, or set \
-             `sandbox.docker_sbx.agent: shell` in your global config to mount it.",
-            kit.name()
-        );
-    }
     if kit.needs_custom_image() && config.image.is_none() {
         bail!(
             "workmux has no sandbox image with GitHub Copilot CLI. Set `sandbox.image` to an \
@@ -439,6 +430,20 @@ fn kit_for(config: &SandboxConfig, agent: &str) -> Result<Kit> {
         );
     }
     Ok(kit)
+}
+
+/// Under `agent: kit`, a note that `sandbox.agent_config_dir` is ignored:
+/// it applies to `agent: shell` and the other backends, which is why it's
+/// often set globally, while the kit sets the agent up in the sandbox's own
+/// home.
+fn ignored_config_dir_note(config: &SandboxConfig, kit: Kit) -> Option<String> {
+    config.agent_config_dir.as_ref().map(|_| {
+        format!(
+            "sandbox.agent_config_dir is ignored under sandbox.docker_sbx.agent: kit: sbx's \
+             {} kit sets the agent up in the sandbox's own home.",
+            kit.name()
+        )
+    })
 }
 
 /// Under `agent: kit`, a warning for each variable of the named agent's
@@ -1670,7 +1675,11 @@ pub fn launch_plan(
         exec: exec_command(target, exec),
         hangup: hangup_command(target, exec),
         teardown,
-        notes: network_notes(config, target.toolchain),
+        notes: kit
+            .and_then(|kit| ignored_config_dir_note(config, kit))
+            .into_iter()
+            .chain(network_notes(config, target.toolchain))
+            .collect(),
         warnings: check_warnings(state)
             .into_iter()
             .chain(network_warnings(config, state, name))
@@ -3417,20 +3426,34 @@ mod tests {
     }
 
     #[test]
-    fn under_kit_agent_config_dir_is_an_error_naming_agent_shell() {
-        // The kit's sandbox has its own config; silently ignoring the
-        // setting would run the agent on other settings than meant.
+    fn under_kit_agent_config_dir_is_ignored_with_a_note() {
+        // It applies to `shell` and the other backends, where it's usually
+        // set globally; the kit's sandbox has its own config.
         let p = paths();
         let config = SandboxConfig {
             agent_config_dir: Some("/home/me/.{agent}".to_string()),
             ..kit_config()
         };
-        let err = launch_plan(&config, &target(&p), "claude", &missing(), &exec())
-            .unwrap_err()
-            .to_string();
+        let plan = launch_plan(&config, &target(&p), "claude", &missing(), &exec()).unwrap();
+
         assert!(
-            err.contains("agent_config_dir") && err.contains("sandbox.docker_sbx.agent: shell"),
-            "{err}"
+            !workspaces(&plan).iter().any(|w| w.contains("/home/me")),
+            "{:?}",
+            plan.create
+        );
+        assert_eq!(plan.create_settings.agent_config_dir, None);
+        assert!(
+            plan.notes
+                .iter()
+                .any(|n| n.contains("agent_config_dir") && n.contains("ignored")),
+            "{:?}",
+            plan.notes
+        );
+        let plan = launch_plan(&kit_config(), &target(&p), "claude", &missing(), &exec()).unwrap();
+        assert!(
+            !plan.notes.iter().any(|n| n.contains("agent_config_dir")),
+            "{:?}",
+            plan.notes
         );
     }
 
