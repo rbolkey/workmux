@@ -1,28 +1,29 @@
 //! Per-sandbox acceptance of what sbx lets a `deny` sandbox reach beyond
 //! `allowed_domains`, like Lima's reduced-isolation acknowledgement.
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use std::path::PathBuf;
 use tracing::warn;
 
-use crate::config::Config;
+use crate::config::{Config, DockerSbxAgent};
+use crate::sandbox::acknowledgement::{Acknowledgement, ask_on_stdin, can_ask};
 
 use super::plan::Widening;
 
-/// What an acknowledgement file holds.
-const ACCEPTED: &str = "accepted-v1\n";
-
-/// Return the directory of the acknowledgement files, beside Lima's.
-fn acknowledgement_dir() -> Result<PathBuf> {
+/// Return the acknowledgement file of sandbox `name`, beside Lima's.
+fn marker(name: &str) -> Result<PathBuf> {
     Ok(crate::xdg::state_dir()?
         .join("docker-sbx-acknowledgements")
-        .join("wider-network-policy-v1"))
+        .join("wider-network-policy-v1")
+        .join(name))
 }
 
-/// Check whether stdin is a terminal the user can answer from.
-pub(super) fn can_ask() -> bool {
-    use std::io::IsTerminal;
-    std::io::stdin().is_terminal()
+/// Check whether to ask after `sbx create` instead of before: kits add rules
+/// at create, and asking once after seeing them needs a terminal.
+pub(super) fn asks_after_create(config: &Config) -> bool {
+    let sbx = &config.sandbox.docker_sbx;
+    let kits_add_rules = sbx.agent() == DockerSbxAgent::Kit || !sbx.kits().is_empty();
+    kits_add_rules && can_ask() && !sbx.accepts_wider_network_policy()
 }
 
 /// Have the user accept `widenings` for sandbox `name`, once per sandbox.
@@ -30,78 +31,37 @@ pub(super) fn can_ask() -> bool {
 /// Accepts by `accept_wider_network_policy` or by asking on a terminal, and
 /// fails otherwise.
 pub(super) fn acknowledge(config: &Config, name: &str, widenings: &[Widening]) -> Result<()> {
-    use std::io::Write;
-
     if widenings.is_empty() {
         return Ok(());
     }
-    let state_dir = acknowledgement_dir()?;
-    let acknowledgement = state_dir.join(name);
-    if let Ok(metadata) = std::fs::symlink_metadata(&acknowledgement) {
-        if metadata.file_type().is_symlink()
-            || !metadata.is_file()
-            || std::fs::read_to_string(&acknowledgement).as_deref().ok() != Some(ACCEPTED)
-        {
-            bail!(
-                "Invalid sbx wider network policy acknowledgement at {}",
-                acknowledgement.display()
-            );
-        }
-        return Ok(());
+    let marker = marker(name)?;
+    let warnings: Vec<String> = widenings.iter().map(|w| w.warning(name)).collect();
+    let question = format!("Create sbx sandbox {name} with this wider network access?");
+    let refused = format!(
+        "sbx sandbox {name} would reach more than sandbox.network.allowed_domains under \
+         sandbox.network.policy: deny, as the warnings above say, and creating it needs \
+         your acceptance. Set sandbox.docker_sbx.accept_wider_network_policy: true in your \
+         global config for unattended use, or narrow sbx's global policy with \
+         `sbx policy init deny-all` (after `sbx policy reset`)."
+    );
+    Acknowledgement {
+        marker: &marker,
+        marker_name: "sbx wider network policy acknowledgement",
+        warnings: &warnings,
+        accepted_by_config: config.sandbox.docker_sbx.accepts_wider_network_policy(),
+        question: &question,
+        refused: &refused,
     }
-
-    for widening in widenings {
-        eprintln!("warning: {}", widening.warning(name));
-    }
-    let accepted = if config.sandbox.docker_sbx.accepts_wider_network_policy() {
-        true
-    } else if can_ask() {
-        eprint!("Create sbx sandbox {name} with this wider network access? [y/N] ");
-        std::io::stderr().flush()?;
-        let mut input = String::new();
-        std::io::stdin().read_line(&mut input)?;
-        input.trim().eq_ignore_ascii_case("y")
-    } else {
-        false
-    };
-    if !accepted {
-        bail!(
-            "sbx sandbox {name} would reach more than sandbox.network.allowed_domains under \
-             sandbox.network.policy: deny, as the warnings above say, and creating it needs \
-             your acceptance. Set sandbox.docker_sbx.accept_wider_network_policy: true in your \
-             global config for unattended use, or narrow sbx's global policy with \
-             `sbx policy init deny-all` (after `sbx policy reset`)."
-        );
-    }
-
-    std::fs::create_dir_all(&state_dir)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o700))?;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&acknowledgement)?;
-        file.write_all(ACCEPTED.as_bytes())?;
-    }
-    #[cfg(not(unix))]
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&acknowledgement)?
-        .write_all(ACCEPTED.as_bytes())?;
-    Ok(())
+    .acknowledge(can_ask().then_some(ask_on_stdin))
 }
 
 /// Forget the acceptance for a removed sandbox, so a new one asks again.
 /// Best effort: a failure is logged.
 pub(crate) fn remove_acknowledgement(name: &str) {
-    let Ok(dir) = acknowledgement_dir() else {
+    let Ok(marker) = marker(name) else {
         return;
     };
-    match std::fs::remove_file(dir.join(name)) {
+    match std::fs::remove_file(marker) {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
             warn!(sandbox = %name, error = %e, "failed to remove sbx network acknowledgement")
         }
