@@ -75,9 +75,8 @@ fn exec(name: &str, command: &[&str], stdin: Option<Vec<u8>>) -> SbxCommand {
     args.push(name.to_string());
     args.extend(command.iter().map(|word| word.to_string()));
     SbxCommand {
-        args,
-        env: Vec::new(),
         stdin,
+        ..SbxCommand::new(args)
     }
 }
 

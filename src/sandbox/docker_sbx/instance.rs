@@ -128,23 +128,6 @@ const RULE_NOT_FOUND: &str = "rule not found";
 /// The error sbx prints for every sandbox verb before `sbx policy init`.
 const POLICY_NOT_INITIALIZED: &str = "global network policy has not been initialized";
 
-/// Run an sbx command that prints JSON and return its stdout.
-fn sbx_json(args: &[&str]) -> Result<Vec<u8>> {
-    let output = Command::new("sbx")
-        .args(args)
-        .arg("--json")
-        .output()
-        .with_context(|| format!("Failed to run sbx {}", args.join(" ")))?;
-    if !output.status.success() {
-        bail!(
-            "sbx {} failed: {}",
-            args.join(" "),
-            sbx_error(&String::from_utf8_lossy(&output.stderr))
-        );
-    }
-    Ok(output.stdout)
-}
-
 /// Run `sbx diagnose --json`, reading its checks even when it exits 1 for a
 /// failed check.
 fn sbx_diagnose() -> Result<Vec<SbxCheck>> {
@@ -155,12 +138,22 @@ fn sbx_diagnose() -> Result<Vec<SbxCheck>> {
     match parse_sbx_checks(&output.stdout) {
         Ok(checks) => Ok(checks),
         Err(e) if output.status.success() => Err(e),
-        Err(_) => bail!(
-            "sbx diagnose failed ({}): {}",
-            output.status,
-            sbx_error(&String::from_utf8_lossy(&output.stderr))
-        ),
+        Err(_) => Err(sbx_failed(
+            &["diagnose"],
+            &String::from_utf8_lossy(&output.stderr),
+        )),
     }
+}
+
+/// Build the error for a failed sbx command, from its arguments and stderr.
+fn sbx_failed(args: &[impl AsRef<str>], stderr: &str) -> anyhow::Error {
+    let command: Vec<&str> = args
+        .iter()
+        .map(AsRef::as_ref)
+        .take(2)
+        .take_while(|arg| !arg.starts_with('-'))
+        .collect();
+    anyhow::anyhow!("sbx {} failed: {}", command.join(" "), sbx_error(stderr))
 }
 
 /// Turn sbx's stderr into an error message that names the fix.
@@ -180,21 +173,17 @@ pub struct SbxInstance;
 impl SbxInstance {
     /// Check if sbx is available on the system.
     pub fn is_sbx_available() -> bool {
-        Command::new("sbx")
-            .arg("version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+        sbx(&["version"]).is_ok()
     }
 
     /// List all sbx sandboxes.
     pub fn list() -> Result<Vec<SbxSandboxInfo>> {
-        parse_sbx_sandboxes(&sbx_json(&["ls"])?)
+        parse_sbx_sandboxes(&sbx(&["ls", "--json"])?.stdout)
     }
 
     /// Stop a sandbox by name. Succeeds if it is already stopped.
     pub fn stop_by_name(name: &str) -> Result<()> {
-        run_sbx_args(&["stop", name])
+        sbx(&["stop", name]).map(drop)
     }
 }
 
@@ -218,32 +207,12 @@ fn remove_sandbox_with(
     acknowledgement: &Path,
     run: &mut impl FnMut(&SbxCommand) -> Result<SbxOutput>,
 ) -> Result<()> {
-    let remove = SbxCommand {
-        args: vec!["rm".to_string(), "-f".to_string(), name.to_string()],
-        env: Vec::new(),
-        stdin: None,
-    };
+    let remove = SbxCommand::new(vec!["rm".to_string(), "-f".to_string(), name.to_string()]);
     match run(&remove) {
         Err(e) if !e.to_string().contains("not found") => return Err(e),
         _ => {}
     }
     acknowledgement::forget(name, acknowledgement);
-    Ok(())
-}
-
-/// Run an sbx command, failing with sbx's error.
-fn run_sbx_args(args: &[&str]) -> Result<()> {
-    let output = Command::new("sbx")
-        .args(args)
-        .output()
-        .with_context(|| format!("Failed to run sbx {}", args.join(" ")))?;
-    if !output.status.success() {
-        bail!(
-            "sbx {} failed: {}",
-            args.join(" "),
-            sbx_error(&String::from_utf8_lossy(&output.stderr))
-        );
-    }
     Ok(())
 }
 
@@ -320,11 +289,11 @@ fn list_sandbox_and_rules(name: &str) -> Result<(Option<SbxSandboxInfo>, Vec<Sbx
     // An uninitialised global policy is reported by the plan. Any other
     // failure is fatal: the plan needs the rules to keep `deny` narrow.
     let policy_ls = match &sandbox {
-        Some(_) => vec!["policy", "ls", name],
-        None => vec!["policy", "ls"],
+        Some(_) => vec!["policy", "ls", name, "--json"],
+        None => vec!["policy", "ls", "--json"],
     };
-    let rules = match sbx_json(&policy_ls) {
-        Ok(stdout) => parse_sbx_rules(&stdout)?,
+    let rules = match sbx(&policy_ls) {
+        Ok(output) => parse_sbx_rules(&output.stdout)?,
         Err(e) if e.to_string().contains(POLICY_NOT_INITIALIZED) => {
             debug!(error = %e, "failed to list sbx rules");
             Vec::new()
@@ -530,7 +499,14 @@ pub(super) struct SbxOutput {
     pub stderr: String,
 }
 
-/// Run one sbx command from a plan.
+/// Run sbx with `args`, failing with sbx's error.
+pub(super) fn sbx(args: &[&str]) -> Result<SbxOutput> {
+    run_sbx(&SbxCommand::new(
+        args.iter().map(|arg| arg.to_string()).collect(),
+    ))
+}
+
+/// Run one sbx command, failing with sbx's error.
 fn run_sbx(command: &SbxCommand) -> Result<SbxOutput> {
     debug!(args = ?command.args, "running sbx");
     let mut child = Command::new("sbx")
@@ -564,7 +540,7 @@ fn run_sbx(command: &SbxCommand) -> Result<SbxOutput> {
             debug!(args = ?command.args, "sbx rule already removed");
             return Ok(SbxOutput::default());
         }
-        bail!("sbx {} failed: {}", command.args[0], sbx_error(&stderr));
+        return Err(sbx_failed(&command.args, &stderr));
     }
     Ok(SbxOutput {
         stdout: output.stdout,
@@ -762,8 +738,7 @@ fn apply_plan_with(
         let output = crate::spinner::with_spinner(&msg, || run(&create.command))?;
         notices = create_notices(&output.stderr);
         if let Err(error) = after_create() {
-            remove_unfinished(name, acknowledgement, &mut run);
-            return Err(error);
+            return Err(remove_unfinished(name, acknowledgement, &mut run, error));
         }
     }
     let creating = plan.create.is_some();
@@ -772,10 +747,10 @@ fn apply_plan_with(
             if !creating {
                 return Err(error);
             }
-            remove_unfinished(name, acknowledgement, &mut run);
-            return Err(error.context(format!(
+            let error = error.context(format!(
                 "Setting up sbx sandbox {name} failed; the sandbox was removed, launch again"
-            )));
+            ));
+            return Err(remove_unfinished(name, acknowledgement, &mut run, error));
         }
     }
     if plan.network_rules != pending {
@@ -784,12 +759,12 @@ fn apply_plan_with(
     if let Some(hooks) = &plan.status_hooks
         && let Err(error) = super::hooks::install(name, hooks, &mut run)
     {
-        remove_unfinished(name, acknowledgement, &mut run);
-        return Err(error.context(format!(
+        let error = error.context(format!(
             "Installing workmux's status hooks for {} in sbx sandbox {name} failed; the \
              sandbox was removed, launch again",
             hooks.agent.name()
-        )));
+        ));
+        return Err(remove_unfinished(name, acknowledgement, &mut run, error));
     }
     let built_in_failed = format!(
         "workmux's built-in provisioning failed in sbx sandbox {name}; the sandbox was \
@@ -812,8 +787,8 @@ fn apply_plan_with(
     for (command, failed) in provisioning {
         let msg = format!("Provisioning sbx sandbox {name}");
         if let Err(error) = crate::spinner::with_spinner(&msg, || run(command)) {
-            remove_unfinished(name, acknowledgement, &mut run);
-            return Err(error.context(failed.clone()));
+            let error = error.context(failed.clone());
+            return Err(remove_unfinished(name, acknowledgement, &mut run, error));
         }
     }
     if creating {
@@ -822,16 +797,19 @@ fn apply_plan_with(
     Ok(notices)
 }
 
-/// Remove a sandbox this launch couldn't finish setting up. Best effort.
+/// Remove a sandbox this launch couldn't finish setting up, and return the
+/// `error` that stopped it. Best effort.
 fn remove_unfinished(
     name: &str,
     acknowledgement: &Path,
     run: &mut impl FnMut(&SbxCommand) -> Result<SbxOutput>,
-) {
+    error: anyhow::Error,
+) -> anyhow::Error {
     // The state directory stays: it holds the lock and the rules record.
     if let Err(e) = remove_sandbox_with(name, acknowledgement, run) {
         warn!(sandbox = %name, error = %e, "failed to remove unfinished sbx sandbox");
     }
+    error
 }
 
 /// Generate an identifier for one exec's processes in the guest.
@@ -1075,17 +1053,27 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_sbx_command_is_named_by_its_verb_without_its_options_or_script() {
+        let exec = ["exec", "-i", "wm-test", "sh", "-c", "cat > x"];
+        assert_eq!(
+            sbx_failed(&exec, "boom\n").to_string(),
+            "sbx exec failed: boom"
+        );
+        let policy_ls = ["policy", "ls", "wm-test", "--json"];
+        assert_eq!(
+            sbx_failed(&policy_ls, "boom").to_string(),
+            "sbx policy ls failed: boom"
+        );
+    }
+
+    #[test]
     fn uninitialised_policy_error_names_sbx_policy_init() {
         let message = sbx_error("error: global network policy has not been initialized\n");
         assert!(message.contains("sbx policy init"), "{message}");
     }
 
     fn command(words: &str) -> SbxCommand {
-        SbxCommand {
-            args: words.split(' ').map(str::to_string).collect(),
-            env: Vec::new(),
-            stdin: None,
-        }
+        SbxCommand::new(words.split(' ').map(str::to_string).collect())
     }
 
     fn rule() -> NetworkRule {
