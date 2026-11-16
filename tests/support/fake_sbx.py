@@ -15,7 +15,7 @@ import shlex
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Generic, Optional, TypeVar
 
 FAKE_SBX = r"""
 import fcntl, json, os, subprocess, sys
@@ -97,7 +97,6 @@ def sbx():
     elif verb == "create":
         name = flag("--name")
         sandboxes.append({"name": name, "status": "running"})
-        write("sandboxes.json", sandboxes)
         for path, content in read("kit_files.json").items():
             file = home(name) / path
             file.parent.mkdir(parents=True, exist_ok=True)
@@ -106,12 +105,12 @@ def sbx():
         exec_in_guest()
     elif verb == "rm":
         names = [word for word in argv[1:] if not word.startswith("-")]
-        write("sandboxes.json", [s for s in sandboxes if s["name"] not in names])
+        sandboxes = [s for s in sandboxes if s["name"] not in names]
     elif verb == "stop":
         for sandbox in sandboxes:
             if sandbox["name"] in argv[1:]:
                 sandbox["status"] = "stopped"
-        write("sandboxes.json", sandboxes)
+    write("sandboxes.json", sandboxes)
 
 
 def docker():
@@ -144,6 +143,24 @@ def passing_checks() -> list[dict[str, str]]:
     ]
 
 
+T = TypeVar("T")
+
+
+class _JsonFile(Generic[T]):
+    """A `FakeSbx` attribute kept in a JSON file of its state dir, where the
+    fake `sbx` reads it."""
+
+    def __init__(self, file: str, doc: str):
+        self.file = file
+        self.__doc__ = doc
+
+    def __get__(self, fake: "FakeSbx", owner: Any = None) -> T:
+        return json.loads((fake.state_dir / self.file).read_text())
+
+    def __set__(self, fake: "FakeSbx", value: T) -> None:
+        (fake.state_dir / self.file).write_text(json.dumps(value))
+
+
 @dataclass
 class SbxCall:
     """One invocation of the fake `sbx` or `docker`."""
@@ -160,6 +177,25 @@ class FakeSbx:
     `install_script` comes from the test environment, which puts the fake-bin
     directory first on PATH, ahead of any real `sbx` or `docker`.
     """
+
+    sandboxes = _JsonFile[list[dict[str, str]]](
+        "sandboxes.json",
+        "What `sbx ls --json` lists: each sandbox's `name` and `status`.",
+    )
+    global_rules = _JsonFile[list[dict[str, Any]]](
+        "rules.json", "The rules `sbx policy ls --json` lists, for every sandbox."
+    )
+    kit_resources = _JsonFile[list[str]](
+        "kit_resources.json",
+        "What the rule each sandbox's kit adds at create allows (`host:port`).",
+    )
+    kit_files = _JsonFile[dict[str, str]](
+        "kit_files.json",
+        "Files each sandbox's kit writes at create, by path under the guest home.",
+    )
+    checks = _JsonFile[list[dict[str, str]]](
+        "checks.json", "The checks `sbx diagnose --json` reports."
+    )
 
     def __init__(
         self, bin_dir: Path, state_dir: Path, install_script: Callable[..., Path]
@@ -184,61 +220,10 @@ class FakeSbx:
                 + ' "$@"\n',
             )
 
-    def _write(self, name: str, value: Any) -> None:
-        (self.state_dir / name).write_text(json.dumps(value))
-
-    def _read(self, name: str) -> Any:
-        return json.loads((self.state_dir / name).read_text())
-
-    @property
-    def sandboxes(self) -> list[dict[str, str]]:
-        """What `sbx ls --json` lists: each sandbox's `name` and `status`."""
-        return self._read("sandboxes.json")
-
-    @sandboxes.setter
-    def sandboxes(self, value: list[dict[str, str]]) -> None:
-        self._write("sandboxes.json", value)
-
-    @property
-    def global_rules(self) -> list[dict[str, Any]]:
-        """The rules `sbx policy ls --json` lists, for every sandbox."""
-        return self._read("rules.json")
-
-    @global_rules.setter
-    def global_rules(self, value: list[dict[str, Any]]) -> None:
-        self._write("rules.json", value)
-
-    @property
-    def kit_resources(self) -> list[str]:
-        """What the rule each sandbox's kit adds at create allows (`host:port`)."""
-        return self._read("kit_resources.json")
-
-    @kit_resources.setter
-    def kit_resources(self, value: list[str]) -> None:
-        self._write("kit_resources.json", value)
-
-    @property
-    def kit_files(self) -> dict[str, str]:
-        """Files each sandbox's kit writes at create, by path under the guest home."""
-        return self._read("kit_files.json")
-
-    @kit_files.setter
-    def kit_files(self, value: dict[str, str]) -> None:
-        self._write("kit_files.json", value)
-
     def guest_file(self, sandbox: str, path: str) -> Optional[str]:
         """A file in `sandbox`'s guest home, by path under it, if it exists."""
         file = self.state_dir / "homes" / sandbox / path
         return file.read_text() if file.is_file() else None
-
-    @property
-    def checks(self) -> list[dict[str, str]]:
-        """The checks `sbx diagnose --json` reports."""
-        return self._read("checks.json")
-
-    @checks.setter
-    def checks(self, value: list[dict[str, str]]) -> None:
-        self._write("checks.json", value)
 
     def calls(self, program: str = "sbx") -> list[SbxCall]:
         """Every recorded invocation of `program`, in order."""
