@@ -971,6 +971,7 @@ fn run_prune_docker_sbx(force: bool) -> Result<()> {
                 {
                     tracing::warn!(sandbox = %sandbox.name, error = %e, "failed to clean up state dir");
                 }
+                docker_sbx::remove_acknowledgement(&sandbox.name);
             }
             Err(e) => {
                 println!("failed");

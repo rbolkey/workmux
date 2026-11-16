@@ -229,6 +229,11 @@ pub struct LaunchPlan {
     /// `allowed_domains`, and create-time settings changed since the
     /// sandbox was created.
     pub warnings: Vec<String>,
+    /// What the sandbox the plan creates would reach under `policy: deny`
+    /// beyond `allowed_domains`, which the user accepts before it's created.
+    /// Empty when the plan launches into an existing sandbox, or under
+    /// `allow`.
+    pub widenings: Vec<Widening>,
     /// The `sandbox.network` and toolchain rules workmux has written for the
     /// sandbox once `setup` has run; the record the next launch reconciles
     /// against.
@@ -876,9 +881,8 @@ fn network_notes(config: &SandboxConfig, toolchain: &DetectedToolchain) -> Vec<S
 
 /// How many destinations the user's global sbx policy allows. Every
 /// sandbox can reach them, whatever its own rules say.
-fn global_network_allows(state: &SbxState) -> usize {
-    state
-        .rules
+fn global_network_allows(rules: &[SbxRule]) -> usize {
+    rules
         .iter()
         .filter(|rule| {
             rule.scope == "global" && rule.decision == "allow" && rule.resource_type == "network"
@@ -887,39 +891,101 @@ fn global_network_allows(state: &SbxState) -> usize {
         .sum()
 }
 
-/// Where sbx under `deny` gives the sandbox more than workmux's CONNECT
-/// proxy would on the container backend, which it can't take back per
-/// sandbox: what the global sbx policy allows, and private or loopback
-/// addresses an allowed domain resolves to. Warned on every launch.
-fn network_warnings(config: &SandboxConfig, state: &SbxState, name: &str) -> Vec<String> {
+/// Something sbx lets a sandbox under `policy: deny` reach beyond
+/// `allowed_domains`, which workmux can't take back per sandbox.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Widening {
+    /// The global sbx policy allows this many destinations.
+    GlobalPolicy { destinations: usize },
+    /// sbx reaches private or loopback addresses an allowed domain
+    /// resolves to: it has no `allow_private_ips: false`.
+    PrivateAddresses,
+    /// The rules sbx's kits added allow these resources (`host:port`).
+    KitHosts(Vec<String>),
+}
+
+impl Widening {
+    /// The warning naming the widening of sandbox `name`.
+    pub fn warning(&self, name: &str) -> String {
+        match self {
+            Self::GlobalPolicy { destinations } => format!(
+                "sandbox.network.policy is deny, but sbx's global network policy also allows \
+                 {destinations} destinations besides sandbox.network.allowed_domains \
+                 (`sbx policy ls {name}` lists them), and a sandbox's rules can't take them \
+                 back. For the container backend's behaviour, choose `sbx policy init \
+                 deny-all` (after `sbx policy reset`); workmux never changes the global policy."
+            ),
+            Self::PrivateAddresses => "sbx doesn't refuse private or loopback addresses an \
+                 allowed domain resolves to, so allow_private_ips: false can't be enforced \
+                 under the docker_sbx backend."
+                .to_string(),
+            Self::KitHosts(resources) => format!(
+                "sandbox.network.policy is deny, but the rules sbx's kits added to this \
+                 sandbox also allow {}, which sandbox.network.allowed_domains doesn't cover \
+                 (`sbx policy ls {name}` lists them). workmux never removes a kit's rules, \
+                 which the kit needs; list your agent's API domains in allowed_domains (it \
+                 covers port 443 only) to keep this warning to the rest.",
+                resources.join(", ")
+            ),
+        }
+    }
+}
+
+/// Under `deny`, what sbx gives the sandbox `name` beyond workmux's CONNECT
+/// proxy on the container backend, from its `rules` (`sbx policy ls`): what
+/// the global sbx policy allows, private or loopback addresses an allowed
+/// domain resolves to, and what the rules sbx's kits added (the agent
+/// kit's and any mixin kit's) allow that `allowed_domains` doesn't cover.
+/// A kit adds its rules at create, scoped to the sandbox and `provisioned`;
+/// the user's rules and workmux's are `added`. A resource workmux's own
+/// rules (`network_rules`) name isn't counted: workmux's allow is its own,
+/// and its deny (a wildcard's base) wins over the kit's allow. workmux
+/// never removes a kit's rules: the kit needs them.
+pub fn widenings(
+    config: &SandboxConfig,
+    rules: &[SbxRule],
+    name: &str,
+    network_rules: &[NetworkRule],
+) -> Vec<Widening> {
     if !config.network_policy_is_deny() {
         return Vec::new();
     }
-    let mut warnings = Vec::new();
-    let global_allows = global_network_allows(state);
-    if global_allows > 0 {
-        warnings.push(format!(
-            "sandbox.network.policy is deny, but sbx's global network policy also allows \
-             {global_allows} destinations besides sandbox.network.allowed_domains \
-             (`sbx policy ls {name}` lists them), and a sandbox's rules can't take them back. \
-             For the container backend's behaviour, choose `sbx policy init deny-all` \
-             (after `sbx policy reset`); workmux never changes the global policy."
-        ));
+    let mut widenings = Vec::new();
+    let destinations = global_network_allows(rules);
+    if destinations > 0 {
+        widenings.push(Widening::GlobalPolicy { destinations });
     }
-    if global_allows > 0
+    if destinations > 0
         || config
             .network
             .allowed_domains()
             .iter()
             .any(|entry| !entry.allow_private_ips())
     {
-        warnings.push(
-            "sbx doesn't refuse private or loopback addresses an allowed domain resolves to, \
-             so allow_private_ips: false can't be enforced under the docker_sbx backend."
-                .to_string(),
-        );
+        widenings.push(Widening::PrivateAddresses);
     }
-    warnings
+    let scope = format!("sandbox:{name}");
+    let allowed = allowed_hosts(config);
+    let mut uncovered: Vec<String> = Vec::new();
+    let kit_resources = rules
+        .iter()
+        .filter(|rule| {
+            rule.scope == scope
+                && rule.decision == "allow"
+                && rule.resource_type == "network"
+                && rule.provenance.created_via == "provisioned"
+        })
+        .flat_map(|rule| &rule.resources);
+    for resource in kit_resources {
+        let recorded = network_rules.iter().any(|own| own.resource == *resource);
+        if !recorded && !resource_covered(&allowed, resource) && !uncovered.contains(resource) {
+            uncovered.push(resource.clone());
+        }
+    }
+    if !uncovered.is_empty() {
+        widenings.push(Widening::KitHosts(uncovered));
+    }
+    widenings
 }
 
 /// Whether `allowed` (`allowed_domains` hosts) covers an sbx resource
@@ -935,60 +1001,11 @@ fn resource_covered(allowed: &[String], resource: &str) -> bool {
     }
 }
 
-/// Under `deny`, what the rules sbx's kits added to the sandbox (the agent
-/// kit's and any mixin kit's) allow that `allowed_domains` doesn't cover,
-/// as a warning; for every launch, and again after a launch creates the
-/// sandbox, since the kit adds them at create. A kit's rule is scoped to
-/// the sandbox and `provisioned`; the user's rules and workmux's are
-/// `added`. A resource workmux's own rules (`network_rules`, its record
-/// after the launch) name isn't counted either: workmux's allow is its own,
-/// and its deny (a wildcard's base) wins over the kit's allow. workmux never
-/// removes a kit's rules: the kit needs them.
-pub fn kit_rule_warnings(
-    config: &SandboxConfig,
-    rules: &[SbxRule],
-    name: &str,
-    network_rules: &[NetworkRule],
-) -> Vec<String> {
-    if !config.network_policy_is_deny() {
-        return Vec::new();
-    }
-    let scope = format!("sandbox:{name}");
-    let allowed = allowed_hosts(config);
-    let mut uncovered: Vec<&str> = Vec::new();
-    let kit_resources = rules
-        .iter()
-        .filter(|rule| {
-            rule.scope == scope
-                && rule.decision == "allow"
-                && rule.resource_type == "network"
-                && rule.provenance.created_via == "provisioned"
-        })
-        .flat_map(|rule| &rule.resources);
-    for resource in kit_resources {
-        let recorded = network_rules.iter().any(|own| own.resource == *resource);
-        if !recorded && !resource_covered(&allowed, resource) && !uncovered.contains(&&**resource) {
-            uncovered.push(resource);
-        }
-    }
-    if uncovered.is_empty() {
-        return Vec::new();
-    }
-    vec![format!(
-        "sandbox.network.policy is deny, but the rules sbx's kits added to this sandbox also \
-         allow {}, which sandbox.network.allowed_domains doesn't cover \
-         (`sbx policy ls {name}` lists them). workmux never removes a kit's rules, which the \
-         kit needs; list your agent's API domains in allowed_domains (it covers port 443 \
-         only) to keep this warning to the rest.",
-        uncovered.join(", ")
-    )]
-}
-
 /// Fail closed when a project's `.workmux.yaml` chose docker_sbx for a
 /// global `deny` that sbx's global policy would widen: a repository can
 /// lower its own sandbox's protection only with the user's say-so.
 fn check_backend_choice(config: &SandboxConfig, state: &SbxState) -> Result<()> {
-    let global_allows = global_network_allows(state);
+    let global_allows = global_network_allows(&state.rules);
     if config.backend_from_project && config.network_policy_is_deny() && global_allows > 0 {
         bail!(
             "sandbox.backend: docker_sbx comes from the project config (.workmux.yaml), but \
@@ -1467,6 +1484,8 @@ pub fn launch_plan(
         }
     }
 
+    let widenings = widenings(config, &state.rules, name, &network_rules);
+
     let default_provision = if !exists && !config.docker_sbx.skip_default_provision() {
         default_provision(target)
     } else {
@@ -1492,19 +1511,14 @@ pub fn launch_plan(
             .collect(),
         warnings: check_warnings(state)
             .into_iter()
-            .chain(network_warnings(config, state, name))
-            .chain(kit_rule_warnings(
-                config,
-                &state.rules,
-                name,
-                &network_rules,
-            ))
+            .chain(widenings.iter().map(|widening| widening.warning(name)))
             .chain(
                 created_with
                     .into_iter()
                     .flat_map(|created| create_settings_warnings(&create_settings, created, name)),
             )
             .collect(),
+        widenings: if exists { Vec::new() } else { widenings },
         network_rules,
         create_settings,
     })
@@ -2588,6 +2602,70 @@ mod tests {
         );
         let plan = launch_plan(&config, &target(&p), "claude", &state, &exec()).unwrap();
         assert!(kit_warnings(&plan).is_empty(), "{:?}", plan.warnings);
+    }
+
+    #[test]
+    fn a_sandbox_created_under_deny_reports_what_widens_it_for_acknowledgement() {
+        // A stopped sandbox no launch finished is created again; sbx still
+        // lists the rule its kit added the first time.
+        let p = Paths {
+            created: CreateRecord::Missing,
+            ..kit_paths()
+        };
+        let creating = |rules: Vec<SbxRule>| SbxState {
+            sandbox: Some(sandbox("stopped")),
+            rules,
+            ..missing()
+        };
+        let widenings = |config: &SandboxConfig, state: &SbxState| {
+            let plan = launch_plan(config, &target(&p), "claude", state, &exec()).unwrap();
+            assert!(plan.create.is_some());
+            plan.widenings
+        };
+        let narrow = kit_network(
+            NetworkPolicy::Deny,
+            private_ips_allowed(&["api.anthropic.com"]),
+        );
+
+        // A deny-all global policy, the kit's hosts covered and private
+        // addresses allowed for every domain: nothing to accept.
+        let mut deny_all = deny_all_global_rules();
+        deny_all.push(kit_rule(&["api.anthropic.com:443"]));
+        assert_eq!(widenings(&narrow, &creating(deny_all.clone())), vec![]);
+
+        let mut wider = balanced_global_rules();
+        wider.push(kit_rule(&["api.anthropic.com:443", "claude.com:443"]));
+        assert_eq!(
+            widenings(&narrow, &creating(wider.clone())),
+            vec![
+                Widening::GlobalPolicy { destinations: 2 },
+                Widening::PrivateAddresses,
+                Widening::KitHosts(args(&["claude.com:443"])),
+            ]
+        );
+        let private = kit_network(NetworkPolicy::Deny, domains(&["api.anthropic.com"]));
+        assert_eq!(
+            widenings(&private, &creating(deny_all)),
+            vec![Widening::PrivateAddresses]
+        );
+
+        // `allow` promises nothing narrower.
+        let allow = kit_network(NetworkPolicy::Allow, Vec::new());
+        assert_eq!(widenings(&allow, &creating(wider.clone())), vec![]);
+
+        // Launching into an existing sandbox only logs them.
+        let existing = kit_paths();
+        let plan = launch_plan(
+            &narrow,
+            &target(&existing),
+            "claude",
+            &running_with(wider),
+            &exec(),
+        )
+        .unwrap();
+        assert!(plan.create.is_none());
+        assert_eq!(plan.widenings, vec![]);
+        assert_eq!(plan.warnings.len(), 3, "{:?}", plan.warnings);
     }
 
     #[test]

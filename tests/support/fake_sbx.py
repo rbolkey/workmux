@@ -2,7 +2,8 @@
 
 The fake `sbx` keeps its sandboxes in a JSON file, answers the queries workmux
 makes (`ls`, `policy ls`, `diagnose`, `template ls`) with canned JSON and
-succeeds at everything else. Both fakes record each invocation, in order, so a
+succeeds at everything else. `policy ls <name>` of an existing sandbox also
+lists the rule its agent kit added at create. Both fakes record each invocation, in order, so a
 test asserts on the commands workmux issued.
 """
 
@@ -50,7 +51,18 @@ def sbx():
     if verb == "ls":
         print(json.dumps(sandboxes))
     elif verb == "policy" and argv[1:2] == ["ls"]:
-        print(json.dumps({"rules": read("rules.json")}))
+        rules = read("rules.json")
+        name = argv[2] if len(argv) > 2 and not argv[2].startswith("-") else None
+        kit = read("kit_resources.json")
+        if kit and any(sandbox["name"] == name for sandbox in sandboxes):
+            rules = rules + [{
+                "scope": "sandbox:" + name,
+                "decision": "allow",
+                "resource_type": "network",
+                "resources": kit,
+                "provenance": {"created_via": "provisioned"},
+            }]
+        print(json.dumps({"rules": rules}))
     elif verb == "diagnose":
         print(json.dumps({"checks": read("checks.json")}))
     elif verb == "template" and argv[1:2] == ["ls"]:
@@ -124,6 +136,7 @@ class FakeSbx:
         (state_dir / "fake_sbx.py").write_text(FAKE_SBX)
         self.sandboxes = []
         self.global_rules = []
+        self.kit_resources = []
         self.checks = passing_checks()
         for program in ("sbx", "docker"):
             install_script(
@@ -159,6 +172,15 @@ class FakeSbx:
     @global_rules.setter
     def global_rules(self, value: list[dict[str, Any]]) -> None:
         self._write("rules.json", value)
+
+    @property
+    def kit_resources(self) -> list[str]:
+        """What the rule each sandbox's kit adds at create allows (`host:port`)."""
+        return self._read("kit_resources.json")
+
+    @kit_resources.setter
+    def kit_resources(self, value: list[str]) -> None:
+        self._write("kit_resources.json", value)
 
     @property
     def checks(self) -> list[dict[str, str]]:
