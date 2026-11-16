@@ -105,9 +105,6 @@ pub fn run(
     }
 
     let (config, config_location) = config::Config::load_with_location(None, config_override)?;
-    if continue_session {
-        crate::sandbox::docker_sbx::check_resume_flag(&config.sandbox, false, "--continue")?;
-    }
     let mux = create_backend(detect_backend());
     let context = WorkflowContext::new(config, mux, config_location)?;
 

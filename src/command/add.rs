@@ -529,18 +529,7 @@ pub fn run(
     )?;
 
     if fork.is_some() {
-        crate::sandbox::docker_sbx::check_resume_flag(
-            &initial_config.sandbox,
-            sandbox_override,
-            "--fork",
-        )?;
-    }
-    if continue_session {
-        crate::sandbox::docker_sbx::check_resume_flag(
-            &initial_config.sandbox,
-            sandbox_override,
-            "--continue",
-        )?;
+        crate::sandbox::docker_sbx::check_fork(&initial_config.sandbox, sandbox_override)?;
     }
 
     // Resolve fork source if --fork is set
