@@ -20,6 +20,7 @@ import pytest
 
 SANDBOX_PREFIX = "wm-learn-"
 FIXTURE_DIR = Path(__file__).parent.parent / "fixtures" / "sbx"
+DOCKER_DIR = Path(__file__).parent.parent.parent / "docker"
 TEMPLATE_TAG = "wm-learn-sbx-claude:latest"
 CREATE_TIMEOUT = float(os.environ.get("WORKMUX_TEST_SBX_CREATE_TIMEOUT", "600"))
 
@@ -119,12 +120,15 @@ class Sandbox:
         script: str,
         *,
         user: Optional[str] = None,
+        workdir: Optional[str] = None,
         env: Optional[dict[str, str]] = None,
         input: Optional[str] = None,
         timeout: float = 120,
     ) -> subprocess.CompletedProcess[str]:
         """Run a shell script in the sandbox with captured, non-TTY stdio."""
-        argv = self.exec_args(["bash", "-c", script], user=user, env=env)
+        argv = self.exec_args(
+            ["bash", "-c", script], user=user, workdir=workdir, env=env
+        )
         return sbx(argv[1:], input=input, timeout=timeout)
 
     def sh_ok(self, script: str, **kwargs: Any) -> str:
@@ -232,6 +236,39 @@ def load_learning_template(agent: str = "claude") -> str:
         check=True,
         capture_output=True,
     )
+    load_into_sbx(tag)
+    return tag
+
+
+@functools.cache
+def load_workmux_template(image: str) -> str:
+    """Build workmux's own sbx layer (`docker/Dockerfile.sbx`, what
+    `workmux sandbox build` puts in a `workmux-sbx:` template) over
+    workmux's image `ghcr.io/raine/workmux-sandbox:<image>` and load it into
+    sbx."""
+    tag = f"wm-learn-wmsbx-{image}:latest"
+    subprocess.run(
+        [
+            "docker",
+            "build",
+            "-q",
+            "--build-arg",
+            f"BASE=ghcr.io/raine/workmux-sandbox:{image}",
+            "-f",
+            str(DOCKER_DIR / "Dockerfile.sbx"),
+            "-t",
+            tag,
+            str(DOCKER_DIR),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    load_into_sbx(tag)
+    return tag
+
+
+def load_into_sbx(tag: str) -> None:
+    """Load a Docker image into sbx's template store."""
     tar = (
         Path(os.environ.get("TMPDIR", "/tmp")) / f"wm-learn-{uuid.uuid4().hex[:6]}.tar"
     )
@@ -245,4 +282,3 @@ def load_learning_template(agent: str = "claude") -> str:
         assert loaded.returncode == 0, loaded.stderr
     finally:
         tar.unlink(missing_ok=True)
-    return tag

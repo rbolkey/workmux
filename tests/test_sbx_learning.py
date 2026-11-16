@@ -25,7 +25,7 @@ import termios
 import threading
 import time
 from pathlib import Path
-from typing import Generator, Iterator, Optional, Sequence
+from typing import Callable, Generator, Iterator, Optional, Sequence
 
 import pytest
 
@@ -34,6 +34,7 @@ from .support.sbx import (
     Sandbox,
     create_sandbox,
     load_learning_template,
+    load_workmux_template,
     new_sandbox_name,
     requires_docker,
     requires_sbx,
@@ -1942,3 +1943,501 @@ def test_claude_kit_no_longer_needs_an_agent_owned_claude_dir(workspace: Path):
     finally:
         tar.unlink(missing_ok=True)
         sbx(["template", "rm", "-f", tag])
+
+
+# --- Agent kits (ticket 16) --------------------------------------------------
+
+# Each kit workmux would create a sandbox for under `agent: kit`: the workmux
+# image its template is built from (workmux has no Copilot image, so its
+# base image stands in), and the config file the kit writes in the
+# sandbox's own home.
+KITS = {
+    "claude": ("claude", ".claude/settings.json"),
+    "codex": ("codex", ".codex/config.toml"),
+    "copilot": ("base", ".copilot/config.json"),
+    "gemini": ("gemini", ".gemini/settings.json"),
+    "opencode": ("opencode", ".config/opencode/opencode.json"),
+}
+
+# The variables each kit sets to sbx's placeholder, and the services it
+# reports a credential mode for (`SBX_CRED_<SERVICE>_MODE`).
+KIT_PLACEHOLDERS = {
+    "claude": ({"MCP_SENTINEL_TOKEN_NAME"}, {"ANTHROPIC"}),
+    "codex": ({"MCP_SENTINEL_TOKEN_NAME", "OPENAI_API_KEY"}, {"OPENAI"}),
+    "copilot": (
+        {"MCP_SENTINEL_TOKEN_NAME", "COPILOT_GITHUB_TOKEN", "GH_TOKEN"},
+        {"COPILOT", "GITHUB"},
+    ),
+    "gemini": ({"MCP_SENTINEL_TOKEN_NAME", "GEMINI_API_KEY"}, {"GOOGLE"}),
+    "opencode": (
+        {
+            "MCP_SENTINEL_TOKEN_NAME",
+            "ANTHROPIC_API_KEY",
+            "GITHUB_TOKEN",
+            "GOOGLE_GENERATIVE_AI_API_KEY",
+            "GROQ_API_KEY",
+            "OPENAI_API_KEY",
+            "OPENROUTER_API_KEY",
+            "XAI_API_KEY",
+        },
+        {"ANTHROPIC", "GITHUB", "GOOGLE", "GROQ", "OPENAI", "OPENROUTER", "XAI"},
+    ),
+}
+
+# Hosts each kit's own sandbox rule allows (a subset; the rule lists more).
+KIT_HOSTS = {
+    "claude": {
+        "api.anthropic.com:443",
+        "claude.com:443",
+        "downloads.claude.ai:443",
+        "mcp-proxy.anthropic.com:443",
+    },
+    "codex": {"api.openai.com:443", "auth.openai.com:443", "chatgpt.com:443"},
+    "copilot": {"api.githubcopilot.com:443", "github.com:443"},
+    "gemini": {"accounts.google.com:443"},
+    "opencode": {"api.anthropic.com:443", "api.openai.com:443", "opencode.ai:443"},
+}
+
+# sbx's credential bindings file: built-in kits that sbx counts as
+# third-party (opencode, copilot) need an entry there for their credentials.
+SBX_BINDINGS = Path.home() / ".config" / "sbx" / "credentials.yaml"
+
+
+def global_secret(service: str) -> bool:
+    return any(
+        secret["scope"] == "global" and secret["name"] == service
+        for secret in sbx_json(["secret", "ls"])["secrets"]
+    )
+
+
+@pytest.fixture(scope="module")
+def wm_templates() -> Generator[Callable[[str], str], None, None]:
+    """workmux's own templates per image, removed after the module."""
+    loaded: set[str] = set()
+
+    def load(image: str) -> str:
+        tag = load_workmux_template(image)
+        loaded.add(tag)
+        return tag
+
+    try:
+        yield load
+    finally:
+        load_workmux_template.cache_clear()
+        for tag in loaded:
+            sbx(["template", "rm", "-f", tag])
+            subprocess.run(["docker", "rmi", "-f", tag], capture_output=True)
+
+
+KitSandbox = tuple[Sandbox, subprocess.CompletedProcess[str]]
+
+
+@pytest.fixture(scope="module")
+def kit_sandboxes(
+    workspace: Path, wm_templates: Callable[[str], str]
+) -> Generator[Callable[[str], KitSandbox], None, None]:
+    """One sandbox per kit from workmux's template, created on first use.
+    Each create also leaves a `sandbox-kit-assembled` template behind."""
+    made: dict[str, KitSandbox] = {}
+
+    def get(kit: str) -> KitSandbox:
+        if kit not in made:
+            template = wm_templates(KITS[kit][0])
+            made[kit] = create_sandbox(
+                f"kit-{kit}",
+                [str(workspace)],
+                agent=kit,
+                extra=["-t", template, "--pull", "never"],
+            )
+        return made[kit]
+
+    with removing_assembled_templates():
+        try:
+            yield get
+        finally:
+            for sandbox, _ in made.values():
+                sandbox.remove()
+
+
+def kit_sandbox(kit_sandboxes: Callable[[str], KitSandbox], kit: str) -> Sandbox:
+    sandbox, created = kit_sandboxes(kit)
+    assert created.returncode == 0, created.stderr
+    return sandbox
+
+
+@requires_docker
+@pytest.mark.parametrize("kit", list(KITS))
+def test_each_kit_sets_its_agent_up_in_workmuxs_template(
+    kit: str, kit_sandboxes: Callable[[str], KitSandbox]
+):
+    """`sbx create <kit> -t <workmux template> --pull never` works for every
+    kit with `docker/Dockerfile.sbx` as it is: the kit writes the agent's
+    config into the sandbox's own home, owned by agent. The agent itself
+    comes from the template, and workmux has no Copilot image."""
+    sandbox = kit_sandbox(kit_sandboxes, kit)
+    config = KITS[kit][1]
+    assert sandbox.sh_ok(f"stat -c %U ~/{config}").strip() == "agent"
+    assert (sandbox.sh(f"command -v {kit}").returncode == 0) == (kit != "copilot")
+
+
+@requires_docker
+@pytest.mark.parametrize("kit", list(KITS))
+def test_every_agent_but_gemini_ships_as_an_inspectable_kit(
+    kit: str, kit_sandboxes: Callable[[str], KitSandbox]
+):
+    """Since v0.51.0 sbx resolves an agent to its kit `docker.io/sbx/<agent>`,
+    saying so on create's stderr. Gemini still has a `sbx create gemini`
+    subcommand of its own, and its kit can't be pulled (401)."""
+    _, created = kit_sandboxes(kit)
+    assert created.returncode == 0, created.stderr
+    notice = f"{kit} — now ships as a kit; resolving docker.io/sbx/{kit}:latest"
+    assert (notice in created.stderr) == (kit != "gemini")
+    inspected = sbx(["kit", "inspect", f"docker.io/sbx/{kit}", "--format", "json"])
+    if kit == "gemini":
+        assert "401" in inspected.stderr
+    else:
+        assert inspected.returncode == 0, inspected.stderr
+        assert json.loads(inspected.stdout)["name"] == kit
+
+
+@requires_docker
+@pytest.mark.parametrize("kit", list(KITS))
+def test_kit_placeholders_reach_a_command_run_as_workmux_runs_it(
+    kit: str, kit_sandboxes: Callable[[str], KitSandbox], workspace: Path
+):
+    """`sbx exec -w <cwd> -e … <name> bash -c <command>`, workmux's exec,
+    gets the kit's placeholder variables as `sbx run` would: sbx sets them
+    for every process in the sandbox, and `sbx run` only execs the agent
+    from /usr/local/lib/sandbox/start-agent with the same BASH_ENV."""
+    sandbox = kit_sandbox(kit_sandboxes, kit)
+    out = sandbox.sh_ok(
+        'echo "$WM_LEARN $PWD"; env',
+        workdir=str(workspace),
+        env={"WM_LEARN": "passed"},
+    )
+    first, *env = out.splitlines()
+    assert first == f"passed {workspace}"
+    placeholders = {
+        line.split("=", 1)[0] for line in env if line.endswith("=proxy-managed")
+    }
+    modes = {
+        line.split("=", 1)[0][len("SBX_CRED_") : -len("_MODE")]
+        for line in env
+        if line.startswith("SBX_CRED_")
+    }
+    assert (placeholders, modes) == KIT_PLACEHOLDERS[kit]
+    assert "exec" in sandbox.sh_ok("cat /usr/local/lib/sandbox/start-agent")
+
+
+@requires_docker
+def test_create_succeeds_with_warnings_on_stderr_for_withheld_credentials(
+    kit_sandboxes: Callable[[str], KitSandbox],
+):
+    """A kit whose credential sbx can't give the agent still creates (exit
+    0) and says why on stderr: Codex with no OpenAI secret (and that a login
+    inside the sandbox stays in that sandbox), and OpenCode and Copilot,
+    which sbx gives no credential at all without a binding in
+    ~/.config/sbx/credentials.yaml. Claude with the user's anthropic secret
+    prints only the kit notice."""
+    if global_secret("openai") or SBX_BINDINGS.exists():
+        pytest.skip("needs no global openai secret and no sbx credential bindings")
+    stderr = {}
+    for kit in ["claude", "codex", "opencode", "copilot"]:
+        _, created = kit_sandboxes(kit)
+        assert created.returncode == 0, created.stderr
+        assert "Created sandbox" in created.stdout
+        stderr[kit] = created.stderr
+    assert [line for line in stderr["claude"].splitlines() if line.strip()] == [
+        "  ○ claude — now ships as a kit; resolving docker.io/sbx/claude:latest"
+    ]
+    assert (
+        "warning: no OpenAI credentials available; codex will start logged-out"
+        in stderr["codex"]
+    )
+    assert (
+        "it stays in that sandbox, so every new codex sandbox starts logged-out"
+        in (stderr["codex"])
+    )
+    assert "try: sbx secret set openai --oauth" in stderr["codex"]
+    assert (
+        "Note: no binding authorizes anthropic, github, google, groq, openai, "
+        "openrouter, xai — the credential was not injected" in stderr["opencode"]
+    )
+    assert (
+        "Note: no binding authorizes copilot, github — the credential was not "
+        "injected" in stderr["copilot"]
+    )
+
+
+@requires_docker
+@pytest.mark.parametrize("kit", list(KITS))
+def test_kit_rule_is_one_provisioned_rule_workmux_can_tell_from_its_own(
+    kit: str, kit_sandboxes: Callable[[str], KitSandbox]
+):
+    """`sbx policy ls <name> --json` lists the kit's hosts as one rule named
+    `kit:<sandbox>`, provisioned by sbx and not editable; a rule workmux
+    adds is named by its ID, editable and `added`."""
+    sandbox = kit_sandbox(kit_sandboxes, kit)
+    [kit_rule] = sandbox.local_rules()
+    assert {
+        key: kit_rule[key] for key in ["name", "decision", "editable", "provenance"]
+    } == {
+        "name": f"kit:{sandbox.name}",
+        "decision": "allow",
+        "editable": False,
+        "provenance": {"created_via": "provisioned", "source": "sandboxes"},
+    }
+    assert KIT_HOSTS[kit] <= set(kit_rule["resources"])
+
+    added = sandbox.allow("example.com:443")
+    assert added.returncode == 0, added.stderr
+    try:
+        [own] = [r for r in sandbox.local_rules() if r["id"] != kit_rule["id"]]
+        assert (own["name"], own["editable"], own["provenance"]) == (
+            own["id"],
+            True,
+            {"created_via": "added"},
+        )
+    finally:
+        sandbox.remove_rule("example.com:443")
+
+
+@pytest.fixture(scope="module")
+def claude_with_api_key(
+    workspace: Path, wm_templates: Callable[[str], str]
+) -> Generator[Sandbox, None, None]:
+    """A claude kit sandbox whose dummy anthropic API key was scoped to it
+    before it was created (sbx removes the secret with the sandbox)."""
+    sandbox = Sandbox(new_sandbox_name("kit-key"))
+    with removing_assembled_templates():
+        yield from _claude_with_api_key(sandbox, workspace, wm_templates)
+
+
+def _claude_with_api_key(
+    sandbox: Sandbox, workspace: Path, wm_templates: Callable[[str], str]
+) -> Generator[Sandbox, None, None]:
+    stored = sbx(
+        ["secret", "set", "anthropic", "--sandbox", sandbox.name],
+        input="wm-learn-dummy-anthropic\n",
+    )
+    assert stored.returncode == 0, stored.stderr
+    created = sbx(
+        [
+            "create",
+            "--name",
+            sandbox.name,
+            "--no-progress",
+            "-t",
+            wm_templates("claude"),
+            "--pull",
+            "never",
+            "claude",
+            str(workspace),
+        ],
+        timeout=CREATE_TIMEOUT,
+    )
+    try:
+        assert created.returncode == 0, created.stderr
+        yield sandbox
+    finally:
+        sandbox.remove()
+        sbx(["secret", "rm", "anthropic", "--sandbox", sandbox.name, "-f"])
+
+
+# Claude retries a 401 for minutes unless told not to.
+CLAUDE_PROMPT = (
+    "CLAUDE_CODE_MAX_RETRIES=0 timeout 120 claude -p 'say hi' </dev/null 2>&1"
+)
+
+
+@requires_docker
+def test_claude_kit_sends_its_sandbox_scoped_api_key_under_workmuxs_exec(
+    claude_with_api_key: Sandbox, workspace: Path
+):
+    """With an anthropic API key scoped to the sandbox, the claude kit sets
+    `apiKeyHelper` to print the placeholder, and the proxy swaps the
+    secret in ("Invalid API key", the dummy, not a missing one)."""
+    sandbox = claude_with_api_key
+    out = sandbox.sh(CLAUDE_PROMPT, workdir=str(workspace), timeout=180).stdout
+    assert "Invalid API key" in out
+    assert intercepted(sandbox, "api.anthropic.com")
+    settings = json.loads(sandbox.sh_ok("cat ~/.claude/settings.json"))
+    assert settings["apiKeyHelper"] == "echo proxy-managed"
+    assert sandbox.sh_ok("echo $SBX_CRED_ANTHROPIC_MODE").strip() == "apikey"
+
+
+@requires_docker
+def test_codex_kit_sends_a_secret_set_after_create(
+    kit_sandboxes: Callable[[str], KitSandbox], workspace: Path
+):
+    """A sandbox-scoped openai secret set on a running codex sandbox reaches
+    Codex at once through the kit's `OPENAI_API_KEY` placeholder, though
+    the kit's recorded credential mode stays what it was at create."""
+    sandbox = kit_sandbox(kit_sandboxes, "codex")
+    with dummy_secrets(sandbox, ["openai"]):
+        time.sleep(3)
+        out = sandbox.sh(
+            "timeout 150 codex exec --skip-git-repo-check 'say hi' </dev/null 2>&1",
+            workdir=str(workspace),
+            timeout=180,
+        ).stdout
+        assert "Incorrect API key provided: wm-learn" in out
+        assert sandbox.sh_ok("echo $SBX_CRED_OPENAI_MODE").strip() == "none"
+
+
+@requires_docker
+def test_gemini_kit_sends_its_placeholder_api_key_to_the_proxy(
+    kit_sandboxes: Callable[[str], KitSandbox], workspace: Path
+):
+    sandbox = kit_sandbox(kit_sandboxes, "gemini")
+    with dummy_secrets(sandbox, ["google"]):
+        time.sleep(3)
+        out = sandbox.sh(
+            "timeout 120 gemini -p 'say hi' </dev/null 2>&1",
+            workdir=str(workspace),
+            timeout=180,
+        ).stdout
+        assert "API_KEY_INVALID" in out
+        assert intercepted(sandbox, "generativelanguage.googleapis.com")
+
+
+@requires_docker
+def test_opencode_kit_gets_no_credential_without_a_binding(
+    kit_sandboxes: Callable[[str], KitSandbox], workspace: Path
+):
+    """Without a binding, sbx intercepts OpenCode's requests but sends no
+    credential, even with a secret scoped to the sandbox."""
+    if SBX_BINDINGS.exists():
+        pytest.skip("sbx credential bindings exist")
+    sandbox = kit_sandbox(kit_sandboxes, "opencode")
+    with dummy_secrets(sandbox, ["openai"]):
+        time.sleep(3)
+        out = sandbox.sh(
+            "timeout 120 opencode run -m openai/gpt-4o-mini 'say hi' </dev/null 2>&1",
+            workdir=str(workspace),
+            timeout=180,
+        ).stdout
+        assert "Missing bearer or basic authentication" in out
+        assert intercepted(sandbox, "api.openai.com")
+
+
+@requires_docker
+def test_kits_seed_onboarding_and_hooks_calling_helpers_the_template_lacks(
+    kit_sandboxes: Callable[[str], KitSandbox], workspace: Path
+):
+    """The claude kit completes onboarding, trusts the workspace and bypasses
+    permissions in the sandbox's own config, and adds its own hooks and
+    status line; codex's kit adds a `notify` command. Both call helpers
+    that live in the kits' own images, not in workmux's template."""
+    claude = kit_sandbox(kit_sandboxes, "claude")
+    state = json.loads(claude.sh_ok("cat ~/.claude.json"))
+    assert state["hasCompletedOnboarding"] is True
+    assert state["projects"][str(workspace)]["hasTrustDialogAccepted"] is True
+    settings = json.loads(claude.sh_ok("cat ~/.claude/settings.json"))
+    assert settings["permissions"]["defaultMode"] == "bypassPermissions"
+    commands = {
+        hook["command"]
+        for groups in settings["hooks"].values()
+        for group in groups
+        for hook in group["hooks"]
+    }
+    assert commands == {"/usr/local/bin/sbx-claude-hook claude"}
+    assert sorted(settings["hooks"]) == [
+        "Notification",
+        "Stop",
+        "StopFailure",
+        "UserPromptSubmit",
+    ]
+    assert claude.sh("test -e /usr/local/bin/sbx-claude-hook").returncode != 0
+
+    codex = kit_sandbox(kit_sandboxes, "codex")
+    config = codex.sh_ok("cat ~/.codex/config.toml")
+    assert 'notify = ["/usr/local/bin/sbx-codex-hook", "codex"]' in config
+    assert codex.sh("test -e /usr/local/bin/sbx-codex-hook").returncode != 0
+
+
+@pytest.fixture
+def rpc_server() -> Iterator[tuple[int, list[tuple[dict, dict]]]]:
+    """A stand-in for workmux's RPC server on the workstation's loopback:
+    records each (auth header, request) and answers Ok."""
+    server = socket.socket()
+    server.bind(("127.0.0.1", 0))
+    server.listen(8)
+    server.settimeout(0.5)
+    port = server.getsockname()[1]
+    received: list[tuple[dict, dict]] = []
+    stop = threading.Event()
+
+    def serve() -> None:
+        while not stop.is_set():
+            try:
+                conn, _ = server.accept()
+            except socket.timeout:
+                continue
+            with conn, conn.makefile("rwb") as stream:
+                auth, request = stream.readline(), stream.readline()
+                received.append((json.loads(auth), json.loads(request)))
+                stream.write(b'{"type":"Ok"}\n')
+                stream.flush()
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    try:
+        yield port, received
+    finally:
+        stop.set()
+        thread.join()
+        server.close()
+
+
+PLUGIN_JSON = Path(__file__).parent.parent / ".claude-plugin" / "plugin.json"
+
+# Append workmux's hook groups (stdin) to the kit's in ~/.claude/settings.json.
+MERGE_HOOKS = (
+    "cat > /tmp/wm-hooks.json && jq --slurpfile wm /tmp/wm-hooks.json "
+    "'reduce ($wm[0] | to_entries[]) as $e (.; .hooks[$e.key] += $e.value)' "
+    "~/.claude/settings.json > /tmp/settings.json "
+    "&& cp /tmp/settings.json ~/.claude/settings.json"
+)
+
+
+@requires_docker
+def test_workmux_hooks_written_into_the_kits_settings_reach_the_host_over_rpc(
+    claude_with_api_key: Sandbox,
+    workspace: Path,
+    rpc_server: tuple[int, list[tuple[dict, dict]]],
+):
+    """workmux's Claude hooks, appended to the kit's settings.json with an
+    exec (no `workmux setup`, which needs a terminal and asks), run beside
+    the kit's own and reach the workstation through the image's workmux
+    over RPC. The edit survives the sandbox stopping."""
+    sandbox = claude_with_api_key
+    port, received = rpc_server
+    assert sandbox.allow(f"localhost:{port}").returncode == 0
+    hooks = json.loads(PLUGIN_JSON.read_text())["hooks"]
+    sandbox.sh_ok(MERGE_HOOKS, input=json.dumps(hooks))
+    sandbox.stop()
+
+    settings = json.loads(sandbox.sh_ok("cat ~/.claude/settings.json"))
+    commands = [
+        hook["command"]
+        for group in settings["hooks"]["UserPromptSubmit"]
+        for hook in group["hooks"]
+    ]
+    assert commands == [
+        "/usr/local/bin/sbx-claude-hook claude",
+        "workmux set-window-status working",
+    ]
+    rpc_env = {
+        "WM_SANDBOX_GUEST": "1",
+        "WM_RPC_HOST": "host.docker.internal",
+        "WM_RPC_PORT": str(port),
+        "WM_RPC_TOKEN": "wm-learn-token",
+    }
+    sandbox.sh(CLAUDE_PROMPT, workdir=str(workspace), env=rpc_env, timeout=180)
+    assert wait_for(lambda: len(received) >= 2, timeout=10)
+    assert all(auth == {"token": "wm-learn-token"} for auth, _ in received)
+    assert [request for _, request in received][:2] == [
+        {"type": "SetStatus", "status": "register"},
+        {"type": "SetStatus", "status": "working", "prompt": "say hi"},
+    ]
