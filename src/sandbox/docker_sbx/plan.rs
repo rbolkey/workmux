@@ -988,6 +988,69 @@ fn network_warnings(config: &SandboxConfig, state: &SbxState, name: &str) -> Vec
     warnings
 }
 
+/// Whether `allowed` (`allowed_domains` hosts) covers an sbx resource
+/// (`host:port`, `*.d` for one label, `**.d` for `d` and any depth). Only
+/// port 443, the only port `allowed_domains` allows.
+fn resource_covered(allowed: &[String], resource: &str) -> bool {
+    let Some((host, "443")) = resource.rsplit_once(':') else {
+        return false;
+    };
+    let host = host.to_ascii_lowercase();
+    match host.strip_prefix("**.") {
+        Some(base) => host_allowed(allowed, base) && host_allowed(allowed, &format!("*.{base}")),
+        None => host_allowed(allowed, &host),
+    }
+}
+
+/// Under `deny`, what the rules sbx's kits added to the sandbox (the agent
+/// kit's and any mixin kit's) allow that `allowed_domains` doesn't cover,
+/// as a warning; for every launch, and again after a launch creates the
+/// sandbox, since the kit adds them at create. A kit's rule is scoped to
+/// the sandbox and `provisioned`; the user's rules and workmux's are
+/// `added`. A resource workmux's own rules (`network_rules`, its record
+/// after the launch) name isn't counted either: workmux's allow is its own,
+/// and its deny (a wildcard's base) wins over the kit's allow. workmux never
+/// removes a kit's rules: the kit needs them.
+pub fn kit_rule_warnings(
+    config: &SandboxConfig,
+    rules: &[SbxRule],
+    name: &str,
+    network_rules: &[NetworkRule],
+) -> Vec<String> {
+    if !config.network_policy_is_deny() {
+        return Vec::new();
+    }
+    let scope = format!("sandbox:{name}");
+    let allowed = allowed_hosts(config);
+    let mut uncovered: Vec<&str> = Vec::new();
+    let kit_resources = rules
+        .iter()
+        .filter(|rule| {
+            rule.scope == scope
+                && rule.decision == "allow"
+                && rule.resource_type == "network"
+                && rule.provenance.created_via == "provisioned"
+        })
+        .flat_map(|rule| &rule.resources);
+    for resource in kit_resources {
+        let recorded = network_rules.iter().any(|own| own.resource == *resource);
+        if !recorded && !resource_covered(&allowed, resource) && !uncovered.contains(&&**resource) {
+            uncovered.push(resource);
+        }
+    }
+    if uncovered.is_empty() {
+        return Vec::new();
+    }
+    vec![format!(
+        "sandbox.network.policy is deny, but the rules sbx's kits added to this sandbox also \
+         allow {}, which sandbox.network.allowed_domains doesn't cover \
+         (`sbx policy ls {name}` lists them). workmux never removes a kit's rules, which the \
+         kit needs; list your agent's API domains in allowed_domains (it covers port 443 \
+         only) to keep this warning to the rest.",
+        uncovered.join(", ")
+    )]
+}
+
 /// Fail closed when a project's `.workmux.yaml` chose docker_sbx for a
 /// global `deny` that sbx's global policy would widen: a repository can
 /// lower its own sandbox's protection only with the user's say-so.
@@ -1573,6 +1636,12 @@ pub fn launch_plan(
         warnings: check_warnings(state)
             .into_iter()
             .chain(network_warnings(config, state, name))
+            .chain(kit_rule_warnings(
+                config,
+                &state.rules,
+                name,
+                &network_rules,
+            ))
             .chain(credential_warnings(config, state, name, exec))
             .chain(kit.map_or_else(Vec::new, |kit| agent_env_warnings(target, kit)))
             .chain(predates_record)
@@ -1594,6 +1663,7 @@ mod tests {
         AllowedDomainDetails, AllowedDomainEntry, DockerSbxAgent, DockerSbxConfig, ExtraMount,
         NetworkConfig, NetworkPolicy,
     };
+    use crate::sandbox::docker_sbx::instance::SbxRuleProvenance;
     use std::path::PathBuf;
 
     fn args(words: &[&str]) -> Vec<String> {
@@ -2062,6 +2132,9 @@ mod tests {
             decision: "allow".to_string(),
             resource_type: "network".to_string(),
             resources: vec![resource.to_string()],
+            provenance: SbxRuleProvenance {
+                created_via: "added".to_string(),
+            },
         }
     }
 
@@ -2555,6 +2628,111 @@ mod tests {
         );
         let plan = launch_plan(&config, &target(&p), "claude", &deny_all, &exec()).unwrap();
         assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
+    }
+
+    /// The rule an agent kit adds when sbx creates the sandbox for it, as
+    /// `sbx policy ls <name> --json` lists it.
+    fn kit_rule(resources: &[&str]) -> SbxRule {
+        SbxRule {
+            scope: SCOPE.to_string(),
+            decision: "allow".to_string(),
+            resource_type: "network".to_string(),
+            resources: args(resources),
+            provenance: SbxRuleProvenance {
+                created_via: "provisioned".to_string(),
+            },
+        }
+    }
+
+    /// Some of the claude kit's hosts, as ticket 16 saw them.
+    const CLAUDE_KIT_HOSTS: &[&str] = &[
+        "api.anthropic.com:443",
+        "claude.com:443",
+        "downloads.claude.ai:443",
+        "deb.debian.org:80",
+    ];
+
+    /// An existing sandbox created under `agent: kit`.
+    fn kit_paths() -> Paths {
+        Paths {
+            created: Some(CreateSettings {
+                agent_mode: DockerSbxAgent::Kit,
+                agent_config_dir: None,
+                ..created_settings()
+            }),
+            ..paths()
+        }
+    }
+
+    fn kit_network(policy: NetworkPolicy, domains: Vec<AllowedDomainEntry>) -> SandboxConfig {
+        let mut config = with_network(policy, domains);
+        config.agent_config_dir = None;
+        config.docker_sbx.agent = Some(DockerSbxAgent::Kit);
+        config
+    }
+
+    /// The warnings about kit rules, without the private-address one.
+    fn kit_warnings(plan: &LaunchPlan) -> Vec<&String> {
+        plan.warnings.iter().filter(|w| w.contains("kit")).collect()
+    }
+
+    #[test]
+    fn deny_warns_on_every_launch_with_the_kit_hosts_allowed_domains_doesnt_cover() {
+        // allowed_domains allows port 443 only, so a kit's `:80` host stays
+        // uncovered. workmux denies a wildcard's base (`claude.com:443`),
+        // and sbx's deny wins over the kit's allow.
+        let mut p = kit_paths();
+        p.record = vec![recorded(RuleDecision::Allow, "dropped.com:443")];
+        let config = kit_network(
+            NetworkPolicy::Deny,
+            domains(&["api.anthropic.com", "*.claude.com", "deb.debian.org"]),
+        );
+        // workmux's own stale rule and the user's rule aren't the kit's.
+        let state = running_with(vec![
+            kit_rule(CLAUDE_KIT_HOSTS),
+            rule(SCOPE, "dropped.com:443"),
+            rule(SCOPE, "users-own.com:443"),
+        ]);
+        let plan = launch_plan(&config, &target(&p), "claude", &state, &exec()).unwrap();
+
+        let warnings = kit_warnings(&plan);
+        assert_eq!(warnings.len(), 1, "{:?}", plan.warnings);
+        let warning = warnings[0];
+        for expected in [
+            "also allow downloads.claude.ai:443, deb.debian.org:80, which",
+            "sbx policy ls wm-proj-12345678",
+            "allowed_domains",
+        ] {
+            assert!(warning.contains(expected), "{expected}: {warning}");
+        }
+        for unexpected in ["api.anthropic.com", "dropped.com", "users-own.com"] {
+            assert!(!warning.contains(unexpected), "{unexpected}: {warning}");
+        }
+        // workmux never removes them.
+        let commands = policy_commands(&plan);
+        assert_eq!(
+            commands.iter().filter(|c| c[1] == "rm").collect::<Vec<_>>(),
+            vec![&policy("rm", "dropped.com:443")],
+        );
+    }
+
+    #[test]
+    fn no_kit_host_warning_under_allow_or_when_allowed_domains_covers_them() {
+        let p = kit_paths();
+        let state = running_with(vec![kit_rule(&[
+            "api.anthropic.com:443",
+            "claude.com:443",
+            "**.anthropic.com:443",
+        ])]);
+        let allow = kit_network(NetworkPolicy::Allow, Vec::new());
+        let covered = kit_network(
+            NetworkPolicy::Deny,
+            domains(&["claude.com", "anthropic.com", "*.anthropic.com"]),
+        );
+        for config in [allow, covered] {
+            let plan = launch_plan(&config, &target(&p), "claude", &state, &exec()).unwrap();
+            assert!(kit_warnings(&plan).is_empty(), "{:?}", plan.warnings);
+        }
     }
 
     #[test]

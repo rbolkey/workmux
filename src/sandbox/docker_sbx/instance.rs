@@ -63,6 +63,18 @@ pub struct SbxRule {
     pub resource_type: String,
     #[serde(default)]
     pub resources: Vec<String>,
+    /// How the rule came to be: `added` (`sbx policy allow`/`deny`, by
+    /// workmux or the user), `provisioned` (by a kit, at create), or
+    /// `default` (the global policy).
+    #[serde(default)]
+    pub provenance: SbxRuleProvenance,
+}
+
+/// A rule's `provenance` from `sbx policy ls --json`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SbxRuleProvenance {
+    #[serde(default)]
+    pub created_via: String,
 }
 
 /// A secret from `sbx secret ls --json`: its service and scope, never its
@@ -711,6 +723,25 @@ pub fn prepare_launch(
         warn!(sandbox = %name, notice, "sbx create notice");
         eprintln!("sbx: {notice}");
     }
+    // The plan saw the rules from before the sandbox existed; its kits add
+    // theirs at create.
+    if plan.create.is_some() && config.sandbox.network_policy_is_deny() {
+        match list_sandbox_and_rules(&name) {
+            Ok((_, rules)) => {
+                let warnings = super::plan::kit_rule_warnings(
+                    &config.sandbox,
+                    &rules,
+                    &name,
+                    &plan.network_rules,
+                );
+                for warning in &warnings {
+                    warn!(sandbox = %name, warning, "sbx launch warning");
+                    eprintln!("warning: {warning}");
+                }
+            }
+            Err(e) => debug!(sandbox = %name, error = %e, "failed to list sbx rules after create"),
+        }
+    }
     Ok(plan)
 }
 
@@ -970,6 +1001,9 @@ mod tests {
         assert_eq!(rules.len(), 2);
         assert_eq!(rules[1].scope, "sandbox:wm-proj-1");
         assert_eq!(rules[1].resources, vec!["localhost".to_string()]);
+        // How it came to be tells a kit's rule from the user's and workmux's.
+        assert_eq!(rules[0].provenance.created_via, "default");
+        assert_eq!(rules[1].provenance.created_via, "");
     }
 
     #[test]
