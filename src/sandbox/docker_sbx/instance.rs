@@ -73,17 +73,6 @@ pub struct SbxSecret {
     pub scope: String,
     /// The service, such as `github`.
     pub name: String,
-    /// What's stored, never the value: `(stored)` for an API key or token,
-    /// `(oauth configured)` for an OAuth login.
-    #[serde(default)]
-    pub secret: String,
-}
-
-impl SbxSecret {
-    /// Whether the secret is an OAuth login rather than an API key.
-    pub fn is_oauth(&self) -> bool {
-        self.secret == "(oauth configured)"
-    }
 }
 
 /// A check from `sbx diagnose --json`.
@@ -340,15 +329,14 @@ fn list_sandbox_and_rules(name: &str) -> Result<(Option<SbxSandboxInfo>, Vec<Sbx
     Ok((sandbox, rules))
 }
 
-/// Secret names and scopes from `sbx secret ls`, never values, or sbx's
-/// error when listing them failed. The credential warnings are advisory
-/// and leave a failure out; placeholder agent credentials fail on it.
-fn list_secrets() -> Result<(Vec<SbxSecret>, Option<String>)> {
+/// Secret names and scopes from `sbx secret ls`, never values. Advisory
+/// only: a listing failure leaves the credential warnings out.
+fn list_secrets() -> Result<Vec<SbxSecret>> {
     match sbx_json(&["secret", "ls"]) {
-        Ok(stdout) => Ok((parse_sbx_secrets(&stdout)?, None)),
+        Ok(stdout) => parse_sbx_secrets(&stdout),
         Err(e) => {
             debug!(error = %e, "failed to list sbx secrets");
-            Ok((Vec::new(), Some(e.to_string())))
+            Ok(Vec::new())
         }
     }
 }
@@ -377,14 +365,13 @@ pub fn gather_state(name: &str) -> Result<SbxState> {
     });
     let checks = checks?;
     let (sandbox, rules) = sandbox_and_rules?;
-    let (secrets, secrets_error) = secrets?;
+    let secrets = secrets?;
     Ok(SbxState {
         platform,
         checks,
         sandbox,
         rules,
         secrets,
-        secrets_error,
     })
 }
 
@@ -858,8 +845,6 @@ mod tests {
             services,
             vec![("global", "anthropic"), ("wm-proj-1", "github")]
         );
-        assert!(secrets[0].is_oauth());
-        assert!(!secrets[1].is_oauth());
     }
 
     #[test]
@@ -905,19 +890,28 @@ mod tests {
     }
 
     #[test]
-    fn records_from_before_placeholders_read_as_credential_mounts() {
+    fn records_from_placeholder_credentials_still_load() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join(CREATED_RECORD_FILE),
-            r#"{"agent":"claude","template":"t","toolchain":"none"}"#,
+            r#"{"agent":"claude","agent_config_dir":"/home/me/.claude",
+                "excluded_files":["/code/wt/.env"],
+                "agent_credentials":"placeholder",
+                "credential_placeholders":[{"target":"/home/agent/.claude/.credentials.json","contents":"{}"}],
+                "template":"t","toolchain":"none"}"#,
         )
         .unwrap();
-        let record = read_created_record(dir.path()).unwrap();
         assert_eq!(
-            record.agent_credentials,
-            crate::config::AgentCredentials::Mount
+            read_created_record(dir.path()),
+            Some(CreateSettings {
+                agent: "claude".to_string(),
+                agent_config_dir: Some(PathBuf::from("/home/me/.claude")),
+                excluded_files: vec![PathBuf::from("/code/wt/.env")],
+                template: "t".to_string(),
+                toolchain: "none".to_string(),
+                ..Default::default()
+            })
         );
-        assert!(record.credential_placeholders.is_empty());
     }
 
     #[test]

@@ -1,16 +1,15 @@
 //! The launch plan: what a pane launch asks of sbx.
 //!
 //! [`launch_plan`] is pure, but for checking whether a writable extra mount
-//! is a file and which excluded files and agent credential files exist.
-//! Callers gather sbx's state (see [`super::instance::gather_state`]),
-//! compute the plan, run its setup commands, then run its exec in the
-//! foreground.
+//! is a file and which excluded files exist. Callers gather sbx's state (see
+//! [`super::instance::gather_state`]), compute the plan, run its setup
+//! commands, then run its exec in the foreground.
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::path::{Component, Path, PathBuf};
 
-use crate::config::{AgentCredentials, SandboxConfig};
+use crate::config::SandboxConfig;
 use crate::sandbox::toolchain::{self, DetectedToolchain};
 use crate::shell::shell_quote;
 
@@ -41,8 +40,6 @@ pub struct SbxState {
     pub rules: Vec<SbxRule>,
     /// Secrets from `sbx secret ls --json`: names and scopes, never values.
     pub secrets: Vec<SbxSecret>,
-    /// sbx's error when `sbx secret ls` failed, leaving `secrets` empty.
-    pub secrets_error: Option<String>,
 }
 
 /// The worktree a launch is for, with the host paths the plan mounts.
@@ -81,7 +78,9 @@ pub struct LaunchTarget<'a> {
 }
 
 /// What a sandbox is created with and later launches can't change, as
-/// recorded in its state directory once it's fully set up.
+/// recorded in its state directory once it's fully set up. Fields an older
+/// record holds that are no longer kept, such as `agent_credentials`, are
+/// ignored when it's read.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CreateSettings {
@@ -94,11 +93,6 @@ pub struct CreateSettings {
     pub extra_mounts: Vec<String>,
     /// The files `sandbox.container.excluded_files` masked.
     pub excluded_files: Vec<PathBuf>,
-    /// `docker_sbx.agent_credentials`.
-    pub agent_credentials: AgentCredentials,
-    /// The placeholders over the agent's credential files, which hold no
-    /// secret.
-    pub credential_placeholders: Vec<Mask>,
     pub cpus: Option<u32>,
     pub memory: Option<String>,
     pub kits: Vec<String>,
@@ -202,8 +196,7 @@ pub struct LaunchPlan {
     /// Creates the sandbox, when it's missing.
     pub create: Option<CreateStep>,
     /// Files mounted over others when the plan creates the sandbox
-    /// (`excluded_files`, and under placeholder mode the agent's credential
-    /// files), whose sources must be written (see
+    /// (`excluded_files`), whose sources must be written (see
     /// [`super::mask::write_masks`]) before `create` runs.
     pub masks: Vec<Mask>,
     /// Commands to run, in order, after `create` and before `exec`.
@@ -354,13 +347,8 @@ fn words(words: &[&str]) -> Vec<String> {
 /// The interactive `sbx exec` that runs the command in the pane's working
 /// directory, with a terminal when stdin is one. Values travel in the
 /// process environment; argv names them only.
-fn exec_command(
-    target: &LaunchTarget,
-    exec: &ExecRequest,
-    placeholder_env: &[(String, String)],
-) -> SbxCommand {
+fn exec_command(target: &LaunchTarget, exec: &ExecRequest) -> SbxCommand {
     let mut env = exec.env.clone();
-    env.extend(placeholder_env.iter().cloned());
     keep_sbx_git_config(&mut env);
     env.push((SESSION_ENV.to_string(), exec.session.clone()));
     let interactive = if exec.tty { "-it" } else { "-i" };
@@ -841,17 +829,28 @@ fn credential_service(var: &str) -> Option<&'static str> {
     }
 }
 
+/// The value an agent sends in place of a credential sbx's proxy supplies,
+/// as sbx's own agent kits write it. A variable holding it carries no
+/// credential.
+const PROXY_MANAGED: &str = "proxy-managed";
+
 /// Variables from `sandbox.env` and `sandbox.env_passthrough` the exec
 /// passes that hold a credential sbx already holds a secret for, globally
 /// or for this sandbox. sbx's proxy would inject it with the agent holding
-/// only a placeholder; passed in, the agent holds the real value.
+/// only a placeholder; passed in, the agent holds the real value. A
+/// variable passing sbx's own placeholder holds no credential: tools that
+/// require the variable can be given it that way.
 fn credential_warnings(
     config: &SandboxConfig,
     state: &SbxState,
     name: &str,
     exec: &ExecRequest,
 ) -> Vec<String> {
-    let passed = |var: &str| exec.env.iter().any(|(key, _)| key == var);
+    let passed = |var: &str| {
+        exec.env
+            .iter()
+            .any(|(key, value)| key == var && value != PROXY_MANAGED)
+    };
     let configured = config
         .env_vars()
         .into_iter()
@@ -879,279 +878,6 @@ fn credential_warnings(
         }
     }
     warnings
-}
-
-/// The value an agent sends in place of a credential sbx's proxy supplies,
-/// as sbx's own agent kits write it.
-const PROXY_MANAGED: &str = "proxy-managed";
-
-/// What an agent sees in place of its agent credential under
-/// `agent_credentials: placeholder`.
-#[derive(Debug, Default)]
-struct Placeholders {
-    /// Placeholders mounted over the agent's credential files.
-    masks: Vec<Mask>,
-    /// Placeholder values for the variables the agent reads its key from.
-    env: Vec<(String, String)>,
-}
-
-/// A credential file in the agent's config directory and the placeholder
-/// over it.
-struct CredentialFile {
-    /// Relative to the config directory.
-    file: &'static str,
-    contents: String,
-    /// Whether the agent needs the placeholder to use sbx's secret, rather
-    /// than it only hiding the file.
-    needed: bool,
-}
-
-/// The providers OpenCode reaches with an API key sbx can hold, and the
-/// variable it reads each key from, as sbx's opencode kit lists them.
-const OPENCODE_PROVIDER_KEYS: &[(&str, &str)] = &[
-    ("anthropic", "ANTHROPIC_API_KEY"),
-    ("openai", "OPENAI_API_KEY"),
-    ("google", "GOOGLE_GENERATIVE_AI_API_KEY"),
-    ("groq", "GROQ_API_KEY"),
-    ("openrouter", "OPENROUTER_API_KEY"),
-    ("xai", "XAI_API_KEY"),
-];
-
-/// The sbx services whose secrets serve the agent's credential under
-/// placeholder mode.
-fn agent_services(agent: &str) -> Vec<&'static str> {
-    match agent {
-        "claude" => vec!["anthropic"],
-        "codex" => vec!["openai"],
-        "gemini" => vec!["google"],
-        "opencode" => OPENCODE_PROVIDER_KEYS
-            .iter()
-            .map(|(service, _)| *service)
-            .collect(),
-        _ => Vec::new(),
-    }
-}
-
-/// Whether sbx holds an API key for `service` serving the sandbox, which
-/// gets OpenCode a placeholder key for that provider.
-fn opencode_serves(state: &SbxState, name: &str, service: &str) -> bool {
-    service_secret(state, name, service).is_some_and(|secret| !secret.is_oauth())
-}
-
-/// Fail if `sandbox.env` or `sandbox.env_passthrough` would hand the agent
-/// its own credential, which placeholder mode keeps from it: for OpenCode,
-/// the keys of the providers sbx serves it; another provider's key is the
-/// user's own, as under credential mounts. Unlike a tool credential's
-/// warning, this doesn't depend on the variable being set.
-fn check_agent_credential_env(
-    config: &SandboxConfig,
-    agent: &str,
-    state: &SbxState,
-    name: &str,
-) -> Result<()> {
-    let services: Vec<&str> = agent_services(agent)
-        .into_iter()
-        .filter(|service| agent != "opencode" || opencode_serves(state, name, service))
-        .collect();
-    let configured = config
-        .env_vars()
-        .into_iter()
-        .map(|(var, _)| ("sandbox.env", var))
-        .chain(
-            config
-                .env_passthrough()
-                .into_iter()
-                .map(|var| ("sandbox.env_passthrough", var)),
-        );
-    for (setting, var) in configured {
-        if let Some(service) = credential_service(var).filter(|s| services.contains(s)) {
-            bail!(
-                "{setting} passes {var} into the sandbox, handing {agent} its own credential, \
-                 which docker_sbx.agent_credentials: placeholder keeps from it. Remove {var} \
-                 from {setting}; sbx supplies it from `sbx secret set {service}`."
-            );
-        }
-    }
-    Ok(())
-}
-
-/// The sbx secret serving `service` in the sandbox: its own, or else the
-/// global one.
-fn service_secret<'a>(state: &'a SbxState, name: &str, service: &str) -> Option<&'a SbxSecret> {
-    let held = |scope: &str| {
-        state
-            .secrets
-            .iter()
-            .find(|secret| secret.name == service && secret.scope == scope)
-    };
-    held(name).or_else(|| held("global"))
-}
-
-/// sbx's claude kit's credential file for an OAuth login, holding sentinels
-/// the proxy swaps for the real tokens. It expires far ahead: the mask is
-/// read-only, so Claude must never refresh it itself.
-fn claude_oauth_sentinels() -> String {
-    serde_json::json!({
-        "claudeAiOauth": {
-            "accessToken": "sk-ant-oat01-proxy-managed",
-            "refreshToken": "sk-ant-ort01-proxy-managed",
-            "expiresAt": 4_102_444_800_000u64,
-            "scopes": ["user:inference", "user:profile"],
-        }
-    })
-    .to_string()
-}
-
-/// The placeholders standing in for the agent's credential, from the sbx
-/// secret that serves it. A credential file missing on the host is masked
-/// only when the agent needs its placeholder, and then it's an error: sbx
-/// would create the file in the workstation's config directory.
-fn agent_placeholders(
-    config: &SandboxConfig,
-    agent: &str,
-    state: &SbxState,
-    name: &str,
-) -> Result<Placeholders> {
-    let mut placeholders = Placeholders::default();
-    let Some((config_dir, subpath)) = config_dir_and_home_subpath(config, agent) else {
-        return Ok(placeholders);
-    };
-    check_agent_credential_env(config, agent, state, name)?;
-    // Without the listing, sbx can't tell whether it holds the secret.
-    if let Some(error) = &state.secrets_error
-        && !agent_services(agent).is_empty()
-    {
-        bail!(
-            "docker_sbx.agent_credentials: placeholder needs the sbx secret serving \
-             {agent}'s credential, but listing sbx's secrets failed: {error}"
-        );
-    }
-    let missing = |service: &str| {
-        anyhow!(
-            "sbx holds no secret for {service}, which serves {agent}'s credential under \
-             docker_sbx.agent_credentials: placeholder. Store it with \
-             `sbx secret set {service}`, or set docker_sbx.agent_credentials: mount."
-        )
-    };
-    let mut files = Vec::new();
-    match agent {
-        // sbx's claude kit writes OAuth sentinels for a login, and for an
-        // API key an `apiKeyHelper` printing the placeholder, which in the
-        // workstation's settings becomes the variable Claude also reads.
-        "claude" => {
-            let secret =
-                service_secret(state, name, "anthropic").ok_or_else(|| missing("anthropic"))?;
-            if secret.is_oauth() {
-                files.push(CredentialFile {
-                    file: ".credentials.json",
-                    contents: claude_oauth_sentinels(),
-                    needed: true,
-                });
-            } else {
-                files.push(CredentialFile {
-                    file: ".credentials.json",
-                    contents: "{}".to_string(),
-                    needed: false,
-                });
-                placeholders
-                    .env
-                    .push(("ANTHROPIC_API_KEY".to_string(), PROXY_MANAGED.to_string()));
-            }
-        }
-        // sbx's codex kit's auth.json for an API key.
-        "codex" => {
-            let secret = service_secret(state, name, "openai").ok_or_else(|| missing("openai"))?;
-            if secret.is_oauth() {
-                bail!(
-                    "sbx holds a ChatGPT login for openai, which sbx serves Codex only through \
-                     a model provider in ~/.codex/config.toml, the workstation's own under \
-                     workmux. Store an OpenAI API key with `sbx secret set openai`, or set \
-                     docker_sbx.agent_credentials: mount."
-                );
-            }
-            files.push(CredentialFile {
-                file: "auth.json",
-                contents: serde_json::json!({ "OPENAI_API_KEY": PROXY_MANAGED }).to_string(),
-                needed: true,
-            });
-        }
-        // sbx's google service holds an API key only; a Google login stays
-        // hidden.
-        "gemini" => {
-            service_secret(state, name, "google").ok_or_else(|| missing("google"))?;
-            files.push(CredentialFile {
-                file: "oauth_creds.json",
-                contents: "{}".to_string(),
-                needed: false,
-            });
-            placeholders
-                .env
-                .push(("GEMINI_API_KEY".to_string(), PROXY_MANAGED.to_string()));
-        }
-        // sbx's opencode kit marks each provider's key variable
-        // proxy-managed; logins stored in auth.json stay hidden.
-        "opencode" => {
-            for (service, var) in OPENCODE_PROVIDER_KEYS {
-                if opencode_serves(state, name, service) {
-                    placeholders
-                        .env
-                        .push((var.to_string(), PROXY_MANAGED.to_string()));
-                }
-            }
-            if placeholders.env.is_empty() {
-                bail!(
-                    "sbx holds no API key for a provider OpenCode uses, which serves its \
-                     credential under docker_sbx.agent_credentials: placeholder. Store one \
-                     with `sbx secret set anthropic` (or openai, google, groq, openrouter, \
-                     xai), or set docker_sbx.agent_credentials: mount."
-                );
-            }
-            files.push(CredentialFile {
-                file: "auth.json",
-                contents: "{}".to_string(),
-                needed: false,
-            });
-        }
-        _ => bail!(
-            "sbx can't supply {agent}'s credential (sbx serves Claude, Codex, Gemini and \
-             OpenCode in workmux's sandboxes). Set docker_sbx.agent_credentials: mount in \
-             your global config to run {agent} with its config directory's own login."
-        ),
-    }
-    for credential in files {
-        let host = config_dir.join(credential.file);
-        if host.is_file() {
-            placeholders.masks.push(Mask {
-                target: PathBuf::from(format!("{GUEST_HOME}/{subpath}/{}", credential.file)),
-                contents: credential.contents,
-            });
-        } else if credential.needed {
-            bail!(
-                "docker_sbx.agent_credentials: placeholder puts a placeholder over {}, which \
-                 doesn't exist; sbx would leave an empty file there in your agent config \
-                 directory. Log {agent} in once with docker_sbx.agent_credentials: mount (or \
-                 create the file), then try again.",
-                host.display()
-            );
-        }
-    }
-    Ok(placeholders)
-}
-
-/// The sandbox's own `~/.claude.json`: completed onboarding, as on the
-/// other backends, and under placeholder mode the placeholder key approved,
-/// since Claude asks once before using a key from the environment.
-fn claude_onboarding_seed(credentials: AgentCredentials) -> String {
-    let seed = crate::sandbox::CLAUDE_ONBOARDING_JSON;
-    if credentials == AgentCredentials::Mount {
-        return seed.to_string();
-    }
-    let mut seed: serde_json::Value = serde_json::from_str(seed).expect("onboarding seed is JSON");
-    seed["customApiKeyResponses"] = serde_json::json!({
-        "approved": [PROXY_MANAGED],
-        "rejected": [],
-    });
-    seed.to_string()
 }
 
 /// The `sbx policy` command adding or removing a rule scoped to the sandbox.
@@ -1264,11 +990,6 @@ fn create_settings_warnings(
             "container.excluded_files",
             current.excluded_files != created.excluded_files,
         ),
-        (
-            "docker_sbx.agent_credentials",
-            current.agent_credentials != created.agent_credentials
-                || current.credential_placeholders != created.credential_placeholders,
-        ),
         ("docker_sbx.cpus", current.cpus != created.cpus),
         ("docker_sbx.memory", current.memory != created.memory),
         ("docker_sbx.kits", current.kits != created.kits),
@@ -1290,55 +1011,27 @@ fn create_settings_warnings(
     )]
 }
 
-/// Fail closed when the agent could read a file workmux hides, one that
-/// exists now but the existing sandbox wasn't created masking: one of
-/// `excluded_files`, listed or created since, or under placeholder mode one
-/// of the agent's credential files in the config directory the sandbox
-/// mounts. Masks are fixed when sbx creates the sandbox, where the
-/// container backend masks on every launch. A masked file deleted since,
-/// or a placeholder that changed, only gets the settings warning: nothing
-/// is exposed.
+/// Fail closed when the agent could read a file workmux hides: one of
+/// `excluded_files` that exists now but the existing sandbox wasn't created
+/// masking, listed or created since. Masks are fixed when sbx creates the
+/// sandbox, where the container backend masks on every launch. A masked
+/// file deleted since only gets the settings warning: sbx puts an empty
+/// file back over it.
 fn check_masked_since_create(
     excluded: &[Mask],
-    placeholders: &[Mask],
-    config_dir: Option<&(PathBuf, &'static str)>,
     created: &CreateSettings,
     name: &str,
 ) -> Result<()> {
-    let recreate = format!(
-        "Masks are fixed when the sandbox is created; recreate it with \
-         `workmux sandbox prune` or `sbx rm -f {name}`."
-    );
     if let Some(mask) = excluded
         .iter()
         .find(|mask| !created.excluded_files.contains(&mask.target))
     {
         bail!(
             "sandbox.container.excluded_files lists {}, but sbx sandbox {name} was created \
-             without a mask over it, so the agent could read it. {recreate}",
+             without a mask over it, so the agent could read it. Masks are fixed when the \
+             sandbox is created; recreate it with `workmux sandbox prune` or `sbx rm -f {name}`.",
             mask.target.display()
         );
-    }
-    let Some((config_dir, subpath)) = config_dir else {
-        return Ok(());
-    };
-    if created.agent_config_dir.as_ref() != Some(config_dir) {
-        return Ok(());
-    }
-    let guest_dir = Path::new(GUEST_HOME).join(subpath);
-    for mask in placeholders {
-        let hidden = created
-            .credential_placeholders
-            .iter()
-            .any(|created| created.target == mask.target);
-        if !hidden && let Ok(file) = mask.target.strip_prefix(&guest_dir) {
-            bail!(
-                "docker_sbx.agent_credentials: placeholder hides {}, but sbx sandbox {name} \
-                 was created without a placeholder over it, so the agent could read it. \
-                 {recreate}",
-                config_dir.join(file).display()
-            );
-        }
     }
     Ok(())
 }
@@ -1362,16 +1055,12 @@ pub fn creates_sandbox(
 /// A running sandbox that predates the record of the settings it was
 /// created with is launched into as it is, but for the files workmux hides,
 /// which it has no mask over: the agent could read them.
-fn predates_record_warnings(
-    excluded: &[Mask],
-    placeholders: &[Mask],
-    name: &str,
-) -> Result<Vec<String>> {
+fn predates_record_warnings(excluded: &[Mask], name: &str) -> Result<Vec<String>> {
     let recreate = format!(
         "Close the worktree's panes: the first launch once sbx has stopped the sandbox \
          (about 30 seconds later) recreates it. Or remove it with `sbx rm -f {name}`."
     );
-    if let Some(mask) = excluded.iter().chain(placeholders).next() {
+    if let Some(mask) = excluded.first() {
         bail!(
             "sbx sandbox {name} was created before workmux recorded how it creates sandboxes, \
              so it has no mask over {}, which the agent could read. It's running, so workmux \
@@ -1396,9 +1085,8 @@ fn predates_record_warnings(
 /// worktree, the main repository's git dir (read-only but for what commits
 /// write) and the shims at their host paths, an empty file over each of
 /// `excluded_files`, the agent's config directory where the agent looks for
-/// it (under `agent_credentials: placeholder`, with a placeholder over each
-/// of its credential files), and `extra_mounts`; then, as root, give the
-/// agent the config directory's parents and seed Claude's onboarding state.
+/// it, and `extra_mounts`; then, as root, give the agent the config
+/// directory's parents and seed Claude's onboarding state.
 /// On every launch: bind pi's and OMP's binaries directory to a guest-local
 /// one, reconcile the sandbox's rules with `sandbox.network` and the
 /// toolchain's endpoints, and allow the supervisor's RPC port until the exec
@@ -1407,7 +1095,7 @@ fn predates_record_warnings(
 /// sandbox was just created, workmux's built-in
 /// provisioning (shims on login shells' `PATH`, Nix and Devbox for a
 /// toolchain) and the `provision` script. The exec runs the agent command in the toolchain's
-/// environment, with placeholder keys under placeholder mode.
+/// environment.
 pub fn launch_plan(
     config: &SandboxConfig,
     target: &LaunchTarget,
@@ -1429,10 +1117,6 @@ pub fn launch_plan(
     let mut masks = Vec::new();
     let template = super::template::template_tag(&config.resolved_image(agent));
     let config_dir = config_dir_and_home_subpath(config, agent);
-    let placeholders = match config.docker_sbx.agent_credentials() {
-        AgentCredentials::Mount => Placeholders::default(),
-        AgentCredentials::Placeholder => agent_placeholders(config, agent, state, name)?,
-    };
     let opencode_config_dir = target.opencode_config_dir.filter(|_| agent == "opencode");
     let sbx = &config.docker_sbx;
     let create_settings = CreateSettings {
@@ -1441,8 +1125,6 @@ pub fn launch_plan(
         opencode_config_dir: opencode_config_dir.map(Path::to_path_buf),
         extra_mounts: extra_mount_settings(config)?,
         excluded_files: excluded.iter().map(|mask| mask.target.clone()).collect(),
-        agent_credentials: config.docker_sbx.agent_credentials(),
-        credential_placeholders: placeholders.masks.clone(),
         cpus: sbx.cpus(),
         memory: sbx.memory().map(str::to_string),
         kits: sbx.kits().to_vec(),
@@ -1465,16 +1147,10 @@ pub fn launch_plan(
 
     let predates_record = match target.created_with {
         Some(created) if exists => {
-            check_masked_since_create(
-                &excluded,
-                &placeholders.masks,
-                config_dir.as_ref(),
-                created,
-                name,
-            )?;
+            check_masked_since_create(&excluded, created, name)?;
             Vec::new()
         }
-        None if exists => predates_record_warnings(&excluded, &placeholders.masks, name)?,
+        None if exists => predates_record_warnings(&excluded, name)?,
         _ => Vec::new(),
     };
 
@@ -1512,13 +1188,6 @@ pub fn launch_plan(
         if let Some((config_dir, subpath)) = &config_dir {
             workspaces.push(format!("{}:{GUEST_HOME}/{subpath}", config_dir.display()));
         }
-        workspaces.extend(
-            placeholders
-                .masks
-                .iter()
-                .map(|mask| mask.workspace(target.state_dir)),
-        );
-        masks.extend(placeholders.masks.iter().cloned());
         if let Some(dir) = opencode_config_dir {
             workspaces.push(format!(
                 "{}:{GUEST_HOME}/{OPENCODE_CONFIG_SUBPATH}:ro",
@@ -1556,9 +1225,7 @@ pub fn launch_plan(
                 "sh",
             ]);
             command.push(format!("{GUEST_HOME}/.claude.json"));
-            command.push(claude_onboarding_seed(
-                config.docker_sbx.agent_credentials(),
-            ));
+            command.push(crate::sandbox::CLAUDE_ONBOARDING_JSON.to_string());
             setup.push(root_exec(name, command));
         }
     }
@@ -1650,7 +1317,7 @@ pub fn launch_plan(
         setup,
         default_provision,
         provision,
-        exec: exec_command(target, exec, &placeholders.env),
+        exec: exec_command(target, exec),
         hangup: hangup_command(target, exec),
         teardown,
         notes: network_notes(config, target.toolchain),
@@ -1674,8 +1341,8 @@ pub fn launch_plan(
 mod tests {
     use super::*;
     use crate::config::{
-        AgentCredentials, AllowedDomainDetails, AllowedDomainEntry, DockerSbxConfig, ExtraMount,
-        NetworkConfig, NetworkPolicy,
+        AllowedDomainDetails, AllowedDomainEntry, DockerSbxConfig, ExtraMount, NetworkConfig,
+        NetworkPolicy,
     };
     use std::path::PathBuf;
 
@@ -1719,7 +1386,6 @@ mod tests {
             sandbox: None,
             rules: Vec::new(),
             secrets: Vec::new(),
-            secrets_error: None,
         }
     }
 
@@ -1977,8 +1643,6 @@ mod tests {
                 opencode_config_dir: None,
                 extra_mounts: Vec::new(),
                 excluded_files: Vec::new(),
-                agent_credentials: AgentCredentials::Mount,
-                credential_placeholders: Vec::new(),
                 cpus: Some(4),
                 memory: Some("8g".to_string()),
                 kits: vec!["docker.io/sbx/task:latest".to_string()],
@@ -2590,7 +2254,6 @@ mod tests {
         SbxSecret {
             scope: scope.to_string(),
             name: service.to_string(),
-            secret: "(stored)".to_string(),
         }
     }
 
@@ -2738,6 +2401,32 @@ mod tests {
             let plan = launch_plan(&config, &target(&p), "claude", &state, &exec).unwrap();
             assert!(plan.warnings.is_empty(), "{case}: {:?}", plan.warnings);
         }
+    }
+
+    #[test]
+    fn sbxs_proxy_managed_placeholder_is_no_credential_so_gets_no_warning() {
+        let p = paths();
+        let config = SandboxConfig {
+            env: Some([("OPENAI_API_KEY".to_string(), "proxy-managed".to_string())].into()),
+            env_passthrough: Some(vec!["GH_TOKEN".to_string()]),
+            ..config()
+        };
+        let state = with_secrets(vec![secret("global", "openai"), secret("global", "github")]);
+
+        let exec = passing(&[
+            ("OPENAI_API_KEY", "proxy-managed"),
+            ("GH_TOKEN", "proxy-managed"),
+        ]);
+        let plan = launch_plan(&config, &target(&p), "claude", &state, &exec).unwrap();
+        assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
+
+        // Only sbx's exact value: anything else may be a real credential.
+        let exec = passing(&[
+            ("OPENAI_API_KEY", "proxy-managed "),
+            ("GH_TOKEN", "Proxy-Managed"),
+        ]);
+        let plan = launch_plan(&config, &target(&p), "claude", &state, &exec).unwrap();
+        assert_eq!(plan.warnings.len(), 2, "{:?}", plan.warnings);
     }
 
     #[test]
@@ -3979,528 +3668,5 @@ mod tests {
             policy_commands(&plan)
         );
         assert!(plan.network_rules.is_empty(), "{:?}", plan.network_rules);
-    }
-
-    // --- Placeholder agent credentials --------------------------------------
-
-    /// Agent config dirs under a temp dir, holding `files` (relative to
-    /// it, e.g. `claude/.credentials.json`), and a config in placeholder
-    /// mode mounting them.
-    fn placeholder_config(files: &[&str]) -> (tempfile::TempDir, SandboxConfig) {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
-        for agent in ["claude", "codex", "gemini", "opencode"] {
-            std::fs::create_dir_all(root.join(agent)).unwrap();
-        }
-        for file in files {
-            std::fs::write(root.join(file), r#"{"real":"credential"}"#).unwrap();
-        }
-        let config = SandboxConfig {
-            agent_config_dir: Some(format!("{}/{{agent}}", root.display())),
-            docker_sbx: DockerSbxConfig {
-                agent_credentials: Some(AgentCredentials::Placeholder),
-                ..Default::default()
-            },
-            ..config()
-        };
-        (dir, config)
-    }
-
-    fn stored(scope: &str, service: &str) -> SbxSecret {
-        SbxSecret {
-            secret: "(stored)".to_string(),
-            ..secret(scope, service)
-        }
-    }
-
-    fn oauth(scope: &str, service: &str) -> SbxSecret {
-        SbxSecret {
-            secret: "(oauth configured)".to_string(),
-            ..secret(scope, service)
-        }
-    }
-
-    fn placeholder_plan(
-        config: &SandboxConfig,
-        agent: &str,
-        secrets: Vec<SbxSecret>,
-    ) -> Result<LaunchPlan> {
-        let p = paths();
-        launch_plan(config, &target(&p), agent, &with_secrets(secrets), &exec())
-    }
-
-    /// The placeholder over `file` under the guest home, as JSON.
-    fn placeholder(plan: &LaunchPlan, file: &str) -> serde_json::Value {
-        let target = PathBuf::from(GUEST_HOME).join(file);
-        let mask = plan
-            .masks
-            .iter()
-            .find(|mask| mask.target == target)
-            .unwrap_or_else(|| panic!("no placeholder over {file}: {:?}", plan.masks));
-        serde_json::from_str(&mask.contents).unwrap()
-    }
-
-    /// The value the exec passes for `var`, if any.
-    fn exec_value(plan: &LaunchPlan, var: &str) -> Option<String> {
-        plan.exec
-            .env
-            .iter()
-            .find(|(key, _)| key == var)
-            .map(|(_, value)| value.clone())
-    }
-
-    #[test]
-    fn claudes_oauth_login_is_replaced_by_sbx_kits_sentinels() {
-        let (_dir, config) = placeholder_config(&["claude/.credentials.json"]);
-        let plan = placeholder_plan(&config, "claude", vec![oauth("global", "anthropic")]).unwrap();
-
-        let creds = placeholder(&plan, ".claude/.credentials.json");
-        let oauth = &creds["claudeAiOauth"];
-        assert_eq!(oauth["accessToken"], "sk-ant-oat01-proxy-managed");
-        assert_eq!(oauth["refreshToken"], "sk-ant-ort01-proxy-managed");
-        assert!(
-            oauth["scopes"]
-                .as_array()
-                .unwrap()
-                .contains(&"user:inference".into())
-        );
-        // Far enough ahead that Claude never refreshes it: the mask is
-        // read-only.
-        assert!(oauth["expiresAt"].as_u64().unwrap() > 4_000_000_000_000);
-
-        // Mounted read-only over the file, after the config dir it's in.
-        let workspaces = workspaces(&plan);
-        let target = PathBuf::from("/home/agent/.claude/.credentials.json");
-        let mount = format!(
-            "{}:{}:ro",
-            Mask::empty(target.clone()).source(&paths().state).display(),
-            target.display()
-        );
-        let mask_at = workspaces.iter().position(|w| *w == mount);
-        let dir_at = workspaces
-            .iter()
-            .position(|w| w.ends_with(":/home/agent/.claude"));
-        assert!(dir_at.is_some() && mask_at > dir_at, "{workspaces:?}");
-        assert_eq!(exec_value(&plan, "ANTHROPIC_API_KEY"), None);
-    }
-
-    #[test]
-    fn claude_with_an_api_key_gets_a_placeholder_key_it_uses_without_asking() {
-        let (_dir, config) = placeholder_config(&["claude/.credentials.json"]);
-        let plan =
-            placeholder_plan(&config, "claude", vec![stored("global", "anthropic")]).unwrap();
-
-        // The OAuth login stays hidden; the key comes from the environment,
-        // named on the exec's command line, valued in its environment.
-        assert_eq!(
-            placeholder(&plan, ".claude/.credentials.json"),
-            serde_json::json!({})
-        );
-        assert_eq!(
-            exec_value(&plan, "ANTHROPIC_API_KEY").as_deref(),
-            Some("proxy-managed")
-        );
-        assert!(
-            plan.exec
-                .args
-                .windows(2)
-                .any(|w| w == ["-e", "ANTHROPIC_API_KEY"]),
-            "{:?}",
-            plan.exec.args
-        );
-        // Claude asks once before using a key from the environment; the
-        // sandbox's own ~/.claude.json approves the placeholder.
-        let seed = setup_args(&plan)
-            .into_iter()
-            .find(|a| a.iter().any(|w| w == "/home/agent/.claude.json"))
-            .unwrap();
-        let seed: serde_json::Value = serde_json::from_str(seed.last().unwrap()).unwrap();
-        assert_eq!(seed["hasCompletedOnboarding"], true);
-        assert_eq!(
-            seed["customApiKeyResponses"]["approved"],
-            serde_json::json!(["proxy-managed"])
-        );
-    }
-
-    #[test]
-    fn a_credential_file_missing_on_the_host_is_masked_only_if_the_agent_needs_it() {
-        // Masking a missing file would make sbx create it in the
-        // workstation's config dir. With an API key Claude needs no file.
-        let (_dir, config) = placeholder_config(&[]);
-        let plan =
-            placeholder_plan(&config, "claude", vec![stored("global", "anthropic")]).unwrap();
-        assert!(plan.masks.is_empty(), "{:?}", plan.masks);
-        assert!(exec_value(&plan, "ANTHROPIC_API_KEY").is_some());
-
-        // An OAuth login needs the sentinel file: name the missing one.
-        let (dir, config) = placeholder_config(&[]);
-        let error = placeholder_plan(&config, "claude", vec![oauth("global", "anthropic")])
-            .unwrap_err()
-            .to_string();
-        let file = dir
-            .path()
-            .canonicalize()
-            .unwrap()
-            .join("claude/.credentials.json");
-        assert!(error.contains(&file.display().to_string()), "{error}");
-        assert!(error.contains("agent_credentials: mount"), "{error}");
-        assert!(!file.exists());
-    }
-
-    #[test]
-    fn credential_mounts_need_no_placeholders() {
-        let (_dir, config) = placeholder_config(&["claude/.credentials.json"]);
-        let config = SandboxConfig {
-            docker_sbx: DockerSbxConfig::default(),
-            ..config
-        };
-        let plan =
-            placeholder_plan(&config, "claude", vec![stored("global", "anthropic")]).unwrap();
-        assert!(plan.masks.is_empty(), "{:?}", plan.masks);
-        assert_eq!(exec_value(&plan, "ANTHROPIC_API_KEY"), None);
-    }
-
-    #[test]
-    fn codex_with_an_api_key_reads_sbx_kits_placeholder_auth_json() {
-        let (_dir, config) = placeholder_config(&["codex/auth.json"]);
-        let plan = placeholder_plan(&config, "codex", vec![stored("global", "openai")]).unwrap();
-        assert_eq!(
-            placeholder(&plan, ".codex/auth.json"),
-            serde_json::json!({"OPENAI_API_KEY": "proxy-managed"})
-        );
-
-        // Codex needs the file to use the key.
-        let (_dir, config) = placeholder_config(&[]);
-        let error = placeholder_plan(&config, "codex", vec![stored("global", "openai")])
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("codex/auth.json"), "{error}");
-    }
-
-    #[test]
-    fn codex_with_a_chatgpt_login_cant_be_served() {
-        // sbx's codex kit serves a ChatGPT login through a model provider in
-        // ~/.codex/config.toml, which is the workstation's here.
-        let (_dir, config) = placeholder_config(&["codex/auth.json"]);
-        let error = placeholder_plan(&config, "codex", vec![oauth("global", "openai")])
-            .unwrap_err()
-            .to_string();
-        for expected in [
-            "ChatGPT",
-            "sbx secret set openai",
-            "agent_credentials: mount",
-        ] {
-            assert!(error.contains(expected), "{expected}: {error}");
-        }
-    }
-
-    #[test]
-    fn gemini_gets_a_placeholder_api_key_with_its_google_login_hidden() {
-        let (_dir, config) = placeholder_config(&["gemini/oauth_creds.json"]);
-        let plan = placeholder_plan(&config, "gemini", vec![stored("global", "google")]).unwrap();
-        assert_eq!(
-            placeholder(&plan, ".gemini/oauth_creds.json"),
-            serde_json::json!({})
-        );
-        assert_eq!(
-            exec_value(&plan, "GEMINI_API_KEY").as_deref(),
-            Some("proxy-managed")
-        );
-
-        let (_dir, config) = placeholder_config(&[]);
-        let plan = placeholder_plan(&config, "gemini", vec![stored("global", "google")]).unwrap();
-        assert!(plan.masks.is_empty(), "{:?}", plan.masks);
-    }
-
-    #[test]
-    fn opencode_gets_a_placeholder_key_for_each_provider_sbx_holds_a_key_for() {
-        let (_dir, config) = placeholder_config(&["opencode/auth.json"]);
-        let secrets = vec![
-            stored("global", "anthropic"),
-            stored("wm-proj-12345678", "google"),
-            oauth("global", "openai"),
-            stored("global", "github"),
-            stored("other-sandbox", "groq"),
-        ];
-        let plan = placeholder_plan(&config, "opencode", secrets).unwrap();
-
-        assert_eq!(
-            placeholder(&plan, ".local/share/opencode/auth.json"),
-            serde_json::json!({})
-        );
-        let keys: Vec<(String, String)> = plan
-            .exec
-            .env
-            .iter()
-            .filter(|(key, _)| key.ends_with("_API_KEY"))
-            .cloned()
-            .collect();
-        assert_eq!(
-            keys,
-            vec![
-                ("ANTHROPIC_API_KEY".to_string(), "proxy-managed".to_string()),
-                (
-                    "GOOGLE_GENERATIVE_AI_API_KEY".to_string(),
-                    "proxy-managed".to_string()
-                ),
-            ]
-        );
-    }
-
-    #[test]
-    fn an_agent_without_its_sbx_secret_fails_naming_sbx_secret_set() {
-        for (agent, service) in [
-            ("claude", "anthropic"),
-            ("codex", "openai"),
-            ("gemini", "google"),
-            ("opencode", "anthropic"),
-        ] {
-            let (_dir, config) = placeholder_config(&[]);
-            // Another sandbox's secret doesn't serve this one.
-            let secrets = vec![stored("other-sandbox", service), stored("global", "github")];
-            let error = placeholder_plan(&config, agent, secrets)
-                .unwrap_err()
-                .to_string();
-            assert!(
-                error.contains(&format!("sbx secret set {service}")),
-                "{agent}: {error}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_failed_secret_listing_is_an_error_under_placeholders_naming_sbxs_own() {
-        // Not "sbx holds no secret": sbx couldn't say.
-        let (_dir, config) = placeholder_config(&["claude/.credentials.json"]);
-        let p = paths();
-        let state = SbxState {
-            secrets_error: Some("sbx secret ls failed: keychain is locked".to_string()),
-            ..missing()
-        };
-        let error = launch_plan(&config, &target(&p), "claude", &state, &exec())
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("keychain is locked"), "{error}");
-        assert!(!error.contains("holds no secret"), "{error}");
-
-        // Under credential mounts it only leaves the env warnings out.
-        let config = SandboxConfig {
-            docker_sbx: DockerSbxConfig::default(),
-            env_passthrough: Some(vec!["GH_TOKEN".to_string()]),
-            ..config
-        };
-        let plan = launch_plan(
-            &config,
-            &target(&p),
-            "claude",
-            &state,
-            &passing(&[("GH_TOKEN", "gho_real")]),
-        )
-        .unwrap();
-        assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
-    }
-
-    #[test]
-    fn a_sandbox_scoped_secret_serves_the_sandbox_before_a_global_one() {
-        let (_dir, config) = placeholder_config(&["claude/.credentials.json"]);
-        let secrets = vec![
-            oauth("global", "anthropic"),
-            stored("wm-proj-12345678", "anthropic"),
-        ];
-        let plan = placeholder_plan(&config, "claude", secrets).unwrap();
-        assert_eq!(
-            placeholder(&plan, ".claude/.credentials.json"),
-            serde_json::json!({})
-        );
-        assert!(exec_value(&plan, "ANTHROPIC_API_KEY").is_some());
-    }
-
-    #[test]
-    fn agents_sbx_cant_serve_fail_naming_credential_mounts() {
-        // Copilot's secret is served only in sandboxes made with sbx's
-        // copilot kit; the others have no sbx service for their login.
-        for agent in ["copilot", "agy", "pi", "omp"] {
-            let (_dir, config) = placeholder_config(&[]);
-            let secrets = vec![stored("global", "copilot"), stored("global", "github")];
-            let error = placeholder_plan(&config, agent, secrets)
-                .unwrap_err()
-                .to_string();
-            assert!(
-                error.contains("docker_sbx.agent_credentials: mount"),
-                "{agent}: {error}"
-            );
-            assert!(error.contains(agent), "{agent}: {error}");
-        }
-    }
-
-    #[test]
-    fn env_carrying_the_agents_own_credential_is_an_error_under_placeholders() {
-        let (_dir, placeholders) = placeholder_config(&[]);
-        for config in [
-            SandboxConfig {
-                env_passthrough: Some(vec!["ANTHROPIC_API_KEY".to_string()]),
-                ..placeholders.clone()
-            },
-            SandboxConfig {
-                env: Some(
-                    [("ANTHROPIC_API_KEY".to_string(), "sk-ant-real".to_string())]
-                        .into_iter()
-                        .collect(),
-                ),
-                ..placeholders.clone()
-            },
-        ] {
-            // An error, not ticket 08's warning, whether or not the variable
-            // is set on the workstation.
-            let error = placeholder_plan(&config, "claude", vec![stored("global", "anthropic")])
-                .unwrap_err()
-                .to_string();
-            for expected in ["ANTHROPIC_API_KEY", "agent_credentials: placeholder"] {
-                assert!(error.contains(expected), "{expected}: {error}");
-            }
-            assert!(!error.contains("sk-ant-real"), "{error}");
-        }
-
-        // A tool credential, even another agent's, still only warns.
-        let config = SandboxConfig {
-            env_passthrough: Some(vec!["OPENAI_API_KEY".to_string()]),
-            ..placeholders
-        };
-        let p = paths();
-        let state = with_secrets(vec![
-            stored("global", "anthropic"),
-            stored("global", "openai"),
-        ]);
-        let exec = passing(&[("OPENAI_API_KEY", "sk-real")]);
-        let plan = launch_plan(&config, &target(&p), "claude", &state, &exec).unwrap();
-        assert_eq!(plan.warnings.len(), 1, "{:?}", plan.warnings);
-        assert!(plan.warnings[0].contains("OPENAI_API_KEY"));
-    }
-
-    #[test]
-    fn opencode_keeps_its_own_keys_for_providers_sbx_holds_none_for() {
-        // Only the providers sbx gets a placeholder for are kept from
-        // OpenCode; for the others the key is the user's own, as under
-        // credential mounts.
-        let (_dir, placeholders) = placeholder_config(&["opencode/auth.json"]);
-        let config = SandboxConfig {
-            env_passthrough: Some(vec![
-                "OPENAI_API_KEY".to_string(),
-                "GROQ_API_KEY".to_string(),
-            ]),
-            ..placeholders.clone()
-        };
-        let p = paths();
-        let state = with_secrets(vec![stored("global", "anthropic")]);
-        let exec = passing(&[("OPENAI_API_KEY", "sk-own"), ("GROQ_API_KEY", "gsk-own")]);
-        let plan = launch_plan(&config, &target(&p), "opencode", &state, &exec).unwrap();
-        assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
-        assert_eq!(
-            exec_value(&plan, "OPENAI_API_KEY").as_deref(),
-            Some("sk-own")
-        );
-        assert_eq!(
-            exec_value(&plan, "ANTHROPIC_API_KEY").as_deref(),
-            Some("proxy-managed")
-        );
-
-        // The provider sbx serves is kept from it.
-        let config = SandboxConfig {
-            env_passthrough: Some(vec!["ANTHROPIC_API_KEY".to_string()]),
-            ..placeholders
-        };
-        let error = launch_plan(&config, &target(&p), "opencode", &state, &exec)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("ANTHROPIC_API_KEY"), "{error}");
-    }
-
-    #[test]
-    fn a_credential_file_the_sandbox_wasnt_created_hiding_is_an_error() {
-        // The file appeared on the workstation after the sandbox was
-        // created (Claude with an API key needs none), or the sandbox was
-        // created under credential mounts: the agent could read it.
-        let (dir, config) = placeholder_config(&["claude/.credentials.json"]);
-        let file = dir
-            .path()
-            .canonicalize()
-            .unwrap()
-            .join("claude/.credentials.json");
-        let config_dir = file.parent().unwrap().to_path_buf();
-        let secrets = vec![stored("global", "anthropic")];
-        for agent_credentials in [AgentCredentials::Placeholder, AgentCredentials::Mount] {
-            let mut p = paths();
-            p.created = Some(CreateSettings {
-                agent_config_dir: Some(config_dir.clone()),
-                agent_credentials,
-                ..created_settings()
-            });
-            let state = SbxState {
-                secrets: secrets.clone(),
-                ..running_with(Vec::new())
-            };
-            let error = launch_plan(&config, &target(&p), "claude", &state, &exec())
-                .unwrap_err()
-                .to_string();
-            for expected in [
-                file.display().to_string().as_str(),
-                "agent_credentials: placeholder",
-                "sbx rm -f wm-proj-12345678",
-            ] {
-                assert!(error.contains(expected), "{expected}: {error}");
-            }
-        }
-    }
-
-    #[test]
-    fn placeholders_are_recorded_and_switching_modes_warns_how_to_recreate() {
-        let (_dir, config) = placeholder_config(&["claude/.credentials.json"]);
-        let secrets = vec![oauth("global", "anthropic")];
-        let created = placeholder_plan(&config, "claude", secrets.clone())
-            .unwrap()
-            .create_settings;
-        assert_eq!(created.agent_credentials, AgentCredentials::Placeholder);
-        let targets: Vec<&Path> = created
-            .credential_placeholders
-            .iter()
-            .map(|mask| mask.target.as_path())
-            .collect();
-        assert_eq!(
-            targets,
-            vec![Path::new("/home/agent/.claude/.credentials.json")]
-        );
-
-        let launch = |config: &SandboxConfig, secrets: Vec<SbxSecret>| {
-            let mut p = paths();
-            p.created = Some(created.clone());
-            let state = SbxState {
-                secrets,
-                ..running_with(Vec::new())
-            };
-            launch_plan(config, &target(&p), "claude", &state, &exec()).unwrap()
-        };
-        // Unchanged: no warning.
-        assert!(launch(&config, secrets.clone()).warnings.is_empty());
-
-        // Back to credential mounts.
-        let mounts = SandboxConfig {
-            docker_sbx: DockerSbxConfig::default(),
-            ..config.clone()
-        };
-        let warnings = launch(&mounts, secrets).warnings;
-        assert_eq!(warnings.len(), 1, "{warnings:?}");
-        assert!(
-            warnings[0].contains("docker_sbx.agent_credentials"),
-            "{warnings:?}"
-        );
-
-        // The sbx secret changed from an OAuth login to an API key: the
-        // placeholder differs.
-        let warnings = launch(&config, vec![stored("global", "anthropic")]).warnings;
-        assert_eq!(warnings.len(), 1, "{warnings:?}");
-        assert!(
-            warnings[0].contains("docker_sbx.agent_credentials"),
-            "{warnings:?}"
-        );
     }
 }
