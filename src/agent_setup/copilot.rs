@@ -12,7 +12,8 @@ use std::path::{Path, PathBuf};
 use super::{StatusCheck, UpdatePreview};
 
 /// Hooks configuration embedded at compile time.
-const HOOKS_JSON: &str = include_str!("../../resources/copilot/hooks/workmux-status/hooks.json");
+pub(crate) const HOOKS_JSON: &str =
+    include_str!("../../resources/copilot/hooks/workmux-status/hooks.json");
 const HOOKS_FILE_NAME: &str = "workmux-status.json";
 
 fn copilot_dir() -> Option<PathBuf> {

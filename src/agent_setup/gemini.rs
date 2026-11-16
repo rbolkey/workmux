@@ -113,7 +113,7 @@ fn uninstall_at(path: PathBuf) -> Result<String> {
     )
 }
 
-fn load_hooks() -> Result<Value> {
+pub(crate) fn load_hooks() -> Result<Value> {
     json_config::hooks_from_embedded(HOOKS_JSON, "hooks config missing hooks key")
 }
 
