@@ -588,10 +588,38 @@ pub fn prepare_launch(
         eprintln!("warning: {warning}");
     }
 
-    let creating = plan.create_template.is_some();
     let image = config.sandbox.resolved_image(agent);
-    if creating {
+    if plan.create.is_some() {
         super::template::ensure_template(&image)?;
+    } else {
+        // The template matters only when a sandbox is created; keep its
+        // freshness cache current for the next one.
+        super::template::check_freshness_in_background(&image);
+        if config.sandbox.docker_sbx.provision_script().is_some() {
+            info!(sandbox = %name, "custom provision script only runs on sandbox creation; recreate sandbox to apply changes");
+        }
+    }
+    apply_plan_with(&plan, &state_dir, unfinished, &network_record, run_sbx)?;
+    Ok(plan)
+}
+
+/// Run a plan's commands up to its exec, keeping the sandbox's state
+/// directory in step so that a launch that fails or is killed partway is
+/// recovered by the next one: the `creating` marker and the masks' sources
+/// are written before the sandbox is created, the network rules about to be
+/// written are recorded before they're written, and the create record is
+/// written only once the sandbox is fully set up and provisioned. A
+/// sandbox this launch creates is removed again when anything after
+/// `sbx create` fails. `run` runs one sbx command.
+fn apply_plan_with(
+    plan: &LaunchPlan,
+    state_dir: &Path,
+    unfinished: bool,
+    network_record: &[NetworkRule],
+    mut run: impl FnMut(&SbxCommand) -> Result<()>,
+) -> Result<()> {
+    let name = &plan.sandbox_name;
+    if let Some(create) = &plan.create {
         if let Some(remove) = &plan.remove {
             let why = if unfinished {
                 "an earlier launch didn't finish setting it up"
@@ -600,27 +628,21 @@ pub fn prepare_launch(
             };
             info!(sandbox = %name, why, "removing sbx sandbox to create it again");
             eprintln!("Removing sbx sandbox {name}, as {why}; creating it again");
-            run_sbx(remove)?;
+            run(remove)?;
         }
-        remove_created_record(&state_dir)?;
+        remove_created_record(state_dir)?;
         std::fs::write(state_dir.join(CREATING_MARKER_FILE), b"")
             .context("Failed to mark the sbx sandbox as being created")?;
-        super::mask::write_masks(&state_dir, &plan.masks)?;
+        super::mask::write_masks(state_dir, &plan.masks)?;
         info!(sandbox = %name, "creating sbx sandbox");
         eprintln!("  Workspaces:");
-        if let Some(create) = plan.setup.first() {
-            for workspace in create.args.iter().skip_while(|a| *a != "shell").skip(1) {
-                eprintln!("    {workspace}");
-            }
+        for workspace in &create.workspaces {
+            eprintln!("    {workspace}");
         }
-    } else {
-        // The template matters only when a sandbox is created; keep its
-        // freshness cache current for the next one.
-        super::template::check_freshness_in_background(&image);
     }
     // Record the rules about to be written before writing them, so a
     // failed launch still knows which rules are workmux's.
-    let mut pending = network_record.clone();
+    let mut pending = network_record.to_vec();
     pending.extend(
         plan.network_rules
             .iter()
@@ -628,61 +650,72 @@ pub fn prepare_launch(
             .cloned(),
     );
     if pending != network_record {
-        write_network_record(&state_dir, &pending)?;
+        write_network_record(state_dir, &pending)?;
+    }
+    if let Some(create) = &plan.create {
+        let msg = format!("Creating sbx sandbox {name}");
+        crate::spinner::with_spinner(&msg, || run(&create.command))?;
     }
     // Everything after `sbx create` finishes a sandbox this launch creates:
     // when any of it fails, remove the sandbox so the next launch creates
     // and provisions it again.
-    let remove_unfinished = |error: anyhow::Error| {
-        if let Err(rm) = SbxInstance::remove_by_name(&name) {
-            warn!(sandbox = %name, error = %rm, "failed to remove unfinished sbx sandbox");
-        }
-        error
-    };
-    for (i, command) in plan.setup.iter().enumerate() {
-        if i == 0 && creating {
-            let msg = format!("Creating sbx sandbox {name}");
-            crate::spinner::with_spinner(&msg, || run_sbx(command))?;
-        } else if creating {
-            run_sbx(command)
-                .map_err(remove_unfinished)
-                .with_context(|| {
-                    format!(
-                        "Setting up sbx sandbox {name} failed; the sandbox was removed, \
-                     launch again"
-                    )
-                })?;
-        } else {
-            run_sbx(command)?;
+    let creating = plan.create.is_some();
+    for command in &plan.setup {
+        if let Err(error) = run(command) {
+            if !creating {
+                return Err(error);
+            }
+            remove_unfinished(name, &mut run);
+            return Err(error.context(format!(
+                "Setting up sbx sandbox {name} failed; the sandbox was removed, launch again"
+            )));
         }
     }
     if plan.network_rules != pending {
-        write_network_record(&state_dir, &plan.network_rules)?;
+        write_network_record(state_dir, &plan.network_rules)?;
     }
-    let provision = |command: &SbxCommand| {
+    let built_in_failed = format!(
+        "workmux's built-in provisioning failed in sbx sandbox {name}; the sandbox was \
+         removed. `sbx policy log` lists requests sbx blocked; launch again, or set \
+         sandbox.docker_sbx.skip_default_provision if the image provides the toolchain"
+    );
+    let custom_failed = format!(
+        "sandbox.docker_sbx.provision failed in sbx sandbox {name}; the sandbox was removed, \
+         fix the script and launch again"
+    );
+    let provisioning = plan
+        .default_provision
+        .iter()
+        .map(|command| (command, &built_in_failed))
+        .chain(
+            plan.provision
+                .iter()
+                .map(|command| (command, &custom_failed)),
+        );
+    for (command, failed) in provisioning {
         let msg = format!("Provisioning sbx sandbox {name}");
-        crate::spinner::with_spinner(&msg, || run_sbx(command)).map_err(remove_unfinished)
-    };
-    for command in &plan.default_provision {
-        provision(command).context(format!(
-            "workmux's built-in provisioning failed in sbx sandbox {name}; the sandbox \
-             was removed. `sbx policy log` lists requests sbx blocked; launch again, or set \
-             sandbox.docker_sbx.skip_default_provision if the image provides the toolchain"
-        ))?;
-    }
-    if let Some(command) = &plan.provision {
-        provision(command).context(format!(
-            "sandbox.docker_sbx.provision failed in sbx sandbox {name}; \
-             the sandbox was removed, fix the script and launch again"
-        ))?;
-    } else if !creating && config.sandbox.docker_sbx.provision_script().is_some() {
-        info!(sandbox = %name, "custom provision script only runs on sandbox creation; recreate sandbox to apply changes");
+        if let Err(error) = crate::spinner::with_spinner(&msg, || run(command)) {
+            remove_unfinished(name, &mut run);
+            return Err(error.context(failed.clone()));
+        }
     }
     if creating {
-        write_created_record(&state_dir, &plan.create_settings)?;
-        remove_state_file(&state_dir, CREATING_MARKER_FILE)?;
+        write_created_record(state_dir, &plan.create_settings)?;
+        remove_state_file(state_dir, CREATING_MARKER_FILE)?;
     }
-    Ok(plan)
+    Ok(())
+}
+
+/// Remove a sandbox this launch created but couldn't finish setting up.
+/// Best effort: a failure is logged.
+fn remove_unfinished(name: &str, run: &mut impl FnMut(&SbxCommand) -> Result<()>) {
+    let remove = SbxCommand {
+        args: vec!["rm".to_string(), "-f".to_string(), name.to_string()],
+        env: Vec::new(),
+    };
+    if let Err(e) = run(&remove) {
+        warn!(sandbox = %name, error = %e, "failed to remove unfinished sbx sandbox");
+    }
 }
 
 /// A fresh identifier for one exec's processes in the guest.
@@ -903,5 +936,160 @@ mod tests {
     fn uninitialised_policy_error_names_sbx_policy_init() {
         let message = sbx_error("error: global network policy has not been initialized\n");
         assert!(message.contains("sbx policy init"), "{message}");
+    }
+
+    fn command(words: &str) -> SbxCommand {
+        SbxCommand {
+            args: words.split(' ').map(str::to_string).collect(),
+            env: Vec::new(),
+        }
+    }
+
+    fn rule() -> NetworkRule {
+        NetworkRule {
+            decision: super::super::plan::RuleDecision::Allow,
+            resource: "example.com:443".to_string(),
+        }
+    }
+
+    /// A plan that creates the sandbox again, with one setup command, the
+    /// built-in provisioning and a provision script.
+    fn creating_plan() -> LaunchPlan {
+        LaunchPlan {
+            sandbox_name: "wm-test".to_string(),
+            remove: Some(command("rm -f wm-test")),
+            create: Some(super::super::plan::CreateStep {
+                command: command("create --name wm-test"),
+                workspaces: vec!["/code/proj".to_string()],
+            }),
+            masks: vec![super::super::mask::Mask::empty(PathBuf::from(
+                "/code/proj/.env",
+            ))],
+            setup: vec![command("setup")],
+            default_provision: vec![command("exec built-in")],
+            provision: Some(command("exec custom")),
+            exec: command("exec agent"),
+            hangup: command("exec hangup"),
+            teardown: Vec::new(),
+            notes: Vec::new(),
+            warnings: Vec::new(),
+            network_rules: vec![rule()],
+            create_settings: CreateSettings {
+                agent: "claude".to_string(),
+                ..Default::default()
+            },
+        }
+    }
+
+    /// Apply `plan` with a fake sbx that fails the command `fail`, returning
+    /// the commands run and the result.
+    fn apply(plan: &LaunchPlan, state_dir: &Path, fail: &str) -> (Vec<String>, Result<()>) {
+        let mut ran = Vec::new();
+        let result = apply_plan_with(plan, state_dir, true, &[], |command| {
+            let line = command.args.join(" ");
+            ran.push(line.clone());
+            if line == fail {
+                bail!("sbx {line} failed");
+            }
+            Ok(())
+        });
+        (ran, result)
+    }
+
+    #[test]
+    fn a_created_sandbox_is_recorded_only_once_set_up_and_provisioned() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path();
+        write_created_record(state_dir, &CreateSettings::default()).unwrap();
+        let plan = creating_plan();
+
+        let mut ran = Vec::new();
+        apply_plan_with(&plan, state_dir, true, &[], |command| {
+            let line = command.args.join(" ");
+            if line.starts_with("create") {
+                // A launch killed from here on is recovered by the next.
+                assert!(state_dir.join(CREATING_MARKER_FILE).exists());
+                assert!(read_created_record(state_dir).is_none());
+                assert!(state_dir.join("masks").is_dir());
+                assert_eq!(read_network_record(state_dir), vec![rule()]);
+            }
+            ran.push(line);
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(
+            ran,
+            [
+                "rm -f wm-test",
+                "create --name wm-test",
+                "setup",
+                "exec built-in",
+                "exec custom"
+            ]
+        );
+        assert_eq!(read_created_record(state_dir), Some(plan.create_settings));
+        assert!(!state_dir.join(CREATING_MARKER_FILE).exists());
+        assert_eq!(read_network_record(state_dir), vec![rule()]);
+    }
+
+    #[test]
+    fn a_failure_after_create_removes_the_sandbox_it_created() {
+        for (fail, message) in [
+            ("setup", "Setting up sbx sandbox wm-test failed"),
+            ("exec built-in", "built-in provisioning failed"),
+            ("exec custom", "sandbox.docker_sbx.provision failed"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let state_dir = dir.path();
+
+            let (ran, result) = apply(&creating_plan(), state_dir, fail);
+
+            let error = format!("{:#}", result.unwrap_err());
+            assert!(error.contains(message), "{fail}: {error}");
+            assert_eq!(ran.last().unwrap(), "rm -f wm-test", "{fail}: {ran:?}");
+            assert!(read_created_record(state_dir).is_none(), "{fail}");
+            assert!(state_dir.join(CREATING_MARKER_FILE).exists(), "{fail}");
+            // The rules recorded before the failure stay workmux's.
+            assert_eq!(read_network_record(state_dir), vec![rule()], "{fail}");
+        }
+    }
+
+    #[test]
+    fn a_failed_create_leaves_the_next_launch_to_create_it_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path();
+
+        let (ran, result) = apply(&creating_plan(), state_dir, "create --name wm-test");
+
+        assert!(result.is_err());
+        assert_eq!(ran, ["rm -f wm-test", "create --name wm-test"]);
+        assert!(state_dir.join(CREATING_MARKER_FILE).exists());
+        assert!(read_created_record(state_dir).is_none());
+    }
+
+    #[test]
+    fn a_failure_in_an_existing_sandbox_leaves_it_and_its_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path();
+        write_created_record(state_dir, &CreateSettings::default()).unwrap();
+        let plan = LaunchPlan {
+            remove: None,
+            create: None,
+            masks: Vec::new(),
+            default_provision: Vec::new(),
+            provision: None,
+            ..creating_plan()
+        };
+
+        let (ran, result) = apply(&plan, state_dir, "setup");
+
+        assert!(result.is_err());
+        assert_eq!(ran, ["setup"]);
+        assert!(!state_dir.join(CREATING_MARKER_FILE).exists());
+        assert_eq!(
+            read_created_record(state_dir),
+            Some(CreateSettings::default())
+        );
     }
 }
