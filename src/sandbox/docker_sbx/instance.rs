@@ -648,13 +648,8 @@ pub fn prepare_launch(
         warn!(sandbox = %name, warning, "sbx launch warning");
     }
 
-    // Ask before creating the sandbox, unless kits add rules at create: then
-    // `after_create` asks once, after seeing them.
-    let sbx = &config.sandbox.docker_sbx;
-    let kits_add_rules = sbx.agent() == DockerSbxAgent::Kit || !sbx.kits().is_empty();
-    if plan.create.is_some()
-        && !(kits_add_rules && acknowledgement::can_ask() && !sbx.accepts_wider_network_policy())
-    {
+    // Ask before creating, unless `after_create` asks once it sees the kits' rules.
+    if plan.create.is_some() && !acknowledgement::asks_after_create(config) {
         acknowledgement::acknowledge(config, &name, &plan.widenings)?;
     }
 
