@@ -167,6 +167,17 @@ pub struct SbxCommand {
     pub stdin: Option<Vec<u8>>,
 }
 
+impl SbxCommand {
+    /// Build `sbx <args>` with no extra env or stdin.
+    pub fn new(args: Vec<String>) -> Self {
+        Self {
+            args,
+            env: Vec::new(),
+            stdin: None,
+        }
+    }
+}
+
 /// Creating a missing sandbox.
 #[derive(Debug, Clone)]
 pub struct CreateStep {
@@ -418,22 +429,14 @@ awk '!/^notify[ \t]*=.*sbx-codex-hook/' "$f" > "$f.tmp" && mv "$f.tmp" "$f""#;
 
 /// Run `script` with `sh -c` as the agent user.
 fn agent_script(name: &str, script: &str) -> SbxCommand {
-    SbxCommand {
-        args: words(&["exec", name, "sh", "-c", script]),
-        env: Vec::new(),
-        stdin: None,
-    }
+    SbxCommand::new(words(&["exec", name, "sh", "-c", script]))
 }
 
 /// Run `command` as root in the sandbox.
 fn root_exec(name: &str, command: Vec<String>) -> SbxCommand {
     let mut args = words(&["exec", "-u", "root", name]);
     args.extend(command);
-    SbxCommand {
-        args,
-        env: Vec::new(),
-        stdin: None,
-    }
+    SbxCommand::new(args)
 }
 
 /// Make the agent own the parents of `subpaths` under the guest home.
@@ -574,11 +577,9 @@ if ! grep -q 'nix-daemon.sh' ~/.profile 2>/dev/null; then
 fi
 devbox version
 "#;
-        commands.push(SbxCommand {
-            args: words(&["exec", name, "bash", "-c", script]),
-            env: Vec::new(),
-            stdin: None,
-        });
+        commands.push(SbxCommand::new(words(&[
+            "exec", name, "bash", "-c", script,
+        ])));
     }
     commands
 }
@@ -591,11 +592,7 @@ fn hangup_command(target: &LaunchTarget, exec: &ExecRequest) -> SbxCommand {
          && kill -HUP \"${{p#/proc/}}\"; done; true",
         exec.session
     );
-    SbxCommand {
-        args: words(&["exec", target.sandbox_name, "sh", "-c", &script]),
-        env: Vec::new(),
-        stdin: None,
-    }
+    SbxCommand::new(words(&["exec", target.sandbox_name, "sh", "-c", &script]))
 }
 
 /// Build workspaces that keep the main repository's git metadata read-only.
@@ -990,11 +987,7 @@ fn policy_command(name: &str, verb: &str, resource: &str) -> SbxCommand {
     } else {
         args.push(resource.to_string());
     }
-    SbxCommand {
-        args,
-        env: Vec::new(),
-        stdin: None,
-    }
+    SbxCommand::new(args)
 }
 
 /// Check whether sbx's diagnostics report `name` as failed.
@@ -1245,11 +1238,8 @@ pub fn launch_plan(
     };
 
     let exists = !creates_sandbox(state, target.created_with);
-    let remove = (state.sandbox.is_some() && !exists).then(|| SbxCommand {
-        args: words(&["rm", "-f", name]),
-        env: Vec::new(),
-        stdin: None,
-    });
+    let remove =
+        (state.sandbox.is_some() && !exists).then(|| SbxCommand::new(words(&["rm", "-f", name])));
 
     let created_with = if exists {
         let created = existing_settings(target.created_with, name)?;
@@ -1302,11 +1292,7 @@ pub fn launch_plan(
         workspaces.extend(extra_mounts);
         args.extend(workspaces.iter().cloned());
         create = Some(CreateStep {
-            command: SbxCommand {
-                args,
-                env: Vec::new(),
-                stdin: None,
-            },
+            command: SbxCommand::new(args),
             workspaces,
         });
 

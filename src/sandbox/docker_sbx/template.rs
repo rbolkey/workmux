@@ -75,16 +75,7 @@ pub fn parse_sbx_templates(stdout: &[u8]) -> Result<Vec<SbxTemplateInfo>> {
 }
 
 fn template_loaded(tag: &str) -> Result<bool> {
-    let output = Command::new("sbx")
-        .args(["template", "ls", "--json"])
-        .output()
-        .context("Failed to list sbx templates")?;
-    if !output.status.success() {
-        bail!(
-            "Failed to list sbx templates: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
+    let output = super::instance::sbx(&["template", "ls", "--json"])?;
     Ok(parse_sbx_templates(&output.stdout)?
         .iter()
         .any(|template| template.is(tag)))
@@ -214,17 +205,7 @@ pub fn ensure_template(image: &str) -> Result<String> {
 
     let msg = format!("Loading sbx template {tag}");
     crate::spinner::with_spinner(&msg, || {
-        let output = Command::new("sbx")
-            .args(["template", "load", &tar_path])
-            .output()
-            .context("Failed to run sbx template load")?;
-        if !output.status.success() {
-            bail!(
-                "sbx template load failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-        Ok(())
+        super::instance::sbx(&["template", "load", &tar_path]).map(drop)
     })?;
     write_template_record(&record_path, &source_image_id)?;
     Ok(tag)
