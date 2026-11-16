@@ -5,6 +5,8 @@ description: Run agents in Docker Sandboxes (sbx) microVMs
 
 workmux can run agents in [Docker Sandboxes](https://docs.docker.com/ai/sandboxes/) (the `sbx` CLI). Each worktree gets its own sbx sandbox for each agent it runs, a microVM with its own kernel, and sbx's host-side proxy enforces its network policy.
 
+Docker Sandboxes owns the agent; workmux owns the worktree workflow. By default (`agent: kit`), each sandbox is created for sbx's own agent kit: the kit installs and configures the agent in the sandbox's own home, sbx holds the agent's login as an sbx secret, and the agent sees only sbx's placeholder credentials. workmux mounts the worktree, runs the agent command and keeps status tracking, host commands, the clipboard and the rest of its [shared features](/guide/sandbox/features/) working. The compatibility mode, `agent: shell`, mounts the agent's config directory from your workstation as the container and Lima backends do, for agents sbx has no kit for or to keep your workstation's agent settings (see [Agent setup](#agent-setup-kit-or-shell)).
+
 ## Setup
 
 ### 1. Install and set up sbx
@@ -18,6 +20,8 @@ sbx policy init   # choose allow-all, balanced or deny-all
 
 workmux never runs `sbx login` or `sbx policy init` for you. It checks both before creating a sandbox and stops with an error naming the command to run.
 
+Under `agent: kit`, sign the agent in through sbx. For Claude, either sign in once inside a sandbox (`/login` when Claude says "Not logged in"): sbx keeps the subscription login as its global `anthropic` secret, so every later sandbox starts logged in; or give sbx an API key with `sbx secret set anthropic`. A subscription login is global to sbx; for a different account per sandbox, use API keys scoped to the sandbox (`sbx secret set anthropic --sandbox <sandbox>`).
+
 workmux also needs Docker (`docker` on `PATH`) to build the sandbox template.
 
 ### 2. Enable in config
@@ -27,6 +31,15 @@ workmux also needs Docker (`docker` on `PATH`) to build the sandbox template.
 sandbox:
   enabled: true
   backend: docker_sbx
+```
+
+`agent: kit` is the default. To mount your agent config instead, set `agent: shell` in your global config (a project's `.workmux.yaml` can't choose it):
+
+```yaml
+# ~/.config/workmux/config.yaml
+sandbox:
+  docker_sbx:
+    agent: shell
 ```
 
 ## Prerequisites
@@ -51,7 +64,7 @@ The generic `sandbox` settings keep their meaning:
 | `backend`          | `container`                             | Set to `docker_sbx` for Docker Sandboxes                                                                                       |
 | `image`            | `ghcr.io/raine/workmux-sandbox:<agent>` | Agent image the sbx template is built from                                                                                     |
 | `rpc_host`         | `host.docker.internal`                  | Hostname the guest uses to reach workmux's RPC server. **Global config only.**                                                 |
-| `agent_config_dir` | agent's default (e.g. `~/.claude/`)     | Host directory mounted as the agent's config directory. **Global config only.**                                                |
+| `agent_config_dir` | agent's default (e.g. `~/.claude/`)     | Host directory mounted as the agent's config directory, under `agent: shell`. **Global config only.**                          |
 | `env_passthrough`  | `[]`                                    | Environment variables to pass through to the sandbox. **Global config only.**                                                  |
 | `env`              | `{}`                                    | Environment variables to set with explicit values. **Global config only.**                                                     |
 | `host_commands`    | `[]`                                    | Commands to proxy from the sandbox to the host via RPC (see [shared features](/guide/sandbox/features/#host-command-proxying)) |
@@ -74,13 +87,24 @@ sandbox:
 
 | Option                              | Default                       | Description                                                                                     |
 | ----------------------------------- | ----------------------------- | ----------------------------------------------------------------------------------------------- |
+| `docker_sbx.agent`                  | `kit`                         | `kit` or `shell` (see [Agent setup](#agent-setup-kit-or-shell)). **Global config only.**        |
 | `docker_sbx.cpus`                   | all host CPUs (sbx's default) | Number of CPUs for the sandbox (`0` means all)                                                  |
 | `docker_sbx.memory`                 | half the host's memory        | Memory for the sandbox in sbx's binary units (`512m`, `8g`); at least `512m`                    |
 | `docker_sbx.provision`              | -                             | Shell script run once, as root, when the sandbox is created (see [Provisioning](#provisioning)) |
 | `docker_sbx.skip_default_provision` | `false`                       | Skip workmux's built-in provisioning (see [Provisioning](#provisioning))                        |
 | `docker_sbx.kits`                   | `[]`                          | sbx mixin kits added when the sandbox is created (see [Kits](#kits)). **Global config only.**   |
 
-sbx has no per-sandbox disk setting, so there is no `disk`. Resources, `provision` and `kits` apply when the sandbox is created; recreate it with `workmux sandbox prune` after changing them. workmux warns at launch when a setting fixed at creation (`agent`, `agent_config_dir`, `extra_mounts`, `cpus`, `memory`, `kits`, `image`, the toolchain) differs from what the sandbox was created with, naming the settings. A change that would leave a file the agent shouldn't read unhidden is an error instead (see [`excluded_files`](#whats-mounted)).
+sbx has no per-sandbox disk setting, so there is no `disk`. Resources, `provision` and `kits` apply when the sandbox is created; recreate it with `workmux sandbox prune` after changing them. workmux warns at launch when a setting fixed at creation (`agent`, `agent_config_dir`, `extra_mounts`, `cpus`, `memory`, `kits`, `image`, the toolchain) differs from what the sandbox was created with, naming the settings. A change that would leave a file the agent shouldn't read unhidden is an error instead (see [`excluded_files`](#whats-mounted)), as is a change of `docker_sbx.agent` (see [Agent setup](#agent-setup-kit-or-shell)).
+
+## Agent setup: `kit` or `shell`
+
+`sandbox.docker_sbx.agent` decides who sets the agent up in its sandbox. It's read only from your global config: under `shell` the agent holds its real credential, so a repository can't choose it (workmux ignores it in `.workmux.yaml`, with a warning).
+
+**`kit` (default).** workmux creates the sandbox for sbx's [agent kit](https://docs.docker.com/ai/sandboxes/) (`sbx create claude …`), with the same template, worktree, git metadata and other mounts, and no agent config directory. The kit installs the agent's settings in the sandbox's own home, completes Claude's onboarding, trusts the workspace and adds its own network rules for the agent's vendor (`sbx policy ls <sandbox>` lists them). sbx holds the agent's credential: Claude's `~/.claude/.credentials.json` in the sandbox holds only sbx's placeholder, and sbx's proxy signs Claude's requests. When it creates the sandbox, workmux adds its [status hooks](/guide/status-tracking/) to the kit's `~/.claude/settings.json`, so the sidebar shows the agent's state as under `shell`. The kit's own hooks and status line call `sbx-claude-hook`, which comes with sbx's own Claude image, not workmux's template; workmux drops them when the template doesn't have it. Your workstation's Claude settings, hooks, plugins and sessions aren't in the sandbox; configure sbx's own settings (secrets, MCP servers, skills) with sbx. Claude is the agent `kit` supports so far; for other agents, use `shell`.
+
+**`shell`.** workmux creates the sandbox with sbx's generic `shell` agent and mounts the agent's config directory from your workstation where the agent looks for it (see [What's mounted](#whats-mounted)), as on the container and Lima backends: the agent keeps your settings, hooks and login, which it holds itself. sbx's kits can't share that home: they write the agent's settings and credentials into it.
+
+Under both, workmux runs the agent command itself with `sbx exec`, never `sbx run`. The mode is fixed when the sandbox is created and recorded with it. A sandbox created under the other mode fails to launch with an error naming how to recreate it (`workmux sandbox prune`, or `sbx rm -f <sandbox>`), so switching to `kit` never keeps running a sandbox with your real credential mounted; sandboxes from before workmux recorded the mode count as `shell`.
 
 ## How it works
 
@@ -109,7 +133,7 @@ A sandbox belongs to the worktree and an agent, not to a pane:
 
 ### What's mounted
 
-sbx mounts the worktree, the git metadata and the shims at their host paths, and the agent's config directories at their usual place under `/home/agent`:
+sbx mounts the worktree, the git metadata and the shims at their host paths, and, under `agent: shell`, the agent's config directories at their usual place under `/home/agent`:
 
 | Mount                                          | Access       | Purpose                                                                |
 | ---------------------------------------------- | ------------ | ---------------------------------------------------------------------- |
@@ -117,21 +141,19 @@ sbx mounts the worktree, the git metadata and the shims at their host paths, and
 | Main repository's `.git`                       | read-only    | Git control policy and administrative namespace                        |
 | Git objects, refs, logs                        | read-write   | Commits and branch updates                                             |
 | Current worktree admin                         | read-write\* | Index, HEAD, merge, and rebase state                                   |
-| Agent config directory                         | read-write   | Agent settings and credentials, at its usual place under `/home/agent` |
-| OpenCode's `~/.config/opencode/` (opencode)    | read-only    | OpenCode's global config, at `/home/agent/.config/opencode`            |
+| Agent config directory (`shell`)               | read-write   | Agent settings and credentials, at its usual place under `/home/agent` |
+| OpenCode's `~/.config/opencode/` (`shell`)     | read-only    | OpenCode's global config, at `/home/agent/.config/opencode`            |
 | `~/.local/state/workmux/docker-sbx/<sandbox>/` | read-only    | Host-command shims                                                     |
 | `excluded_files` entries                       | masked       | An empty file mounted over each, so the agent can't read it            |
 | `extra_mounts` entries                         | read-only\*  | User-configured paths                                                  |
 
 \* As on the [container backend](/guide/sandbox/container/#whats-mounted), git pointer files, per-worktree config, object information, submodules' hooks and config, and files the repository config includes or runs stay read-only within writable git mounts, so an agent can't plant hooks or change git config. For a filter, diff or merge driver or fsmonitor, that's every file in the worktree or git dir its command names, so `sh ./scripts/clean.sh` protects the script as well. sbx enforces read-only mounts on the host, even against root in the sandbox. Sandboxes require a linked worktree: workmux refuses to sandbox the main worktree, whose admin files are the repository's own. Hooks in the main repository must be regular files, not symbolic or hard links.
 
-See [Credentials](/guide/sandbox/features/#credentials) for each agent's config directory. These mounts are made when the sandbox is created; each agent has its own sandbox, so another agent gets its own config directory. For Claude, workmux also writes the sandbox's own `~/.claude.json` with onboarding marked complete. Pi and OMP download Linux `fd` and `rg` binaries into their config directory; workmux binds a directory inside the sandbox over `~/.pi/agent/bin/` and `~/.omp/agent/tools/` each time a pane starts, so the workstation's binaries are never overwritten.
+Under `agent: shell`, see [Credentials](/guide/sandbox/features/#credentials) for each agent's config directory. These mounts are made when the sandbox is created; each agent has its own sandbox, so another agent gets its own config directory. For Claude, workmux also writes the sandbox's own `~/.claude.json` with onboarding marked complete. Pi and OMP download Linux `fd` and `rg` binaries into their config directory; workmux binds a directory inside the sandbox over `~/.pi/agent/bin/` and `~/.omp/agent/tools/` each time a pane starts, so the workstation's binaries are never overwritten.
 
 `extra_mounts` entries are mounted at their `guest_path`, or at their host path without one. sbx mounts a single file only read-only, so a writable entry that is a file is an error. A `guest_path` inside the worktree or another mount appears on the workstation too: sbx creates the mount point there (an empty directory or file) if it's missing.
 
 `sandbox.container.excluded_files` works as on the [container backend](/guide/sandbox/container/), and is global-only there too: each listed file that exists in the worktree is hidden behind an empty, read-only file that workmux keeps in the sandbox's state directory. A symbolic link is masked at the file it points to in the worktree. Missing paths and directories are skipped with a warning in the log, as are links that point outside the worktree; the main worktree, which the container backend masks too, isn't mounted here, so such links don't resolve in the sandbox. Like other mounts, masks are made when the sandbox is created, where the container backend masks them on every launch. So a listed file the sandbox has no mask over, because it was listed or created after the sandbox, is an error at launch naming the file, until you recreate the sandbox with `workmux sandbox prune` (or `sbx rm -f <sandbox>`): the agent could read it. A masked file that's deleted or no longer listed only gets a warning; sbx puts an empty file back where a masked file was deleted when it next starts the sandbox.
-
-Sandboxes are created with sbx's generic `shell` agent, never an agent kit: sbx's kits write the agent's settings and credentials into its home, which here is your mounted config directory. workmux runs the agent command itself, as on the container backend.
 
 Mounts are fixed when the sandbox is created. After changing `extra_mounts` or `excluded_files`, recreate the sandbox with `workmux sandbox prune`; sandboxes created before workmux protected the git metadata need the same.
 
@@ -166,7 +188,7 @@ With `backend: docker_sbx` they use Docker, whatever `sandbox.container.runtime`
 
 ### Authentication
 
-Agents use the login in their mounted config directory, as on the container backend: Codex, Gemini, OpenCode, pi and OMP start logged in if you've logged in on the workstation. Claude stores its login in the macOS Keychain, which the sandbox can't reach. Sign in to Claude once inside a sandbox; the login is written to the mounted config directory and persists across sandboxes. See [Credentials](/guide/sandbox/features/#credentials).
+Under `agent: kit`, sbx holds the agent's login (see [Setup](#1-install-and-set-up-sbx)) and the agent sees only placeholders. Under `agent: shell`, agents use the login in their mounted config directory, as on the container backend: Codex, Gemini, OpenCode, pi and OMP start logged in if you've logged in on the workstation. Claude stores its login in the macOS Keychain, which the sandbox can't reach. Sign in to Claude once inside a sandbox; the login is written to the mounted config directory and persists across sandboxes. See [Credentials](/guide/sandbox/features/#credentials).
 
 ### Tool credentials
 
@@ -187,7 +209,7 @@ sbx also sets git config of its own in the sandbox (keeping its `.sbx` directori
 
 ## Provisioning
 
-The `provision` script runs once, after workmux creates the sandbox, sets it up (config directory parents, Claude's onboarding state, network rules) and runs its [built-in provisioning](#built-in-provisioning), never on later launches. It runs as root with `bash -c`, in the worktree; the template has no `sudo`, so don't use it. Its downloads go through sbx's proxy and network policy like any other request in the sandbox; sbx's `balanced` policy reaches package mirrors over HTTPS only, which is why the [template](#template) switches the image's Debian sources to HTTPS. A changed script applies the next time the sandbox is created (`workmux sandbox prune`, or `workmux remove`). If the script fails, workmux deletes the sandbox and stops with its error, so the next launch creates and provisions it again. The same holds for every step after `sbx create`: workmux records a sandbox's settings in its state directory only once it's fully set up, and a launch that finds a sandbox a launch began creating without finishing (say, after workmux was killed while provisioning) deletes it and creates it again. A sandbox without the record that no launch began creating predates the record: when it's stopped, workmux deletes it and creates it again; while it's running, panes may be in it, so workmux warns and launches into it as it is, or fails if it would have to hide a file (`excluded_files`) the sandbox has no mask over. Close the worktree's panes, and the first launch once sbx has stopped it recreates it.
+The `provision` script runs once, after workmux creates the sandbox, sets it up (network rules; under `agent: kit`, workmux's status hooks; under `agent: shell`, config directory parents and Claude's onboarding state) and runs its [built-in provisioning](#built-in-provisioning), never on later launches. It runs as root with `bash -c`, in the worktree; the template has no `sudo`, so don't use it. Its downloads go through sbx's proxy and network policy like any other request in the sandbox; sbx's `balanced` policy reaches package mirrors over HTTPS only, which is why the [template](#template) switches the image's Debian sources to HTTPS. A changed script applies the next time the sandbox is created (`workmux sandbox prune`, or `workmux remove`). If the script fails, workmux deletes the sandbox and stops with its error, so the next launch creates and provisions it again. The same holds for every step after `sbx create`: workmux records a sandbox's settings in its state directory only once it's fully set up, and a launch that finds a sandbox a launch began creating without finishing (say, after workmux was killed while provisioning) deletes it and creates it again. A sandbox without the record that no launch began creating predates the record: when it's stopped, workmux deletes it and creates it again; while it's running, panes may be in it, so workmux warns and launches into it as it is, or fails if it would have to hide a file (`excluded_files`) the sandbox has no mask over. Close the worktree's panes, and the first launch once sbx has stopped it recreates it.
 
 ```yaml
 sandbox:
@@ -239,7 +261,7 @@ sandbox:
       - docker.io/sbx/task:latest
 ```
 
-A kit can add network rules, credentials and install steps to the sandbox. sbx adds a kit's network rules as rules scoped to the sandbox, so they widen its access beyond `network.allowed_domains`, and workmux leaves them alone (`sbx policy ls <sandbox>` lists them). `kits` is therefore a global-only setting: workmux ignores it in a project's `.workmux.yaml`, with a warning. Use only mixin kits: workmux creates sandboxes with sbx's `shell` agent itself, as described [above](#whats-mounted). sbx keeps composed kits in its template store (`sbx template ls`, as `sandbox-kit-assembled`).
+A kit can add network rules, credentials and install steps to the sandbox. sbx adds a kit's network rules as rules scoped to the sandbox, so they widen its access beyond `network.allowed_domains`, and workmux leaves them alone (`sbx policy ls <sandbox>` lists them). `kits` is therefore a global-only setting: workmux ignores it in a project's `.workmux.yaml`, with a warning. Use only mixin kits: workmux picks the sandbox's agent kit, or sbx's `shell` agent, itself (see [Agent setup](#agent-setup-kit-or-shell)). sbx keeps composed kits in its template store (`sbx template ls`, as `sandbox-kit-assembled`).
 
 ## Network restrictions
 
