@@ -120,9 +120,12 @@ fn merge(
         }
         std::fs::write(path, content)?;
     }
-    match version {
-        Some(version) => opencode::install_dir_for(dir.path(), version),
-        None => agent_setup::install_in(agent, dir.path()),
+    match agent {
+        Agent::OpenCode => opencode::install_dir_for(
+            dir.path(),
+            version.context("OpenCode's version is needed to install its hooks")?,
+        ),
+        _ => agent_setup::install_in(agent, dir.path()),
     }?;
     let mut after = BTreeMap::new();
     collect_files(dir.path(), dir.path(), &mut after)?;
