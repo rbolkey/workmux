@@ -218,26 +218,15 @@ def create_sandbox(
 
 
 @functools.cache
-def load_learning_template(agent: str = "claude") -> str:
-    """Build the thin sbx layer over workmux's image for `agent` and load it
-    into sbx."""
-    tag = TEMPLATE_TAG if agent == "claude" else f"wm-learn-sbx-{agent}:latest"
+def load_learning_template() -> str:
+    """Build the thin sbx layer over workmux's claude image and load it into sbx."""
     subprocess.run(
-        [
-            "docker",
-            "build",
-            "-q",
-            "--build-arg",
-            f"BASE=ghcr.io/raine/workmux-sandbox:{agent}",
-            "-t",
-            tag,
-            str(FIXTURE_DIR),
-        ],
+        ["docker", "build", "-q", "-t", TEMPLATE_TAG, str(FIXTURE_DIR)],
         check=True,
         capture_output=True,
     )
-    load_into_sbx(tag)
-    return tag
+    load_into_sbx(TEMPLATE_TAG)
+    return TEMPLATE_TAG
 
 
 @functools.cache
