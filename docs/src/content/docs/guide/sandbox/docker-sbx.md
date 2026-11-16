@@ -119,7 +119,7 @@ When it creates the sandbox, workmux adds its [status hooks](/guide/status-track
 - Copilot: `~/.copilot/hooks/`
 - OpenCode: a plugin in `~/.config/opencode/plugins/`
 
-The workmux in the template installs them, as the agent user, so the hooks match that workmux rather than the one on your workstation. If its workmux is too old to install them, creating the sandbox fails and workmux removes it again. Update the template's workmux with `workmux sandbox pull`, or with `workmux sandbox install-dev` for a local build.
+workmux on your workstation copies those files out of the sandbox, adds its hooks as `workmux setup` would, and writes back the files it changed, as the agent user. For OpenCode, the plugin follows the version of `opencode` in the sandbox. If any step fails, creating the sandbox fails and workmux removes it again.
 
 workmux's panes start Codex with `--dangerously-bypass-hook-trust` (see [Agent flags](/guide/sandbox/features/#agent-flags)), so Codex runs these hooks without asking you to review them. Approvals given on your workstation wouldn't apply anyway, because the sandbox has a `~/.codex` of its own. Codex shows a startup warning that the flag is on. A Codex you start yourself in the sandbox, such as with `workmux sandbox shell -- codex`, asks once, and trusting the hooks records that in the sandbox's `~/.codex/config.toml`.
 
