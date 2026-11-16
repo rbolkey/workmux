@@ -7,6 +7,7 @@
 
 mod acknowledgement;
 mod git;
+mod hooks;
 mod instance;
 mod mask;
 mod plan;

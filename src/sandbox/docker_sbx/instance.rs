@@ -4,8 +4,9 @@ use anyhow::{Context, Result, bail};
 use nix::fcntl::{Flock, FlockArg};
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
@@ -504,13 +505,35 @@ fn lock_state_dir(state_dir: &Path) -> Result<Flock<File>> {
         .with_context(|| format!("Failed to acquire lock: {}", lock_path.display()))
 }
 
-/// Run one sbx command from a plan and return its stderr.
-fn run_sbx(command: &SbxCommand) -> Result<String> {
+/// What one sbx command printed.
+#[derive(Debug, Default)]
+pub(super) struct SbxOutput {
+    pub stdout: Vec<u8>,
+    pub stderr: String,
+}
+
+/// Run one sbx command from a plan.
+fn run_sbx(command: &SbxCommand) -> Result<SbxOutput> {
     debug!(args = ?command.args, "running sbx");
-    let output = Command::new("sbx")
+    let mut child = Command::new("sbx")
         .args(&command.args)
         .envs(command.env.iter().map(|(k, v)| (k, v)))
-        .output()
+        .stdin(if command.stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("Failed to run sbx {}", command.args[0]))?;
+    if let (Some(input), Some(mut stdin)) = (&command.stdin, child.stdin.take()) {
+        stdin
+            .write_all(input)
+            .with_context(|| format!("Failed to write to sbx {}", command.args[0]))?;
+    }
+    let output = child
+        .wait_with_output()
         .with_context(|| format!("Failed to run sbx {}", command.args[0]))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -521,11 +544,14 @@ fn run_sbx(command: &SbxCommand) -> Result<String> {
             && stderr.contains(RULE_NOT_FOUND)
         {
             debug!(args = ?command.args, "sbx rule already removed");
-            return Ok(String::new());
+            return Ok(SbxOutput::default());
         }
         bail!("sbx {} failed: {}", command.args[0], sbx_error(&stderr));
     }
-    Ok(String::from_utf8_lossy(&output.stderr).into_owned())
+    Ok(SbxOutput {
+        stdout: output.stdout,
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    })
 }
 
 /// Extract the warnings and notes `sbx create` printed, without its progress
@@ -677,7 +703,7 @@ fn apply_plan_with(
     state_dir: &Path,
     network_record: &[NetworkRule],
     after_create: impl FnOnce() -> Result<()>,
-    mut run: impl FnMut(&SbxCommand) -> Result<String>,
+    mut run: impl FnMut(&SbxCommand) -> Result<SbxOutput>,
 ) -> Result<Vec<String>> {
     let name = &plan.sandbox_name;
     if let Some(create) = &plan.create {
@@ -712,8 +738,8 @@ fn apply_plan_with(
     let mut notices = Vec::new();
     if let Some(create) = &plan.create {
         let msg = format!("Creating sbx sandbox {name}");
-        let stderr = crate::spinner::with_spinner(&msg, || run(&create.command))?;
-        notices = create_notices(&stderr);
+        let output = crate::spinner::with_spinner(&msg, || run(&create.command))?;
+        notices = create_notices(&output.stderr);
         if let Err(error) = after_create() {
             remove_unfinished(name, &mut run);
             return Err(error);
@@ -734,16 +760,14 @@ fn apply_plan_with(
     if plan.network_rules != pending {
         write_network_record(state_dir, &plan.network_rules)?;
     }
-    // The template's workmux may predate the setup flags this one passes.
-    if let Some(command) = &plan.status_hooks
-        && let Err(error) = run(command)
+    if let Some(hooks) = &plan.status_hooks
+        && let Err(error) = super::hooks::install(name, hooks, &mut run)
     {
         remove_unfinished(name, &mut run);
         return Err(error.context(format!(
-            "Installing workmux's status hooks in sbx sandbox {name} failed; the sandbox was \
-             removed. If the sandbox image's workmux is older than this one, update it: \
-             `workmux sandbox pull` for the published image, or `workmux sandbox install-dev` \
-             for a local build"
+            "Installing workmux's status hooks for {} in sbx sandbox {name} failed; the \
+             sandbox was removed, launch again",
+            hooks.agent.name()
         )));
     }
     let built_in_failed = format!(
@@ -778,10 +802,11 @@ fn apply_plan_with(
 }
 
 /// Remove a sandbox this launch couldn't finish setting up. Best effort.
-fn remove_unfinished(name: &str, run: &mut impl FnMut(&SbxCommand) -> Result<String>) {
+fn remove_unfinished(name: &str, run: &mut impl FnMut(&SbxCommand) -> Result<SbxOutput>) {
     let remove = SbxCommand {
         args: vec!["rm".to_string(), "-f".to_string(), name.to_string()],
         env: Vec::new(),
+        stdin: None,
     };
     if let Err(e) = run(&remove) {
         warn!(sandbox = %name, error = %e, "failed to remove unfinished sbx sandbox");
@@ -1038,6 +1063,7 @@ mod tests {
         SbxCommand {
             args: words.split(' ').map(str::to_string).collect(),
             env: Vec::new(),
+            stdin: None,
         }
     }
 
@@ -1047,6 +1073,22 @@ mod tests {
             resource: "example.com:443".to_string(),
         }
     }
+
+    /// `command`'s arguments, with any `sh -c` script elided.
+    fn describe(command: &SbxCommand) -> String {
+        let mut args = command.args.clone();
+        if let Some(i) = args.iter().position(|a| a == "-c") {
+            args[i + 1] = "<script>".to_string();
+        }
+        args.join(" ")
+    }
+
+    /// The status hooks' read and write in [`creating_plan`]'s sandbox, which
+    /// has no Copilot config.
+    const HOOKS_READ: &str =
+        "exec wm-test sh -c <script> sh /home/agent/.copilot hooks/workmux-status.json";
+    const HOOKS_WRITE: &str =
+        "exec -i wm-test sh -c <script> sh /home/agent/.copilot/hooks/workmux-status.json";
 
     /// A plan that creates the sandbox again, with one setup command, the
     /// status hooks, the built-in provisioning and a provision script.
@@ -1062,7 +1104,11 @@ mod tests {
                 "/code/proj/.env",
             ))],
             setup: vec![command("setup")],
-            status_hooks: Some(command("exec status-hooks")),
+            status_hooks: Some(super::super::plan::StatusHooks {
+                agent: crate::agent_setup::Agent::Copilot,
+                config_dir: "/home/agent/.copilot".to_string(),
+                files: &["hooks/workmux-status.json"],
+            }),
             default_provision: vec![command("exec built-in")],
             provision: Some(command("exec custom")),
             exec: command("exec agent"),
@@ -1093,12 +1139,12 @@ mod tests {
             &[],
             || Ok(()),
             |command| {
-                let line = command.args.join(" ");
+                let line = describe(command);
                 ran.push(line.clone());
                 if line == fail {
                     bail!("sbx {line} failed");
                 }
-                Ok(String::new())
+                Ok(SbxOutput::default())
             },
         );
         (ran, result)
@@ -1118,7 +1164,7 @@ mod tests {
             &[],
             || Ok(()),
             |command| {
-                let line = command.args.join(" ");
+                let line = describe(command);
                 if line.starts_with("create") {
                     // A launch killed from here on is recovered by the next.
                     assert_eq!(read_created_record(state_dir), CreateRecord::Missing);
@@ -1126,7 +1172,7 @@ mod tests {
                     assert_eq!(read_network_record(state_dir), vec![rule()]);
                 }
                 ran.push(line);
-                Ok(String::new())
+                Ok(SbxOutput::default())
             },
         )
         .unwrap();
@@ -1137,7 +1183,8 @@ mod tests {
                 "rm -f wm-test",
                 "create --name wm-test",
                 "setup",
-                "exec status-hooks",
+                HOOKS_READ,
+                HOOKS_WRITE,
                 "exec built-in",
                 "exec custom"
             ]
@@ -1168,10 +1215,13 @@ mod tests {
             &[],
             || Ok(()),
             |command| {
-                Ok(if command.args[0] == "create" {
-                    stderr.to_string()
-                } else {
-                    String::new()
+                Ok(SbxOutput {
+                    stderr: if command.args[0] == "create" {
+                        stderr.to_string()
+                    } else {
+                        String::new()
+                    },
+                    ..Default::default()
                 })
             },
         )
@@ -1194,7 +1244,10 @@ mod tests {
     fn a_failure_after_create_removes_the_sandbox_it_created() {
         for (fail, message) in [
             ("setup", "Setting up sbx sandbox wm-test failed"),
-            ("exec status-hooks", "workmux sandbox install-dev"),
+            (
+                HOOKS_WRITE,
+                "status hooks for Copilot CLI in sbx sandbox wm-test",
+            ),
             ("exec built-in", "built-in provisioning failed"),
             ("exec custom", "sandbox.docker_sbx.provision failed"),
         ] {

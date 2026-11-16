@@ -452,11 +452,6 @@ pub fn install() -> Result<String> {
     install_version(&config_dir, installed_version()?)
 }
 
-/// [`install`] into `config_dir`.
-pub(crate) fn install_dir(config_dir: &Path) -> Result<String> {
-    install_version(config_dir, installed_version()?)
-}
-
 /// [`install`] into `config_dir` for the OpenCode whose `--version` printed
 /// `version`.
 pub(crate) fn install_dir_for(config_dir: &Path, version: &str) -> Result<String> {
