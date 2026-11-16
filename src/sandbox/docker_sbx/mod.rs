@@ -41,6 +41,12 @@ const DEFAULT_SUPERVISOR: &str = "workmux sandbox run";
 /// an RPC server and runs the command through `sbx exec` in that agent's
 /// sandbox. `supervisor` replaces the default `workmux sandbox run` words,
 /// already shell-quoted, for callers that must pin a specific binary.
+///
+/// The twin of the container backend's `wrap_for_container` (with its own
+/// `DEFAULT_SUPERVISOR`), plus `--agent`. It's a copy rather than a shared
+/// helper because this backend reimplements what lives only inside the
+/// container backend instead of extracting it, keeping the container
+/// backend's code unchanged.
 pub fn wrap_for_docker_sbx(
     command: &str,
     supervisor: Option<&str>,
