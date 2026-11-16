@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Component, Path, PathBuf};
 
 use crate::config::{DockerSbxAgent, SandboxConfig};
+use crate::sandbox::network_proxy::domain_matches;
 use crate::sandbox::toolchain::{self, DetectedToolchain};
 use crate::shell::shell_quote;
 
@@ -266,22 +267,6 @@ const TOOLCHAIN_HOSTS: &[&str] = &[
 /// sbx's name for the workstation in policy rules.
 const WORKSTATION_HOST: &str = "localhost";
 
-/// Where an agent's config directory is linked under the guest home, or
-/// `None` for agents whose config directory workmux doesn't mount.
-fn agent_home_subpath(agent: &str) -> Option<&'static str> {
-    match agent {
-        "claude" => Some(".claude"),
-        "copilot" => Some(".copilot"),
-        "gemini" => Some(".gemini"),
-        "agy" => Some(".gemini/antigravity-cli"),
-        "codex" => Some(".codex"),
-        "opencode" => Some(".local/share/opencode"),
-        "pi" => Some(".pi/agent"),
-        "omp" => Some(".omp/agent"),
-        _ => None,
-    }
-}
-
 /// Where OpenCode's global config directory goes under the guest home.
 const OPENCODE_CONFIG_SUBPATH: &str = ".config/opencode";
 
@@ -301,7 +286,7 @@ fn config_dir_and_home_subpath(
     config: &SandboxConfig,
     agent: &str,
 ) -> Option<(PathBuf, &'static str)> {
-    let subpath = agent_home_subpath(agent)?;
+    let subpath = crate::sandbox::agent_config_guest_subpath(agent)?;
     Some((config.resolved_agent_config_dir(agent)?, subpath))
 }
 
@@ -838,15 +823,10 @@ fn extra_mount_workspaces(
     Ok(workspaces)
 }
 
-/// Whether `host` matches one of `patterns`, workmux's allowed-domain
-/// forms (`host` or `*.suffix`).
+/// Whether `host` matches one of `patterns`, as the network proxy matches
+/// allowed domains.
 fn host_allowed(patterns: &[String], host: &str) -> bool {
-    patterns
-        .iter()
-        .any(|pattern| match pattern.strip_prefix('*') {
-            Some(suffix) => host.ends_with(suffix),
-            None => host == pattern,
-        })
+    patterns.iter().any(|pattern| domain_matches(host, pattern))
 }
 
 /// `sandbox.allowed_domains` hosts, lowercased.
@@ -1001,10 +981,9 @@ fn resource_covered(allowed: &[String], resource: &str) -> bool {
     let Some((host, "443")) = resource.rsplit_once(':') else {
         return false;
     };
-    let host = host.to_ascii_lowercase();
     match host.strip_prefix("**.") {
         Some(base) => host_allowed(allowed, base) && host_allowed(allowed, &format!("*.{base}")),
-        None => host_allowed(allowed, &host),
+        None => host_allowed(allowed, host),
     }
 }
 
@@ -2636,6 +2615,27 @@ mod tests {
             let plan = launch_plan(&config, &target(&p), "claude", &state, &exec()).unwrap();
             assert!(kit_warnings(&plan).is_empty(), "{:?}", plan.warnings);
         }
+    }
+
+    #[test]
+    fn kit_hosts_match_allowed_domains_whatever_their_case() {
+        let p = kit_paths();
+        let state = running_with(vec![kit_rule(&[
+            "API.Anthropic.com:443",
+            "Claude.COM:443",
+            "**.Anthropic.COM:443",
+        ])]);
+        let config = kit_network(
+            NetworkPolicy::Deny,
+            domains(&[
+                "api.anthropic.COM",
+                "CLAUDE.com",
+                "Anthropic.com",
+                "*.ANTHROPIC.com",
+            ]),
+        );
+        let plan = launch_plan(&config, &target(&p), "claude", &state, &exec()).unwrap();
+        assert!(kit_warnings(&plan).is_empty(), "{:?}", plan.warnings);
     }
 
     #[test]

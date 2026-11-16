@@ -44,8 +44,8 @@ const TEMPLATE_REPOSITORY: &str = "workmux-sbx";
 /// own template.
 pub fn template_tag(image: &str) -> String {
     let readable = image.rsplit('/').next().unwrap_or(image);
-    let hash = crate::sandbox::lima::hash_key(&format!("{image}\n{DOCKERFILE_SBX}"), 8);
-    let name = crate::sandbox::lima::sanitize_name(readable, 40);
+    let hash = crate::sandbox::hash_key(&format!("{image}\n{DOCKERFILE_SBX}"), 8);
+    let name = crate::sandbox::sanitize_name(readable, 40);
     if name.is_empty() {
         format!("{TEMPLATE_REPOSITORY}:{hash}")
     } else {
@@ -105,16 +105,6 @@ fn run_docker(args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-fn image_present(image: &str) -> Result<bool> {
-    Ok(Command::new("docker")
-        .args(["image", "inspect", image])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .context("Failed to run docker; the docker_sbx backend builds its template with Docker")?
-        .success())
-}
-
 /// Docker's ID for a local image (`sha256:...`), which changes whenever
 /// the image does: a pull of a newer image, a local build, `install-dev`.
 fn local_image_id(image: &str) -> Result<String> {
@@ -129,43 +119,6 @@ fn local_image_id(image: &str) -> Result<String> {
         );
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
-/// Make sure the agent image is in Docker's image store, pulling it when
-/// it's missing, and for workmux's official images pull an update the
-/// freshness check found, as the container backend does. A pulled update
-/// changes the image ID, which reloads the template.
-fn ensure_image_ready(image: &str) -> Result<()> {
-    let runtime = SandboxRuntime::Docker;
-    let is_official = freshness::is_official_image(image);
-
-    if !image_present(image)? {
-        eprintln!("Pulling image {image}...");
-        run_docker(&["pull", image])?;
-        if is_official {
-            freshness::mark_fresh(image, runtime);
-        }
-        return Ok(());
-    }
-
-    if is_official {
-        if freshness::cached_is_stale(image, runtime) == Some(true) {
-            eprintln!("Updating sandbox image '{}'...", image);
-            match run_docker(&["pull", image]) {
-                Ok(()) => freshness::mark_fresh(image, runtime),
-                Err(e) => {
-                    eprintln!(
-                        "warning: failed to update sandbox image: {}; continuing with local image",
-                        e
-                    );
-                    freshness::check_in_background(image.to_string(), runtime);
-                }
-            }
-        } else {
-            freshness::check_in_background(image.to_string(), runtime);
-        }
-    }
-    Ok(())
 }
 
 /// Refresh the freshness cache for the agent image in the background, so
@@ -225,12 +178,11 @@ pub fn template_loaded_for(image: &str) -> Result<bool> {
 }
 
 /// Make sure the template for `image` is loaded into sbx and built from
-/// the agent image Docker has now, pulling the image first when it's
-/// missing or the freshness check found an update. Builds and reloads the
-/// template when the image changed since it was loaded. Returns the
-/// template tag.
+/// the agent image Docker has now, readying the image as the container
+/// backend does. Builds and reloads the template when the image changed
+/// since it was loaded. Returns the template tag.
 pub fn ensure_template(image: &str) -> Result<String> {
-    ensure_image_ready(image)?;
+    crate::sandbox::ensure_image_ready(SandboxRuntime::Docker, image)?;
     let tag = template_tag(image);
     let source_image_id = local_image_id(image)?;
     let record_path = template_record_path(&tag)?;

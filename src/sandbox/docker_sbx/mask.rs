@@ -34,7 +34,7 @@ impl Mask {
     /// The mask's source file in the sandbox's state directory, one per
     /// target.
     pub fn source(&self, state_dir: &Path) -> PathBuf {
-        let key = crate::sandbox::lima::hash_key(&self.target.to_string_lossy(), 16);
+        let key = crate::sandbox::hash_key(&self.target.to_string_lossy(), 16);
         state_dir.join(MASKS_DIR).join(key)
     }
 

@@ -16,48 +16,11 @@ pub use wrap::wrap_for_lima;
 /// Prefix for all workmux-managed Lima VM names.
 pub const VM_PREFIX: &str = "wm-";
 
+use super::{hash_key, sanitize_name};
 use crate::config::{Config, IsolationLevel};
 use anyhow::Result;
 use std::path::Path;
 use tracing::debug;
-
-/// Sanitize a project name for use in a Lima VM instance name.
-///
-/// Lowercases, replaces non-alphanumeric characters with hyphens,
-/// collapses consecutive hyphens, and strips leading/trailing hyphens.
-pub(crate) fn sanitize_name(name: &str, max_len: usize) -> String {
-    let mut result = String::with_capacity(name.len());
-    let mut prev_hyphen = false;
-
-    for c in name.chars() {
-        if c.is_ascii_alphanumeric() {
-            result.push(c.to_ascii_lowercase());
-            prev_hyphen = false;
-        } else if !prev_hyphen {
-            result.push('-');
-            prev_hyphen = true;
-        }
-    }
-
-    let trimmed = result.trim_matches('-');
-    if trimmed.len() <= max_len {
-        trimmed.to_string()
-    } else {
-        trimmed[..max_len].trim_end_matches('-').to_string()
-    }
-}
-
-/// Hash a key and return the first `len` hex characters (zero-padded).
-pub(crate) fn hash_key(key: &str, len: usize) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
-    let mut hasher = DefaultHasher::new();
-    key.hash(&mut hasher);
-    let hash = hasher.finish();
-    let hex = format!("{:016x}", hash);
-    hex[..len].to_string()
-}
 
 /// Generate a unique instance name for a worktree based on isolation level.
 ///

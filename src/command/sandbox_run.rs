@@ -537,7 +537,7 @@ fn run_container(
     )
     .name();
     let freshness_image = config.sandbox.resolved_image(agent);
-    crate::sandbox::ensure_image_ready(&config.sandbox, &freshness_image)?;
+    crate::sandbox::ensure_image_ready(config.sandbox.runtime(), &freshness_image)?;
 
     // Merge built-in commands (e.g. afplay, clipboard shims) with user-configured ones.
     // A node's host is not the user's machine, so it runs none.

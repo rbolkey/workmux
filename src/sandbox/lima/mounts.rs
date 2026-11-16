@@ -199,22 +199,6 @@ pub(crate) fn seed_claude_json(vm_name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Where an agent's config directory is mounted under the guest home, or
-/// `None` for agents whose config directory workmux doesn't mount.
-fn agent_config_guest_subpath(agent: &str) -> Option<&'static str> {
-    match agent {
-        "claude" => Some(".claude"),
-        "copilot" => Some(".copilot"),
-        "gemini" => Some(".gemini"),
-        "agy" => Some(".gemini/antigravity-cli"),
-        "codex" => Some(".codex"),
-        "opencode" => Some(".local/share/opencode"),
-        "pi" => Some(".pi/agent"),
-        "omp" => Some(".omp/agent"),
-        _ => None,
-    }
-}
-
 /// Generate mount points for Lima VM based on isolation level and config.
 ///
 /// The `agent` parameter controls agent-specific mounts (e.g. `~/.claude`
@@ -296,7 +280,7 @@ fn generate_mounts_with_state_root(
 
     // Mount agent config directory
     if let Some(auth_dir) = config.sandbox.resolved_agent_config_dir(agent)
-        && let Some(guest_subpath) = agent_config_guest_subpath(agent)
+        && let Some(guest_subpath) = crate::sandbox::agent_config_guest_subpath(agent)
     {
         let guest_path = lima_guest_home()
             .map(|h| h.join(guest_subpath))
