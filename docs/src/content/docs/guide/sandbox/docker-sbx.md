@@ -402,9 +402,22 @@ Differences from the container backend:
 
 ### Accepting a wider policy
 
-Under `policy: deny`, when workmux creates a sandbox that would reach more than `allowed_domains` (your global sbx policy allows more than `deny-all`, an allowed domain leaves `allow_private_ips` false, or the agent kit's hosts aren't all covered), it prints a `warning:` line for each of these to the terminal and asks `[y/N]` before going on. This happens in `workmux add` and `workmux open` before the window opens, and in the pane when a pane has to create its sandbox again. Under `agent: kit`, or with mixin `kits`, workmux asks right after `sbx create`, once the kits' rules exist, and deletes the sandbox if you answer no. Kits with port-80 hosts, such as the claude kit, are never fully covered, since `allowed_domains` covers port 443 only, so their sandboxes always ask.
+Under `policy: deny`, when workmux creates a sandbox that would reach more than `allowed_domains` (your global sbx policy allows more than `deny-all`, an allowed domain leaves `allow_private_ips` false, or the agent kit's hosts aren't all covered), it prints one warning listing them to the terminal and asks before going on:
 
-You're asked once per sandbox. workmux records your answer in `~/.local/state/workmux/docker-sbx-acknowledgements/wider-network-policy-v1/<sandbox>` (readable only by you), beside Lima's acknowledgements, and deletes it with the sandbox in `workmux remove` and `workmux sandbox prune`, so a new sandbox asks again. Later launches into the sandbox don't ask, and only log the warnings, so a change to your global sbx policy still shows up in workmux's log.
+```text
+warning: sbx sandbox wm-x-claude reaches more than allowed_domains:
+  - 195 destinations allowed by your global sbx policy
+  - private and loopback addresses of allowed domains
+  - hosts added by the claude kit: mcp-proxy.anthropic.com:443,
+    bridge.claudeusercontent.com:443, deb.debian.org:80, dhi.io:80
+  Details: sbx policy ls wm-x-claude
+  To narrow your global sbx policy: sbx policy init deny-all
+Create it anyway? [y/N]
+```
+
+Each line is one of the cases under [Network restrictions](#network-restrictions), which explains it; the last line of the warning appears only when your global policy is the cause. This happens in `workmux add` and `workmux open` before the window opens, and in the pane when a pane has to create its sandbox again. Under `agent: kit`, or with mixin `kits`, workmux asks right after `sbx create`, once the kits' rules exist, and deletes the sandbox if you answer no. Kits with port-80 hosts, such as the claude kit, are never fully covered, since `allowed_domains` covers port 443 only, so their sandboxes always ask.
+
+You're asked once per sandbox. workmux records your answer in `~/.local/state/workmux/docker-sbx-acknowledgements/wider-network-policy-v1/<sandbox>` (readable only by you), beside Lima's acknowledgements, and deletes it with the sandbox in `workmux remove` and `workmux sandbox prune`, so a new sandbox asks again. Later launches into the sandbox don't ask, and only log the same warning, so a change to your global sbx policy still shows up in workmux's log.
 
 To accept without asking, for scripts and coordinator agents, set it in your global config. workmux ignores it in a project's `.workmux.yaml`, so a repository can't accept for you:
 
@@ -415,7 +428,7 @@ sandbox:
     accept_wider_network_policy: true
 ```
 
-Without a terminal to ask in and without the setting, creating the sandbox fails with an error naming the setting and `sbx policy init deny-all`, and no sandbox is left behind. Under `policy: allow` workmux never asks: `allow` makes no promise to narrow access.
+With the setting, workmux prints the warning without the question. Without a terminal to ask in and without the setting, creating the sandbox fails with an error naming the setting and `sbx policy init deny-all`, and no sandbox is left behind. Under `policy: allow` workmux never asks: `allow` makes no promise to narrow access.
 
 ### Blocked requests
 

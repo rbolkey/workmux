@@ -854,31 +854,69 @@ pub enum Widening {
     KitHosts(Vec<String>),
 }
 
-impl Widening {
-    /// Describe the widening of sandbox `name`.
-    pub fn warning(&self, name: &str) -> String {
-        match self {
-            Self::GlobalPolicy { destinations } => format!(
-                "sandbox.network.policy is deny, but sbx's global network policy also allows \
-                 {destinations} destinations besides sandbox.network.allowed_domains \
-                 (`sbx policy ls {name}` lists them), and a sandbox's rules can't take them \
-                 back. For the container backend's behaviour, choose `sbx policy init \
-                 deny-all` (after `sbx policy reset`); workmux never changes the global policy."
-            ),
-            Self::PrivateAddresses => "sbx doesn't refuse private or loopback addresses an \
-                 allowed domain resolves to, so allow_private_ips: false can't be enforced \
-                 under the docker_sbx backend."
-                .to_string(),
-            Self::KitHosts(resources) => format!(
-                "sandbox.network.policy is deny, but the rules sbx's kits added to this \
-                 sandbox also allow {}, which sandbox.network.allowed_domains doesn't cover \
-                 (`sbx policy ls {name}` lists them). workmux never removes a kit's rules, \
-                 which the kit needs; list your agent's API domains in allowed_domains (it \
-                 covers port 443 only) to keep this warning to the rest.",
-                resources.join(", ")
-            ),
+/// Width the widening report wraps a kit host list at.
+const REPORT_WIDTH: usize = 72;
+
+/// Name what added a sandbox's kit rules: the agent kit, when it's the only
+/// kit, or else all of them.
+pub fn kits_label(config: &SandboxConfig, agent: &str) -> String {
+    if config.docker_sbx.agent() == DockerSbxAgent::Kit && config.docker_sbx.kits().is_empty() {
+        format!("the {agent} kit")
+    } else {
+        "the sandbox's kits".to_string()
+    }
+}
+
+/// Describe in one block what sandbox `name` reaches beyond `allowed_domains`,
+/// one bullet per widening. `kits` names what added the kit hosts.
+///
+/// The docs explain why each widening exists and what to do about it.
+pub fn widening_report(name: &str, kits: &str, widenings: &[Widening]) -> String {
+    let mut report = format!("sbx sandbox {name} reaches more than allowed_domains:");
+    let mut global = false;
+    for widening in widenings {
+        report.push_str("\n  - ");
+        match widening {
+            Widening::GlobalPolicy { destinations } => {
+                global = true;
+                report.push_str(&format!(
+                    "{destinations} destinations allowed by your global sbx policy"
+                ));
+            }
+            Widening::PrivateAddresses => {
+                report.push_str("private and loopback addresses of allowed domains")
+            }
+            Widening::KitHosts(resources) => {
+                report.push_str(&wrap_list(&format!("hosts added by {kits}:"), resources))
+            }
         }
     }
+    report.push_str(&format!("\n  Details: sbx policy ls {name}"));
+    if global {
+        report.push_str("\n  To narrow your global sbx policy: sbx policy init deny-all");
+    }
+    report
+}
+
+/// Write `items` after `lead`, comma-separated, continuing on indented
+/// lines so a report bullet stays within [`REPORT_WIDTH`].
+fn wrap_list(lead: &str, items: &[String]) -> String {
+    let mut text = lead.to_string();
+    // The bullet's `  - ` precedes `lead`.
+    let mut line_len = 4 + lead.len();
+    for (i, item) in items.iter().enumerate() {
+        let comma = if i + 1 < items.len() { "," } else { "" };
+        let width = 1 + item.len() + comma.len();
+        if i > 0 && line_len + width > REPORT_WIDTH {
+            text.push_str("\n   ");
+            line_len = 3;
+        }
+        text.push(' ');
+        text.push_str(item);
+        text.push_str(comma);
+        line_len += width;
+    }
+    text
 }
 
 /// List what sbx lets sandbox `name` reach under `deny` beyond the container
@@ -1400,7 +1438,10 @@ pub fn launch_plan(
             .collect(),
         warnings: check_warnings(state)
             .into_iter()
-            .chain(widenings.iter().map(|widening| widening.warning(name)))
+            .chain(
+                (!widenings.is_empty())
+                    .then(|| widening_report(name, &kits_label(config, agent), &widenings)),
+            )
             .chain(
                 created_with
                     .into_iter()
@@ -2305,11 +2346,12 @@ mod tests {
 
             assert!(plan.notes.is_empty(), "{:?}", plan.notes);
             // The global policy's destinations can resolve to private
-            // addresses too.
-            assert_eq!(plan.warnings.len(), 2, "{:?}", plan.warnings);
+            // addresses too, in the same report.
+            assert_eq!(plan.warnings.len(), 1, "{:?}", plan.warnings);
             let warning = &plan.warnings[0];
             for expected in [
-                "2 destinations",
+                "2 destinations allowed by your global sbx policy",
+                "private and loopback",
                 "sbx policy ls wm-proj-12345678",
                 "sbx policy init deny-all",
             ] {
@@ -2352,8 +2394,8 @@ mod tests {
         let plan = launch_plan(&config, &target(&p), "claude", &deny_all, &exec()).unwrap();
         assert_eq!(plan.warnings.len(), 1, "{:?}", plan.warnings);
         assert!(
-            plan.warnings[0].contains("private or loopback")
-                && plan.warnings[0].contains("allow_private_ips"),
+            plan.warnings[0].contains("private and loopback addresses of allowed domains")
+                && !plan.warnings[0].contains("deny-all"),
             "{:?}",
             plan.warnings
         );
@@ -2436,7 +2478,8 @@ mod tests {
         assert_eq!(warnings.len(), 1, "{:?}", plan.warnings);
         let warning = warnings[0];
         for expected in [
-            "also allow downloads.claude.ai:443, deb.debian.org:80, which",
+            "hosts added by the claude kit: downloads.claude.ai:443,",
+            "deb.debian.org:80\n",
             "sbx policy ls wm-proj-12345678",
             "allowed_domains",
         ] {
@@ -2554,7 +2597,69 @@ mod tests {
         .unwrap();
         assert!(plan.create.is_none());
         assert_eq!(plan.widenings, vec![]);
-        assert_eq!(plan.warnings.len(), 3, "{:?}", plan.warnings);
+        assert_eq!(plan.warnings.len(), 1, "{:?}", plan.warnings);
+        assert!(
+            plan.warnings[0].starts_with("sbx sandbox wm-proj-12345678 reaches more"),
+            "{:?}",
+            plan.warnings
+        );
+    }
+
+    #[test]
+    fn the_widening_report_lists_each_widening_once_in_one_block() {
+        let report = widening_report(
+            "wm-x-claude",
+            "the claude kit",
+            &[
+                Widening::GlobalPolicy { destinations: 195 },
+                Widening::PrivateAddresses,
+                Widening::KitHosts(args(&[
+                    "mcp-proxy.anthropic.com:443",
+                    "bridge.claudeusercontent.com:443",
+                    "deb.debian.org:80",
+                    "dhi.io:80",
+                ])),
+            ],
+        );
+        assert_eq!(
+            report,
+            "sbx sandbox wm-x-claude reaches more than allowed_domains:\n\
+             \x20 - 195 destinations allowed by your global sbx policy\n\
+             \x20 - private and loopback addresses of allowed domains\n\
+             \x20 - hosts added by the claude kit: mcp-proxy.anthropic.com:443,\n\
+             \x20   bridge.claudeusercontent.com:443, deb.debian.org:80, dhi.io:80\n\
+             \x20 Details: sbx policy ls wm-x-claude\n\
+             \x20 To narrow your global sbx policy: sbx policy init deny-all"
+        );
+    }
+
+    #[test]
+    fn the_widening_report_hints_deny_all_only_for_the_global_policy() {
+        let report = widening_report(
+            "wm-x-claude",
+            "the sandbox's kits",
+            &[
+                Widening::PrivateAddresses,
+                Widening::KitHosts(args(&["dhi.io:80"])),
+            ],
+        );
+        assert_eq!(
+            report,
+            "sbx sandbox wm-x-claude reaches more than allowed_domains:\n\
+             \x20 - private and loopback addresses of allowed domains\n\
+             \x20 - hosts added by the sandbox's kits: dhi.io:80\n\
+             \x20 Details: sbx policy ls wm-x-claude"
+        );
+    }
+
+    #[test]
+    fn kit_hosts_are_named_after_the_agent_kit_unless_mixins_add_theirs() {
+        let mut config = kit_network(NetworkPolicy::Deny, Vec::new());
+        assert_eq!(kits_label(&config, "claude"), "the claude kit");
+        config.docker_sbx.kits = Some(vec!["docker.io/sbx/task:latest".to_string()]);
+        assert_eq!(kits_label(&config, "claude"), "the sandbox's kits");
+        config.docker_sbx.agent = Some(DockerSbxAgent::Shell);
+        assert_eq!(kits_label(&config, "claude"), "the sandbox's kits");
     }
 
     #[test]
