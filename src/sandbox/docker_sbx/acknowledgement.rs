@@ -8,7 +8,7 @@ use tracing::warn;
 use crate::config::{Config, DockerSbxAgent};
 use crate::sandbox::acknowledgement::{Acknowledgement, ask_on_stdin_interruptibly, can_ask};
 
-use super::plan::Widening;
+use super::plan::{Widening, kits_label, widening_report};
 
 /// Return the acknowledgement file of sandbox `name`, beside Lima's.
 pub(super) fn marker(name: &str) -> Result<PathBuf> {
@@ -27,33 +27,34 @@ pub(super) fn asks_after_create(config: &Config) -> bool {
 }
 
 /// Have the user accept `widenings` for sandbox `name`, once per sandbox.
+/// `agent` names the agent kit in the report.
 ///
 /// Accepts by `accept_wider_network_policy` or by asking on a terminal, and
 /// fails otherwise. Ctrl-C at the question declines.
-pub(super) fn acknowledge(config: &Config, name: &str, widenings: &[Widening]) -> Result<()> {
+pub(super) fn acknowledge(
+    config: &Config,
+    name: &str,
+    agent: &str,
+    widenings: &[Widening],
+) -> Result<()> {
     if widenings.is_empty() {
         return Ok(());
     }
     let marker = marker(name)?;
-    let warnings: Vec<String> = widenings.iter().map(|w| w.warning(name)).collect();
-    let question = format!("Create sbx sandbox {name} with this wider network access?");
+    let report = widening_report(name, &kits_label(&config.sandbox, agent), widenings);
     let refused = format!(
-        "sbx sandbox {name} would reach more than sandbox.network.allowed_domains under \
-         sandbox.network.policy: deny, as the warnings above say, and creating it needs \
-         your acceptance. Set sandbox.docker_sbx.accept_wider_network_policy: true in your \
-         global config for unattended use, or narrow sbx's global policy with \
-         `sbx policy init deny-all` (after `sbx policy reset`)."
+        "Creating sbx sandbox {name} needs your acceptance of the above. Set \
+         sandbox.docker_sbx.accept_wider_network_policy: true in your global config for \
+         unattended use, or narrow your global sbx policy with `sbx policy init deny-all`."
     );
     Acknowledgement {
         marker: &marker,
         marker_name: "sbx wider network policy acknowledgement",
-        warnings: &warnings,
+        warnings: &[report],
         accepted_by_config: config.sandbox.docker_sbx.accepts_wider_network_policy(),
-        question: &question,
+        question: "Create it anyway?",
         refused: &refused,
-        declined: &format!(
-            "Creating sbx sandbox {name} with this wider network access was declined"
-        ),
+        declined: &format!("Creating sbx sandbox {name} was declined"),
     }
     .acknowledge(can_ask().then_some(ask_on_stdin_interruptibly))
 }

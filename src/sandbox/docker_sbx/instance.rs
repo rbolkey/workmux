@@ -644,7 +644,7 @@ pub fn prepare_launch(
 
     // Ask before creating, unless `after_create` asks once it sees the kits' rules.
     if plan.create.is_some() && !acknowledgement::asks_after_create(config) {
-        acknowledgement::acknowledge(config, &name, &plan.widenings)?;
+        acknowledgement::acknowledge(config, &name, agent, &plan.widenings)?;
     }
 
     let image = config.sandbox.resolved_image(agent);
@@ -665,13 +665,13 @@ pub fn prepare_launch(
         let (_, rules) = list_sandbox_and_rules(&name)
             .context("Failed to list the new sbx sandbox's network rules")?;
         let widenings = super::plan::widenings(&config.sandbox, &rules, &name, &plan.network_rules);
-        for widening in &widenings {
-            if let Widening::KitHosts(_) = widening {
-                let warning = widening.warning(&name);
-                warn!(sandbox = %name, warning, "sbx launch warning");
-            }
+        // The plan's report, logged above, didn't have the kits' hosts yet.
+        if widenings.iter().any(|w| matches!(w, Widening::KitHosts(_))) {
+            let kits = super::plan::kits_label(&config.sandbox, agent);
+            let warning = super::plan::widening_report(&name, &kits, &widenings);
+            warn!(sandbox = %name, warning, "sbx launch warning");
         }
-        acknowledgement::acknowledge(config, &name, &widenings)
+        acknowledgement::acknowledge(config, &name, agent, &widenings)
     };
     let notices = apply_plan_with(
         &plan,

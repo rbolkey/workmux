@@ -209,7 +209,14 @@ def test_deny_under_a_wider_global_policy_fails_without_a_terminal(
         mux_server, workmux_exe_path, mux_repo_path, "feature-sbx-wider", True
     )
 
-    assert "warning: sandbox.network.policy is deny, but sbx's global" in result.stderr
+    assert (
+        "reaches more than allowed_domains:\n"
+        "  - 2 destinations allowed by your global sbx policy\n"
+    ) in result.stderr, result.stderr
+    assert (
+        "  To narrow your global sbx policy: sbx policy init deny-all\n"
+        in result.stderr
+    )
     for expected in [
         "sandbox.docker_sbx.accept_wider_network_policy: true",
         "sbx policy init deny-all",
@@ -234,7 +241,10 @@ def test_kit_hosts_found_at_create_fail_without_a_terminal_and_remove_the_sandbo
         mux_server, workmux_exe_path, mux_repo_path, "feature-sbx-kit-hosts", True
     )
 
-    assert "also allow downloads.claude.ai:443, which" in result.stderr
+    assert (
+        "  - hosts added by the claude kit: downloads.claude.ai:443\n" in result.stderr
+    ), result.stderr
+    assert "To narrow your global sbx policy" not in result.stderr, result.stderr
     assert "accept_wider_network_policy" in result.stderr, result.stderr
     created = created_sandboxes(fake_sbx)
     assert len(created) == 1
@@ -263,7 +273,8 @@ def test_the_setting_accepts_a_wider_policy_and_records_it_until_remove(
         mux_server, workmux_exe_path, mux_repo_path, branch_name
     )
 
-    assert "warning: sandbox.network.policy is deny" in result.stderr
+    assert "reaches more than allowed_domains:" in result.stderr, result.stderr
+    assert "Create it anyway?" not in result.stderr, result.stderr
     created = created_sandboxes(fake_sbx)
     assert len(created) == 1
     [acknowledgement] = acknowledgements(mux_server)
