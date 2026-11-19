@@ -217,6 +217,42 @@ impl ResolvedCommand {
     }
 }
 
+/// List the panes `setup_panes` lays out, with their index and resolved
+/// command. A pane after the first without a split direction isn't laid out.
+#[allow(clippy::too_many_arguments)]
+pub fn laid_out_panes<'a>(
+    panes: &'a [crate::config::PaneConfig],
+    run_commands: bool,
+    prompt_file_path: Option<&'a Path>,
+    working_dir: &'a Path,
+    config: &'a Config,
+    task_agent: Option<&'a str>,
+    shell: &'a str,
+) -> impl Iterator<
+    Item = (
+        usize,
+        &'a crate::config::PaneConfig,
+        Option<ResolvedCommand>,
+    ),
+> + 'a {
+    panes
+        .iter()
+        .enumerate()
+        .filter(|(i, pane)| *i == 0 || pane.split.is_some())
+        .map(move |(i, pane)| {
+            let command = resolve_pane_command_with_config(
+                pane.command.as_deref(),
+                run_commands,
+                prompt_file_path,
+                working_dir,
+                config,
+                task_agent,
+                shell,
+            );
+            (i, pane, command)
+        })
+}
+
 pub fn resolve_pane_command_with_config(
     pane_command: Option<&str>,
     run_commands: bool,
@@ -618,6 +654,52 @@ mod tests {
         .unwrap();
         assert_eq!(resolved.command, "codex exec -m mini");
         assert_eq!(resolved.selected_agent.unwrap().kind(), "codex");
+    }
+
+    #[test]
+    fn panes_name_their_agent_as_named_agent_or_agent_type() {
+        let mut config = config_with_agent("cc-personal");
+        for (name, command, kind) in [
+            ("cc-personal", "claude", "claude"),
+            ("codex-mini", "codex", "codex"),
+        ] {
+            config.agents.insert(
+                name.to_string(),
+                crate::config::AgentEntry {
+                    command: Some(command.to_string()),
+                    agent_type: Some(kind.to_string()),
+                    args: Vec::new(),
+                    env: std::collections::BTreeMap::new(),
+                },
+            );
+        }
+        let agent_name = |command: &str, task_agent: Option<&str>| {
+            resolve_pane_command_with_config(
+                Some(command),
+                true,
+                None,
+                Path::new("/tmp"),
+                &config,
+                task_agent,
+                "/bin/zsh",
+            )
+            .unwrap()
+            .selected_agent
+            .map(|agent| agent.name().to_string())
+        };
+        // The "design" layout: the default agent's command, and another agent type.
+        assert_eq!(agent_name("claude", None).as_deref(), Some("cc-personal"));
+        assert_eq!(agent_name("codex", None).as_deref(), Some("codex"));
+        assert_eq!(agent_name("<agent>", None).as_deref(), Some("cc-personal"));
+        assert_eq!(
+            agent_name("<agent>", Some("codex")).as_deref(),
+            Some("codex")
+        );
+        assert_eq!(
+            agent_name("<agent:codex-mini>", None).as_deref(),
+            Some("codex-mini")
+        );
+        assert_eq!(agent_name("vim", None), None);
     }
 
     #[test]

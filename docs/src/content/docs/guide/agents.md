@@ -135,6 +135,8 @@ Structured profiles support these fields:
 
 String entries still work for simple aliases, but structured profiles avoid quoting long commands by hand.
 
+Under the [Docker Sandboxes](/guide/sandbox/docker-sbx/#accounts-per-named-agent) backend, a named agent gets its account from sbx.
+
 :::tip
 Named agents are global-only for security. Define them in `~/.config/workmux/config.yaml`, not in project `.workmux.yaml` files. Project configs can reference them but not define them.
 :::

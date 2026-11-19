@@ -205,7 +205,7 @@ struct ProxyContext {
 ///
 /// Supports exact match and wildcard prefix (`*.example.com` matches
 /// `foo.example.com` but not `example.com` itself).
-fn domain_matches(domain: &str, pattern: &str) -> bool {
+pub(crate) fn domain_matches(domain: &str, pattern: &str) -> bool {
     let domain = domain.to_ascii_lowercase();
     let pattern = pattern.to_ascii_lowercase();
     if let Some(suffix) = pattern.strip_prefix('*') {

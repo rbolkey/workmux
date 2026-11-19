@@ -1,9 +1,9 @@
 ---
 title: "Shared features"
-description: Features shared across container and Lima sandbox backends
+description: Features shared across the container, Lima and Docker Sandboxes backends
 ---
 
-These features work with both the container and Lima sandbox backends.
+These features work with the container, Lima and [Docker Sandboxes](/guide/sandbox/docker-sbx/) sandbox backends.
 
 ## Extra mounts
 
@@ -135,6 +135,8 @@ Key behaviors:
 - OMP uses file-backed state and credentials mounted from `~/.omp/agent/`.
 
 The container backend also uses a separate config file for Claude, mounted to `/tmp/.claude.json` inside the container. Docker/Podman use `~/.claude-sandbox.json` (file mount); Apple Container uses `~/.claude-sandbox-config/claude.json` (directory mount, since Apple Container only supports directory mounts).
+
+For the Docker Sandboxes backend's credentials, see [Agent setup](/guide/sandbox/docker-sbx/#agent-setup-kit-or-shell) and [Tool credentials](/guide/sandbox/docker-sbx/#tool-credentials).
 
 ### Custom config directory
 

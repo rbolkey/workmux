@@ -984,9 +984,11 @@ fn is_headless_add(cmd: &Commands) -> bool {
 }
 
 /// Check if the command should show the nerdfont setup prompt.
-/// Only commands that display icons should trigger the prompt.
-fn should_prompt_nerdfont(cmd: &Commands) -> bool {
-    !is_headless_add(cmd)
+/// Only commands that display icons should trigger the prompt, and never in
+/// a sandbox guest, whose workmux has no config of its own.
+fn should_prompt_nerdfont(cmd: &Commands, sandbox_guest: bool) -> bool {
+    !sandbox_guest
+        && !is_headless_add(cmd)
         && matches!(
             cmd,
             Commands::Add { .. }
@@ -999,8 +1001,11 @@ fn should_prompt_nerdfont(cmd: &Commands) -> bool {
 /// Check if the command should show the status tracking setup wizard.
 /// Excludes `Setup` to avoid double-prompting (the setup command handles its own flow).
 /// Excludes `Dashboard` because the wizard prompt interferes with the TUI.
-fn should_prompt_status_setup(cmd: &Commands) -> bool {
-    !is_headless_add(cmd)
+/// Never in a sandbox guest: accepting there would install hooks and skills
+/// into the agent config mounted from the host.
+fn should_prompt_status_setup(cmd: &Commands, sandbox_guest: bool) -> bool {
+    !sandbox_guest
+        && !is_headless_add(cmd)
         && matches!(
             cmd,
             Commands::Add { .. } | Commands::Init | Commands::List { .. }
@@ -1082,10 +1087,11 @@ pub fn run() -> Result<()> {
         Err(_) => (config::Config::default(), false),
     };
     let has_pua = nerdfont::config_has_pua(&cfg);
+    let sandbox_guest = crate::sandbox::guest::is_sandbox_guest();
     let nerdfont_enabled = if cfg.nerdfont.is_some() || has_pua {
         // Already configured or PUA detected
         cfg.nerdfont.unwrap_or(has_pua)
-    } else if config_ok && should_prompt_nerdfont(&cli.command) {
+    } else if config_ok && should_prompt_nerdfont(&cli.command, sandbox_guest) {
         // Prompt user (returns None in non-interactive mode)
         nerdfont::check_and_prompt(&cfg)?.unwrap_or(false)
     } else {
@@ -1096,7 +1102,7 @@ pub fn run() -> Result<()> {
     // Check agent status tracking setup after nerdfont.
     // Uses a separate gate to avoid double-prompting when running `workmux setup`.
     if config_ok
-        && should_prompt_status_setup(&cli.command)
+        && should_prompt_status_setup(&cli.command, sandbox_guest)
         && let Err(e) = crate::agent_setup::prompt_wizard()
     {
         tracing::debug!(?e, "status setup wizard failed");
@@ -1577,6 +1583,29 @@ fn print_fish_dynamic_completion() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn first_run_prompts_never_show_in_a_sandbox_guest() {
+        // A guest's workmux has no config of its own; accepting there would
+        // install hooks and skills into the mounted agent config.
+        let command = |args: &[&str]| Cli::try_parse_from(args).unwrap().command;
+        for args in [
+            &["workmux", "add", "feat"][..],
+            &["workmux", "init"],
+            &["workmux", "list"],
+        ] {
+            assert!(should_prompt_nerdfont(&command(args), false), "{args:?}");
+            assert!(
+                should_prompt_status_setup(&command(args), false),
+                "{args:?}"
+            );
+            assert!(!should_prompt_nerdfont(&command(args), true), "{args:?}");
+            assert!(
+                !should_prompt_status_setup(&command(args), true),
+                "{args:?}"
+            );
+        }
+    }
 
     #[test]
     fn remote_notice_only_follows_human_facing_commands() {

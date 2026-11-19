@@ -408,15 +408,31 @@ pub fn check_in(agent: Agent, dir: &Path) -> Result<StatusCheck> {
     }
 }
 
+/// List the files, relative to the dir, that installing `agent` in a dir
+/// reads or writes: [`install_in`], or [`opencode::install_dir_for`].
+pub fn dir_files(agent: Agent) -> &'static [&'static str] {
+    match agent {
+        Agent::Claude => claude::DIR_FILES,
+        Agent::Codex => codex::DIR_FILES,
+        Agent::Copilot => copilot::DIR_FILES,
+        Agent::Gemini => gemini::DIR_FILES,
+        Agent::OpenCode => opencode::DIR_FILES,
+        Agent::Pi => pi::DIR_FILES,
+        Agent::Omp => omp::DIR_FILES,
+        Agent::Antigravity | Agent::Grok => &[],
+    }
+}
+
 /// Install status tracking for `agent` in `dir`; see [`check_in`].
 pub fn install_in(agent: Agent, dir: &Path) -> Result<String> {
     match agent {
         Agent::Claude => claude::install_dir(dir),
         Agent::Codex => codex::install_dir(dir),
+        Agent::Copilot => copilot::install_dir(dir),
         Agent::Gemini => gemini::install_dir(dir),
         Agent::Pi => pi::install_dir(dir),
         Agent::Omp => omp::install_dir(dir),
-        Agent::Antigravity | Agent::Copilot | Agent::Grok | Agent::OpenCode => {
+        Agent::Antigravity | Agent::Grok | Agent::OpenCode => {
             anyhow::bail!("{} cannot be set up in a given directory", agent.name())
         }
     }
@@ -688,6 +704,37 @@ mod tests {
             Some(&extensions.join("workmux-status.ts")),
             Some(&alias.join("workmux-status.ts")),
         ));
+    }
+
+    fn read_json(path: &Path) -> serde_json::Value {
+        serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn install_in_writes_copilots_personal_hook_file() {
+        let dir = tempfile::tempdir().unwrap();
+
+        install_in(Agent::Copilot, dir.path()).unwrap();
+
+        let hooks = read_json(&dir.path().join("hooks/workmux-status.json"));
+        assert_eq!(hooks["version"], 1);
+        assert!(
+            hooks["hooks"]["agentStop"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|hook| hook["bash"] == "workmux set-window-status done"),
+            "{hooks}"
+        );
+    }
+
+    #[test]
+    fn install_in_fails_when_the_directory_cant_be_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("not-a-dir");
+        fs::write(&file, "").unwrap();
+
+        assert!(install_in(Agent::Copilot, &file).is_err());
     }
 
     #[test]

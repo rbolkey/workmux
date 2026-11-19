@@ -131,6 +131,10 @@ export default defineConfig({
             { label: "Overview", slug: "guide/sandbox" },
             { label: "Container backend", slug: "guide/sandbox/container" },
             { label: "Lima VM backend", slug: "guide/sandbox/lima" },
+            {
+              label: "Docker Sandboxes backend",
+              slug: "guide/sandbox/docker-sbx",
+            },
             { label: "Shared features", slug: "guide/sandbox/features" },
             { label: "Alternatives", slug: "guide/sandbox/alternatives" },
           ],

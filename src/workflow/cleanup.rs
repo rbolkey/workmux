@@ -402,9 +402,17 @@ fn perform_destructive_cleanup(
         }
     }
 
+    // sbx sandboxes outlive their panes, so delete them with the worktree,
+    // after any launch setting one up, which needs the worktree in place.
+    let project_root = git_common_dir.parent().unwrap_or(git_common_dir);
+    let sbx_removals = crate::sandbox::prepare_docker_sbx_removal(project_root, worktree_path);
     let quarantine = expected
         .map(|expected| quarantine_worktree(worktree_path, expected.directory, expected.repository))
         .transpose()?;
+    // The worktree is gone from its path; nothing can call the removal off.
+    for removal in sbx_removals {
+        removal.remove();
+    }
 
     // The original worktree path is absent after quarantine, allowing Git to
     // discard its linked-worktree registration. These Git operations use the

@@ -528,6 +528,10 @@ pub fn run(
         config_override,
     )?;
 
+    if fork.is_some() {
+        crate::sandbox::docker_sbx::check_fork(&initial_config.sandbox, sandbox_override)?;
+    }
+
     // Resolve fork source if --fork is set
     let fork_source = if let Some(ref fork_arg) = fork {
         let agent_name = initial_config.agent.as_deref().unwrap_or("claude");

@@ -158,9 +158,13 @@ pub fn install() -> Result<String> {
     install_dir(&dir)
 }
 
+/// The files [`install_dir`] reads and writes, relative to `dir`.
+pub(super) const DIR_FILES: &[&str] = &[SETTINGS_FILE];
+const SETTINGS_FILE: &str = "settings.json";
+
 /// [`install`] into the Gemini config directory `dir`.
 pub(crate) fn install_dir(dir: &Path) -> Result<String> {
-    let path = dir.join("settings.json");
+    let path = dir.join(SETTINGS_FILE);
     install_at(&path)?;
 
     Ok(format!("Installed hooks to {}", path.display()))
