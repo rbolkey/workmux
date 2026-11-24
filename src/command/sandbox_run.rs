@@ -1,9 +1,11 @@
 //! The `workmux sandbox run` supervisor process.
 //!
 //! Runs inside a tmux pane. Starts a TCP RPC server and executes the agent
-//! command inside a sandbox (Lima VM or Docker/Podman container).
+//! command inside a sandbox (Lima VM, Docker/Podman container or Docker
+//! Sandboxes microVM).
 
 use anyhow::{Context, Result, anyhow, bail};
+use std::io::IsTerminal;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -17,6 +19,7 @@ use crate::frozen_config::FrozenConfigGuard;
 use crate::multiplexer;
 use crate::remote::node::{NodeRoot, secrets};
 use crate::sandbox::build_docker_run_args;
+use crate::sandbox::docker_sbx;
 use crate::sandbox::ensure_sandbox_config_dirs;
 use crate::sandbox::lima;
 use crate::sandbox::network_proxy::NetworkProxy;
@@ -65,7 +68,9 @@ impl Drop for ContainerGuard {
 /// Run the sandbox supervisor.
 ///
 /// Detects the sandbox backend from config and dispatches to the
-/// appropriate handler (Lima VM or Docker/Podman container).
+/// appropriate handler (Lima VM, Docker/Podman container or sbx sandbox).
+///
+/// `agent` is the pane agent, which picks the sandbox under docker_sbx.
 ///
 /// With `node` (root and workspace id), the supervisor runs on a remote node
 /// for an agent the laptop started: the config is the workspace's frozen
@@ -75,6 +80,7 @@ pub fn run(
     worktree: PathBuf,
     worktree_root: Option<PathBuf>,
     command: Vec<String>,
+    agent: Option<String>,
     node: Option<(PathBuf, String)>,
 ) -> Result<i32> {
     if command.is_empty() {
@@ -101,6 +107,23 @@ pub fn run(
             bail!("remote agents run in docker containers, not Lima")
         }
         SandboxBackend::Lima => run_lima(&config, frozen_config.path(), &worktree, &command),
+        SandboxBackend::DockerSbx if node_root.is_some() => {
+            bail!("remote agents run in docker containers, not Docker Sandboxes")
+        }
+        SandboxBackend::DockerSbx => {
+            let wt_root = worktree_root
+                .map(|p| p.canonicalize().unwrap_or(p))
+                .unwrap_or_else(|| worktree.clone());
+            let agent = agent.unwrap_or_else(|| docker_sbx::selected_agent(&config, None));
+            run_docker_sbx(
+                &config,
+                frozen_config.path(),
+                &worktree,
+                &wt_root,
+                &agent,
+                &command,
+            )
+        }
         SandboxBackend::Container => {
             let wt_root = worktree_root
                 .map(|p| p.canonicalize().unwrap_or(p))
@@ -360,6 +383,110 @@ fn run_lima(
     Ok(exit_code)
 }
 
+fn run_docker_sbx(
+    config: &Config,
+    frozen_config_path: &Path,
+    pane_cwd: &Path,
+    worktree_root: &Path,
+    agent: &str,
+    command: &[String],
+) -> Result<i32> {
+    info!(
+        pane_cwd = %pane_cwd.display(),
+        worktree_root = %worktree_root.display(),
+        agent,
+        "sandbox supervisor starting (docker_sbx)"
+    );
+
+    // Validate that pane_cwd is under worktree_root
+    if !pane_cwd.starts_with(worktree_root) {
+        bail!(
+            "Working directory {} is not under worktree root {}",
+            pane_cwd.display(),
+            worktree_root.display()
+        );
+    }
+
+    // Resolve toolchain for host-exec command wrapping (runs on host, not in the sandbox)
+    let detected = toolchain::resolve_toolchain(&config.sandbox.toolchain(), worktree_root);
+    if detected != toolchain::DetectedToolchain::None {
+        info!(toolchain = ?detected, "wrapping host-exec commands with toolchain environment");
+    }
+
+    // Create shims (built-in commands like afplay, clipboard shims, + user-configured ones)
+    // in the sandbox's state directory, which the sandbox mounts read-only.
+    let host_commands = shims::effective_host_commands(config.sandbox.host_commands());
+    // Clipboard shims use ClipboardRead RPC, not Exec -- exclude from exec allowlist
+    let allowed_commands: HashSet<String> = host_commands
+        .iter()
+        .filter(|cmd| !shims::is_clipboard_shim(cmd))
+        .cloned()
+        .collect();
+    let sandbox_name = docker_sbx::sandbox_name(worktree_root, agent)?;
+    let state_dir = docker_sbx::sbx_state_dir_path(&sandbox_name)?;
+    shims::create_shim_directory(&state_dir, &host_commands)?;
+    info!(commands = ?host_commands, "created host-exec shims");
+
+    // sbx's `localhost:<port>` rule reaches listeners on the workstation's
+    // loopback, so the RPC server needn't listen anywhere else.
+    let (rpc_server, rpc_port, rpc_token, ctx) = start_rpc(
+        config,
+        frozen_config_path,
+        pane_cwd,
+        allowed_commands,
+        detected,
+        config.sandbox.allow_unsandboxed_host_exec(),
+        Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        None,
+    )?;
+    let _rpc_handle = rpc_server.spawn(ctx);
+
+    let mut env: Vec<(String, String)> = vec![
+        ("WM_SANDBOX_GUEST".into(), "1".into()),
+        ("WM_RPC_HOST".into(), config.sandbox.resolved_rpc_host()),
+        ("WM_RPC_PORT".into(), rpc_port.to_string()),
+        ("WM_RPC_TOKEN".into(), rpc_token),
+    ];
+    env.extend(docker_sbx_guest_env(config, worktree_root));
+
+    let exec = docker_sbx::ExecRequest {
+        command: command.to_vec(),
+        env,
+        session: docker_sbx::new_session()?,
+        rpc_port: Some(rpc_port),
+        tty: std::io::stdin().is_terminal(),
+        in_toolchain: true,
+    };
+    let plan = docker_sbx::prepare_launch(config, worktree_root, pane_cwd, agent, &exec)?;
+
+    let exit_code = docker_sbx::run_exec(&plan)?;
+    info!(exit_code, "agent command exited");
+    Ok(exit_code)
+}
+
+/// Build the workstation environment a command in a docker_sbx sandbox gets,
+/// for both the pane supervisor and `workmux sandbox shell`.
+pub(crate) fn docker_sbx_guest_env(config: &Config, repo: &Path) -> Vec<(String, String)> {
+    let mut env = Vec::new();
+    for term_var in ["TERM", "COLORTERM"] {
+        if let Ok(val) = std::env::var(term_var) {
+            env.push((term_var.to_string(), val));
+        }
+    }
+    for var in config.sandbox.env_passthrough() {
+        if let Ok(val) = std::env::var(var) {
+            env.push((var.to_string(), val));
+        }
+    }
+    // Explicit env vars from config
+    for (key, val) in config.sandbox.env_vars() {
+        env.push((key.to_string(), val.to_string()));
+    }
+    // Inject host git user config (user.name, user.email) for commits
+    env.extend(git_user_config_envs(repo));
+    env
+}
+
 fn run_container(
     config: &Config,
     frozen_config_path: &Path,
@@ -406,7 +533,7 @@ fn run_container(
     )
     .name();
     let freshness_image = config.sandbox.resolved_image(agent);
-    crate::sandbox::ensure_image_ready(&config.sandbox, &freshness_image)?;
+    crate::sandbox::ensure_image_ready(config.sandbox.runtime(), &freshness_image)?;
 
     // Merge built-in commands (e.g. afplay, clipboard shims) with user-configured ones.
     // A node's host is not the user's machine, so it runs none.
@@ -625,6 +752,24 @@ mod tests {
         for bad in ["", "\n", "0.0.0.0", "203.0.113.5", "fd00::1"] {
             assert!(parse_bridge_gateway(bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn docker_sbx_guest_env_carries_sandbox_env_and_passthrough() {
+        let home = std::env::var("HOME").expect("HOME is set for tests");
+        let mut config = Config::default();
+        config.sandbox.env = Some([("OPENAI_API_KEY".into(), "proxy-managed".into())].into());
+        config.sandbox.env_passthrough = Some(vec!["HOME".into(), "WM_TEST_UNSET_VAR".into()]);
+        let tmp = tempfile::tempdir().unwrap();
+
+        let env = docker_sbx_guest_env(&config, tmp.path());
+
+        assert!(
+            env.contains(&("OPENAI_API_KEY".into(), "proxy-managed".into())),
+            "{env:?}"
+        );
+        assert!(env.contains(&("HOME".into(), home)), "{env:?}");
+        assert!(!env.iter().any(|(key, _)| key == "WM_TEST_UNSET_VAR"));
     }
 
     #[test]

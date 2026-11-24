@@ -688,24 +688,18 @@ pub trait Multiplexer: Send + Sync {
         let mut pane_ids: Vec<String> = vec![initial_pane_id.to_string()];
         let shell = self.get_default_shell()?;
 
-        for (i, pane_config) in panes.iter().enumerate() {
+        // Resolve each laid-out pane's command: handle <agent> placeholders
+        // and prompt injection
+        for (i, pane_config, adjusted_command) in util::laid_out_panes(
+            panes,
+            options.run_commands,
+            options.prompt_file_path,
+            working_dir,
+            config,
+            task_agent,
+            &shell,
+        ) {
             let is_first = i == 0;
-
-            // Skip non-first panes that have no split direction
-            if !is_first && pane_config.split.is_none() {
-                continue;
-            }
-
-            // Resolve command: handle <agent> placeholders and prompt injection
-            let adjusted_command = util::resolve_pane_command_with_config(
-                pane_config.command.as_deref(),
-                options.run_commands,
-                options.prompt_file_path,
-                working_dir,
-                config,
-                task_agent,
-                &shell,
-            );
 
             let has_command = adjusted_command.is_some();
             let pane_id = if let Some(mut resolved) = adjusted_command {
@@ -801,6 +795,20 @@ pub trait Multiplexer: Send + Sync {
                                 crate::sandbox::wrap_for_container(
                                     &command_to_wrap,
                                     options.sandbox_supervisor,
+                                    wt_root,
+                                    working_dir,
+                                )
+                            }
+                            // Each agent runs in its own sbx sandbox.
+                            crate::config::SandboxBackend::DockerSbx => {
+                                crate::sandbox::wrap_for_docker_sbx(
+                                    &command_to_wrap,
+                                    options.sandbox_supervisor,
+                                    &crate::sandbox::docker_sbx::pane_agent(
+                                        config,
+                                        resolved.selected_agent.as_ref(),
+                                        task_agent,
+                                    ),
                                     wt_root,
                                     working_dir,
                                 )

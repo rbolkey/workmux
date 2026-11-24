@@ -6,6 +6,10 @@ use std::process::Command;
 use anyhow::{Context, Result};
 
 use crate::config::{SandboxConfig, SandboxRuntime};
+use crate::sandbox::git_boundary::{
+    POLICY_DIRS, ProgramPaths, collect_worktree_git_pointers, config_include_paths,
+    ensure_policy_dir, ensure_policy_file, module_git_roots, validate_git_hooks,
+};
 use crate::state::StateStore;
 
 /// Default image registry prefix.
@@ -85,8 +89,8 @@ pub fn ensure_sandbox_config_dirs() -> Result<SandboxPaths> {
 }
 
 /// Build the sandbox Docker image locally (two-stage: base + agent).
-pub fn build_image(config: &SandboxConfig, agent: &str) -> Result<()> {
-    let runtime = config.runtime().binary_name();
+pub fn build_image(config: &SandboxConfig, runtime: SandboxRuntime, agent: &str) -> Result<()> {
+    let runtime = runtime.binary_name();
 
     let agent_dockerfile = dockerfile_for_agent(agent).ok_or_else(|| {
         anyhow::anyhow!(
@@ -147,9 +151,7 @@ pub fn build_image(config: &SandboxConfig, agent: &str) -> Result<()> {
 }
 
 /// Pull the sandbox image from the registry.
-pub fn pull_image(config: &SandboxConfig, image: &str) -> Result<()> {
-    let runtime = config.runtime();
-
+pub fn pull_image(runtime: SandboxRuntime, image: &str) -> Result<()> {
     let status = Command::new(runtime.binary_name())
         .args(runtime.pull_args(image))
         .status()
@@ -162,15 +164,14 @@ pub fn pull_image(config: &SandboxConfig, image: &str) -> Result<()> {
     Ok(())
 }
 
-/// Ensure the container image is ready to run.
+/// Ensure the container image is ready to run in `runtime`'s image store.
 ///
 /// - If the image is missing and it's an official image, pull it automatically.
 /// - If the image exists but is stale (per freshness cache), pull the update.
 ///   If the update pull fails, warn and continue with the local image.
 /// - For custom (non-official) images, only check existence.
 /// - Kicks off a background freshness cache update for the next run.
-pub fn ensure_image_ready(config: &SandboxConfig, image: &str) -> Result<()> {
-    let runtime = config.runtime();
+pub fn ensure_image_ready(runtime: SandboxRuntime, image: &str) -> Result<()> {
     let runtime_bin = runtime.binary_name();
     let runtime_display = runtime.display_name();
     let is_official = crate::sandbox::freshness::is_official_image(image);
@@ -187,7 +188,7 @@ pub fn ensure_image_ready(config: &SandboxConfig, image: &str) -> Result<()> {
     if !exists {
         if is_official {
             eprintln!("Image '{}' not found locally, pulling...", image);
-            pull_image(config, image)?;
+            pull_image(runtime, image)?;
             crate::sandbox::freshness::mark_fresh(image, runtime);
             return Ok(());
         } else {
@@ -206,7 +207,7 @@ pub fn ensure_image_ready(config: &SandboxConfig, image: &str) -> Result<()> {
         let stale = crate::sandbox::freshness::cached_is_stale(image, runtime);
         if stale == Some(true) {
             eprintln!("Updating sandbox image '{}'...", image);
-            match pull_image(config, image) {
+            match pull_image(runtime, image) {
                 Ok(()) => {
                     crate::sandbox::freshness::mark_fresh(image, runtime);
                 }
@@ -347,186 +348,6 @@ fn git_private_state_dir(worktree: &Path, state_root: Option<&Path>) -> Result<P
     Ok(path)
 }
 
-fn collect_worktree_git_pointers(worktree: &Path) -> Result<Vec<PathBuf>> {
-    fn visit(dir: &Path, pointers: &mut Vec<PathBuf>) -> Result<()> {
-        for entry in std::fs::read_dir(dir)? {
-            let path = entry?.path();
-            let metadata = std::fs::symlink_metadata(&path)?;
-            if metadata.file_type().is_symlink() {
-                continue;
-            }
-            if path.file_name() == Some(std::ffi::OsStr::new(".git")) {
-                if metadata.is_file() {
-                    pointers.push(path);
-                }
-                continue;
-            }
-            if metadata.is_dir() {
-                visit(&path, pointers)?;
-            }
-        }
-        Ok(())
-    }
-
-    let mut pointers = Vec::new();
-    visit(worktree, &mut pointers)?;
-    Ok(pointers)
-}
-
-fn config_include_paths(config: &Path) -> Result<Vec<PathBuf>> {
-    fn visit(
-        config: &Path,
-        visited: &mut std::collections::HashSet<PathBuf>,
-        paths: &mut Vec<PathBuf>,
-    ) -> Result<()> {
-        let config = config.canonicalize()?;
-        if !visited.insert(config.clone()) {
-            return Ok(());
-        }
-        let output = crate::git::unattended_git(None)?
-            .args([
-                "config",
-                "--file",
-                config.to_string_lossy().as_ref(),
-                "--get-regexp",
-                "^include.*\\.path$",
-            ])
-            .output()?;
-        if !output.status.success() && output.status.code() != Some(1) {
-            anyhow::bail!(
-                "Failed to inspect Git config includes in {}",
-                config.display()
-            );
-        }
-        for line in String::from_utf8(output.stdout)?.lines() {
-            let Some((_, value)) = line.split_once(char::is_whitespace) else {
-                continue;
-            };
-            if value.contains(['*', '?', '[', '%']) {
-                anyhow::bail!("Git config include path cannot be protected safely: {value}");
-            }
-            let include = if let Some(rest) = value.strip_prefix("~/") {
-                home::home_dir()
-                    .context("Could not resolve home directory for Git config include")?
-                    .join(rest)
-            } else {
-                let path = Path::new(value);
-                if path.is_absolute() {
-                    path.to_path_buf()
-                } else {
-                    config.parent().unwrap_or(Path::new("/")).join(path)
-                }
-            };
-            if !include.is_file() {
-                anyhow::bail!(
-                    "Git config include target must exist before sandbox startup: {}",
-                    include.display()
-                );
-            }
-            paths.push(include.clone());
-            visit(&include, visited, paths)?;
-        }
-
-        let executable_output = crate::git::unattended_git(None)?
-            .args([
-                "config",
-                "--file",
-                config.to_string_lossy().as_ref(),
-                "--get-regexp",
-                "^(core\\.(hooksPath|fsmonitor)|diff\\..*\\.(command|textconv)|filter\\..*\\.(clean|smudge|process)|merge\\..*\\.driver)$",
-            ])
-            .output()?;
-        if !executable_output.status.success() && executable_output.status.code() != Some(1) {
-            anyhow::bail!(
-                "Failed to inspect executable Git config in {}",
-                config.display()
-            );
-        }
-        for line in String::from_utf8(executable_output.stdout)?.lines() {
-            let Some((key, value)) = line.split_once(char::is_whitespace) else {
-                continue;
-            };
-            if key.eq_ignore_ascii_case("core.fsmonitor") && matches!(value, "true" | "false") {
-                continue;
-            }
-            let token = value
-                .trim_start_matches('!')
-                .split_whitespace()
-                .next()
-                .unwrap_or("")
-                .trim_matches(['\'', '"']);
-            if token.is_empty() || token.contains(['$', '`', '%']) {
-                continue;
-            }
-            let candidate = Path::new(token);
-            let candidate = if candidate.is_absolute() {
-                candidate.to_path_buf()
-            } else {
-                config.parent().unwrap_or(Path::new("/")).join(candidate)
-            };
-            if candidate.exists() {
-                paths.push(candidate);
-            }
-        }
-        Ok(())
-    }
-
-    let mut paths = Vec::new();
-    visit(config, &mut std::collections::HashSet::new(), &mut paths)?;
-    Ok(paths)
-}
-
-fn ensure_policy_file(path: &Path) -> Result<()> {
-    if path.exists() {
-        let metadata = std::fs::symlink_metadata(path)?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            anyhow::bail!("Git policy path must be a regular file: {}", path.display());
-        }
-        #[cfg(unix)]
-        if metadata.nlink() > 1 {
-            anyhow::bail!(
-                "Git policy files must not have hard links: {}",
-                path.display()
-            );
-        }
-        return Ok(());
-    }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, b"")?;
-    Ok(())
-}
-
-#[cfg(unix)]
-use std::os::unix::fs::MetadataExt;
-
-/// Reject hook layouts whose executable policy can be changed outside the protected directory.
-fn validate_git_hooks(common_dir: &Path) -> Result<()> {
-    let hooks = common_dir.join("hooks");
-    if hooks.exists() {
-        let metadata = std::fs::symlink_metadata(&hooks)?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            anyhow::bail!("Git hooks path must be a directory: {}", hooks.display());
-        }
-        for entry in std::fs::read_dir(&hooks)? {
-            let path = entry?.path();
-            let metadata = std::fs::symlink_metadata(&path)?;
-            if metadata.file_type().is_symlink() {
-                anyhow::bail!("Git hooks must not be symbolic links: {}", path.display());
-            }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::MetadataExt;
-                if metadata.is_file() && metadata.nlink() > 1 {
-                    anyhow::bail!("Git hooks must not have hard links: {}", path.display());
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
 fn protect_writable_git_root(
     args: &mut Vec<String>,
     runtime: SandboxRuntime,
@@ -536,13 +357,9 @@ fn protect_writable_git_root(
     config_index: &mut usize,
 ) -> Result<()> {
     if full_git_dir {
-        for directory in ["hooks", "info", "objects/info", "modules", "worktrees"] {
+        for directory in POLICY_DIRS {
             let path = root.join(directory);
-            std::fs::create_dir_all(&path)?;
-            let metadata = std::fs::symlink_metadata(&path)?;
-            if metadata.file_type().is_symlink() || !metadata.is_dir() {
-                anyhow::bail!("Git policy path must be a directory: {}", path.display());
-            }
+            ensure_policy_dir(&path)?;
             push_read_only_path(args, runtime, &path);
         }
     }
@@ -575,44 +392,6 @@ fn protect_writable_git_root(
         }
     }
     Ok(())
-}
-
-fn module_git_roots(common_dir: &Path) -> Result<Vec<PathBuf>> {
-    fn visit(path: &Path, roots: &mut Vec<PathBuf>) -> Result<()> {
-        if !path.is_dir() {
-            return Ok(());
-        }
-        let is_root = path.join("config").is_file()
-            || (path.join("HEAD").is_file() && path.join("objects").is_dir());
-        if is_root {
-            roots.push(path.to_path_buf());
-        }
-        let children = if is_root {
-            path.join("modules")
-        } else {
-            path.to_path_buf()
-        };
-        if children.is_dir() {
-            for entry in std::fs::read_dir(children)? {
-                let child = entry?.path();
-                if child.is_dir() {
-                    visit(&child, roots)?;
-                }
-            }
-        }
-        Ok(())
-    }
-    let mut roots = Vec::new();
-    let modules = common_dir.join("modules");
-    if modules.is_dir() {
-        for entry in std::fs::read_dir(modules)? {
-            let child = entry?.path();
-            if child.is_dir() {
-                visit(&child, &mut roots)?;
-            }
-        }
-    }
-    Ok(roots)
 }
 
 fn add_git_metadata_boundary(
@@ -683,7 +462,7 @@ fn add_git_metadata_boundary(
 
     let common_config = identity.common_dir.join("config");
     ensure_policy_file(&common_config)?;
-    for include in config_include_paths(&common_config)? {
+    for include in config_include_paths(&common_config, ProgramPaths::BesideConfig)? {
         if include.starts_with(&identity.worktree) || include.starts_with(&identity.common_dir) {
             push_read_only_path(args, runtime, &include);
         }
@@ -1309,6 +1088,17 @@ pub fn wrap_for_container(
     worktree_root: &Path,
     pane_cwd: &Path,
 ) -> Result<String> {
+    wrap_for_supervisor(command, supervisor, worktree_root, pane_cwd, None)
+}
+
+/// Wrap a command for the sandbox supervisor, passing `--agent` when given.
+pub(super) fn wrap_for_supervisor(
+    command: &str,
+    supervisor: Option<&str>,
+    worktree_root: &Path,
+    pane_cwd: &Path,
+    agent: Option<&str>,
+) -> Result<String> {
     // Strip the leading history-prevention space before passing the command to
     // the sandbox supervisor.
     let command = command.strip_prefix(' ').unwrap_or(command);
@@ -1327,6 +1117,9 @@ pub fn wrap_for_container(
         ));
     }
 
+    if let Some(agent) = agent {
+        parts.push_str(&format!(" --agent '{}'", shell_escape(agent)));
+    }
     parts.push_str(&format!(" -- '{}'", shell_escape(command)));
 
     // Prefix with space to prevent shell history entry.

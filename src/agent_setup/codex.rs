@@ -338,13 +338,18 @@ pub fn install() -> Result<String> {
     install_dir(&dir)
 }
 
+/// The files [`install_dir`] reads and writes, relative to `dir`.
+pub(super) const DIR_FILES: &[&str] = &[HOOKS_FILE, CONFIG_FILE];
+const HOOKS_FILE: &str = "hooks.json";
+const CONFIG_FILE: &str = "config.toml";
+
 /// [`install`] into the Codex home `dir`.
 pub(crate) fn install_dir(dir: &Path) -> Result<String> {
-    let path = dir.join("hooks.json");
+    let path = dir.join(HOOKS_FILE);
     install_hooks_at(&path)?;
 
     let mut message = format!("Installed hooks to {}", path.display());
-    let config_path = dir.join("config.toml");
+    let config_path = dir.join(CONFIG_FILE);
     if ensure_hooks_feature_flag_at(&config_path)? {
         message.push_str(&format!(", enabled hooks in {}", config_path.display()));
     }

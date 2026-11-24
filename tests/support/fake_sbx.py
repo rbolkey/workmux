@@ -1,0 +1,236 @@
+"""PATH doubles for Docker Sandboxes' `sbx` and the `docker` it builds templates with.
+
+The fake `sbx` keeps its sandboxes in a JSON file, answers the queries workmux
+makes (`ls`, `policy ls`, `diagnose`, `template ls`) with canned JSON and
+succeeds at everything else. `policy ls <name>` of an existing sandbox also
+lists the rule its agent kit added at create. Each sandbox has a home
+directory, seeded at create with the files its kit writes; an `sbx exec` of
+`sh -c <script> <arg0> <args>...` runs the script there with real `sh`. Both
+fakes record each invocation, in order, so a test asserts on the commands
+workmux issued.
+"""
+
+import json
+import shlex
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Callable, Generic, Optional, TypeVar
+
+FAKE_SBX = r"""
+import fcntl, json, os, subprocess, sys
+from pathlib import Path
+
+STATE = Path(sys.argv[1])
+PROGRAM = sys.argv[2]
+argv = sys.argv[3:]
+
+
+def read(name):
+    return json.loads((STATE / name).read_text())
+
+
+def write(name, value):
+    (STATE / name).write_text(json.dumps(value))
+
+
+def tmux_windows():
+    if not os.environ.get("TMUX"):
+        return None
+    result = subprocess.run(
+        ["tmux", "list-windows", "-a", "-F", "#{window_name}"],
+        capture_output=True, text=True,
+    )
+    return result.stdout.split()
+
+
+def flag(name):
+    return argv[argv.index(name) + 1] if name in argv else None
+
+
+GUEST_HOME = "/home/agent"
+
+
+def home(name):
+    return STATE / "homes" / name
+
+
+def exec_in_guest():
+    # Run an `exec` of `sh -c <script> <arg0> <args>...` in the sandbox's home.
+    i = 1
+    while i < len(argv) and argv[i].startswith("-"):
+        i += 2 if argv[i] in ("-u", "-w", "-e") else 1
+    name, command = argv[i], argv[i + 1 :]
+    if command[:2] != ["sh", "-c"] or len(command) < 5:
+        return
+    root = str(home(name))
+    args = [arg.replace(GUEST_HOME, root) for arg in command]
+    stdin = sys.stdin.buffer.read() if "-i" in argv[1:i] else b""
+    result = subprocess.run(args, input=stdin, capture_output=True)
+    sys.stdout.buffer.write(result.stdout)
+    sys.stderr.buffer.write(result.stderr)
+    sys.exit(result.returncode)
+
+
+def sbx():
+    sandboxes = read("sandboxes.json")
+    verb = argv[0] if argv else ""
+    if verb == "ls":
+        print(json.dumps(sandboxes))
+    elif verb == "policy" and argv[1:2] == ["ls"]:
+        rules = read("rules.json")
+        name = argv[2] if len(argv) > 2 and not argv[2].startswith("-") else None
+        kit = read("kit_resources.json")
+        if kit and any(sandbox["name"] == name for sandbox in sandboxes):
+            rules = rules + [{
+                "scope": "sandbox:" + name,
+                "decision": "allow",
+                "resource_type": "network",
+                "resources": kit,
+                "provenance": {"created_via": "provisioned"},
+            }]
+        print(json.dumps({"rules": rules}))
+    elif verb == "diagnose":
+        print(json.dumps({"checks": read("checks.json")}))
+    elif verb == "template" and argv[1:2] == ["ls"]:
+        print("[]")
+    elif verb == "create":
+        name = flag("--name")
+        sandboxes.append({"name": name, "status": "running"})
+        for path, content in read("kit_files.json").items():
+            file = home(name) / path
+            file.parent.mkdir(parents=True, exist_ok=True)
+            file.write_text(content)
+    elif verb == "exec":
+        exec_in_guest()
+    elif verb == "rm":
+        names = [word for word in argv[1:] if not word.startswith("-")]
+        sandboxes = [s for s in sandboxes if s["name"] not in names]
+    elif verb == "stop":
+        for sandbox in sandboxes:
+            if sandbox["name"] in argv[1:]:
+                sandbox["status"] = "stopped"
+    write("sandboxes.json", sandboxes)
+
+
+def docker():
+    if argv[:2] == ["image", "inspect"] and "--format" in argv:
+        print("sha256:" + "0" * 64)
+    elif argv[:1] == ["build"]:
+        sys.stdin.read()
+    elif argv[:1] == ["save"] and "-o" in argv:
+        Path(flag("-o")).write_bytes(b"")
+    elif argv[:2] == ["network", "inspect"]:
+        print("172.17.0.1")
+
+
+with open(STATE / ".lock", "w") as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    entry = {"program": PROGRAM, "argv": argv}
+    if PROGRAM == "sbx" and argv[:1] == ["create"]:
+        entry["windows"] = tmux_windows()
+    with open(STATE / "calls.jsonl", "a") as log:
+        log.write(json.dumps(entry) + "\n")
+    sbx() if PROGRAM == "sbx" else docker()
+"""
+
+
+def passing_checks() -> list[dict[str, str]]:
+    """`sbx diagnose` checks for a logged-in sbx with its global policy chosen."""
+    return [
+        {"name": "Authentication", "status": "pass"},
+        {"name": "Global network policy", "status": "pass"},
+    ]
+
+
+T = TypeVar("T")
+
+
+class _JsonFile(Generic[T]):
+    """A `FakeSbx` attribute kept in a JSON file of its state dir, where the
+    fake `sbx` reads it."""
+
+    def __init__(self, file: str, doc: str):
+        self.file = file
+        self.__doc__ = doc
+
+    def __get__(self, fake: "FakeSbx", owner: Any = None) -> T:
+        return json.loads((fake.state_dir / self.file).read_text())
+
+    def __set__(self, fake: "FakeSbx", value: T) -> None:
+        (fake.state_dir / self.file).write_text(json.dumps(value))
+
+
+@dataclass
+class SbxCall:
+    """One invocation of the fake `sbx` or `docker`."""
+
+    program: str
+    argv: list[str]
+    # Window names in the multiplexer when `sbx create` ran (tmux only).
+    windows: Optional[list[str]] = None
+
+
+class FakeSbx:
+    """Fake `sbx` and `docker` installed in a test's fake-bin directory.
+
+    `install_script` comes from the test environment, which puts the fake-bin
+    directory first on PATH, ahead of any real `sbx` or `docker`.
+    """
+
+    sandboxes = _JsonFile[list[dict[str, str]]](
+        "sandboxes.json",
+        "What `sbx ls --json` lists: each sandbox's `name` and `status`.",
+    )
+    global_rules = _JsonFile[list[dict[str, Any]]](
+        "rules.json", "The rules `sbx policy ls --json` lists, for every sandbox."
+    )
+    kit_resources = _JsonFile[list[str]](
+        "kit_resources.json",
+        "What the rule each sandbox's kit adds at create allows (`host:port`).",
+    )
+    kit_files = _JsonFile[dict[str, str]](
+        "kit_files.json",
+        "Files each sandbox's kit writes at create, by path under the guest home.",
+    )
+    checks = _JsonFile[list[dict[str, str]]](
+        "checks.json", "The checks `sbx diagnose --json` reports."
+    )
+
+    def __init__(
+        self, bin_dir: Path, state_dir: Path, install_script: Callable[..., Path]
+    ):
+        self.state_dir = state_dir
+        state_dir.mkdir(parents=True, exist_ok=True)
+        (state_dir / "calls.jsonl").write_text("")
+        (state_dir / "fake_sbx.py").write_text(FAKE_SBX)
+        self.sandboxes = []
+        self.global_rules = []
+        self.kit_resources = []
+        self.kit_files = {}
+        self.checks = passing_checks()
+        for program in ("sbx", "docker"):
+            install_script(
+                bin_dir / program,
+                "#!/bin/sh\nexec "
+                + shlex.join(
+                    [sys.executable, "-I", str(state_dir / "fake_sbx.py")]
+                    + [str(state_dir), program]
+                )
+                + ' "$@"\n',
+            )
+
+    def guest_file(self, sandbox: str, path: str) -> Optional[str]:
+        """A file in `sandbox`'s guest home, by path under it, if it exists."""
+        file = self.state_dir / "homes" / sandbox / path
+        return file.read_text() if file.is_file() else None
+
+    def calls(self, program: str = "sbx") -> list[SbxCall]:
+        """Every recorded invocation of `program`, in order."""
+        lines = (self.state_dir / "calls.jsonl").read_text().splitlines()
+        calls = [SbxCall(**json.loads(line)) for line in lines]
+        return [call for call in calls if call.program == program]
+
+    def verb_calls(self, *verb: str) -> list[SbxCall]:
+        """The `sbx` invocations whose argv starts with `verb`."""
+        return [call for call in self.calls() if call.argv[: len(verb)] == list(verb)]

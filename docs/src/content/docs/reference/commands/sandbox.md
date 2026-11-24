@@ -5,6 +5,8 @@ description: Manage sandbox backends and tooling
 
 Commands for managing sandbox functionality across container (Docker/Podman/Apple Container) and Lima backends.
 
+`build`, `pull`, `init-dockerfile`, `stop`, `prune`, `agent`, `shell`, `install-dev` and `run` also work with [Docker Sandboxes](/guide/sandbox/docker-sbx/).
+
 ## Container commands
 
 ### sandbox build
@@ -74,7 +76,7 @@ This command helps you stop running Lima VMs created by workmux to free up syste
 
 **Notes:**
 
-- This command only works with Lima backend and requires `limactl` to be installed
+- With the Lima backend, this command requires `limactl` to be installed
 - Only running VMs are shown in interactive mode
 - If a specified VM is already stopped, the command reports this and exits successfully
 - Non-interactive environments (pipes, scripts) require `--all` or a specific VM name
@@ -144,12 +146,14 @@ workmux sandbox shell --exec
 **Options:**
 
 - `-e, --exec` - Exec into an existing container for this worktree instead of starting a new one (container backend only)
+- `-a, --agent <name>` - The agent whose sandbox to open: a named agent or an agent type (docker_sbx, where each agent of a worktree has its own sandbox; default: the selected agent)
 - `<command...>` - Command to run instead of bash
 
 **Backend behavior:**
 
 - **Container:** Starts a fresh container with the same mounts and environment as a normal worktree sandbox. With `--exec`, attaches to an existing container instead.
 - **Lima:** Connects to the Lima VM for the current worktree (creating it if needed). The `--exec` flag is not supported since Lima VMs are persistent and `shell` always connects to the existing VM.
+- **Docker Sandboxes:** See [Docker Sandboxes](/guide/sandbox/docker-sbx/#sandbox-management).
 
 ### sandbox install-dev
 

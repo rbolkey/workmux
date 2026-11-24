@@ -17,6 +17,7 @@ import pytest
 import yaml
 
 from .support.executable import SCRIPT_RUNNER, install_script
+from .support.fake_sbx import FakeSbx
 
 
 # =============================================================================
@@ -1373,6 +1374,16 @@ def script_runner() -> Path:
 def fake_agent_installer(mux_server: MuxEnvironment) -> FakeAgentInstaller:
     """Provides a factory for installing fake agent commands."""
     return FakeAgentInstaller(env=mux_server)
+
+
+@pytest.fixture
+def fake_sbx(mux_server: MuxEnvironment) -> FakeSbx:
+    """Fake `sbx` and `docker` ahead of any real ones on PATH."""
+    return FakeSbx(
+        mux_server.fake_bin_dir,
+        mux_server.tmp_path / "fake-sbx",
+        mux_server.install_script,
+    )
 
 
 def slugify(text: str) -> str:

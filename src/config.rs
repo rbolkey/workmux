@@ -1566,6 +1566,9 @@ pub enum SandboxBackend {
     Container,
     /// Lima VM backend
     Lima,
+    /// Docker Sandboxes (`sbx`) microVM backend
+    #[serde(rename = "docker_sbx")]
+    DockerSbx,
 }
 
 /// Container runtime for sandbox
@@ -1727,7 +1730,7 @@ pub enum SandboxTarget {
     All,
 }
 
-/// Toolchain integration mode for Lima sandboxes.
+/// Toolchain integration mode for Lima and docker_sbx sandboxes.
 /// Controls whether devbox.json/flake.nix are detected and used
 /// to wrap agent commands with the appropriate environment.
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Default)]
@@ -1890,6 +1893,204 @@ impl LimaConfig {
             accept_reduced_git_metadata_isolation: project
                 .accept_reduced_git_metadata_isolation
                 .or(global.accept_reduced_git_metadata_isolation),
+        }
+    }
+}
+
+/// Docker Sandboxes (`sbx`) specific sandbox configuration.
+/// Nested under `sandbox.docker_sbx` in YAML.
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
+pub struct DockerSbxConfig {
+    /// Number of CPUs for the sandbox (sbx `--cpus`; 0 means all host CPUs).
+    #[serde(default)]
+    pub cpus: Option<u32>,
+
+    /// Memory for the sandbox in sbx's binary units (e.g. "512m", "8g").
+    /// Minimum 512 MiB.
+    #[serde(default)]
+    pub memory: Option<String>,
+
+    /// Custom provision script run as root once, when the sandbox is created.
+    #[serde(default)]
+    pub provision: Option<String>,
+
+    /// Skip built-in provisioning (shims on login shells' PATH, Nix and
+    /// Devbox). Custom `provision` script still runs if specified.
+    #[serde(default)]
+    pub skip_default_provision: Option<bool>,
+
+    /// sbx mixin kits added to the sandbox at creation (sbx `--kit`).
+    /// Global-only, since a kit can add network rules and credentials.
+    #[serde(default)]
+    pub kits: Option<Vec<String>>,
+
+    /// How the agent is set up in its sandbox (default `kit`). Global-only,
+    /// since under `shell` the agent holds its real credential.
+    #[serde(default)]
+    pub agent: Option<DockerSbxAgent>,
+
+    /// Files (relative to the worktree root) to hide from the agent.
+    /// Global-only, so a repository can't unhide its own secrets.
+    #[serde(default)]
+    pub excluded_files: Option<Vec<String>>,
+
+    /// Accept without asking that a `deny` sandbox reaches more than
+    /// `allowed_domains`. Global-only.
+    #[serde(default)]
+    pub accept_wider_network_policy: Option<bool>,
+}
+
+/// How the agent is set up in a `docker_sbx` sandbox
+/// (`sandbox.docker_sbx.agent`).
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum DockerSbxAgent {
+    /// sbx's agent kit sets the agent up and holds its credential.
+    #[default]
+    Kit,
+    /// sbx's generic `shell` agent, with the agent's config directory mounted.
+    Shell,
+}
+
+impl DockerSbxAgent {
+    /// Return the config's name for the mode.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Kit => "kit",
+            Self::Shell => "shell",
+        }
+    }
+}
+
+/// sbx's smallest sandbox memory (`--memory`).
+const DOCKER_SBX_MIN_MEMORY: f64 = 512.0 * 1024.0 * 1024.0;
+
+/// Parse a memory size as sbx reads `--memory` (`512m`, `8G`, `1GiB`) to
+/// bytes.
+fn parse_docker_sbx_memory(memory: &str) -> Option<f64> {
+    let digits = memory
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(memory.len());
+    let (number, unit) = memory.split_at(digits);
+    if number.is_empty() || number.starts_with('.') || number.ends_with('.') {
+        return None;
+    }
+    let number: f64 = number.parse().ok()?;
+    let unit = unit.strip_prefix(' ').unwrap_or(unit).to_ascii_lowercase();
+    let unit = unit.strip_suffix('b').unwrap_or(&unit);
+    let unit = unit.strip_suffix('i').unwrap_or(unit);
+    let power = match unit {
+        "" => 0,
+        "k" => 1,
+        "m" => 2,
+        "g" => 3,
+        "t" => 4,
+        "p" => 5,
+        _ => return None,
+    };
+    Some(number * 1024f64.powi(power))
+}
+
+impl DockerSbxConfig {
+    /// CPUs to pass to `sbx create --cpus`, if configured.
+    pub fn cpus(&self) -> Option<u32> {
+        self.cpus
+    }
+
+    /// Memory to pass to `sbx create --memory`, if configured.
+    pub fn memory(&self) -> Option<&str> {
+        self.memory.as_deref()
+    }
+
+    pub fn provision_script(&self) -> Option<&str> {
+        self.provision.as_deref().filter(|s| !s.trim().is_empty())
+    }
+
+    pub fn skip_default_provision(&self) -> bool {
+        self.skip_default_provision.unwrap_or(false)
+    }
+
+    /// Mixin kits to pass to `sbx create --kit`. Returns empty slice when unset.
+    pub fn kits(&self) -> &[String] {
+        self.kits.as_deref().unwrap_or(&[])
+    }
+
+    /// How the agent is set up in its sandbox. Defaults to `kit`.
+    pub fn agent(&self) -> DockerSbxAgent {
+        self.agent.unwrap_or_default()
+    }
+
+    /// Files to hide from the agent. Returns empty slice when unset.
+    pub fn excluded_files(&self) -> &[String] {
+        self.excluded_files.as_deref().unwrap_or(&[])
+    }
+
+    /// Whether a wider network policy is accepted without asking.
+    pub fn accepts_wider_network_policy(&self) -> bool {
+        self.accept_wider_network_policy.unwrap_or(false)
+    }
+
+    /// Check `memory` is a size sbx accepts. Called at config load.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if let Some(memory) = self.memory() {
+            match parse_docker_sbx_memory(memory) {
+                Some(bytes) if bytes >= DOCKER_SBX_MIN_MEMORY => {}
+                Some(_) => anyhow::bail!(
+                    "sandbox.docker_sbx.memory '{memory}' is below sbx's minimum of 512 MiB \
+                     (512m)"
+                ),
+                None => anyhow::bail!(
+                    "sandbox.docker_sbx.memory '{memory}' is not a size sbx accepts; \
+                     use binary units such as 512m or 8g"
+                ),
+            }
+        }
+        Ok(())
+    }
+
+    /// Merge: project overrides global, per-field, EXCEPT for `kits`,
+    /// `agent`, `excluded_files` and `accept_wider_network_policy`, which
+    /// are global-only.
+    fn merge(global: Self, project: Self) -> Self {
+        // Security: a repo must not widen its sandbox's access through a kit.
+        if project.kits.is_some() {
+            tracing::warn!(
+                "sandbox.docker_sbx.kits in project config (.workmux.yaml) is ignored -- \
+                move it to your global config (~/.config/workmux/config.yaml)"
+            );
+        }
+        // Security: under `shell` the agent holds its real credential.
+        if project.agent.is_some() {
+            tracing::warn!(
+                "sandbox.docker_sbx.agent in project config (.workmux.yaml) is ignored -- \
+                move it to your global config (~/.config/workmux/config.yaml)"
+            );
+        }
+        // Security: a repo must not unhide its own secrets.
+        if project.excluded_files.is_some() {
+            tracing::warn!(
+                "sandbox.docker_sbx.excluded_files in project config (.workmux.yaml) is ignored -- \
+                move it to your global config (~/.config/workmux/config.yaml)"
+            );
+        }
+        // Security: a repo must not accept a wider network policy for the user.
+        if project.accept_wider_network_policy.is_some() {
+            tracing::warn!(
+                "sandbox.docker_sbx.accept_wider_network_policy in project config (.workmux.yaml) is ignored -- \
+                move it to your global config (~/.config/workmux/config.yaml)"
+            );
+        }
+        Self {
+            cpus: project.cpus.or(global.cpus),
+            memory: project.memory.or(global.memory),
+            provision: project.provision.or(global.provision),
+            skip_default_provision: project
+                .skip_default_provision
+                .or(global.skip_default_provision),
+            kits: global.kits,
+            agent: global.agent,
+            excluded_files: global.excluded_files,
+            accept_wider_network_policy: global.accept_wider_network_policy,
         }
     }
 }
@@ -2236,12 +2437,13 @@ pub struct AllowedDomainRule {
 pub const DEFAULT_NETWORK_MAX_CONNECTIONS: usize = 128;
 pub const MAX_NETWORK_MAX_CONNECTIONS: usize = 1024;
 
-/// Network restriction configuration for the container sandbox.
+/// Network restriction configuration for the container and docker_sbx sandboxes.
 ///
 /// When `policy` is `deny`, all outbound connections are blocked except those
 /// to whitelisted domains via an HTTP CONNECT proxy. An iptables firewall
 /// inside the container enforces that only the proxy and RPC ports are
-/// reachable, preventing bypass via direct connections.
+/// reachable, preventing bypass via direct connections. Under docker_sbx,
+/// sbx enforces the allow list on top of the user's global sbx policy.
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub struct NetworkConfig {
     /// Network restriction policy. Default: allow (no restrictions).
@@ -2256,6 +2458,7 @@ pub struct NetworkConfig {
     pub allowed_domains: Option<Vec<AllowedDomainEntry>>,
 
     /// Maximum number of concurrent CONNECT proxy connections.
+    /// Ignored under docker_sbx, which has no such cap.
     #[serde(default)]
     pub max_connections: Option<usize>,
 }
@@ -2335,7 +2538,7 @@ fn validate_domain(domain: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Configuration for sandboxing (Container or Lima)
+/// Configuration for sandboxing (Container, Lima or Docker Sandboxes)
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub struct SandboxConfig {
     /// Enable sandboxing. Default: false
@@ -2346,16 +2549,23 @@ pub struct SandboxConfig {
     #[serde(default)]
     pub backend: Option<SandboxBackend>,
 
+    /// Whether `.workmux.yaml` chose `backend`. Set during config loading.
+    #[serde(skip)]
+    pub backend_from_project: bool,
+
     /// Which panes to sandbox. Default: agent
     #[serde(default)]
     pub target: Option<SandboxTarget>,
 
     /// Container/VM image. For containers: Docker image name.
     /// For Lima: qcow2 image URL or file:// path.
+    /// For docker_sbx: the agent image the sbx template is built from.
     #[serde(default)]
     pub image: Option<String>,
 
     /// Environment variables to pass to sandbox.
+    /// Under docker_sbx, a tool credential sbx holds a secret for (such as
+    /// GH_TOKEN) is better left to `sbx secret set`; workmux warns.
     /// Default: []
     #[serde(default)]
     pub env_passthrough: Option<Vec<String>>,
@@ -2364,11 +2574,13 @@ pub struct SandboxConfig {
     /// Unlike env_passthrough (which reads from host), these are set directly.
     /// Global-only: project config cannot set this to prevent a sandboxed agent
     /// from injecting env vars into its next session via .workmux.yaml.
+    /// Under docker_sbx, workmux warns as for env_passthrough.
     #[serde(default)]
     pub env: Option<HashMap<String, String>>,
 
     /// Override the hostname used by containers to reach the host RPC server.
-    /// Defaults to `host.docker.internal` (Docker) or `host.containers.internal` (Podman).
+    /// Defaults to `host.docker.internal` (Docker and docker_sbx) or
+    /// `host.containers.internal` (Podman).
     /// Useful for non-standard Podman or custom networking setups.
     #[serde(default)]
     pub rpc_host: Option<String>,
@@ -2406,7 +2618,11 @@ pub struct SandboxConfig {
     #[serde(default)]
     pub container: ContainerConfig,
 
-    /// Network restriction configuration (container backend only).
+    /// Docker Sandboxes (`sbx`) specific configuration
+    #[serde(default)]
+    pub docker_sbx: DockerSbxConfig,
+
+    /// Network restriction configuration (container and docker_sbx backends).
     #[serde(default)]
     pub network: NetworkConfig,
 
@@ -2464,7 +2680,10 @@ impl SandboxConfig {
     pub fn resolved_rpc_host(&self) -> String {
         self.rpc_host
             .clone()
-            .unwrap_or_else(|| self.runtime().rpc_host_address().to_string())
+            .unwrap_or_else(|| match self.backend() {
+                SandboxBackend::DockerSbx => "host.docker.internal".to_string(),
+                _ => self.runtime().rpc_host_address().to_string(),
+            })
     }
 
     pub fn toolchain(&self) -> ToolchainMode {
@@ -3085,6 +3304,11 @@ impl Config {
             .container
             .validate()
             .context("Invalid sandbox container config")?;
+        config
+            .sandbox
+            .docker_sbx
+            .validate()
+            .context("Invalid sandbox docker_sbx config")?;
 
         Ok(config)
     }
@@ -3370,6 +3594,8 @@ impl Config {
                 .backend
                 .clone()
                 .or(self.sandbox.backend.clone()),
+            backend_from_project: project.sandbox.backend.is_some()
+                && project.sandbox.backend != self.sandbox.backend,
             target: project
                 .sandbox
                 .target
@@ -3494,6 +3720,7 @@ impl Config {
                 }
                 ContainerConfig::merge(self.sandbox.container, project.sandbox.container)
             },
+            docker_sbx: DockerSbxConfig::merge(self.sandbox.docker_sbx, project.sandbox.docker_sbx),
             // Security: network is global-only. Project config cannot
             // set it -- this prevents a malicious repo from weakening
             // network restrictions via .workmux.yaml.
@@ -3968,6 +4195,30 @@ pub const EXAMPLE_PROJECT_CONFIG: &str = r#"# workmux project configuration
 #   #   # excluded_files:
 #   #   #   - .env
 #   #   #   - .env.local
+#   # docker_sbx:            # with backend: docker_sbx (Docker Sandboxes)
+#   #   # kit (default): sbx's agent kit sets the agent up and holds its
+#   #   # credential; shell: mount the agent's config dir from the workstation.
+#   #   # GLOBAL-ONLY: ignored when set in a project .workmux.yaml.
+#   #   # agent: kit
+#   #   cpus: 4                # only passed when set (sbx default: all CPUs)
+#   #   memory: 8g             # sbx binary units, at least 512m
+#   #   # Custom provision script (runs once on sandbox creation, as root).
+#   #   # provision: |
+#   #   #   sed -i 's|http://|https://|' /etc/apt/sources.list.d/debian.sources
+#   #   #   apt-get update && apt-get install -y ripgrep jq
+#   #   # sbx mixin kits added at creation. GLOBAL-ONLY: ignored in a
+#   #   # project .workmux.yaml, since a kit can add network rules.
+#   #   # kits:
+#   #   #   - docker.io/sbx/task:latest
+#   #   # Hide files from the agent behind an empty read-only file, mounted
+#   #   # when the sandbox is created (paths relative to the worktree root).
+#   #   # GLOBAL-ONLY: ignored when set in a project .workmux.yaml.
+#   #   # excluded_files:
+#   #   #   - .env
+#   #   # Under network policy: deny, accept without asking that a new
+#   #   # sandbox reaches more than allowed_domains (sbx's global policy,
+#   #   # private addresses, the agent kit's hosts). GLOBAL-ONLY.
+#   #   # accept_wider_network_policy: true
 #   # lima:
 #   #   isolation: project
 #   #   cpus: 4
@@ -4075,11 +4326,12 @@ mod tests {
         AgentColumn, AgentEnvValue, AgentIconConfig, AgentIconDetails, AllowedDomainDetails,
         AllowedDomainEntry, CLEANUP_NODE_MODULES_PLACEHOLDER, Config, ContainerConfig,
         ContainerDevice, DEFAULT_AGENT_COLUMNS, DEFAULT_WORKTREE_COLUMNS, DashboardLayout,
-        ExtraMount, FileConfig, LayoutConfig, LimaConfig, NODE_MODULES_CLEANUP_SCRIPT,
-        NetworkConfig, NetworkPolicy, PaneConfig, SandboxConfig, SandboxRuntime, SandboxTarget,
-        SidebarEnterAction, SidebarHeight, SidebarPosition, SidebarWidth, SplitDirection,
-        ToolchainMode, WindowPlacement, WorktreeColumn, is_agent_command, validate_domain,
-        validate_group_add_entry, validate_layouts_config,
+        DockerSbxAgent, DockerSbxConfig, ExtraMount, FileConfig, LayoutConfig, LimaConfig,
+        NODE_MODULES_CLEANUP_SCRIPT, NetworkConfig, NetworkPolicy, PaneConfig, SandboxBackend,
+        SandboxConfig, SandboxRuntime, SandboxTarget, SidebarEnterAction, SidebarHeight,
+        SidebarPosition, SidebarWidth, SplitDirection, ToolchainMode, WindowPlacement,
+        WorktreeColumn, is_agent_command, validate_domain, validate_group_add_entry,
+        validate_layouts_config,
     };
     use super::{DashboardConfig, InputExitKey, RemoteConfig, RemoteIsolation};
     use crate::test_support;
@@ -6473,6 +6725,297 @@ container:
         assert_eq!(merged.isolation(), super::IsolationLevel::Shared);
         assert_eq!(merged.memory(), "4GiB");
         assert!(merged.accepts_reduced_git_metadata_isolation());
+    }
+
+    #[test]
+    fn sandbox_docker_sbx_yaml_format() {
+        let yaml = r#"
+enabled: true
+backend: docker_sbx
+docker_sbx: {}
+"#;
+        let config: SandboxConfig = serde_yaml::from_str(yaml).unwrap();
+
+        assert!(config.is_enabled());
+        assert_eq!(config.backend(), SandboxBackend::DockerSbx);
+    }
+
+    #[test]
+    fn sandbox_docker_sbx_settings_yaml_format() {
+        let yaml = r#"
+backend: docker_sbx
+docker_sbx:
+  cpus: 8
+  memory: 8g
+  provision: |
+    apt-get install -y ripgrep
+  skip_default_provision: true
+  kits:
+    - docker.io/sbx/task:latest
+"#;
+        let config: SandboxConfig = serde_yaml::from_str(yaml).unwrap();
+        let sbx = &config.docker_sbx;
+
+        assert_eq!(sbx.cpus(), Some(8));
+        assert_eq!(sbx.memory(), Some("8g"));
+        assert_eq!(sbx.provision_script(), Some("apt-get install -y ripgrep\n"));
+        assert_eq!(sbx.skip_default_provision, Some(true));
+        assert_eq!(sbx.kits(), &["docker.io/sbx/task:latest".to_string()]);
+    }
+
+    #[test]
+    fn docker_sbx_settings_default_to_sbx_own() {
+        let sbx = DockerSbxConfig::default();
+        assert_eq!(sbx.cpus(), None);
+        assert_eq!(sbx.memory(), None);
+        assert_eq!(sbx.provision_script(), None);
+        assert_eq!(sbx.skip_default_provision, None);
+        assert!(sbx.kits().is_empty());
+    }
+
+    fn docker_sbx_cfg(edit: impl FnOnce(&mut DockerSbxConfig)) -> Config {
+        sandbox_cfg(|sandbox| edit(&mut sandbox.docker_sbx))
+    }
+
+    #[test]
+    fn docker_sbx_resources_and_provision_project_overrides_global() {
+        let global = docker_sbx_cfg(|sbx| {
+            sbx.cpus = Some(4);
+            sbx.memory = Some("4g".into());
+            sbx.provision = Some("echo global".into());
+            sbx.skip_default_provision = Some(true);
+        });
+        let project = docker_sbx_cfg(|sbx| {
+            sbx.cpus = Some(8);
+            sbx.provision = Some("echo project".into());
+            sbx.skip_default_provision = Some(false);
+        });
+        let merged = global.clone().merge(project).sandbox.docker_sbx;
+        assert_eq!(merged.cpus(), Some(8));
+        assert_eq!(merged.memory(), Some("4g"));
+        assert_eq!(merged.provision_script(), Some("echo project"));
+        assert_eq!(merged.skip_default_provision, Some(false));
+
+        let merged = global.merge(Config::default()).sandbox.docker_sbx;
+        assert_eq!(merged.cpus(), Some(4));
+        assert_eq!(merged.provision_script(), Some("echo global"));
+        assert_eq!(merged.skip_default_provision, Some(true));
+    }
+
+    #[test]
+    fn docker_sbx_empty_project_provision_disables_global() {
+        let global = docker_sbx_cfg(|sbx| sbx.provision = Some("echo global".into()));
+        let project = docker_sbx_cfg(|sbx| sbx.provision = Some("".into()));
+        let merged = global.merge(project);
+        assert_eq!(merged.sandbox.docker_sbx.provision_script(), None);
+    }
+
+    #[test]
+    fn docker_sbx_kits_project_is_ignored() {
+        let global =
+            docker_sbx_cfg(|sbx| sbx.kits = Some(vec!["docker.io/sbx/task:latest".into()]));
+        let project = docker_sbx_cfg(|sbx| sbx.kits = Some(vec!["evil/kit:latest".into()]));
+        let merged = global.merge(project);
+        assert_eq!(
+            merged.sandbox.docker_sbx.kits(),
+            &["docker.io/sbx/task:latest".to_string()]
+        );
+    }
+
+    #[test]
+    fn docker_sbx_agent_defaults_to_the_kit() {
+        assert_eq!(DockerSbxConfig::default().agent(), DockerSbxAgent::Kit);
+        for (value, agent) in [
+            ("kit", DockerSbxAgent::Kit),
+            ("shell", DockerSbxAgent::Shell),
+        ] {
+            let config: SandboxConfig = serde_yaml::from_str(&format!(
+                "backend: docker_sbx\ndocker_sbx:\n  agent: {value}\n"
+            ))
+            .unwrap();
+            assert_eq!(config.docker_sbx.agent(), agent, "{value}");
+        }
+        assert!(serde_yaml::from_str::<SandboxConfig>("docker_sbx:\n  agent: claude\n").is_err());
+    }
+
+    #[test]
+    fn docker_sbx_agent_project_is_ignored() {
+        // A repository can't choose whether its agent holds its real
+        // credential.
+        let shell = docker_sbx_cfg(|sbx| sbx.agent = Some(DockerSbxAgent::Shell));
+        let kit = docker_sbx_cfg(|sbx| sbx.agent = Some(DockerSbxAgent::Kit));
+        assert_eq!(
+            Config::default()
+                .merge(shell.clone())
+                .sandbox
+                .docker_sbx
+                .agent(),
+            DockerSbxAgent::Kit
+        );
+        assert_eq!(
+            shell.clone().merge(kit).sandbox.docker_sbx.agent(),
+            DockerSbxAgent::Shell
+        );
+        assert_eq!(
+            shell.merge(Config::default()).sandbox.docker_sbx.agent(),
+            DockerSbxAgent::Shell
+        );
+    }
+
+    #[test]
+    fn docker_sbx_excluded_files_project_is_ignored() {
+        // A repository can't unhide its own secrets, by an empty list or
+        // one of its own.
+        let global = docker_sbx_cfg(|sbx| sbx.excluded_files = Some(vec![".env".into()]));
+        let project = docker_sbx_cfg(|sbx| sbx.excluded_files = Some(vec![]));
+        let config: Config = serde_yaml::from_str(
+            "sandbox:\n  docker_sbx:\n    excluded_files: [.env.production]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            global
+                .clone()
+                .merge(project)
+                .sandbox
+                .docker_sbx
+                .excluded_files(),
+            &[".env".to_string()]
+        );
+        assert!(
+            Config::default()
+                .merge(config.clone())
+                .sandbox
+                .docker_sbx
+                .excluded_files()
+                .is_empty()
+        );
+        assert_eq!(
+            config
+                .merge(Config::default())
+                .sandbox
+                .docker_sbx
+                .excluded_files(),
+            &[".env.production".to_string()]
+        );
+    }
+
+    #[test]
+    fn docker_sbx_accept_wider_network_policy_project_is_ignored() {
+        // A repository can't accept a wider network policy for the user.
+        let config: Config = serde_yaml::from_str(
+            "sandbox:\n  docker_sbx:\n    accept_wider_network_policy: true\n",
+        )
+        .unwrap();
+        assert!(
+            !Config::default()
+                .merge(config.clone())
+                .sandbox
+                .docker_sbx
+                .accepts_wider_network_policy()
+        );
+        assert!(
+            config
+                .merge(Config::default())
+                .sandbox
+                .docker_sbx
+                .accepts_wider_network_policy()
+        );
+        let refused = docker_sbx_cfg(|sbx| sbx.accept_wider_network_policy = Some(false));
+        let accepted = docker_sbx_cfg(|sbx| sbx.accept_wider_network_policy = Some(true));
+        assert!(
+            !refused
+                .merge(accepted)
+                .sandbox
+                .docker_sbx
+                .accepts_wider_network_policy()
+        );
+    }
+
+    #[test]
+    fn docker_sbx_kits_project_ignored_when_no_global() {
+        let global = Config::default();
+        let project = docker_sbx_cfg(|sbx| sbx.kits = Some(vec!["evil/kit:latest".into()]));
+        let merged = global.merge(project);
+        assert!(merged.sandbox.docker_sbx.kits().is_empty());
+    }
+
+    #[test]
+    fn docker_sbx_memory_accepts_sbx_sizes_from_its_minimum() {
+        for memory in ["512m", "8g", "8G", "1GiB", "1gb", "1.5g", "536870912"] {
+            let sbx = DockerSbxConfig {
+                memory: Some(memory.to_string()),
+                ..Default::default()
+            };
+            assert!(sbx.validate().is_ok(), "{memory}: {:?}", sbx.validate());
+        }
+    }
+
+    #[test]
+    fn docker_sbx_memory_below_minimum_or_malformed_is_an_error() {
+        for memory in ["511m", "100m", "abc", "8 GB extra", ""] {
+            let sbx = DockerSbxConfig {
+                memory: Some(memory.to_string()),
+                ..Default::default()
+            };
+            let message = sbx.validate().unwrap_err().to_string();
+            assert!(
+                message.contains("sandbox.docker_sbx.memory") && message.contains("512m"),
+                "{memory}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn sandbox_backend_project_overrides_global() {
+        let global = sandbox_cfg(|sandbox| sandbox.backend = Some(SandboxBackend::Container));
+        let project = sandbox_cfg(|sandbox| sandbox.backend = Some(SandboxBackend::DockerSbx));
+        assert_eq!(
+            global.clone().merge(project).sandbox.backend(),
+            SandboxBackend::DockerSbx
+        );
+        assert_eq!(
+            global.merge(Config::default()).sandbox.backend(),
+            SandboxBackend::Container
+        );
+    }
+
+    #[test]
+    fn sandbox_backend_from_project_is_recorded_only_when_the_project_chose_it() {
+        let container = sandbox_cfg(|sandbox| sandbox.backend = Some(SandboxBackend::Container));
+        let sbx = sandbox_cfg(|sandbox| sandbox.backend = Some(SandboxBackend::DockerSbx));
+        assert!(
+            container
+                .clone()
+                .merge(sbx.clone())
+                .sandbox
+                .backend_from_project
+        );
+        assert!(
+            Config::default()
+                .merge(sbx.clone())
+                .sandbox
+                .backend_from_project
+        );
+        // The user's own choice, whatever the project says.
+        assert!(!sbx.clone().merge(sbx.clone()).sandbox.backend_from_project);
+        assert!(!sbx.merge(Config::default()).sandbox.backend_from_project);
+        assert!(
+            !container
+                .merge(Config::default())
+                .sandbox
+                .backend_from_project
+        );
+    }
+
+    #[test]
+    fn docker_sbx_rpc_host_defaults_to_host_docker_internal() {
+        let config: SandboxConfig =
+            serde_yaml::from_str("backend: docker_sbx\ncontainer:\n  runtime: podman\n").unwrap();
+        assert_eq!(config.resolved_rpc_host(), "host.docker.internal");
+
+        let config: SandboxConfig =
+            serde_yaml::from_str("backend: docker_sbx\nrpc_host: example.internal\n").unwrap();
+        assert_eq!(config.resolved_rpc_host(), "example.internal");
     }
 
     #[test]
