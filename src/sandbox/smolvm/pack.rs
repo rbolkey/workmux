@@ -629,6 +629,28 @@ pub fn remove_pack(dir: &Path, name: &str) -> Result<()> {
     Ok(())
 }
 
+/// What `sandbox prune` deletes: every pack but the current ones of each
+/// project under `root`, as (project directory, pack), whether machines
+/// from them run or not (a machine doesn't need its pack once created).
+pub fn prunable_packs(root: &Path) -> Vec<(PathBuf, String)> {
+    let Ok(projects) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut dirs: Vec<PathBuf> = projects
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect();
+    dirs.sort();
+    dirs.into_iter()
+        .flat_map(|dir| {
+            superseded_packs(&dir)
+                .into_iter()
+                .map(move |name| (dir.clone(), name))
+        })
+        .collect()
+}
+
 /// Record `build` as its image's current pack.
 pub fn mark_current(build: &PackBuild) -> Result<()> {
     let parent = build
@@ -643,9 +665,47 @@ pub fn mark_current(build: &PackBuild) -> Result<()> {
         .with_context(|| format!("Failed to write {}", build.current_marker.display()))
 }
 
+/// Mark `image`'s packs stale after a pull or a local build: the key hashes
+/// the image's reference, not its digest, so remove each project's current
+/// pack of it (and the marker), and the next launch builds a new one from
+/// the image. Machines already created don't need their pack. Returns the
+/// packs removed, as (project directory, pack).
+pub fn mark_image_stale(root: &Path, image: &str) -> Result<Vec<(PathBuf, String)>> {
+    let Ok(projects) = std::fs::read_dir(root) else {
+        return Ok(Vec::new());
+    };
+    let mut dirs: Vec<PathBuf> = projects
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect();
+    dirs.sort();
+    let slot = image_slot(image);
+    let mut removed = Vec::new();
+    for dir in dirs {
+        let marker = dir.join("current").join(&slot);
+        let Ok(name) = std::fs::read_to_string(&marker) else {
+            continue;
+        };
+        let name = name.trim().to_string();
+        std::fs::remove_file(&marker)
+            .with_context(|| format!("Failed to remove {}", marker.display()))?;
+        if dir.join(format!("{name}.smolmachine")).exists() {
+            remove_pack(&dir, &name)?;
+            removed.push((dir, name));
+        }
+    }
+    Ok(removed)
+}
+
 /// Locally built images saved for smolvm, in workmux's state dir.
 pub fn images_root() -> Result<PathBuf> {
     Ok(crate::xdg::state_dir()?.join("smolvm-images"))
+}
+
+/// Where `image`'s `docker save` archive goes under `root`.
+pub fn local_image_archive(root: &Path, image: &str) -> PathBuf {
+    root.join(format!("{}.tar", image_slot(image)))
 }
 
 /// The saved images under `root`, by image slot.
@@ -661,6 +721,17 @@ pub fn local_images(root: &Path) -> BTreeMap<String, PathBuf> {
             (!slot.starts_with('.')).then(|| (slot.to_string(), entry.path()))
         })
         .collect()
+}
+
+/// Delete `image`'s saved archive, so packs of it come from the registry
+/// again. Returns whether there was one.
+pub fn forget_local_image(root: &Path, image: &str) -> Result<bool> {
+    let archive = local_image_archive(root, image);
+    match std::fs::remove_file(&archive) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).with_context(|| format!("Failed to remove {}", archive.display())),
+    }
 }
 
 #[cfg(test)]
@@ -820,12 +891,47 @@ mod tests {
     }
 
     #[test]
+    fn test_marking_an_image_stale_removes_each_projects_current_pack_of_it() {
+        let root = tempfile::tempdir().unwrap();
+        let claude = image_slot("ghcr.io/raine/workmux-sandbox:claude");
+        let codex = image_slot("ghcr.io/raine/workmux-sandbox:codex");
+        let write = |path: &str, body: &str| {
+            let path = root.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        };
+        write("p1/wm-pack-a-1.smolmachine", "");
+        write("p1/wm-pack-a-2.smolmachine", "");
+        write(&format!("p1/current/{claude}"), "wm-pack-a-1\n");
+        write(&format!("p1/current/{codex}"), "wm-pack-a-2\n");
+        write("p2/wm-pack-b-1.smolmachine", "");
+        write(&format!("p2/current/{claude}"), "wm-pack-b-1\n");
+        // A marker whose pack is already gone.
+        write(&format!("p3/current/{claude}"), "wm-pack-c-1\n");
+
+        let stale = mark_image_stale(root.path(), "ghcr.io/raine/workmux-sandbox:claude").unwrap();
+        let names: Vec<&str> = stale.iter().map(|(_, name)| name.as_str()).collect();
+        assert_eq!(names, ["wm-pack-a-1", "wm-pack-b-1"]);
+        assert_eq!(present_packs(&root.path().join("p1")), ["wm-pack-a-2"]);
+        assert!(present_packs(&root.path().join("p2")).is_empty());
+        assert_eq!(
+            current_packs(&root.path().join("p1")),
+            HashSet::from(["wm-pack-a-2".to_string()]),
+            "another image's pack stays current"
+        );
+        assert!(current_packs(&root.path().join("p3")).is_empty());
+        assert!(
+            mark_image_stale(&root.path().join("missing"), "alpine")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn test_saved_images_are_found_by_their_image_slot() {
         let root = tempfile::tempdir().unwrap();
         assert!(local_images(root.path()).is_empty());
-        let archive = root
-            .path()
-            .join(format!("{}.tar", image_slot("my-sandbox:latest")));
+        let archive = local_image_archive(root.path(), "my-sandbox:latest");
         std::fs::write(&archive, "tar").unwrap();
         std::fs::write(root.path().join(".partial.tar.tmp"), "").unwrap();
 
@@ -834,5 +940,38 @@ mod tests {
             found,
             BTreeMap::from([(image_slot("my-sandbox:latest"), archive.clone())])
         );
+        assert!(forget_local_image(root.path(), "my-sandbox:latest").unwrap());
+        assert!(!forget_local_image(root.path(), "my-sandbox:latest").unwrap());
+        assert!(local_images(root.path()).is_empty());
+    }
+
+    #[test]
+    fn test_prune_keeps_only_each_projects_current_packs() {
+        let root = tempfile::tempdir().unwrap();
+        let write = |path: &str, body: &str| {
+            let path = root.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        };
+        write("p1/wm-pack-a-1.smolmachine", "");
+        write("p1/wm-pack-a-2.smolmachine", "");
+        write("p1/wm-pack-a-3.smolmachine", "");
+        write("p1/current/claude", "wm-pack-a-2\n");
+        write("p1/current/codex", "wm-pack-a-3\n");
+        write("p2/wm-pack-b-1.smolmachine", "");
+        write("p2/.wm-pack-b-2.building.smolmachine", "");
+
+        let prunable = prunable_packs(root.path());
+        let names: Vec<&str> = prunable.iter().map(|(_, name)| name.as_str()).collect();
+        assert_eq!(names, ["wm-pack-a-1", "wm-pack-b-1"]);
+        for (dir, name) in &prunable {
+            remove_pack(dir, name).unwrap();
+        }
+        assert_eq!(
+            present_packs(&root.path().join("p1")),
+            ["wm-pack-a-2", "wm-pack-a-3"]
+        );
+        assert!(present_packs(&root.path().join("p2")).is_empty());
+        assert!(prunable_packs(&root.path().join("missing")).is_empty());
     }
 }

@@ -20,6 +20,10 @@ pub const LABEL_OWNER: &str = "wm-owner";
 /// a machine from it runs.
 pub const LABEL_PACK: &str = "wm-pack";
 
+/// The agent segment and label of a `workmux sandbox shell` machine, which
+/// `--exec` doesn't offer as a pane's machine.
+pub const SHELL_AGENT: &str = "shell";
+
 /// The agent label of a pack's base machine.
 pub const PACK_AGENT: &str = "pack";
 
@@ -233,6 +237,10 @@ impl ListedMachine {
         self.labels.get(LABEL_WORKMUX).is_some_and(|v| v == "1")
     }
 
+    pub fn is_running(&self) -> bool {
+        self.state == "running"
+    }
+
     pub fn owner(&self) -> Option<Owner> {
         self.labels.get(LABEL_OWNER).and_then(|v| Owner::parse(v))
     }
@@ -261,6 +269,22 @@ pub fn orphans(
         .iter()
         .filter(|machine| machine.is_workmux())
         .filter(|machine| !machine.owner().is_some_and(|owner| is_alive(&owner)))
+        .collect()
+}
+
+/// The running pane machines of the worktree whose label value is
+/// `worktree_hash`, for `sandbox shell --exec`: shells' own machines and
+/// orphans left out.
+pub fn pane_machines<'a>(
+    machines: &'a [ListedMachine],
+    worktree_hash: &str,
+    is_alive: impl Fn(&Owner) -> bool,
+) -> Vec<&'a ListedMachine> {
+    machines
+        .iter()
+        .filter(|machine| machine.serves_worktree(worktree_hash) && machine.is_running())
+        .filter(|machine| machine.label(LABEL_AGENT) != Some(SHELL_AGENT))
+        .filter(|machine| machine.owner().is_some_and(|owner| is_alive(&owner)))
         .collect()
 }
 
@@ -365,10 +389,40 @@ mod tests {
         let machines = parse_machine_list(json).unwrap();
         assert_eq!(machines.len(), 2);
         assert!(!machines[0].is_workmux());
-        assert!(machines[1].is_workmux());
+        assert!(machines[1].is_workmux() && machines[1].is_running());
         assert_eq!(machines[1].owner(), Some(Owner { pid: 12, start: 34 }));
         assert!(machines[1].serves_worktree("ab"));
         assert!(!machines[0].serves_worktree("ab"));
+    }
+
+    #[test]
+    fn test_a_shell_execs_into_the_worktrees_running_pane_machines() {
+        let pane = |name: &str, state: &str, worktree: &str, agent: &str, owner: &str| {
+            machine(
+                name,
+                state,
+                &[
+                    ("workmux", "1"),
+                    ("wm-worktree", worktree),
+                    ("wm-agent", agent),
+                    ("wm-owner", owner),
+                ],
+            )
+        };
+        let machines = [
+            pane("claude", "running", "w", "claude", "1:1"),
+            pane("stopped", "stopped", "w", "claude", "1:1"),
+            pane("shell", "running", "w", "shell", "1:1"),
+            pane("elsewhere", "running", "x", "claude", "1:1"),
+            pane("orphan", "running", "w", "claude", "9:9"),
+            pane("codex", "running", "w", "codex", "1:1"),
+        ];
+        let live = Owner { pid: 1, start: 1 };
+        let names: Vec<_> = pane_machines(&machines, "w", |owner| *owner == live)
+            .into_iter()
+            .map(|m| m.name.as_str())
+            .collect();
+        assert_eq!(names, ["claude", "codex"]);
     }
 
     #[test]

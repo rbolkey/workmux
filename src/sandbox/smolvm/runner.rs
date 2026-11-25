@@ -80,6 +80,16 @@ impl Runner {
         Ok(())
     }
 
+    /// Run an invocation in the foreground with the terminal attached, and
+    /// return its exit code.
+    pub fn run_foreground(&self, invocation: &Invocation) -> Result<i32> {
+        let status = self
+            .command(invocation)
+            .status()
+            .context("Failed to run smolvm")?;
+        Ok(status.code().unwrap_or(1))
+    }
+
     /// Run `plan` in phases: delete the orphans, build the project pack if
     /// it's missing, run the launch steps, then the exec in the foreground,
     /// then the delete, whatever the exec's exit status. Returns the exec's

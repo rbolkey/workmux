@@ -1650,6 +1650,21 @@ impl SandboxRuntime {
         !matches!(self, SandboxRuntime::AppleContainer)
     }
 
+    /// Arguments to save `image` as an archive at `output` (`docker save`),
+    /// which smolvm boots from.
+    pub fn save_args(&self, image: &str, output: &std::path::Path) -> Vec<String> {
+        let mut args = match self {
+            SandboxRuntime::AppleContainer => vec!["image".to_string(), "save".to_string()],
+            _ => vec!["save".to_string()],
+        };
+        args.extend([
+            "-o".to_string(),
+            output.to_string_lossy().into_owned(),
+            image.to_string(),
+        ]);
+        args
+    }
+
     /// Returns the arguments for pulling an image.
     /// Apple Container uses `image pull`, others use `pull`.
     pub fn pull_args(&self, image: &str) -> Vec<String> {
@@ -7639,6 +7654,23 @@ sandbox:
         assert!(SandboxRuntime::Docker.needs_deny_mode_caps());
         assert!(SandboxRuntime::Podman.needs_deny_mode_caps());
         assert!(!SandboxRuntime::AppleContainer.needs_deny_mode_caps());
+    }
+
+    #[test]
+    fn runtime_save_args() {
+        let out = std::path::Path::new("/state/img.tar");
+        assert_eq!(
+            SandboxRuntime::Docker.save_args("img:latest", out),
+            vec!["save", "-o", "/state/img.tar", "img:latest"]
+        );
+        assert_eq!(
+            SandboxRuntime::Podman.save_args("img:latest", out),
+            vec!["save", "-o", "/state/img.tar", "img:latest"]
+        );
+        assert_eq!(
+            SandboxRuntime::AppleContainer.save_args("img:latest", out),
+            vec!["image", "save", "-o", "/state/img.tar", "img:latest"]
+        );
     }
 
     #[test]

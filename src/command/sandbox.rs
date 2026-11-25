@@ -18,14 +18,14 @@ use crate::sandbox::lima::{LimaInstance, parse_lima_instances};
 {about-with-newline}
 {usage-heading} {usage}
 
-Container commands:
-  build            Build the sandbox container image locally
-  pull             Pull the latest sandbox image from the container registry
+Container and smolvm commands:
+  build            Build the sandbox image locally (saved for smolvm)
+  pull             Pull the latest sandbox image from the registry
   init-dockerfile  Export customizable Dockerfile templates
 
-Lima commands:
-  stop             Stop Lima VMs to free resources
-  prune            Delete unused Lima VMs to reclaim disk space
+Lima and smolvm commands:
+  stop             Stop Lima VMs, or delete running smol machines
+  prune            Delete unused Lima VMs, or orphaned smol machines
 
 General commands:
   agent            Run an agent inside a sandbox with RPC support
@@ -52,7 +52,7 @@ pub enum SandboxCommand {
         #[arg(long)]
         force: bool,
     },
-    /// Delete unused Lima VMs to reclaim disk space.
+    /// Delete unused Lima VMs, or orphaned smol machines, to reclaim disk space.
     Prune {
         /// Skip confirmation and delete all workmux VMs
         #[arg(short, long)]
@@ -79,7 +79,8 @@ pub enum SandboxCommand {
         #[arg(last = true, required = true)]
         command: Vec<String>,
     },
-    /// Cross-compile and install workmux into containers and running Lima VMs for development.
+    /// Cross-compile and install workmux into containers and running Lima VMs, or for new
+    /// smol machines, for development.
     InstallDev {
         /// Skip cross-compilation and use existing binary
         #[arg(long)]
@@ -88,7 +89,7 @@ pub enum SandboxCommand {
         #[arg(long)]
         release: bool,
     },
-    /// Stop Lima VMs to free resources.
+    /// Stop Lima VMs, or delete workmux's running smol machines, to free resources.
     Stop {
         /// VM name to stop (if not provided, show interactive list)
         #[arg(conflicts_with = "all")]
@@ -111,8 +112,8 @@ pub enum SandboxCommand {
     /// Start an interactive shell in a sandbox.
     /// Uses the same mounts and environment as a normal worktree sandbox.
     Shell {
-        /// Exec into an existing container for this worktree instead of starting a new one
-        /// (container backend only)
+        /// Exec into an existing container or smol machine for this worktree instead of
+        /// starting a new one (container and smolvm backends)
         #[arg(long, short)]
         exec: bool,
         /// Command to run instead of bash
@@ -180,7 +181,11 @@ pub fn run(args: SandboxArgs) -> Result<()> {
             release,
         } => run_install_dev(skip_build, release),
         SandboxCommand::Agent { command } => run_agent(command),
+        SandboxCommand::Prune { force } if smolvm_selected() => run_prune_smolvm(force),
         SandboxCommand::Prune { force } => run_prune(force),
+        SandboxCommand::Stop { name, all, yes } if smolvm_selected() => {
+            run_stop_smolvm(name, all, yes)
+        }
         SandboxCommand::Stop { name, all, yes } => run_stop(name, all, yes),
         SandboxCommand::Shell { exec, command } => run_shell(exec, command),
     }
@@ -196,6 +201,12 @@ fn run_build() -> Result<()> {
         agent,
     );
     sandbox::build_image(&config.sandbox, agent)?;
+    if config.sandbox.uses_smolvm() {
+        let image = config.sandbox.resolved_image(agent);
+        let archive = sandbox::smolvm::save_local_image(&config.sandbox, &image)?;
+        println!("Saved '{}' for smolvm at {}", image, archive.display());
+        sandbox::smolvm::refresh_packs(&config, agent, &image)?;
+    }
     println!("\nSandbox image built successfully!");
     println!();
     println!(
@@ -212,6 +223,19 @@ fn run_pull() -> Result<()> {
     let config = Config::load(None)?;
     let agent = resolve_agent(&config);
     let image = config.sandbox.resolved_image(agent);
+
+    if config.sandbox.uses_smolvm() {
+        // smolvm pulls as a pack's base machine starts: make the packs of
+        // this image stale, and come from the registry, not a local build.
+        use sandbox::smolvm::pack;
+        if pack::forget_local_image(&pack::images_root()?, &image)? {
+            println!("Removed the local build of '{}' saved for smolvm.", image);
+        }
+        println!("Pulling image '{}' into a new pack...", image);
+        sandbox::smolvm::refresh_packs(&config, agent, &image)?;
+        println!("Image '{}' is up to date.", image);
+        return Ok(());
+    }
 
     println!("Pulling image '{}'...", image);
     sandbox::pull_image(&config.sandbox, &image)?;
@@ -491,6 +515,17 @@ fn run_install_dev(skip_build: bool, release: bool) -> Result<()> {
         }
         path
     };
+
+    if config.sandbox.uses_smolvm() {
+        let dir = sandbox::smolvm::dev_build::dir()?;
+        let dest = sandbox::smolvm::dev_build::install(&binary_path, &dir)?;
+        println!("Installed {}", dest.display());
+        println!(
+            "New smol machines run it ahead of the image's workmux; delete {} to go back.",
+            dir.display()
+        );
+        return Ok(());
+    }
 
     let mut did_something = false;
 
@@ -867,7 +902,13 @@ fn run_stop(name: Option<String>, all: bool, skip_confirm: bool) -> Result<()> {
             return Ok(());
         }
 
-        select_vms_interactive(&running_vms)?
+        select_interactive(
+            "Running workmux VMs",
+            "Enter VM number to stop (or 'all' for all VMs):",
+            &running_vms,
+            true,
+            |vm| format!("{} ({})", vm.name, vm.status),
+        )?
     };
 
     if vms_to_stop.is_empty() {
@@ -882,21 +923,14 @@ fn run_stop(name: Option<String>, all: bool, skip_confirm: bool) -> Result<()> {
     }
 
     // Confirm unless --yes flag is provided
-    if !skip_confirm {
-        print!(
-            "\nAre you sure you want to stop {} VM(s)? [y/N] ",
+    if !skip_confirm
+        && !confirm(&format!(
+            "\nAre you sure you want to stop {} VM(s)?",
             vms_to_stop.len()
-        );
-        io::stdout().flush()?;
-
-        let mut input = String::new();
-        io::stdin().read_line(&mut input)?;
-
-        let answer = input.trim().to_ascii_lowercase();
-        if !matches!(answer.as_str(), "y" | "yes") {
-            println!("Aborted.");
-            return Ok(());
-        }
+        ))?
+    {
+        println!("Aborted.");
+        return Ok(());
     }
 
     // Stop VMs
@@ -944,9 +978,7 @@ fn run_shell(exec: bool, command: Vec<String>) -> Result<()> {
     match config.sandbox.backend() {
         SandboxBackend::Container => run_shell_container(exec, command, &config),
         SandboxBackend::Lima => run_shell_lima(exec, command, &config),
-        SandboxBackend::Smolvm => {
-            bail!("workmux sandbox shell does not support the smolvm backend yet")
-        }
+        SandboxBackend::Smolvm => run_shell_smolvm(exec, command, &config),
     }
 }
 
@@ -1128,18 +1160,248 @@ fn run_shell_lima(exec: bool, command: Vec<String>, config: &Config) -> Result<(
     std::process::exit(status.code().unwrap_or(1));
 }
 
-fn select_vms_interactive<'a>(
-    vms: &'a [&'a crate::sandbox::lima::LimaInstanceInfo],
-) -> Result<Vec<&'a crate::sandbox::lima::LimaInstanceInfo>> {
+/// Whether the config here selects the smolvm backend. A config that fails
+/// to load leaves `stop` and `prune` on Lima, as before smolvm.
+fn smolvm_selected() -> bool {
+    Config::load(None).is_ok_and(|config| config.sandbox.uses_smolvm())
+}
+
+/// Ask `question`; true on `y` or `yes`.
+fn confirm(question: &str) -> Result<bool> {
+    print!("{question} [y/N] ");
+    io::stdout().flush()?;
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    Ok(matches!(
+        input.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
+/// Delete `machines`, reporting each; fails if any could not be deleted.
+fn delete_machines(
+    runner: &sandbox::smolvm::runner::Runner,
+    machines: &[&sandbox::smolvm::machines::ListedMachine],
+) -> Result<()> {
+    let mut failed = Vec::new();
+    for machine in machines {
+        print!("Deleting {}... ", machine.name);
+        io::stdout().flush().ok();
+        match runner.delete(&machine.name) {
+            Ok(()) => println!("done"),
+            Err(error) => {
+                println!("failed");
+                failed.push((machine.name.clone(), error.to_string()));
+            }
+        }
+    }
+    if !failed.is_empty() {
+        eprintln!("\nFailed to delete {} machine(s):", failed.len());
+        for (name, error) in &failed {
+            eprintln!("  - {name}: {error}");
+        }
+        bail!("Some machines could not be deleted");
+    }
+    Ok(())
+}
+
+/// `sandbox stop` under smolvm: delete workmux's running machines. A
+/// machine's pane loses its sandbox, and its supervisor exits.
+fn run_stop_smolvm(name: Option<String>, all: bool, skip_confirm: bool) -> Result<()> {
+    use std::io::IsTerminal;
+    sandbox::smolvm::prerequisites::ensure_available()?;
+    let runner = sandbox::smolvm::runner::Runner::from_env();
+    let listed = runner.list()?;
+    let running: Vec<_> = listed
+        .iter()
+        .filter(|m| m.is_workmux() && m.is_running())
+        .collect();
+
+    let to_delete = if all {
+        running
+    } else if let Some(name) = name {
+        match listed.iter().find(|m| m.is_workmux() && m.name == name) {
+            Some(machine) => vec![machine],
+            None => bail!(
+                "Machine '{name}' not found. Use 'workmux sandbox stop' to see workmux's machines."
+            ),
+        }
+    } else {
+        if !io::stdin().is_terminal() {
+            bail!("Non-interactive stdin detected. Use --all or specify a machine name.");
+        }
+        if running.is_empty() {
+            println!("No running workmux machines found.");
+            return Ok(());
+        }
+        select_interactive(
+            "Running workmux machines",
+            "Enter machine number to stop (or 'all' for all machines):",
+            &running,
+            true,
+            |m| m.name.clone(),
+        )?
+    };
+    if to_delete.is_empty() {
+        println!("No running workmux machines found.");
+        return Ok(());
+    }
+
+    println!("The following machines will be deleted:");
+    for machine in &to_delete {
+        println!("  - {} ({})", machine.name, machine.state);
+    }
+    if !skip_confirm
+        && !confirm(&format!(
+            "\nDelete {} machine(s)? Their panes' agents stop.",
+            to_delete.len()
+        ))?
+    {
+        println!("Aborted.");
+        return Ok(());
+    }
+    delete_machines(&runner, &to_delete)
+}
+
+/// `sandbox prune` under smolvm: delete workmux's machines whose owner is
+/// gone, as a launch does before creating its machine, and every pack but
+/// each project's current ones.
+fn run_prune_smolvm(force: bool) -> Result<()> {
+    use sandbox::smolvm::machines::{Owner, orphans};
+    use sandbox::smolvm::pack;
+    sandbox::smolvm::prerequisites::ensure_available()?;
+    let runner = sandbox::smolvm::runner::Runner::from_env();
+    let listed = runner.list()?;
+    let orphans = orphans(&listed, Owner::is_alive);
+    let packs = pack::prunable_packs(&pack::packs_root()?);
+    if orphans.is_empty() && packs.is_empty() {
+        println!("No orphaned workmux machines or unused packs found.");
+        return Ok(());
+    }
+    if !orphans.is_empty() {
+        println!("Found {} orphaned workmux machine(s):\n", orphans.len());
+        for machine in &orphans {
+            println!("  - {} ({})", machine.name, machine.state);
+        }
+        println!();
+    }
+    if !packs.is_empty() {
+        println!("Found {} unused pack(s):\n", packs.len());
+        for (_, name) in &packs {
+            println!("  - {name}");
+        }
+        println!();
+    }
+    if !force && !confirm("Delete these?")? {
+        println!("Aborted.");
+        return Ok(());
+    }
+    for (dir, name) in &packs {
+        match pack::remove_pack(dir, name) {
+            Ok(()) => println!("Deleted pack {name}"),
+            Err(error) => eprintln!("Failed to delete pack {name}: {error:#}"),
+        }
+    }
+    if orphans.is_empty() {
+        return Ok(());
+    }
+    delete_machines(&runner, &orphans)
+}
+
+/// `sandbox shell` under smolvm: a machine of its own with the worktree's
+/// mounts, deleted on exit; with `--exec`, a shell in a pane's running
+/// machine for this worktree.
+fn run_shell_smolvm(exec: bool, command: Vec<String>, config: &Config) -> Result<()> {
+    use sandbox::smolvm;
+    smolvm::prerequisites::ensure_available()?;
+    let cwd = std::env::current_dir().context("Failed to get current directory")?;
+    let cwd = cwd.canonicalize().unwrap_or(cwd);
+    let worktree_root = crate::git::get_repo_root()
+        .context("Not inside a git repository. workmux sandbox shell needs a worktree to mount.")?;
+    let worktree_root = worktree_root.canonicalize().unwrap_or(worktree_root);
+    let shell_cmd = if command.is_empty() {
+        "bash".to_string()
+    } else {
+        command.join(" ")
+    };
+    let runner = smolvm::runner::Runner::from_env();
+
+    let exit_code = if exec {
+        let listed = runner.list()?;
+        let hash = smolvm::machines::path_hash(&worktree_root);
+        let candidates =
+            smolvm::machines::pane_machines(&listed, &hash, smolvm::machines::Owner::is_alive);
+        let machine = match candidates.as_slice() {
+            [] => bail!(
+                "No running smol machine found for this worktree.\n\
+                 Start a sandboxed pane first with 'workmux add --sandbox', or use \
+                 'workmux sandbox shell' without --exec."
+            ),
+            [only] => *only,
+            several => {
+                use std::io::IsTerminal;
+                let names: Vec<_> = several.iter().map(|m| m.name.as_str()).collect();
+                if !io::stdin().is_terminal() {
+                    bail!(
+                        "Several machines run for this worktree: {}. Run it from a terminal \
+                         to choose one.",
+                        names.join(", ")
+                    );
+                }
+                select_interactive(
+                    "Running machines for this worktree",
+                    "Enter machine number:",
+                    several,
+                    false,
+                    |m| m.name.clone(),
+                )?[0]
+            }
+        };
+        let invocation = smolvm::plan::plan_shell_exec(&smolvm::plan::ShellExec {
+            machine: &machine.name,
+            user: smolvm::plan::GuestUser::current(),
+            cwd: &cwd,
+            command: &shell_cmd,
+            terminal_env: smolvm::terminal_env(),
+            git_identity: super::sandbox_run::git_user_config_envs(&worktree_root),
+        });
+        debug!(machine = %machine.name, cmd = %shell_cmd, "exec into smol machine");
+        runner.run_foreground(&invocation)?
+    } else {
+        let agent = resolve_agent(config);
+        let input = smolvm::launch_input(
+            config,
+            agent,
+            smolvm::machines::SHELL_AGENT,
+            &worktree_root,
+            &cwd,
+            &shell_cmd,
+            None,
+        )?;
+        eprintln!("sandbox: starting a smol machine for this worktree...");
+        smolvm::launch(&runner, input)?
+    };
+    std::process::exit(exit_code);
+}
+
+/// Ask for one of `items` by number, or `all` when `offer_all`. `heading`
+/// titles the list, `label` names each item, and `prompt` asks for the choice.
+fn select_interactive<'a, T>(
+    heading: &str,
+    prompt: &str,
+    items: &'a [&'a T],
+    offer_all: bool,
+    label: impl Fn(&T) -> String,
+) -> Result<Vec<&'a T>> {
     use std::io::{self, Write};
 
-    println!("Running workmux VMs:");
+    println!("{heading}:");
     println!();
-    for (idx, vm) in vms.iter().enumerate() {
-        println!("  {}. {} ({})", idx + 1, vm.name, vm.status);
+    for (idx, item) in items.iter().enumerate() {
+        println!("  {}. {}", idx + 1, label(item));
     }
     println!();
-    println!("Enter VM number to stop (or 'all' for all VMs):");
+    println!("{prompt}");
     print!("> ");
     io::stdout().flush()?;
 
@@ -1147,21 +1409,23 @@ fn select_vms_interactive<'a>(
     io::stdin().read_line(&mut input)?;
     let input = input.trim();
 
-    if input.eq_ignore_ascii_case("all") {
-        return Ok(vms.to_vec());
+    if offer_all && input.eq_ignore_ascii_case("all") {
+        return Ok(items.to_vec());
     }
 
     // Parse as number
-    let idx: usize = input
-        .parse()
-        .context("Invalid input. Please enter a number or 'all'.")?;
+    let idx: usize = input.parse().context(if offer_all {
+        "Invalid input. Please enter a number or 'all'."
+    } else {
+        "Invalid input. Please enter a number."
+    })?;
 
-    if idx < 1 || idx > vms.len() {
+    if idx < 1 || idx > items.len() {
         anyhow::bail!(
             "Invalid selection. Please choose a number between 1 and {}",
-            vms.len()
+            items.len()
         );
     }
 
-    Ok(vec![vms[idx - 1]])
+    Ok(vec![items[idx - 1]])
 }

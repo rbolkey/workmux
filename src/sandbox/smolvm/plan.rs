@@ -142,6 +142,9 @@ pub struct LaunchInput<'a> {
     pub extra_mounts: Vec<Mount>,
     /// The host's git identity as `GIT_CONFIG_*` variables.
     pub git_identity: Vec<(String, String)>,
+    /// The directory `workmux sandbox install-dev` put a local Linux build
+    /// of workmux in, mounted read-only ahead of the image's on `PATH`.
+    pub dev_build: Option<PathBuf>,
 }
 
 /// The uid and gid the agent runs as in the guest: the workstation user's,
@@ -190,6 +193,8 @@ const GUEST_SHIMS_DIR: &str = "/tmp/.workmux-shims/bin";
 /// smolvm's combined CA bundle (the image's roots plus the machine's CA),
 /// present when the machine has a credential binding.
 const GUEST_CA_BUNDLE: &str = "/run/smolvm/ca-bundle.pem";
+/// Where `install-dev`'s build is mounted, ahead of the image's workmux.
+const GUEST_DEV_BUILD_DIR: &str = "/tmp/.workmux-dev/bin";
 
 /// Plan a pane's launch: create its machine from the project's pack, start
 /// it, mount what comes after boot, exec the command, delete the machine.
@@ -300,11 +305,15 @@ fn boot_mounts(input: &LaunchInput) -> Result<Vec<Mount>> {
     Ok(mounts)
 }
 
-/// The mounts added once the machine runs: shims and `extra_mounts`.
+/// The mounts added once the machine runs: shims, the dev build and
+/// `extra_mounts`.
 fn hot_mounts(input: &LaunchInput) -> Result<Vec<Mount>> {
     let mut hot_mounts = Vec::new();
     if let Some(shims) = &input.shims {
         hot_mounts.push(Mount::new(shims, GUEST_SHIMS_DIR, true));
+    }
+    if let Some(dev_build) = &input.dev_build {
+        hot_mounts.push(Mount::new(dev_build, GUEST_DEV_BUILD_DIR, true));
     }
     let dot_git = input.worktree.join(".git");
     for mount in &input.extra_mounts {
@@ -329,14 +338,17 @@ fn hot_mounts(input: &LaunchInput) -> Result<Vec<Mount>> {
     Ok(hot_mounts)
 }
 
-/// The guest's `PATH`: the shims, then Nix's profile when a toolchain
-/// wraps the command, ahead of the image's.
+/// The guest's `PATH`: the shims, then the dev build, then Nix's profile
+/// when a toolchain wraps the command, ahead of the image's.
 fn guest_path(input: &LaunchInput) -> String {
     let mut path = if input.toolchain == DetectedToolchain::None {
         GUEST_PATH.to_string()
     } else {
         format!("{NIX_PROFILE_BIN}:{GUEST_PATH}")
     };
+    if input.dev_build.is_some() {
+        path = format!("{GUEST_DEV_BUILD_DIR}:{path}");
+    }
     if input.shims.is_some() {
         path = format!("{GUEST_SHIMS_DIR}:{path}");
     }
@@ -520,6 +532,44 @@ fn check_mount_paths(mount: &Mount) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// A shell in a pane's running machine (`workmux sandbox shell --exec`).
+#[derive(Debug, Clone)]
+pub struct ShellExec<'a> {
+    pub machine: &'a str,
+    pub user: GuestUser,
+    pub cwd: &'a Path,
+    pub command: &'a str,
+    pub terminal_env: Vec<(String, String)>,
+    /// The host's git identity as `GIT_CONFIG_*` variables.
+    pub git_identity: Vec<(String, String)>,
+}
+
+/// The exec for a shell in a running machine, as the pane's user with its
+/// `HOME`, but without the pane's RPC token. Nix trusts smolvm's bundle as
+/// in the pane: the machine has the bundle when its launch bound a
+/// credential, which the shell can't derive from its own environment.
+pub fn plan_shell_exec(shell: &ShellExec) -> Invocation {
+    let command = format!(
+        "if [ -e {GUEST_CA_BUNDLE} ]; then export NIX_SSL_CERT_FILE={GUEST_CA_BUNDLE}; fi; {}",
+        shell.command
+    );
+    let mut guest_env = vec![format!("HOME={GUEST_HOME}"), format!("PATH={GUEST_PATH}")];
+    guest_env.extend(
+        shell
+            .git_identity
+            .iter()
+            .chain(&shell.terminal_env)
+            .map(|(key, value)| format!("{key}={value}")),
+    );
+    Invocation::new(exec_args(
+        shell.machine,
+        shell.user,
+        shell.cwd,
+        guest_env,
+        &command,
+    ))
 }
 
 /// `machine exec` as root of a script that gives `user` a passwd entry

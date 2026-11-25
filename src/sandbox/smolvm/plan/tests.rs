@@ -40,6 +40,7 @@ pub(crate) fn claude_input(sandbox: &SandboxConfig) -> LaunchInput<'_> {
         shims: None,
         extra_mounts: Vec::new(),
         git_identity: Vec::new(),
+        dev_build: None,
     }
 }
 
@@ -223,6 +224,33 @@ fn test_shims_are_mounted_read_only_once_the_machine_runs_and_lead_path() {
     );
 }
 
+#[test]
+fn test_a_dev_build_is_mounted_read_only_ahead_of_the_images_workmux_on_path() {
+    let sandbox = SandboxConfig::default();
+    let mut input = claude_input(&sandbox);
+    input.shims = Some(PathBuf::from("/cache/shims/bin"));
+    input.dev_build = Some(PathBuf::from("/state/workmux/smolvm-dev/bin"));
+    let plan = plan_launch(&input).unwrap();
+
+    let added: Vec<_> = hot_mounts(&plan)
+        .into_iter()
+        .map(|args| args.last().unwrap().clone())
+        .collect();
+    assert_eq!(
+        added,
+        [
+            "/cache/shims/bin:/tmp/.workmux-shims/bin:ro",
+            "/state/workmux/smolvm-dev/bin:/tmp/.workmux-dev/bin:ro",
+        ]
+    );
+    assert_eq!(mounts(&plan).len(), 8, "the dev build isn't a boot mount");
+    assert_eq!(
+        exec_env(&plan, "PATH").unwrap(),
+        "/tmp/.workmux-shims/bin:/tmp/.workmux-dev/bin:\
+             /tmp/.local/bin:/usr/local/bin:/usr/bin:/bin"
+    );
+}
+
 fn hot(host: &str, guest: &str, read_only: bool) -> Mount {
     Mount {
         host: PathBuf::from(host),
@@ -369,6 +397,71 @@ fn test_orphaned_machines_are_deleted_before_the_panes_machine_is_created() {
         plan.prepare[1].invocation.args,
         strings(&["machine", "delete", "--name", "wm-old-2", "-f"])
     );
+}
+
+#[test]
+fn test_a_shell_in_a_running_machine_runs_as_the_pane_user_with_its_home() {
+    let exec = plan_shell_exec(&ShellExec {
+        machine: "wm-p-1234abcd-claude-x1y2z3",
+        user: GuestUser { uid: 501, gid: 20 },
+        cwd: Path::new("/src/p__worktrees/feat"),
+        command: "bash",
+        terminal_env: vec![("TERM".into(), "xterm".into())],
+        git_identity: identity(),
+    });
+    let args = &exec.args;
+    assert_eq!(
+        args[..4],
+        strings(&["machine", "exec", "--name", "wm-p-1234abcd-claude-x1y2z3"])
+    );
+    assert!(args.contains(&"-it".to_string()), "{args:?}");
+    assert!(has_pair(args, ["-u", "501:20"]), "{args:?}");
+    assert!(has_pair(args, ["-w", "/src/p__worktrees/feat"]), "{args:?}");
+    for var in [
+        "HOME=/tmp",
+        "PATH=/tmp/.local/bin:/usr/local/bin:/usr/bin:/bin",
+        "GIT_CONFIG_COUNT=1",
+        "GIT_CONFIG_KEY_0=user.name",
+        "GIT_CONFIG_VALUE_0=Ada Lovelace",
+        "TERM=xterm",
+    ] {
+        assert!(has_pair(args, ["-e", var]), "{var}: {args:?}");
+    }
+    assert_eq!(
+        args[args.len() - 4..args.len() - 1],
+        strings(&["--", "sh", "-c"])
+    );
+    assert!(args.last().unwrap().ends_with("; bash"), "{args:?}");
+    assert!(exec.env.is_empty());
+}
+
+#[test]
+fn test_a_shell_trusts_smolvms_bundle_only_where_the_machine_has_one() {
+    // smolvm makes the bundle only for a machine with a credential binding,
+    // which the pane's launch knew and the shell reads off the machine.
+    let exec = plan_shell_exec(&ShellExec {
+        machine: "wm-p-1234abcd-claude-x1y2z3",
+        user: GuestUser { uid: 501, gid: 20 },
+        cwd: Path::new("/src/p__worktrees/feat"),
+        command: "echo \"$NIX_SSL_CERT_FILE\"",
+        terminal_env: Vec::new(),
+        git_identity: Vec::new(),
+    });
+    let script = exec.args.last().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let run = |bundle: &Path| {
+        let script = script.replace("/run/smolvm/ca-bundle.pem", &bundle.to_string_lossy());
+        let out = std::process::Command::new("sh")
+            .args(["-c", &script])
+            .env_remove("NIX_SSL_CERT_FILE")
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    };
+    let bundle = dir.path().join("ca-bundle.pem");
+    assert_eq!(run(&bundle), "", "no bundle, no binding");
+    std::fs::write(&bundle, "").unwrap();
+    assert_eq!(run(&bundle), bundle.to_string_lossy());
 }
 
 #[test]

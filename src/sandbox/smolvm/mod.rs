@@ -11,6 +11,7 @@ use crate::multiplexer::agent::SelectedAgent;
 use crate::multiplexer::util::ResolvedCommand;
 
 pub(crate) mod credentials;
+pub(crate) mod dev_build;
 pub(crate) mod git;
 pub(crate) mod machines;
 pub(crate) mod network;
@@ -117,6 +118,7 @@ pub fn launch_input<'a>(
         shims,
         extra_mounts: extra_mounts(sandbox)?,
         git_identity: crate::command::sandbox_run::git_user_config_envs(worktree_root),
+        dev_build: dev_build::installed()?,
     })
 }
 
@@ -189,6 +191,44 @@ pub fn terminal_env() -> Vec<(String, String)> {
                 .map(|value| (key.to_string(), value))
         })
         .collect()
+}
+
+/// Save the locally built `image` from the container runtime (`docker
+/// save`) where packs of it are made from ([`pack::local_image_archive`]).
+pub fn save_local_image(sandbox: &crate::config::SandboxConfig, image: &str) -> Result<PathBuf> {
+    let root = pack::images_root()?;
+    std::fs::create_dir_all(&root)
+        .with_context(|| format!("Failed to create {}", root.display()))?;
+    let archive = pack::local_image_archive(&root, image);
+    let temp = root.join(format!(".{}.tmp", std::process::id()));
+    let runtime = sandbox.runtime();
+    let status = std::process::Command::new(runtime.binary_name())
+        .args(runtime.save_args(image, &temp))
+        .status()
+        .with_context(|| format!("Failed to run {}", runtime.binary_name()))?;
+    if !status.success() {
+        let _ = std::fs::remove_file(&temp);
+        bail!("Failed to save image '{image}' for smolvm");
+    }
+    std::fs::rename(&temp, &archive)
+        .with_context(|| format!("Failed to write {}", archive.display()))?;
+    Ok(archive)
+}
+
+/// After `sandbox build` or `pull`: mark `image`'s packs stale in every
+/// project, then, inside a project, build its pack for `agent` now (a
+/// registry image is pulled as the base machine starts), so the wait and
+/// any error show here rather than in the next pane.
+pub fn refresh_packs(config: &crate::config::Config, agent: &str, image: &str) -> Result<()> {
+    for (_, name) in pack::mark_image_stale(&pack::packs_root()?, image)? {
+        println!("Marked pack {name} stale");
+    }
+    let Ok(repo) = crate::git::get_repo_root() else {
+        println!("New machines' packs will be built from '{image}' when they're next needed.");
+        return Ok(());
+    };
+    prerequisites::ensure_available()?;
+    build_missing_packs(config, &project_root(&repo), &[agent])
 }
 
 /// Delete the project's superseded packs that no machine was created from
