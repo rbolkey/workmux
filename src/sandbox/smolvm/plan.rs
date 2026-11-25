@@ -289,7 +289,23 @@ fn hot_mounts(input: &LaunchInput) -> Result<Vec<Mount>> {
     if let Some(shims) = &input.shims {
         hot_mounts.push(Mount::new(shims, GUEST_SHIMS_DIR, true));
     }
-    hot_mounts.extend(input.extra_mounts.iter().cloned());
+    let dot_git = input.worktree.join(".git");
+    for mount in &input.extra_mounts {
+        if !mount.read_only {
+            let guest = &mount.guest;
+            let protected = [input.git.common_dir.as_path(), dot_git.as_path()];
+            if protected
+                .iter()
+                .any(|path| guest.starts_with(path) || path.starts_with(guest))
+            {
+                bail!(
+                    "Writable extra mount at {} overlaps protected Git metadata",
+                    guest.display()
+                );
+            }
+        }
+        hot_mounts.push(mount.clone());
+    }
     for mount in &hot_mounts {
         check_mount_paths(mount)?;
     }

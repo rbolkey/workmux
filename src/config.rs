@@ -1913,9 +1913,19 @@ pub struct SmolvmConfig {
     /// Project-overridable; a blank script turns a global one off.
     #[serde(default)]
     pub provision: Option<String>,
+
+    /// Accept, for every project, that a smol machine's agent can change the
+    /// worktree's `.git` file and admin directory, without the prompt.
+    /// Global-only.
+    #[serde(default)]
+    pub accept_reduced_git_metadata_isolation: Option<bool>,
 }
 
 impl SmolvmConfig {
+    pub fn accepts_reduced_git_metadata_isolation(&self) -> bool {
+        self.accept_reduced_git_metadata_isolation.unwrap_or(false)
+    }
+
     pub fn cpus(&self) -> Option<u32> {
         self.cpus
     }
@@ -1938,6 +1948,16 @@ impl SmolvmConfig {
             cpus: project.cpus.or(global.cpus),
             memory: project.memory.or(global.memory),
             provision: project.provision.or(global.provision),
+            accept_reduced_git_metadata_isolation: {
+                if project.accept_reduced_git_metadata_isolation.is_some() {
+                    tracing::warn!(
+                        "sandbox.smolvm.accept_reduced_git_metadata_isolation in project config \
+                         (.workmux.yaml) is ignored -- move it to your global config \
+                         (~/.config/workmux/config.yaml)"
+                    );
+                }
+                global.accept_reduced_git_metadata_isolation
+            },
         }
     }
 }
@@ -6655,6 +6675,32 @@ container:
             sandbox.rpc_host = Some("10.0.0.1".into());
         });
         assert_eq!(overridden.sandbox.resolved_rpc_host(), "10.0.0.1");
+    }
+
+    #[test]
+    fn smolvm_reduced_git_metadata_acceptance_is_global_only() {
+        let parse = |yaml: &str| -> Config { serde_yaml::from_str(yaml).unwrap() };
+        let accepting =
+            parse("sandbox:\n  smolvm:\n    accept_reduced_git_metadata_isolation: true\n");
+        assert!(
+            !Config::default()
+                .sandbox
+                .smolvm
+                .accepts_reduced_git_metadata_isolation()
+        );
+
+        let ignored = Config::default().merge(accepting.clone());
+        assert!(
+            !ignored
+                .sandbox
+                .smolvm
+                .accepts_reduced_git_metadata_isolation()
+        );
+
+        let refusing =
+            parse("sandbox:\n  smolvm:\n    accept_reduced_git_metadata_isolation: false\n");
+        let kept = accepting.merge(refusing);
+        assert!(kept.sandbox.smolvm.accepts_reduced_git_metadata_isolation());
     }
 
     #[test]

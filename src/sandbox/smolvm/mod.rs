@@ -79,6 +79,8 @@ pub fn launch_input<'a>(
     let project_root = project_root(worktree_root);
     let identity = machines::MachineIdentity::new(&project_root, worktree_root, label_agent);
     let git = git::gather(worktree_root)?;
+    git::git_isolation_acknowledgement(sandbox, &crate::xdg::state_dir()?, &identity.project_key())
+        .acknowledge()?;
     let owner = machines::Owner::current()?;
     let pack = pack::gather(
         sandbox,
@@ -125,10 +127,17 @@ pub fn prepare_packs(
 ) -> Result<()> {
     prerequisites::ensure_available()?;
     let project_root = project_root(worktree);
-    // An unsupported git layout or a file in extra_mounts fails here, not
-    // in an empty pane.
+    // Ask before the window opens, in the user's terminal, not in a pane.
+    let identity = machines::MachineIdentity::new(&project_root, worktree, machines::PACK_AGENT);
     git::gather(worktree)?;
+    // A file in extra_mounts fails here, not in an empty pane.
     extra_mounts(&config.sandbox)?;
+    git::git_isolation_acknowledgement(
+        &config.sandbox,
+        &crate::xdg::state_dir()?,
+        &identity.project_key(),
+    )
+    .acknowledge()?;
     build_missing_packs(config, &project_root, agents)
 }
 

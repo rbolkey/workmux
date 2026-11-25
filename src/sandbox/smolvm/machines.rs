@@ -143,6 +143,13 @@ impl MachineIdentity {
         name
     }
 
+    /// `<project>-<hash8>`: the project, as a file name.
+    pub fn project_key(&self) -> String {
+        format!("{}-{}", self.project, &self.project_hash[..8])
+            .trim_start_matches('-')
+            .to_string()
+    }
+
     /// `wm-pack-<project>-<hash8>`, the project's pack names before their
     /// key.
     pub fn pack_prefix(&self) -> String {

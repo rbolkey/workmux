@@ -272,6 +272,26 @@ fn test_hot_mounts_dont_count_against_the_boot_limit() {
 }
 
 #[test]
+fn test_a_writable_extra_mount_over_git_metadata_is_an_error() {
+    let sandbox = SandboxConfig::default();
+    for guest in [
+        "/src/proj/.git/hooks",
+        "/src/proj",
+        "/src/proj__worktrees/feat/.git",
+    ] {
+        let mut input = claude_input(&sandbox);
+        input.extra_mounts = vec![hot("/Users/me/x", guest, false)];
+        let error = plan_launch(&input).unwrap_err().to_string();
+        assert!(
+            error.contains("overlaps protected Git metadata"),
+            "{guest}: {error}"
+        );
+        input.extra_mounts = vec![hot("/Users/me/x", guest, true)];
+        assert!(plan_launch(&input).is_ok(), "{guest} read-only");
+    }
+}
+
+#[test]
 fn test_an_extra_mount_smolvm_cannot_parse_is_an_error() {
     let sandbox = SandboxConfig::default();
     let mut input = claude_input(&sandbox);
