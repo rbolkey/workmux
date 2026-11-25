@@ -8,6 +8,7 @@
 use anyhow::{Result, bail};
 use std::path::{Path, PathBuf};
 
+use super::credentials::{MachineCredentials, SecretValue, machine_credentials};
 use super::git::GitLayout;
 use super::machines::LABEL_PACK;
 use super::network::{PrivateHosts, machine_network};
@@ -17,7 +18,8 @@ use crate::sandbox::agent_config_target;
 use crate::sandbox::toolchain::{self, DetectedToolchain};
 
 /// One `smolvm` invocation. Its `Debug` output names `env`'s variables but
-/// never their values, which may be secrets (the RPC token).
+/// never their values, which may be secrets (the RPC token, git's derived
+/// header).
 #[derive(Clone, PartialEq, Eq)]
 pub struct Invocation {
     /// Arguments after `smolvm` (global options such as `--state-dir` are the
@@ -125,6 +127,13 @@ pub struct LaunchInput<'a> {
     /// Start the machine with smolvm's seccomp and Landlock confinement of
     /// its VMM enforced (Linux hosts).
     pub confine_vmm: bool,
+    /// The variables to pass that the supervisor's environment sets, by
+    /// name only ([`super::credentials::host_env`]): smolvm reads their
+    /// values from its own environment.
+    pub host_env: Vec<String>,
+    /// `GH_TOKEN`/`GITHUB_TOKEN` values git's `github.com` header is derived
+    /// from ([`super::credentials::github_tokens`]), held in memory only.
+    pub github_tokens: Vec<(String, SecretValue)>,
     /// The host's shim directory (`host_commands`, sound, clipboard),
     /// mounted read-only ahead of `PATH` once the machine runs.
     pub shims: Option<PathBuf>,
@@ -178,6 +187,9 @@ const GUEST_PATH: &str = "/tmp/.local/bin:/usr/local/bin:/usr/bin:/bin";
 const GUEST_CLAUDE_CONFIG_DIR: &str = "/tmp/.claude-sandbox-config";
 /// Where the shim directory is mounted, ahead of `PATH` (as on containers).
 const GUEST_SHIMS_DIR: &str = "/tmp/.workmux-shims/bin";
+/// smolvm's combined CA bundle (the image's roots plus the machine's CA),
+/// present when the machine has a credential binding.
+const GUEST_CA_BUNDLE: &str = "/run/smolvm/ca-bundle.pem";
 
 /// Plan a pane's launch: create its machine from the project's pack, start
 /// it, mount what comes after boot, exec the command, delete the machine.
@@ -201,10 +213,12 @@ pub fn plan_launch(input: &LaunchInput) -> Result<LaunchPlan> {
     );
     // A pack doesn't carry virtio-net, so every machine asks for it.
     let network = machine_network(&input.sandbox.network, &input.private_hosts)?;
-    let create = create_args(input, &pack, network.flags)?;
-    let exec = exec_invocation(input);
+    let mut create = create_args(input, &pack, network.flags)?;
+    let credentials = machine_credentials(input.sandbox, &input.host_env, &input.github_tokens)?;
+    let exec = exec_invocation(input, &credentials);
+    create.extend(credentials.create_flags);
     let hot_mounts = hot_mounts(input)?;
-    let start = start_invocation(input);
+    let start = start_invocation(input, &credentials.start_env);
     let prepare = prepare_steps(input, create, start, &hot_mounts);
     Ok(LaunchPlan {
         machine: input.machine.clone(),
@@ -212,7 +226,7 @@ pub fn plan_launch(input: &LaunchInput) -> Result<LaunchPlan> {
         prepare,
         exec,
         delete: delete_machine(&input.machine),
-        notes: network.notes,
+        notes: network.notes.into_iter().chain(credentials.notes).collect(),
     })
 }
 
@@ -233,8 +247,8 @@ fn links_claude_json(input: &LaunchInput) -> bool {
     input.agent == "claude" && input.claude_config_dir.is_some()
 }
 
-/// `machine create`: labels, the pack, the network, resources and the
-/// boot mounts.
+/// `machine create`, up to the credential flags: labels, the pack, the
+/// network, resources and the boot mounts.
 fn create_args(
     input: &LaunchInput,
     pack: &PackPlan,
@@ -329,9 +343,9 @@ fn guest_path(input: &LaunchInput) -> String {
     path
 }
 
-/// The pane's exec, with its secrets passed by name from smolvm's
-/// environment.
-fn exec_invocation(input: &LaunchInput) -> Invocation {
+/// The pane's exec, with the machine's `credentials`: its variables passed
+/// by name from smolvm's environment, and whether it has a binding.
+fn exec_invocation(input: &LaunchInput, credentials: &MachineCredentials) -> Invocation {
     let sandbox = input.sandbox;
     let mut guest_env = vec![
         format!("HOME={GUEST_HOME}"),
@@ -360,6 +374,14 @@ fn exec_invocation(input: &LaunchInput) -> Invocation {
             "WM_RPC_TOKEN".to_string(),
         ]);
     }
+    if credentials.has_binding() {
+        // smolvm intercepts a binding's hosts and puts its CA in a bundle
+        // it names in SSL_CERT_FILE, but Nix prefers NIX_SSL_CERT_FILE,
+        // which Nix's profile script (sourced by devbox) points at the
+        // system bundle unless it is set. Drop this once smolvm sets it.
+        guest_env.push(format!("NIX_SSL_CERT_FILE={GUEST_CA_BUNDLE}"));
+    }
+    guest_env.extend(credentials.exec_names.iter().cloned());
     // `sandbox.env` by name, as the token: smolvm reads the values from its
     // own environment, so they stay out of argv and the logs.
     let mut sandbox_env = sandbox.env_vars();
@@ -401,11 +423,20 @@ fn exec_invocation(input: &LaunchInput) -> Invocation {
     }
 }
 
-/// `machine start`, with the VMM confinement in its environment.
-fn start_invocation(input: &LaunchInput) -> Invocation {
+/// `machine start`, with the VMM confinement and the values smolvm resolves
+/// at start (git's derived header) in its environment.
+fn start_invocation(input: &LaunchInput, start_env: &[(String, SecretValue)]) -> Invocation {
+    // Bound secret refs are resolved at start, so git's derived header is
+    // passed here only.
+    let mut env = confinement_env(input.confine_vmm);
+    env.extend(
+        start_env
+            .iter()
+            .map(|(key, value)| (key.clone(), value.expose().to_string())),
+    );
     Invocation {
         args: words(&["machine", "start", "--name", &input.machine]),
-        env: confinement_env(input.confine_vmm),
+        env,
     }
 }
 

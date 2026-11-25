@@ -1919,9 +1919,146 @@ pub struct SmolvmConfig {
     /// Global-only.
     #[serde(default)]
     pub accept_reduced_git_metadata_isolation: Option<bool>,
+
+    /// Variables, by the name the agent sees, that become placeholders
+    /// smolvm swaps for the real value on requests to their hosts, or that
+    /// take their value from the keychain. Global-only.
+    #[serde(default, deserialize_with = "deserialize_credentials")]
+    pub credentials: Option<BTreeMap<String, CredentialEntry>>,
+}
+
+/// One `sandbox.smolvm.credentials` entry.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(try_from = "RawCredentialEntry", into = "RawCredentialEntry")]
+pub struct CredentialEntry {
+    /// The hosts smolvm sends the real value to. Unset keeps a built-in
+    /// variable's hosts.
+    pub hosts: Option<Vec<String>>,
+    /// How the value is sent. Unset is a header placeholder.
+    pub mode: Option<CredentialMode>,
+    /// Where smolvm reads the value instead of the environment:
+    /// `from_keychain`, parsed when the config loads.
+    pub source: Option<crate::sandbox::smolvm::credentials::EnvSource>,
+}
+
+/// [`CredentialEntry`] as written in YAML.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RawCredentialEntry {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hosts: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mode: Option<CredentialMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    from_keychain: Option<String>,
+}
+
+impl TryFrom<RawCredentialEntry> for CredentialEntry {
+    type Error = String;
+
+    fn try_from(raw: RawCredentialEntry) -> Result<Self, String> {
+        use crate::sandbox::smolvm::credentials::EnvSource;
+        let source = raw
+            .from_keychain
+            .map(|spec| EnvSource::keychain(&spec))
+            .transpose()?;
+        Ok(Self {
+            hosts: raw.hosts,
+            mode: raw.mode,
+            source,
+        })
+    }
+}
+
+impl From<CredentialEntry> for RawCredentialEntry {
+    fn from(entry: CredentialEntry) -> Self {
+        use crate::sandbox::smolvm::credentials::EnvSource;
+        let from_keychain = entry.source.map(|source| match source {
+            EnvSource::Keychain(item) => item.to_string(),
+        });
+        Self {
+            hosts: entry.hosts,
+            mode: entry.mode,
+            from_keychain,
+        }
+    }
+}
+
+/// How smolvm sends a credential's real value: `header` or
+/// `{ set_header: NAME }`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(try_from = "RawCredentialMode", into = "RawCredentialMode")]
+pub enum CredentialMode {
+    /// The placeholder is swapped wherever it appears in a header.
+    Header,
+    /// The named header is set to the complete value.
+    SetHeader(String),
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(untagged)]
+enum RawCredentialMode {
+    Named(String),
+    SetHeader { set_header: String },
+}
+
+impl From<CredentialMode> for RawCredentialMode {
+    fn from(mode: CredentialMode) -> Self {
+        match mode {
+            CredentialMode::Header => Self::Named("header".into()),
+            CredentialMode::SetHeader(set_header) => Self::SetHeader { set_header },
+        }
+    }
+}
+
+impl TryFrom<RawCredentialMode> for CredentialMode {
+    type Error = String;
+
+    fn try_from(raw: RawCredentialMode) -> Result<Self, String> {
+        match raw {
+            RawCredentialMode::Named(name) => match name.as_str() {
+                "header" => Ok(Self::Header),
+                _ => Err(format!(
+                    "unknown credential mode '{name}': use header or {{ set_header: NAME }}"
+                )),
+            },
+            RawCredentialMode::SetHeader { set_header } => {
+                let valid = !set_header.is_empty()
+                    && set_header
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+                if !valid {
+                    return Err(format!("set_header needs a header name: '{set_header}'"));
+                }
+                Ok(Self::SetHeader(set_header))
+            }
+        }
+    }
+}
+
+fn deserialize_credentials<'de, D>(
+    deserializer: D,
+) -> Result<Option<BTreeMap<String, CredentialEntry>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<BTreeMap<String, CredentialEntry>>::deserialize(deserializer)?;
+    for name in value.iter().flat_map(|map| map.keys()) {
+        if !is_valid_env_name(name) {
+            return Err(serde::de::Error::custom(format!(
+                "sandbox.smolvm.credentials: '{name}' is not a valid environment variable name"
+            )));
+        }
+    }
+    Ok(value)
 }
 
 impl SmolvmConfig {
+    /// `credentials`, empty when unset.
+    pub fn credentials(&self) -> BTreeMap<String, CredentialEntry> {
+        self.credentials.clone().unwrap_or_default()
+    }
+
     pub fn accepts_reduced_git_metadata_isolation(&self) -> bool {
         self.accept_reduced_git_metadata_isolation.unwrap_or(false)
     }
@@ -1958,8 +2095,21 @@ impl SmolvmConfig {
                 }
                 global.accept_reduced_git_metadata_isolation
             },
+            credentials: global_only("credentials", global.credentials, project.credentials),
         }
     }
+}
+
+/// A global-only `sandbox.smolvm` key: the project's value is ignored, with
+/// a warning.
+fn global_only<T>(key: &str, global: Option<T>, project: Option<T>) -> Option<T> {
+    if project.is_some() {
+        tracing::warn!(
+            "sandbox.smolvm.{key} in project config (.workmux.yaml) is ignored -- move it to \
+             your global config (~/.config/workmux/config.yaml)"
+        );
+    }
+    global
 }
 
 fn deserialize_smolvm_memory<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
@@ -4197,12 +4347,13 @@ mod tests {
     use super::{
         AgentColumn, AgentEnvValue, AgentIconConfig, AgentIconDetails, AllowedDomainDetails,
         AllowedDomainEntry, CLEANUP_NODE_MODULES_PLACEHOLDER, Config, ContainerConfig,
-        ContainerDevice, DEFAULT_AGENT_COLUMNS, DEFAULT_WORKTREE_COLUMNS, DashboardLayout,
-        ExtraMount, FileConfig, LayoutConfig, LimaConfig, NODE_MODULES_CLEANUP_SCRIPT,
-        NetworkConfig, NetworkPolicy, PaneConfig, SandboxBackend, SandboxConfig, SandboxRuntime,
-        SandboxTarget, SidebarEnterAction, SidebarHeight, SidebarPosition, SidebarWidth,
-        SmolvmConfig, SplitDirection, ToolchainMode, WindowPlacement, WorktreeColumn,
-        is_agent_command, validate_domain, validate_group_add_entry, validate_layouts_config,
+        ContainerDevice, CredentialMode, DEFAULT_AGENT_COLUMNS, DEFAULT_WORKTREE_COLUMNS,
+        DashboardLayout, ExtraMount, FileConfig, LayoutConfig, LimaConfig,
+        NODE_MODULES_CLEANUP_SCRIPT, NetworkConfig, NetworkPolicy, PaneConfig, SandboxBackend,
+        SandboxConfig, SandboxRuntime, SandboxTarget, SidebarEnterAction, SidebarHeight,
+        SidebarPosition, SidebarWidth, SmolvmConfig, SplitDirection, ToolchainMode,
+        WindowPlacement, WorktreeColumn, is_agent_command, validate_domain,
+        validate_group_add_entry, validate_layouts_config,
     };
     use super::{DashboardConfig, InputExitKey, RemoteConfig, RemoteIsolation};
     use crate::test_support;
@@ -6704,6 +6855,71 @@ container:
             parse("sandbox:\n  smolvm:\n    accept_reduced_git_metadata_isolation: false\n");
         let kept = accepting.merge(refusing);
         assert!(kept.sandbox.smolvm.accepts_reduced_git_metadata_isolation());
+    }
+
+    #[test]
+    fn smolvm_credentials_parse_and_are_global_only() {
+        use crate::sandbox::smolvm::credentials::EnvSource;
+        let parse = |yaml: &str| -> Config { serde_yaml::from_str(yaml).unwrap() };
+        let listed = parse(
+            "sandbox:\n  smolvm:\n    credentials:\n      \
+             NPM_TOKEN: { hosts: [registry.npmjs.org] }\n      \
+             PLAIN: { hosts: [auth.example.com], mode: header }\n      \
+             KEYED: { hosts: [api.example.com], mode: { set_header: X-Api-Key }, from_keychain: keyed }\n      \
+             GH_TOKEN: { from_keychain: gh/me }\n",
+        );
+        let credentials = listed.sandbox.smolvm.credentials();
+        assert_eq!(credentials.len(), 4);
+        assert_eq!(
+            credentials["NPM_TOKEN"].hosts.as_deref(),
+            Some(&["registry.npmjs.org".to_string()][..])
+        );
+        assert_eq!(credentials["NPM_TOKEN"].mode, None);
+        assert_eq!(credentials["PLAIN"].mode, Some(CredentialMode::Header));
+        assert_eq!(
+            credentials["KEYED"].mode,
+            Some(CredentialMode::SetHeader("X-Api-Key".into()))
+        );
+        assert_eq!(
+            credentials["KEYED"].source,
+            Some(EnvSource::keychain("keyed").unwrap())
+        );
+        assert_eq!(
+            credentials["GH_TOKEN"].source,
+            Some(EnvSource::keychain("gh/me").unwrap())
+        );
+        assert_eq!(credentials["GH_TOKEN"].hosts, None);
+        // The frozen config a pane's supervisor reads round-trips.
+        let frozen: Config =
+            serde_yaml::from_str(&serde_yaml::to_string(&listed).unwrap()).unwrap();
+        assert_eq!(frozen.sandbox.smolvm.credentials(), credentials);
+
+        let ignored = Config::default().merge(listed.clone());
+        assert!(ignored.sandbox.smolvm.credentials().is_empty());
+        let kept = listed.merge(parse(
+            "sandbox:\n  smolvm:\n    credentials:\n      OTHER: { hosts: [x.com] }\n",
+        ));
+        assert_eq!(kept.sandbox.smolvm.credentials().len(), 4);
+    }
+
+    #[test]
+    fn smolvm_credentials_reject_malformed_entries_when_parsed() {
+        let cases = [
+            ("1BAD: { hosts: [x.com] }", "1BAD"),
+            // A credential's only source is from_keychain.
+            ("TOKEN: { hosts: [x.com], from_file: /run/t }", "from_file"),
+            ("TOKEN: { from_keychain: \"\" }", "service"),
+            ("TOKEN: { hosts: [x.com], mode: sideways }", "mode"),
+            ("TOKEN: { hostz: [x.com] }", "hostz"),
+        ];
+        for (entry, expected) in cases {
+            let yaml = format!("sandbox:\n  smolvm:\n    credentials:\n      {entry}\n");
+            let error = serde_yaml::from_str::<Config>(&yaml)
+                .err()
+                .unwrap_or_else(|| panic!("{entry} parsed"))
+                .to_string();
+            assert!(error.contains(expected), "{entry}: {error}");
+        }
     }
 
     #[test]

@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use crate::multiplexer::agent::SelectedAgent;
 use crate::multiplexer::util::ResolvedCommand;
 
+pub(crate) mod credentials;
 pub(crate) mod git;
 pub(crate) mod machines;
 pub(crate) mod network;
@@ -111,6 +112,8 @@ pub fn launch_input<'a>(
         git,
         private_hosts: network::resolve_private_hosts(&sandbox.network),
         confine_vmm: CONFINE_VMM,
+        host_env: credentials::host_env(sandbox),
+        github_tokens: credentials::github_tokens(sandbox, |var| std::env::var(var).ok()),
         shims,
         extra_mounts: extra_mounts(sandbox)?,
         git_identity: crate::command::sandbox_run::git_user_config_envs(worktree_root),
@@ -424,6 +427,82 @@ mod tests {
         let agent = pane_agent(&resolved, &config, None).unwrap();
         assert_eq!(agent.kind(), "claude");
         assert_eq!(resolved.command, "npm test");
+    }
+
+    #[test]
+    fn test_a_named_agents_from_env_expands_in_the_guest_to_a_placeholder() {
+        let config: crate::config::Config = serde_yaml::from_str(
+            "agent: cc-proxy\n\
+             agents:\n  cc-proxy:\n    type: claude\n    env:\n      \
+             ANTHROPIC_AUTH_TOKEN: { from_env: ANTHROPIC_API_KEY }\n\
+             sandbox:\n  env_passthrough: [ANTHROPIC_API_KEY]\n",
+        )
+        .unwrap();
+        let resolved = crate::multiplexer::util::resolve_pane_command_with_config(
+            Some("<agent>"),
+            true,
+            None,
+            Path::new("/wt"),
+            &config,
+            None,
+            "bash",
+        )
+        .unwrap();
+        let rendered = "env ANTHROPIC_AUTH_TOKEN=\"$ANTHROPIC_API_KEY\" claude";
+        assert_eq!(resolved.command, rendered);
+
+        // The host pane's line single-quotes the reference: no value there.
+        let line = supervisor_command(
+            &resolved.command,
+            None,
+            Path::new("/wt"),
+            Path::new("/wt"),
+            Some("claude"),
+        )
+        .unwrap();
+        assert_eq!(
+            line,
+            format!(" workmux sandbox run --agent 'claude' '/wt' -- '{rendered}'")
+        );
+
+        // The supervisor receives the reference unexpanded, and the guest's
+        // `sh -c` expands it from a variable smolvm holds a placeholder in.
+        let words = shlex::split(&line).unwrap();
+        let received = words.last().unwrap();
+        let mut input = plan::tests::claude_input(&config.sandbox);
+        input.command = received;
+        input.host_env = vec!["ANTHROPIC_API_KEY".to_string()];
+        input.claude_config_dir = None;
+        let launch = plan::plan_launch(&input).unwrap();
+        assert_eq!(
+            launch.exec.args[launch.exec.args.len() - 3..],
+            ["sh", "-c", rendered]
+        );
+        let create = &launch.prepare[0].invocation.args;
+        assert!(
+            create
+                .windows(2)
+                .any(|pair| pair == ["--secret-env", "ANTHROPIC_API_KEY=ANTHROPIC_API_KEY"]),
+            "{create:?}"
+        );
+        assert!(
+            create.windows(2).any(|pair| pair
+                == [
+                    "--credential",
+                    "ANTHROPIC_API_KEY=ANTHROPIC_API_KEY@api.anthropic.com"
+                ]),
+            "{create:?}"
+        );
+        // Not passed by name with its real value.
+        assert!(
+            !launch
+                .exec
+                .args
+                .windows(2)
+                .any(|pair| pair == ["-e", "ANTHROPIC_API_KEY"]),
+            "{:?}",
+            launch.exec.args
+        );
     }
 
     #[test]

@@ -35,6 +35,8 @@ pub(crate) fn claude_input(sandbox: &SandboxConfig) -> LaunchInput<'_> {
         git: git_layout(),
         private_hosts: Vec::new(),
         confine_vmm: false,
+        host_env: Vec::new(),
+        github_tokens: Vec::new(),
         shims: None,
         extra_mounts: Vec::new(),
         git_identity: Vec::new(),
@@ -491,6 +493,26 @@ fn sandbox(yaml: &str) -> SandboxConfig {
     serde_yaml::from_str(yaml).unwrap()
 }
 
+/// A plan for `sandbox` whose supervisor environment sets `set`.
+fn plan_with_env(sandbox: &SandboxConfig, set: &[&str]) -> Result<LaunchPlan> {
+    let mut input = claude_input(sandbox);
+    input.host_env = set.iter().map(|name| name.to_string()).collect();
+    plan_launch(&input)
+}
+
+/// The secret refs and credential bindings of a plan's create, as
+/// `flag value` strings.
+fn credential_flags(plan: &LaunchPlan) -> Vec<String> {
+    let create = &plan.prepare[0].invocation.args;
+    create
+        .windows(2)
+        .filter(|pair| {
+            ["--secret-env", "--secret-keychain", "--credential"].contains(&pair[0].as_str())
+        })
+        .map(|pair| format!("{} {}", pair[0], pair[1]))
+        .collect()
+}
+
 /// The variables the exec passes by name from smolvm's environment,
 /// besides the RPC token.
 fn exec_passed(plan: &LaunchPlan) -> Vec<String> {
@@ -502,6 +524,187 @@ fn exec_passed(plan: &LaunchPlan) -> Vec<String> {
         .collect()
 }
 
+const GITHUB_HOSTS: &str = "api.github.com,uploads.github.com";
+
+#[test]
+fn test_github_tokens_become_placeholders_and_other_variables_pass_by_name() {
+    let sandbox = sandbox("env_passthrough: [GITHUB_TOKEN, GH_TOKEN, EDITOR]\n");
+    let plan = plan_with_env(&sandbox, &["GITHUB_TOKEN", "GH_TOKEN", "EDITOR"]).unwrap();
+    assert_eq!(
+        credential_flags(&plan),
+        [
+            "--secret-env GITHUB_TOKEN=GITHUB_TOKEN".to_string(),
+            format!("--credential GITHUB_TOKEN=GITHUB_TOKEN@{GITHUB_HOSTS}"),
+            "--secret-env GH_TOKEN=GH_TOKEN".to_string(),
+            format!("--credential GH_TOKEN=GH_TOKEN@{GITHUB_HOSTS}"),
+        ]
+    );
+    assert_eq!(exec_passed(&plan), ["EDITOR"]);
+    // The supervisor's environment holds the values; the plan only names them.
+    assert!(
+        plan.prepare
+            .iter()
+            .all(|step| step.invocation.env.is_empty())
+    );
+}
+
+#[test]
+fn test_a_passthrough_variable_the_host_doesnt_set_isnt_passed() {
+    let sandbox = sandbox("env_passthrough: [GITHUB_TOKEN, EDITOR]\n");
+    let plan = plan_with_env(&sandbox, &[]).unwrap();
+    assert!(credential_flags(&plan).is_empty());
+    assert!(exec_passed(&plan).is_empty());
+}
+
+#[test]
+fn test_listed_credentials_choose_hosts_mode_and_source() {
+    let sandbox = sandbox(
+        "env_passthrough: [NPM_TOKEN, GH_TOKEN, KEYED]\n\
+             smolvm:\n  credentials:\n    \
+             NPM_TOKEN: { hosts: [registry.npmjs.org] }\n    \
+             GH_TOKEN: { hosts: [ghe.example.com], from_keychain: gh/me }\n    \
+             KEYED: { hosts: [api.example.com, api2.example.com], mode: { set_header: X-Api-Key }, from_keychain: keyed }\n    \
+             SOURCED: { hosts: [sourced.example.com], from_keychain: sourced/me }\n",
+    );
+    let plan = plan_with_env(&sandbox, &["NPM_TOKEN", "GH_TOKEN", "KEYED", "SOURCED"]).unwrap();
+    assert_eq!(
+        credential_flags(&plan),
+        [
+            "--secret-env NPM_TOKEN=NPM_TOKEN",
+            "--credential NPM_TOKEN=NPM_TOKEN@registry.npmjs.org",
+            "--secret-keychain GH_TOKEN=gh/me",
+            "--credential GH_TOKEN=GH_TOKEN@ghe.example.com",
+            "--secret-keychain KEYED=keyed",
+            "--credential KEYED=KEYED@api.example.com,api2.example.com:set-header=X-Api-Key",
+            // Not passed through, but it has its own source.
+            "--secret-keychain SOURCED=sourced/me",
+            "--credential SOURCED=SOURCED@sourced.example.com",
+        ]
+    );
+    assert!(exec_passed(&plan).is_empty());
+}
+
+/// smolvm feeds a binding only from a ref named after its ENV_VAR. A ref
+/// named after anything else injects the real value into the guest
+/// (measured on smolvm 1.36.1), so every ref must carry the variable's name.
+#[test]
+fn test_every_secret_ref_is_named_after_the_variable_its_credential_binds() {
+    let sandbox = sandbox(
+        "env_passthrough: [GITHUB_TOKEN, A, B]\n\
+             smolvm:\n  credentials:\n    \
+             A: { hosts: [a.example.com], from_keychain: svc/acct }\n    \
+             B: { hosts: [b.example.com] }\n    \
+             C: { hosts: [c.example.com], from_keychain: svc/c }\n",
+    );
+    let plan = plan_with_env(&sandbox, &["GITHUB_TOKEN", "A", "B"]).unwrap();
+    let flags = credential_flags(&plan);
+    let bindings: Vec<&String> = flags
+        .iter()
+        .filter(|f| f.starts_with("--credential "))
+        .collect();
+    assert_eq!(bindings.len(), 4);
+    for binding in bindings {
+        let spec = binding.strip_prefix("--credential ").unwrap();
+        let (name, rest) = spec.split_once('=').unwrap();
+        let (env_var, _) = rest.split_once('@').unwrap();
+        assert_eq!(name, env_var, "{binding}");
+        let refs: Vec<&String> = flags
+            .iter()
+            .filter(|f| f.starts_with("--secret-") && f.contains(&format!(" {env_var}=")))
+            .collect();
+        assert_eq!(refs.len(), 1, "{binding}: {flags:?}");
+    }
+    assert!(
+        flags
+            .iter()
+            .filter(|f| f.starts_with("--secret-"))
+            .all(|f| f.contains(" GITHUB_TOKEN=")
+                || f.contains(" A=")
+                || f.contains(" B=")
+                || f.contains(" C=")),
+        "{flags:?}"
+    );
+}
+
+#[test]
+fn test_under_deny_built_in_hosts_narrow_to_the_allowlist() {
+    let cases: [(&str, &[&str]); 3] = [
+        (
+            "[api.github.com]",
+            &["--credential GITHUB_TOKEN=GITHUB_TOKEN@api.github.com"],
+        ),
+        (
+            "[\"*.github.com\"]",
+            &["--credential GITHUB_TOKEN=GITHUB_TOKEN@api.github.com,uploads.github.com"],
+        ),
+        ("[example.com]", &[]),
+    ];
+    for (domains, expected) in cases {
+        let mut sandbox = deny(domains);
+        sandbox.env_passthrough = Some(vec!["GITHUB_TOKEN".into()]);
+        let plan = plan_with_env(&sandbox, &["GITHUB_TOKEN"]).unwrap();
+        let bindings: Vec<String> = credential_flags(&plan)
+            .into_iter()
+            .filter(|f| f.starts_with("--credential"))
+            .collect();
+        assert_eq!(bindings, expected, "{domains}");
+        if expected.is_empty() {
+            assert!(credential_flags(&plan).is_empty(), "{domains}");
+            assert!(exec_passed(&plan).is_empty(), "{domains}");
+            assert!(
+                plan.notes
+                    .iter()
+                    .any(|n| n.contains("GITHUB_TOKEN") && n.contains("allowed_domains")),
+                "{:?}",
+                plan.notes
+            );
+        }
+    }
+}
+
+#[test]
+fn test_agent_tokens_become_placeholders_with_no_config() {
+    let sandbox = sandbox(
+        "env_passthrough: [ANTHROPIC_API_KEY, CLAUDE_CODE_OAUTH_TOKEN, OPENAI_API_KEY, GEMINI_API_KEY]\n",
+    );
+    let plan = plan_with_env(
+        &sandbox,
+        &[
+            "ANTHROPIC_API_KEY",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "OPENAI_API_KEY",
+            "GEMINI_API_KEY",
+        ],
+    )
+    .unwrap();
+    let bindings: Vec<String> = credential_flags(&plan)
+        .into_iter()
+        .filter(|f| f.starts_with("--credential"))
+        .collect();
+    assert_eq!(
+        bindings,
+        [
+            "--credential ANTHROPIC_API_KEY=ANTHROPIC_API_KEY@api.anthropic.com",
+            "--credential CLAUDE_CODE_OAUTH_TOKEN=CLAUDE_CODE_OAUTH_TOKEN@api.anthropic.com",
+            "--credential OPENAI_API_KEY=OPENAI_API_KEY@api.openai.com",
+            "--credential GEMINI_API_KEY=GEMINI_API_KEY@generativelanguage.googleapis.com",
+        ]
+    );
+    assert!(exec_passed(&plan).is_empty());
+}
+
+/// A plan whose GitHub token values git's header is derived from are
+/// `tokens`.
+fn plan_with_tokens(sandbox: &SandboxConfig, tokens: &[(&str, &str)]) -> LaunchPlan {
+    let mut input = claude_input(sandbox);
+    input.host_env = tokens.iter().map(|(name, _)| name.to_string()).collect();
+    input.github_tokens = tokens
+        .iter()
+        .map(|(name, value)| (name.to_string(), SecretValue::new(value.to_string())))
+        .collect();
+    plan_launch(&input).unwrap()
+}
+
 fn start_env(plan: &LaunchPlan) -> &[(String, String)] {
     &plan
         .prepare
@@ -510,6 +713,195 @@ fn start_env(plan: &LaunchPlan) -> &[(String, String)] {
         .unwrap()
         .invocation
         .env
+}
+
+const GIT_BINDING: &str =
+    "--credential WM_GITHUB_GIT_AUTH=WM_GITHUB_GIT_AUTH@github.com:set-header=Authorization";
+
+#[test]
+fn test_a_github_token_also_becomes_gits_basic_header_for_github_com() {
+    let sandbox = sandbox("env_passthrough: [GITHUB_TOKEN, GH_TOKEN]\n");
+    let plan = plan_with_tokens(
+        &sandbox,
+        &[("GITHUB_TOKEN", "ghp-other"), ("GH_TOKEN", "ghp-throwaway")],
+    );
+    let flags = credential_flags(&plan);
+    assert_eq!(
+        flags[flags.len() - 2..],
+        [
+            "--secret-env WM_GITHUB_GIT_AUTH=WM_GITHUB_GIT_AUTH".to_string(),
+            GIT_BINDING.to_string()
+        ]
+    );
+    // GH_TOKEN first, as gh reads them; base64 without wrapping.
+    assert_eq!(
+        start_env(&plan),
+        [(
+            "WM_GITHUB_GIT_AUTH".to_string(),
+            "Basic eC1hY2Nlc3MtdG9rZW46Z2hwLXRocm93YXdheQ==".to_string()
+        )]
+    );
+    // Only in start's environment: not create's, the exec's, or argv.
+    let everything = format!("{plan:?}");
+    assert!(!everything.contains("eC1hY2Nlc3MtdG9rZW46"), "{everything}");
+    assert!(!everything.contains("ghp-throwaway"), "{everything}");
+    assert!(plan.prepare[0].invocation.env.is_empty());
+    assert!(
+        plan.exec
+            .env
+            .iter()
+            .all(|(key, _)| key != "WM_GITHUB_GIT_AUTH")
+    );
+}
+
+#[test]
+fn test_a_long_token_is_encoded_on_one_line() {
+    let sandbox = sandbox("env_passthrough: [GITHUB_TOKEN]\n");
+    let token = "github_pat_".to_string() + &"x".repeat(82);
+    let plan = plan_with_tokens(&sandbox, &[("GITHUB_TOKEN", &token)]);
+    let (_, value) = &start_env(&plan)[0];
+    assert!(value.len() > 76, "{value}");
+    assert!(!value.contains(['\n', '\r']), "{value}");
+}
+
+#[test]
+fn test_gits_header_follows_the_github_tokens_placement() {
+    let deny_without = {
+        let mut sandbox = deny("[api.github.com]");
+        sandbox.env_passthrough = Some(vec!["GH_TOKEN".into()]);
+        sandbox
+    };
+    let deny_with = {
+        let mut sandbox = deny("[api.github.com, github.com]");
+        sandbox.env_passthrough = Some(vec!["GH_TOKEN".into()]);
+        sandbox
+    };
+    let only_git = {
+        let mut sandbox = deny("[github.com]");
+        sandbox.env_passthrough = Some(vec!["GH_TOKEN".into()]);
+        sandbox
+    };
+    let listed = sandbox(
+        "env_passthrough: [GH_TOKEN]\n\
+             smolvm:\n  credentials:\n    GH_TOKEN: { hosts: [ghe.example.com] }\n",
+    );
+    let cases: [(&str, &SandboxConfig, bool, &str); 4] = [
+        (
+            "deny without github.com",
+            &deny_without,
+            false,
+            "github.com isn't in",
+        ),
+        ("deny with github.com", &deny_with, true, ""),
+        ("deny with only github.com", &only_git, true, ""),
+        ("hosts listed", &listed, false, ""),
+    ];
+    for (case, sandbox, bound, note) in cases {
+        let plan = plan_with_tokens(sandbox, &[("GH_TOKEN", "ghp-throwaway")]);
+        let flags = credential_flags(&plan);
+        assert_eq!(
+            flags.iter().any(|f| f == GIT_BINDING),
+            bound,
+            "{case}: {flags:?}"
+        );
+        assert_eq!(start_env(&plan).is_empty(), !bound, "{case}");
+        if !note.is_empty() {
+            assert!(
+                plan.notes.iter().any(|n| n.contains(note)),
+                "{case}: {:?}",
+                plan.notes
+            );
+        }
+    }
+}
+
+#[test]
+fn test_gits_header_is_never_derived_from_a_keychain_source() {
+    let sandbox = sandbox("smolvm:\n  credentials:\n    GH_TOKEN: { from_keychain: gh-work }\n");
+    let plan = plan_launch(&claude_input(&sandbox)).unwrap();
+    assert!(!credential_flags(&plan).iter().any(|f| f == GIT_BINDING));
+    assert!(
+        plan.notes
+            .iter()
+            .any(|n| n.contains("git over HTTPS") && n.contains("GH_TOKEN")),
+        "{:?}",
+        plan.notes
+    );
+}
+
+#[test]
+fn test_a_listed_credential_nothing_passes_in_is_noted_not_passed() {
+    let sandbox = sandbox(
+        "smolvm:\n  credentials:\n    NPM_TOKEN: { hosts: [registry.npmjs.org] }\n    \
+         KEYED: { hosts: [api.example.com], from_keychain: keyed }\n",
+    );
+    let plan = plan_with_env(&sandbox, &["NPM_TOKEN"]).unwrap();
+    assert!(
+        !credential_flags(&plan)
+            .iter()
+            .any(|f| f.contains("NPM_TOKEN"))
+    );
+    assert!(exec_passed(&plan).is_empty());
+    assert!(
+        plan.notes
+            .iter()
+            .any(|n| n.contains("NPM_TOKEN") && n.contains("env_passthrough")),
+        "{:?}",
+        plan.notes
+    );
+    assert!(
+        !plan.notes.iter().any(|n| n.contains("KEYED")),
+        "{:?}",
+        plan.notes
+    );
+}
+
+#[test]
+fn test_a_variable_without_hosts_passes_its_real_value() {
+    let sandbox = sandbox("env_passthrough: [EDITOR, MY_API_KEY]\n");
+    let plan = plan_with_env(&sandbox, &["EDITOR", "MY_API_KEY"]).unwrap();
+    assert_eq!(exec_passed(&plan), ["EDITOR", "MY_API_KEY"]);
+    assert!(credential_flags(&plan).is_empty());
+}
+
+#[test]
+fn test_nix_trusts_smolvms_bundle_only_when_the_machine_has_a_credential_binding() {
+    let sandbox = sandbox("env_passthrough: [GH_TOKEN, EDITOR]\n");
+    let bound = plan_with_env(&sandbox, &["GH_TOKEN"]).unwrap();
+    assert_eq!(
+        exec_env(&bound, "NIX_SSL_CERT_FILE").as_deref(),
+        Some("/run/smolvm/ca-bundle.pem")
+    );
+    let unbound = plan_with_env(&sandbox, &["EDITOR"]).unwrap();
+    assert_eq!(exec_env(&unbound, "NIX_SSL_CERT_FILE"), None);
+
+    // Git's github.com header alone: GH_TOKEN's own hosts are closed.
+    let mut only_git = deny("[github.com]");
+    only_git.env_passthrough = Some(vec!["GH_TOKEN".into()]);
+    let git = plan_with_tokens(&only_git, &[("GH_TOKEN", "ghp-throwaway")]);
+    assert_eq!(credential_flags(&git).last().unwrap(), GIT_BINDING);
+    assert!(
+        !credential_flags(&git)
+            .iter()
+            .any(|flag| flag.starts_with("--credential GH_TOKEN"))
+    );
+    assert_eq!(
+        exec_env(&git, "NIX_SSL_CERT_FILE").as_deref(),
+        Some("/run/smolvm/ca-bundle.pem")
+    );
+
+    // Whatever the pane's toolchain.
+    for toolchain in [DetectedToolchain::Flake, DetectedToolchain::Devbox] {
+        let mut input = claude_input(&sandbox);
+        input.host_env = vec!["GH_TOKEN".into()];
+        input.toolchain = toolchain.clone();
+        let plan = plan_launch(&input).unwrap();
+        assert_eq!(
+            exec_env(&plan, "NIX_SSL_CERT_FILE").as_deref(),
+            Some("/run/smolvm/ca-bundle.pem"),
+            "{toolchain:?}"
+        );
+    }
 }
 
 fn deny(domains: &str) -> SandboxConfig {

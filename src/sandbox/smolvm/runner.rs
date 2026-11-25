@@ -513,6 +513,8 @@ if [ "$1" != --error-format ] || [ "$2" != json ]; then
 fi
 shift 2
 echo "$* token=${WM_RPC_TOKEN:-}" >> "$FAKE_SMOLVM_LOG"
+if [ -n "${GITHUB_TOKEN:-}" ]; then echo "$4 $GITHUB_TOKEN" >> "$FAKE_SMOLVM_LOG.env"; fi
+if [ -n "${WM_GITHUB_GIT_AUTH:-}" ]; then echo "$4 git $WM_GITHUB_GIT_AUTH" >> "$FAKE_SMOLVM_LOG.env"; fi
 if [ "$3" = machine ] && [ "$4" = create ] && [ -n "${FAKE_SMOLVM_CONTEXT_FILES:-}" ]; then
     prev=
     for word; do
@@ -727,6 +729,86 @@ exit 0
                 ]
             );
         });
+    }
+
+    #[test]
+    fn test_credential_values_reach_smolvm_only_through_its_environment() {
+        const TEST: &str = "sandbox::smolvm::runner::tests::test_credential_values_reach_smolvm_only_through_its_environment";
+        const VALUE: &str = "ghp-throwaway-not-a-real-token";
+        with_fake_smolvm_env(
+            TEST,
+            &[
+                ("GITHUB_TOKEN", Path::new(VALUE)),
+                ("EDITOR", Path::new(VALUE)),
+            ],
+            |log| {
+                use crate::sandbox::smolvm::{credentials, plan};
+                use std::sync::{Arc, Mutex};
+
+                #[derive(Clone, Default)]
+                struct Buffer(Arc<Mutex<Vec<u8>>>);
+                impl std::io::Write for Buffer {
+                    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                        self.0.lock().unwrap().extend_from_slice(bytes);
+                        Ok(bytes.len())
+                    }
+                    fn flush(&mut self) -> std::io::Result<()> {
+                        Ok(())
+                    }
+                }
+
+                let sandbox: crate::config::SandboxConfig =
+                    serde_yaml::from_str("env_passthrough: [GITHUB_TOKEN, EDITOR]\n").unwrap();
+                let mut input = plan::tests::claude_input(&sandbox);
+                input.host_env = credentials::host_env(&sandbox);
+                input.github_tokens =
+                    credentials::github_tokens(&sandbox, |var| std::env::var(var).ok());
+                let mut launch = plan::plan_launch(&input).unwrap();
+                // base64("x-access-token:ghp-throwaway-not-a-real-token")
+                const DERIVED: &str =
+                    "eC1hY2Nlc3MtdG9rZW46Z2hwLXRocm93YXdheS1ub3QtYS1yZWFsLXRva2Vu";
+                let shown = format!("{launch:?}");
+                assert!(!shown.contains(VALUE), "{shown}");
+                assert!(!shown.contains(DERIVED), "{shown}");
+                assert!(shown.contains("WM_GITHUB_GIT_AUTH"), "{shown}");
+                launch.pack = pack(Path::new("/nonexistent-packs"), PackWhen::Present);
+
+                let buffer = Buffer::default();
+                let writer = buffer.clone();
+                let subscriber = tracing_subscriber::fmt()
+                    .with_max_level(tracing::Level::TRACE)
+                    .with_writer(move || writer.clone())
+                    .finish();
+                tracing::subscriber::with_default(subscriber, || {
+                    Runner::from_env().run(&launch).unwrap();
+                });
+                let logged = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
+                assert!(logged.contains("--credential"), "{logged}");
+                assert!(!logged.contains(VALUE), "{logged}");
+                assert!(!logged.contains(DERIVED), "{logged}");
+
+                let argv = std::fs::read_to_string(log).unwrap();
+                assert!(
+                    argv.contains("--secret-env GITHUB_TOKEN=GITHUB_TOKEN"),
+                    "{argv}"
+                );
+                assert!(argv.contains("-e EDITOR "), "{argv}");
+                assert!(
+                    argv.contains(
+                        "--credential WM_GITHUB_GIT_AUTH=WM_GITHUB_GIT_AUTH@github.com:set-header=Authorization"
+                    ),
+                    "{argv}"
+                );
+                assert!(!argv.contains(VALUE), "{argv}");
+                assert!(!argv.contains(DERIVED), "{argv}");
+                // smolvm itself got the values, from its environment; the
+                // derived header only at start.
+                let seen = std::fs::read_to_string(log.with_extension("env")).unwrap();
+                assert!(seen.contains(&format!("start {VALUE}")), "{seen}");
+                let git: Vec<&str> = seen.lines().filter(|line| line.contains(" git ")).collect();
+                assert_eq!(git, [format!("start git Basic {DERIVED}")], "{seen}");
+            },
+        );
     }
 
     #[test]
