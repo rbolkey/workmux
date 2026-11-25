@@ -5,7 +5,7 @@ use std::path::Path;
 use crate::config::ToolchainMode;
 
 /// Detected toolchain type in a project directory.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DetectedToolchain {
     Devbox,
     Flake,

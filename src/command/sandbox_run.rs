@@ -1,7 +1,7 @@
 //! The `workmux sandbox run` supervisor process.
 //!
 //! Runs inside a tmux pane. Starts a TCP RPC server and executes the agent
-//! command inside a sandbox (Lima VM or Docker/Podman container).
+//! command inside a sandbox (Lima VM, smol machine or Docker/Podman container).
 
 use anyhow::{Context, Result, anyhow, bail};
 use std::net::{IpAddr, Ipv4Addr};
@@ -22,6 +22,7 @@ use crate::sandbox::lima;
 use crate::sandbox::network_proxy::NetworkProxy;
 use crate::sandbox::rpc::{NodeWorkspace, RpcContext, RpcServer, generate_token};
 use crate::sandbox::shims;
+use crate::sandbox::smolvm;
 use crate::sandbox::toolchain;
 use crate::state::StateStore;
 
@@ -71,11 +72,15 @@ impl Drop for ContainerGuard {
 /// for an agent the laptop started: the config is the workspace's frozen
 /// snapshot, state lives under the node root, listeners bind only to
 /// docker's bridge, and the container gets the workspace's secrets.
+///
+/// `agent` is the pane's own agent, used by the smolvm backend in place of
+/// the configured one.
 pub fn run(
     worktree: PathBuf,
     worktree_root: Option<PathBuf>,
     command: Vec<String>,
     node: Option<(PathBuf, String)>,
+    agent: Option<&str>,
 ) -> Result<i32> {
     if command.is_empty() {
         bail!("No command specified. Usage: workmux sandbox run <worktree> -- <command...>");
@@ -101,6 +106,22 @@ pub fn run(
             bail!("remote agents run in docker containers, not Lima")
         }
         SandboxBackend::Lima => run_lima(&config, frozen_config.path(), &worktree, &command),
+        SandboxBackend::Smolvm if node_root.is_some() => {
+            bail!("remote agents run in docker containers, not smolvm")
+        }
+        SandboxBackend::Smolvm => {
+            let wt_root = worktree_root
+                .map(|p| p.canonicalize().unwrap_or(p))
+                .unwrap_or_else(|| worktree.clone());
+            run_smolvm(
+                &config,
+                frozen_config.path(),
+                &worktree,
+                &wt_root,
+                &command,
+                agent,
+            )
+        }
         SandboxBackend::Container => {
             let wt_root = worktree_root
                 .map(|p| p.canonicalize().unwrap_or(p))
@@ -206,7 +227,7 @@ fn start_rpc(
 /// The worktree is marked safe for runtimes whose mount ownership differs from
 /// the guest UID. Host user identity is copied so guest commits retain the
 /// configured author name and email.
-pub(super) fn git_user_config_envs(worktree_dir: &Path) -> Vec<(String, String)> {
+pub(crate) fn git_user_config_envs(worktree_dir: &Path) -> Vec<(String, String)> {
     let mut entries = vec![(
         "safe.directory".to_string(),
         worktree_dir.to_string_lossy().into_owned(),
@@ -360,6 +381,87 @@ fn run_lima(
     Ok(exit_code)
 }
 
+/// Run the pane's command in a smol machine of its own: create and start
+/// it, exec the command as the workstation user, and delete it afterwards.
+fn run_smolvm(
+    config: &Config,
+    frozen_config_path: &Path,
+    pane_cwd: &Path,
+    worktree_root: &Path,
+    command: &[String],
+    pane_agent: Option<&str>,
+) -> Result<i32> {
+    info!(
+        pane_cwd = %pane_cwd.display(),
+        worktree_root = %worktree_root.display(),
+        ?pane_agent,
+        "sandbox supervisor starting (smolvm)"
+    );
+    smolvm::prerequisites::ensure_available()?;
+
+    // Built-in commands (sound, clipboard) and the user's host_commands,
+    // as on the other backends. Clipboard shims use ClipboardRead, not Exec.
+    let host_commands = shims::effective_host_commands(config.sandbox.host_commands());
+    let allowed_commands: HashSet<String> = host_commands
+        .iter()
+        .filter(|cmd| !shims::is_clipboard_shim(cmd))
+        .cloned()
+        .collect();
+    // Mounted into the running machine, so it must outlive the launch.
+    let (_shim_dir, shim_bin) = create_shim_dir(&host_commands)?;
+
+    // Host-exec commands run in the worktree's toolchain on the host.
+    let detected = toolchain::resolve_toolchain(&config.sandbox.toolchain(), worktree_root);
+    let (rpc_server, rpc_port, rpc_token, ctx) = start_rpc(
+        config,
+        frozen_config_path,
+        pane_cwd,
+        allowed_commands,
+        detected,
+        config.sandbox.allow_unsandboxed_host_exec(),
+        None,
+        None,
+    )?;
+    let _rpc_handle = rpc_server.spawn(ctx);
+
+    let rpc = smolvm::plan::RpcEndpoint {
+        host: config.sandbox.resolved_rpc_host(),
+        port: rpc_port,
+        token: rpc_token,
+    };
+    let agent = smolvm::machine_agent(config, pane_agent);
+    let command = command.join(" ");
+    let input = smolvm::launch_input(
+        config,
+        agent,
+        agent,
+        worktree_root,
+        pane_cwd,
+        &command,
+        Some(smolvm::HostExec {
+            rpc,
+            shims: shim_bin,
+        }),
+    )?;
+    smolvm::launch(&smolvm::runner::Runner::from_env(), input)
+}
+
+/// Create a pane's host-exec shim directory under `$XDG_CACHE_HOME`, for
+/// containers and smol machines. Returns the directory, removed when
+/// dropped, and its `bin`.
+fn create_shim_dir(host_commands: &[String]) -> Result<(tempfile::TempDir, PathBuf)> {
+    let shims_base = crate::xdg::cache_dir()?.join("shims");
+    std::fs::create_dir_all(&shims_base)
+        .with_context(|| format!("Failed to create {}", shims_base.display()))?;
+    let dir = tempfile::Builder::new()
+        .prefix("shims-")
+        .tempdir_in(&shims_base)
+        .context("Failed to create shim temp dir")?;
+    let bin = shims::create_shim_directory(dir.path(), host_commands)?;
+    info!(commands = ?host_commands, "created host-exec shims");
+    Ok((dir, bin))
+}
+
 fn run_container(
     config: &Config,
     frozen_config_path: &Path,
@@ -434,16 +536,7 @@ fn run_container(
     let _shim_dir = if on_node {
         None
     } else {
-        let shims_base = crate::xdg::cache_dir()?.join("shims");
-        std::fs::create_dir_all(&shims_base)
-            .with_context(|| format!("Failed to create {}", shims_base.display()))?;
-        let dir = tempfile::Builder::new()
-            .prefix("shims-")
-            .tempdir_in(&shims_base)
-            .context("Failed to create shim temp dir")?;
-        shims::create_shim_directory(dir.path(), &host_commands)?;
-        info!(commands = ?host_commands, "created host-exec shims");
-        Some(dir)
+        Some(create_shim_dir(&host_commands)?.0)
     };
 
     let (rpc_server, rpc_port, rpc_token, ctx) = start_rpc(

@@ -847,7 +847,7 @@ pub(crate) fn push_agent_home(
 
 /// Where an agent's config directory is mounted in the container, or `None`
 /// for agents whose config directory workmux doesn't mount.
-fn agent_config_target(agent: &str) -> Option<&'static str> {
+pub(crate) fn agent_config_target(agent: &str) -> Option<&'static str> {
     match agent {
         "claude" => Some("/tmp/.claude"),
         "copilot" => Some("/tmp/.copilot"),
@@ -1309,15 +1309,28 @@ pub fn wrap_for_container(
     worktree_root: &Path,
     pane_cwd: &Path,
 ) -> Result<String> {
+    supervisor_line(command, supervisor, &[], worktree_root, pane_cwd)
+}
+
+/// The supervisor command line [`wrap_for_container`] builds, with
+/// `options` (flag and value) after the supervisor's words, for backends
+/// that pass it more.
+pub(super) fn supervisor_line(
+    command: &str,
+    supervisor: Option<&str>,
+    options: &[(&str, &str)],
+    worktree_root: &Path,
+    pane_cwd: &Path,
+) -> Result<String> {
     // Strip the leading history-prevention space before passing the command to
     // the sandbox supervisor.
     let command = command.strip_prefix(' ').unwrap_or(command);
 
-    let mut parts = format!(
-        "{} '{}'",
-        supervisor.unwrap_or(DEFAULT_SUPERVISOR),
-        shell_escape(&pane_cwd.to_string_lossy()),
-    );
+    let mut parts = supervisor.unwrap_or(DEFAULT_SUPERVISOR).to_string();
+    for (flag, value) in options {
+        parts.push_str(&format!(" {flag} '{}'", shell_escape(value)));
+    }
+    parts.push_str(&format!(" '{}'", shell_escape(&pane_cwd.to_string_lossy())));
 
     // Only add --worktree-root when it differs from pane_cwd
     if worktree_root != pane_cwd {

@@ -109,6 +109,8 @@ fn prepare_destructive_cleanup(
             show_hook_output,
         )?;
     }
+    // After the hooks, which may still use the sandbox's machines.
+    crate::sandbox::smolvm::cleanup_worktree(&context.config, worktree_path);
     cleanup_prompt_files(branch_name);
     Ok(())
 }
@@ -505,6 +507,7 @@ fn cleanup_impl(
                 show_hook_output,
             )?;
         }
+        crate::sandbox::smolvm::cleanup_worktree(&context.config, worktree_path);
         cleanup_prompt_files(branch_name);
         let quarantine_identity = expected_identity
             .as_ref()

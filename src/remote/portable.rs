@@ -204,6 +204,12 @@ fn portable_sandbox(sandbox: &SandboxConfig, dropped: &mut Vec<String>) -> Sandb
             "lima runs on the local machine; the remote uses docker",
         );
     }
+    if sandbox.uses_smolvm() {
+        drop(
+            "backend",
+            "smolvm runs on the local machine; the remote uses docker",
+        );
+    }
     if sandbox.image.is_some() && laptop_lima {
         drop(
             "image",
@@ -443,6 +449,26 @@ mod tests {
             &env,
         );
         assert!(none.secrets.0.is_empty());
+    }
+
+    #[test]
+    fn smolvm_backend_is_dropped_but_its_oci_image_kept() {
+        let mut config = laptop();
+        config.sandbox.backend = Some(SandboxBackend::Smolvm);
+        config.sandbox.image = Some("ghcr.io/me/agent:claude".into());
+        let portable = portable_config(
+            &config,
+            None,
+            RemoteIsolation::Container,
+            Path::new("/n/wt"),
+        );
+        assert_eq!(
+            portable.config.sandbox.image.as_deref(),
+            Some("ghcr.io/me/agent:claude")
+        );
+        assert_eq!(portable.config.sandbox.backend(), SandboxBackend::Container);
+        let report = portable.dropped.join("\n");
+        assert!(report.contains("sandbox.backend"), "{report}");
     }
 
     #[test]

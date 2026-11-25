@@ -1566,6 +1566,8 @@ pub enum SandboxBackend {
     Container,
     /// Lima VM backend
     Lima,
+    /// smolvm microVM backend: one smol machine per sandboxed pane
+    Smolvm,
 }
 
 /// Container runtime for sandbox
@@ -1892,6 +1894,90 @@ impl LimaConfig {
                 .or(global.accept_reduced_git_metadata_isolation),
         }
     }
+}
+
+/// smolvm-specific sandbox configuration.
+/// Nested under `sandbox.smolvm` in YAML.
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
+pub struct SmolvmConfig {
+    /// Maximum vCPUs for each machine. Default: smolvm's (4).
+    #[serde(default)]
+    pub cpus: Option<u32>,
+
+    /// Maximum memory for each machine, in Lima's format (e.g. "4GiB",
+    /// "512MiB"). Default: smolvm's (half the host's RAM, at most 8 GiB).
+    #[serde(default, deserialize_with = "deserialize_smolvm_memory")]
+    pub memory: Option<String>,
+
+    /// A shell script run as root once per pack build, without credentials.
+    /// Project-overridable; a blank script turns a global one off.
+    #[serde(default)]
+    pub provision: Option<String>,
+}
+
+impl SmolvmConfig {
+    pub fn cpus(&self) -> Option<u32> {
+        self.cpus
+    }
+
+    pub fn provision_script(&self) -> Option<&str> {
+        self.provision.as_deref().filter(|s| !s.trim().is_empty())
+    }
+
+    /// `memory` in MiB, as smolvm's `--mem` takes it.
+    pub fn memory_mib(&self) -> Option<u64> {
+        // Validated at load, so a stored value always parses.
+        self.memory
+            .as_deref()
+            .and_then(|m| parse_memory_mib(m).ok())
+    }
+
+    /// Merge: project overrides global, per-field.
+    fn merge(global: Self, project: Self) -> Self {
+        Self {
+            cpus: project.cpus.or(global.cpus),
+            memory: project.memory.or(global.memory),
+            provision: project.provision.or(global.provision),
+        }
+    }
+}
+
+fn deserialize_smolvm_memory<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    if let Some(memory) = &value {
+        parse_memory_mib(memory).map_err(serde::de::Error::custom)?;
+    }
+    Ok(value)
+}
+
+/// Parse a size in Lima's format (`8GiB`, `512MiB`, `4G`, `1.5GiB`; binary
+/// units, case-insensitive) into whole MiB.
+fn parse_memory_mib(raw: &str) -> anyhow::Result<u64> {
+    let invalid = || {
+        anyhow::anyhow!(
+            "invalid sandbox.smolvm.memory {raw:?}: expected a size such as \"4GiB\" or \"512MiB\""
+        )
+    };
+    let trimmed = raw.trim();
+    let split = trimmed
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .ok_or_else(invalid)?;
+    let (number, unit) = trimmed.split_at(split);
+    let number: f64 = number.parse().map_err(|_| invalid())?;
+    let mib_per_unit = match unit.trim().to_ascii_lowercase().as_str() {
+        "m" | "mb" | "mib" => 1.0,
+        "g" | "gb" | "gib" => 1024.0,
+        "t" | "tb" | "tib" => 1024.0 * 1024.0,
+        _ => return Err(invalid()),
+    };
+    let mib = (number * mib_per_unit).floor();
+    if !mib.is_finite() || mib < 1.0 {
+        return Err(invalid());
+    }
+    Ok(mib as u64)
 }
 
 /// Host device mapping for container sandboxes.
@@ -2402,6 +2488,10 @@ pub struct SandboxConfig {
     #[serde(default)]
     pub lima: LimaConfig,
 
+    /// smolvm-specific configuration
+    #[serde(default)]
+    pub smolvm: SmolvmConfig,
+
     /// Container-specific configuration
     #[serde(default)]
     pub container: ContainerConfig,
@@ -2424,6 +2514,11 @@ impl SandboxConfig {
 
     pub fn backend(&self) -> SandboxBackend {
         self.backend.clone().unwrap_or_default()
+    }
+
+    /// Whether `backend` selects smolvm.
+    pub fn uses_smolvm(&self) -> bool {
+        self.backend() == SandboxBackend::Smolvm
     }
 
     pub fn runtime(&self) -> SandboxRuntime {
@@ -2460,11 +2555,15 @@ impl SandboxConfig {
             .unwrap_or_default()
     }
 
-    /// Get the RPC host address, using config override or runtime default.
+    /// Get the RPC host address, using config override or the backend's
+    /// default: smolvm's virtio-net gateway, or the container runtime's.
     pub fn resolved_rpc_host(&self) -> String {
         self.rpc_host
             .clone()
-            .unwrap_or_else(|| self.runtime().rpc_host_address().to_string())
+            .unwrap_or_else(|| match self.backend() {
+                SandboxBackend::Smolvm => crate::sandbox::smolvm::RPC_HOST.to_string(),
+                _ => self.runtime().rpc_host_address().to_string(),
+            })
     }
 
     pub fn toolchain(&self) -> ToolchainMode {
@@ -3453,6 +3552,7 @@ impl Config {
                 self.sandbox.agent_config_dir.clone()
             },
             lima: LimaConfig::merge(self.sandbox.lima, project.sandbox.lima),
+            smolvm: SmolvmConfig::merge(self.sandbox.smolvm, project.sandbox.smolvm),
             // Security: sandbox.container.devices, group_add, oci_runtime,
             // cap_add and security_opt are global-only. devices/group_add
             // expose host hardware and can expand filesystem access via
@@ -4076,10 +4176,10 @@ mod tests {
         AllowedDomainEntry, CLEANUP_NODE_MODULES_PLACEHOLDER, Config, ContainerConfig,
         ContainerDevice, DEFAULT_AGENT_COLUMNS, DEFAULT_WORKTREE_COLUMNS, DashboardLayout,
         ExtraMount, FileConfig, LayoutConfig, LimaConfig, NODE_MODULES_CLEANUP_SCRIPT,
-        NetworkConfig, NetworkPolicy, PaneConfig, SandboxConfig, SandboxRuntime, SandboxTarget,
-        SidebarEnterAction, SidebarHeight, SidebarPosition, SidebarWidth, SplitDirection,
-        ToolchainMode, WindowPlacement, WorktreeColumn, is_agent_command, validate_domain,
-        validate_group_add_entry, validate_layouts_config,
+        NetworkConfig, NetworkPolicy, PaneConfig, SandboxBackend, SandboxConfig, SandboxRuntime,
+        SandboxTarget, SidebarEnterAction, SidebarHeight, SidebarPosition, SidebarWidth,
+        SmolvmConfig, SplitDirection, ToolchainMode, WindowPlacement, WorktreeColumn,
+        is_agent_command, validate_domain, validate_group_add_entry, validate_layouts_config,
     };
     use super::{DashboardConfig, InputExitKey, RemoteConfig, RemoteIsolation};
     use crate::test_support;
@@ -6473,6 +6573,88 @@ container:
         assert_eq!(merged.isolation(), super::IsolationLevel::Shared);
         assert_eq!(merged.memory(), "4GiB");
         assert!(merged.accepts_reduced_git_metadata_isolation());
+    }
+
+    #[test]
+    fn smolvm_backend_and_resources_parse() {
+        let config: Config = serde_yaml::from_str(
+            "sandbox:\n  backend: smolvm\n  smolvm:\n    cpus: 6\n    memory: 8GiB\n",
+        )
+        .unwrap();
+        assert_eq!(config.sandbox.backend(), SandboxBackend::Smolvm);
+        assert_eq!(config.sandbox.smolvm.cpus(), Some(6));
+        assert_eq!(config.sandbox.smolvm.memory_mib(), Some(8192));
+    }
+
+    #[test]
+    fn smolvm_memory_takes_limas_format_in_mib() {
+        for (raw, mib) in [
+            ("8GiB", 8192),
+            ("512MiB", 512),
+            ("4G", 4096),
+            ("1.5GiB", 1536),
+            ("2gib", 2048),
+        ] {
+            let config: SmolvmConfig = serde_yaml::from_str(&format!("memory: {raw}\n")).unwrap();
+            assert_eq!(config.memory_mib(), Some(mib), "{raw}");
+        }
+        for bad in ["lots", "8", "0GiB", "-1GiB", "8 parsecs", "100KiB"] {
+            assert!(
+                serde_yaml::from_str::<SmolvmConfig>(&format!("memory: \"{bad}\"\n")).is_err(),
+                "{bad}"
+            );
+        }
+        assert_eq!(SmolvmConfig::default().memory_mib(), None);
+    }
+
+    #[test]
+    fn smolvm_resources_merge_project_over_global() {
+        let global: SmolvmConfig = serde_yaml::from_str("cpus: 2\nmemory: 2GiB\n").unwrap();
+        let project: SmolvmConfig = serde_yaml::from_str("cpus: 8\n").unwrap();
+        let merged = SmolvmConfig::merge(global, project);
+        assert_eq!(merged.cpus(), Some(8));
+        assert_eq!(merged.memory_mib(), Some(2048));
+    }
+
+    #[test]
+    fn smolvm_provision_is_project_overridable_and_blank_means_none() {
+        let global: Config = serde_yaml::from_str(
+            "sandbox:\n  smolvm:\n    provision: |\n      apt-get install -y tree\n",
+        )
+        .unwrap();
+        assert_eq!(
+            global.sandbox.smolvm.provision_script(),
+            Some("apt-get install -y tree\n")
+        );
+
+        let project = sandbox_cfg(|s| s.smolvm.provision = Some("echo project".into()));
+        let merged = global.clone().merge(project);
+        assert_eq!(
+            merged.sandbox.smolvm.provision_script(),
+            Some("echo project")
+        );
+
+        let fallback = global.clone().merge(Config::default());
+        assert_eq!(
+            fallback.sandbox.smolvm.provision_script(),
+            Some("apt-get install -y tree\n")
+        );
+
+        let blank = sandbox_cfg(|s| s.smolvm.provision = Some("  \n".into()));
+        let disabled = global.merge(blank);
+        assert_eq!(disabled.sandbox.smolvm.provision_script(), None);
+    }
+
+    #[test]
+    fn smolvm_rpc_host_defaults_to_the_gateway_name() {
+        let smolvm = sandbox_cfg(|sandbox| sandbox.backend = Some(SandboxBackend::Smolvm));
+        assert_eq!(smolvm.sandbox.resolved_rpc_host(), "host.smolvm.internal");
+
+        let overridden = sandbox_cfg(|sandbox| {
+            sandbox.backend = Some(SandboxBackend::Smolvm);
+            sandbox.rpc_host = Some("10.0.0.1".into());
+        });
+        assert_eq!(overridden.sandbox.resolved_rpc_host(), "10.0.0.1");
     }
 
     #[test]

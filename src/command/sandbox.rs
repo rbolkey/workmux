@@ -72,6 +72,9 @@ pub enum SandboxCommand {
         /// Workspace id on that node
         #[arg(long, hide = true, requires = "node_root")]
         node_workspace: Option<String>,
+        /// The pane's agent, when it differs from the configured one (smolvm)
+        #[arg(long, hide = true)]
+        agent: Option<String>,
         /// Command and arguments to run inside the sandbox
         #[arg(last = true, required = true)]
         command: Vec<String>,
@@ -149,7 +152,7 @@ fn run_agent(command: Vec<String>) -> Result<()> {
         command
     };
 
-    let exit_code = super::sandbox_run::run(cwd, Some(worktree_root), agent_command, None)?;
+    let exit_code = super::sandbox_run::run(cwd, Some(worktree_root), agent_command, None, None)?;
     std::process::exit(exit_code);
 }
 
@@ -163,11 +166,13 @@ pub fn run(args: SandboxArgs) -> Result<()> {
             worktree_root,
             node_root,
             node_workspace,
+            agent,
             command,
         } => {
-            debug!(worktree = %worktree.display(), ?worktree_root, ?command, "sandbox run");
+            debug!(worktree = %worktree.display(), ?worktree_root, ?agent, ?command, "sandbox run");
             let node = node_root.zip(node_workspace);
-            let exit_code = super::sandbox_run::run(worktree, worktree_root, command, node)?;
+            let exit_code =
+                super::sandbox_run::run(worktree, worktree_root, command, node, agent.as_deref())?;
             std::process::exit(exit_code);
         }
         SandboxCommand::InstallDev {
@@ -939,6 +944,9 @@ fn run_shell(exec: bool, command: Vec<String>) -> Result<()> {
     match config.sandbox.backend() {
         SandboxBackend::Container => run_shell_container(exec, command, &config),
         SandboxBackend::Lima => run_shell_lima(exec, command, &config),
+        SandboxBackend::Smolvm => {
+            bail!("workmux sandbox shell does not support the smolvm backend yet")
+        }
     }
 }
 
