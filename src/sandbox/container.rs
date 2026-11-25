@@ -373,7 +373,7 @@ fn collect_worktree_git_pointers(worktree: &Path) -> Result<Vec<PathBuf>> {
     Ok(pointers)
 }
 
-fn config_include_paths(config: &Path) -> Result<Vec<PathBuf>> {
+pub(super) fn config_include_paths(config: &Path) -> Result<Vec<PathBuf>> {
     fn visit(
         config: &Path,
         visited: &mut std::collections::HashSet<PathBuf>,
@@ -502,7 +502,7 @@ fn ensure_policy_file(path: &Path) -> Result<()> {
 use std::os::unix::fs::MetadataExt;
 
 /// Reject hook layouts whose executable policy can be changed outside the protected directory.
-fn validate_git_hooks(common_dir: &Path) -> Result<()> {
+pub(super) fn validate_git_hooks(common_dir: &Path) -> Result<()> {
     let hooks = common_dir.join("hooks");
     if hooks.exists() {
         let metadata = std::fs::symlink_metadata(&hooks)?;
@@ -577,7 +577,7 @@ fn protect_writable_git_root(
     Ok(())
 }
 
-fn module_git_roots(common_dir: &Path) -> Result<Vec<PathBuf>> {
+pub(super) fn module_git_roots(common_dir: &Path) -> Result<Vec<PathBuf>> {
     fn visit(path: &Path, roots: &mut Vec<PathBuf>) -> Result<()> {
         if !path.is_dir() {
             return Ok(());
