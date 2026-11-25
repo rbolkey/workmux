@@ -260,13 +260,13 @@ fn matching_rule<'a>(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AddressClass {
+pub(crate) enum AddressClass {
     Public,
     PrivateRoutable,
     AlwaysBlocked,
 }
 
-fn classify_ip(addr: &IpAddr) -> AddressClass {
+pub(crate) fn classify_ip(addr: &IpAddr) -> AddressClass {
     match addr {
         IpAddr::V4(ip) => {
             if ip.is_loopback()

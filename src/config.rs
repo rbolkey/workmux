@@ -3204,6 +3204,9 @@ impl Config {
             .container
             .validate()
             .context("Invalid sandbox container config")?;
+        if config.sandbox.uses_smolvm() {
+            crate::sandbox::smolvm::network::validate_allowlist(&config.sandbox.network)?;
+        }
 
         Ok(config)
     }
@@ -6701,6 +6704,31 @@ container:
             parse("sandbox:\n  smolvm:\n    accept_reduced_git_metadata_isolation: false\n");
         let kept = accepting.merge(refusing);
         assert!(kept.sandbox.smolvm.accepts_reduced_git_metadata_isolation());
+    }
+
+    #[test]
+    fn smolvm_allowed_domains_smolvm_cannot_take_are_errors_when_the_config_loads() {
+        // smolvm's --allow-host-pattern takes a DNS hostname or *.domain:
+        // letters, digits and hyphens.
+        let load = |domain: &str, backend: &str| {
+            let global: Config = serde_yaml::from_str(&format!(
+                "sandbox:\n  backend: {backend}\n  network:\n    policy: deny\n    \
+                 allowed_domains: ['{domain}']\n"
+            ))
+            .unwrap();
+            Config::merge_and_apply_defaults(
+                global,
+                Config::default(),
+                None,
+                std::path::Path::new(""),
+            )
+            .map_err(|error| format!("{error:#}"))
+        };
+        let error = load("foo_bar.example.com", "smolvm").unwrap_err();
+        assert!(error.contains("foo_bar.example.com"), "{error}");
+        assert!(error.contains("allowed_domains"), "{error}");
+        load("*.foo-bar.example.com", "smolvm").unwrap();
+        load("foo_bar.example.com", "container").unwrap();
     }
 
     #[test]

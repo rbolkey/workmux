@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use super::git::GitLayout;
 use super::machines::LABEL_PACK;
-use super::network::machine_network;
+use super::network::{PrivateHosts, machine_network};
 use super::pack::{GUEST_TOOLCHAIN_CACHE, NIX_PROFILE_BIN, PackInput, PackPlan, plan_pack};
 use crate::config::SandboxConfig;
 use crate::sandbox::agent_config_target;
@@ -119,6 +119,9 @@ pub struct LaunchInput<'a> {
     pub pack: PackInput,
     /// The main repository's git metadata the worktree needs.
     pub git: GitLayout,
+    /// The addresses of `allowed_domains` hosts with `allow_private_ips`,
+    /// resolved for this pane ([`super::network::resolve_private_hosts`]).
+    pub private_hosts: PrivateHosts,
     /// Start the machine with smolvm's seccomp and Landlock confinement of
     /// its VMM enforced (Linux hosts).
     pub confine_vmm: bool,
@@ -197,7 +200,7 @@ pub fn plan_launch(input: &LaunchInput) -> Result<LaunchPlan> {
         input.confine_vmm,
     );
     // A pack doesn't carry virtio-net, so every machine asks for it.
-    let network = machine_network(&input.sandbox.network)?;
+    let network = machine_network(&input.sandbox.network, &input.private_hosts)?;
     let create = create_args(input, &pack, network.flags)?;
     let exec = exec_invocation(input);
     let hot_mounts = hot_mounts(input)?;

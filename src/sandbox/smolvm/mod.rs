@@ -109,6 +109,7 @@ pub fn launch_input<'a>(
         ),
         pack,
         git,
+        private_hosts: network::resolve_private_hosts(&sandbox.network),
         confine_vmm: CONFINE_VMM,
         shims,
         extra_mounts: extra_mounts(sandbox)?,

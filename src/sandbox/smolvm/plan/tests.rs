@@ -33,6 +33,7 @@ pub(crate) fn claude_input(sandbox: &SandboxConfig) -> LaunchInput<'_> {
         toolchain: DetectedToolchain::None,
         pack: pack_input(&[]),
         git: git_layout(),
+        private_hosts: Vec::new(),
         confine_vmm: false,
         shims: None,
         extra_mounts: Vec::new(),
@@ -509,6 +510,159 @@ fn start_env(plan: &LaunchPlan) -> &[(String, String)] {
         .unwrap()
         .invocation
         .env
+}
+
+fn deny(domains: &str) -> SandboxConfig {
+    SandboxConfig {
+        network: serde_yaml::from_str(&format!("policy: deny\nallowed_domains: {domains}\n"))
+            .unwrap(),
+        ..Default::default()
+    }
+}
+
+/// The network flags of a plan's create: everything after the pack
+/// sidecar up to the first mount or resource flag.
+fn network_flags(plan: &LaunchPlan) -> Vec<String> {
+    let create = &plan.prepare[0].invocation.args;
+    let from = create.iter().position(|a| a == "--from").unwrap() + 2;
+    create[from..]
+        .iter()
+        .take_while(|a| !["-v", "--cpus", "--mem"].contains(&a.as_str()))
+        .cloned()
+        .collect()
+}
+
+#[test]
+fn test_network_policies_become_create_flags() {
+    let gateway = [
+        "--block-private",
+        "--allow-private",
+        "100.96.0.1/32",
+        "--allow-private",
+        "127.0.0.1/32",
+    ];
+    let virtio = ["--net", "--net-backend", "virtio-net"];
+    let cases: Vec<(&str, SandboxConfig, Vec<&str>)> = vec![
+        ("allow", SandboxConfig::default(), virtio.to_vec()),
+        (
+            "deny with hosts",
+            deny("[api.anthropic.com, '*.githubusercontent.com']"),
+            [
+                &virtio[..],
+                &gateway[..],
+                &[
+                    "--allow-host-pattern",
+                    "api.anthropic.com",
+                    "--allow-host-pattern",
+                    "*.githubusercontent.com",
+                ][..],
+            ]
+            .concat(),
+        ),
+        (
+            "deny with no hosts allows only the gateway",
+            deny("[]"),
+            [
+                &virtio[..],
+                &gateway[..],
+                &["--allow-cidr", "100.96.0.1/32"][..],
+            ]
+            .concat(),
+        ),
+        (
+            "deny with no list at all",
+            SandboxConfig {
+                network: serde_yaml::from_str("policy: deny\n").unwrap(),
+                ..Default::default()
+            },
+            [
+                &virtio[..],
+                &gateway[..],
+                &["--allow-cidr", "100.96.0.1/32"][..],
+            ]
+            .concat(),
+        ),
+    ];
+    for (name, sandbox, expected) in cases {
+        let plan = plan_launch(&claude_input(&sandbox)).unwrap();
+        assert_eq!(network_flags(&plan), strings(&expected), "{name}");
+    }
+}
+
+#[test]
+fn test_private_addresses_of_an_exact_host_that_allows_them_are_reopened() {
+    let sandbox = deny("[{host: registry.corp.example, allow_private_ips: true}, public.example]");
+    let mut input = claude_input(&sandbox);
+    input.private_hosts = vec![
+        (
+            "registry.corp.example".into(),
+            ["10.1.2.3", "93.184.216.34", "127.0.0.1", "fd00::7"]
+                .iter()
+                .map(|ip| ip.parse().unwrap())
+                .collect(),
+        ),
+        // Listed without allow_private_ips: its private address stays closed.
+        ("public.example".into(), vec!["10.9.9.9".parse().unwrap()]),
+    ];
+    let flags = network_flags(&plan_launch(&input).unwrap());
+    let reopened: Vec<_> = flags
+        .windows(2)
+        .filter(|w| w[0] == "--allow-private")
+        .map(|w| w[1].as_str())
+        .collect();
+    // Public addresses need no reopening, and loopback stays closed, as
+    // on the container backend's proxy (the gateway's own CIDRs aside).
+    assert_eq!(
+        reopened,
+        [
+            "100.96.0.1/32",
+            "127.0.0.1/32",
+            "10.1.2.3/32",
+            "fd00::7/128"
+        ]
+    );
+    assert!(
+        flags
+            .windows(2)
+            .any(|w| w == ["--allow-host-pattern", "registry.corp.example"])
+    );
+    assert!(
+        flags
+            .windows(2)
+            .any(|w| w == ["--allow-host-pattern", "public.example"])
+    );
+}
+
+#[test]
+fn test_deny_refuses_ip_literals_even_past_config_validation() {
+    let sandbox = deny("['10.0.0.1']");
+    let error = plan_launch(&claude_input(&sandbox))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("10.0.0.1"), "{error}");
+}
+
+#[test]
+fn test_deny_notes_where_smolvm_differs_from_the_container_proxy() {
+    let plan = plan_launch(&claude_input(&SandboxConfig::default())).unwrap();
+    assert!(plan.notes.is_empty(), "{:?}", plan.notes);
+
+    let plan = plan_launch(&claude_input(&deny("[example.com]"))).unwrap();
+    assert!(
+        plan.notes.iter().any(|n| n.contains("every port")),
+        "{:?}",
+        plan.notes
+    );
+    assert!(!plan.notes.iter().any(|n| n.contains("max_connections")));
+
+    let mut sandbox = deny("[example.com]");
+    sandbox.network.max_connections = Some(16);
+    let plan = plan_launch(&claude_input(&sandbox)).unwrap();
+    assert!(
+        plan.notes.iter().any(|n| n.contains("max_connections")),
+        "{:?}",
+        plan.notes
+    );
 }
 
 #[test]
