@@ -1,9 +1,9 @@
 ---
 title: "Shared features"
-description: Features shared across container and Lima sandbox backends
+description: Features shared across the container, Lima and smolvm sandbox backends
 ---
 
-These features work with both the container and Lima sandbox backends.
+These features work with the container, Lima and [smolvm](/guide/sandbox/smolvm/) sandbox backends. The smolvm page notes where that backend differs.
 
 ## Extra mounts
 
@@ -30,7 +30,7 @@ Paths starting with `~` are expanded to the user's home directory. When `guest_p
 
 **Note:** For the Lima backend, mount changes only take effect when the VM is created. To apply changes to an existing VM, recreate it with `workmux sandbox prune`.
 
-**Note:** Apple Container only supports directory mounts. Individual file paths in `extra_mounts` will fail with Apple Container.
+**Note:** Apple Container only supports directory mounts. Individual file paths in `extra_mounts` will fail with Apple Container. The same holds for [smolvm](/guide/sandbox/smolvm/#limits).
 
 ## Host command proxying
 
@@ -121,7 +121,7 @@ Both sandbox backends mount agent-specific credential directories from the host.
 | `pi`       | `~/.pi/agent/`               | `/tmp/.pi/agent/`               | `$HOME/.pi/agent/`               |
 | `omp`      | `~/.omp/agent/`              | `/tmp/.omp/agent/`              | `$HOME/.omp/agent/`              |
 
-Other agents get no config directory mount.
+Other agents get no config directory mount. The [smolvm backend](/guide/sandbox/smolvm/#credentials) mounts the same directories at the container paths, and passes API keys and tokens as placeholders.
 
 OpenCode's global config directory (`~/.config/opencode/`) is also mounted read-only, providing access to `opencode.json`, plugins, and global MCP definitions.
 

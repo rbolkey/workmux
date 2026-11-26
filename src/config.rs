@@ -1566,6 +1566,8 @@ pub enum SandboxBackend {
     Container,
     /// Lima VM backend
     Lima,
+    /// smolvm microVM backend: one smol machine per sandboxed pane
+    Smolvm,
 }
 
 /// Container runtime for sandbox
@@ -1646,6 +1648,21 @@ impl SandboxRuntime {
     /// Apple Container only supports directory mounts via virtiofs.
     pub fn supports_file_mounts(&self) -> bool {
         !matches!(self, SandboxRuntime::AppleContainer)
+    }
+
+    /// Arguments to save `image` as an archive at `output` (`docker save`),
+    /// which smolvm boots from.
+    pub fn save_args(&self, image: &str, output: &std::path::Path) -> Vec<String> {
+        let mut args = match self {
+            SandboxRuntime::AppleContainer => vec!["image".to_string(), "save".to_string()],
+            _ => vec!["save".to_string()],
+        };
+        args.extend([
+            "-o".to_string(),
+            output.to_string_lossy().into_owned(),
+            image.to_string(),
+        ]);
+        args
     }
 
     /// Returns the arguments for pulling an image.
@@ -1892,6 +1909,260 @@ impl LimaConfig {
                 .or(global.accept_reduced_git_metadata_isolation),
         }
     }
+}
+
+/// smolvm-specific sandbox configuration.
+/// Nested under `sandbox.smolvm` in YAML.
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
+pub struct SmolvmConfig {
+    /// Maximum vCPUs for each machine. Default: smolvm's (4).
+    #[serde(default)]
+    pub cpus: Option<u32>,
+
+    /// Maximum memory for each machine, in Lima's format (e.g. "4GiB",
+    /// "512MiB"). Default: smolvm's (half the host's RAM, at most 8 GiB).
+    #[serde(default, deserialize_with = "deserialize_smolvm_memory")]
+    pub memory: Option<String>,
+
+    /// A shell script run as root once per pack build, without credentials.
+    /// Project-overridable; a blank script turns a global one off.
+    #[serde(default)]
+    pub provision: Option<String>,
+
+    /// Accept, for every project, that a smol machine's agent can change the
+    /// worktree's `.git` file and admin directory, without the prompt.
+    /// Global-only.
+    #[serde(default)]
+    pub accept_reduced_git_metadata_isolation: Option<bool>,
+
+    /// Variables, by the name the agent sees, that become placeholders
+    /// smolvm swaps for the real value on requests to their hosts, or that
+    /// take their value from the keychain. Global-only.
+    #[serde(default, deserialize_with = "deserialize_credentials")]
+    pub credentials: Option<BTreeMap<String, CredentialEntry>>,
+}
+
+/// One `sandbox.smolvm.credentials` entry.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(try_from = "RawCredentialEntry", into = "RawCredentialEntry")]
+pub struct CredentialEntry {
+    /// The hosts smolvm sends the real value to. Unset keeps a built-in
+    /// variable's hosts.
+    pub hosts: Option<Vec<String>>,
+    /// How the value is sent. Unset is a header placeholder.
+    pub mode: Option<CredentialMode>,
+    /// Where smolvm reads the value instead of the environment:
+    /// `from_keychain`, parsed when the config loads.
+    pub source: Option<crate::sandbox::smolvm::credentials::EnvSource>,
+}
+
+/// [`CredentialEntry`] as written in YAML.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RawCredentialEntry {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hosts: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mode: Option<CredentialMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    from_keychain: Option<String>,
+}
+
+impl TryFrom<RawCredentialEntry> for CredentialEntry {
+    type Error = String;
+
+    fn try_from(raw: RawCredentialEntry) -> Result<Self, String> {
+        use crate::sandbox::smolvm::credentials::EnvSource;
+        let source = raw
+            .from_keychain
+            .map(|spec| EnvSource::keychain(&spec))
+            .transpose()?;
+        Ok(Self {
+            hosts: raw.hosts,
+            mode: raw.mode,
+            source,
+        })
+    }
+}
+
+impl From<CredentialEntry> for RawCredentialEntry {
+    fn from(entry: CredentialEntry) -> Self {
+        use crate::sandbox::smolvm::credentials::EnvSource;
+        let from_keychain = entry.source.map(|source| match source {
+            EnvSource::Keychain(item) => item.to_string(),
+        });
+        Self {
+            hosts: entry.hosts,
+            mode: entry.mode,
+            from_keychain,
+        }
+    }
+}
+
+/// How smolvm sends a credential's real value: `header` or
+/// `{ set_header: NAME }`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(try_from = "RawCredentialMode", into = "RawCredentialMode")]
+pub enum CredentialMode {
+    /// The placeholder is swapped wherever it appears in a header.
+    Header,
+    /// The named header is set to the complete value.
+    SetHeader(String),
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(untagged)]
+enum RawCredentialMode {
+    Named(String),
+    SetHeader { set_header: String },
+}
+
+impl From<CredentialMode> for RawCredentialMode {
+    fn from(mode: CredentialMode) -> Self {
+        match mode {
+            CredentialMode::Header => Self::Named("header".into()),
+            CredentialMode::SetHeader(set_header) => Self::SetHeader { set_header },
+        }
+    }
+}
+
+impl TryFrom<RawCredentialMode> for CredentialMode {
+    type Error = String;
+
+    fn try_from(raw: RawCredentialMode) -> Result<Self, String> {
+        match raw {
+            RawCredentialMode::Named(name) => match name.as_str() {
+                "header" => Ok(Self::Header),
+                _ => Err(format!(
+                    "unknown credential mode '{name}': use header or {{ set_header: NAME }}"
+                )),
+            },
+            RawCredentialMode::SetHeader { set_header } => {
+                let valid = !set_header.is_empty()
+                    && set_header
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+                if !valid {
+                    return Err(format!("set_header needs a header name: '{set_header}'"));
+                }
+                Ok(Self::SetHeader(set_header))
+            }
+        }
+    }
+}
+
+fn deserialize_credentials<'de, D>(
+    deserializer: D,
+) -> Result<Option<BTreeMap<String, CredentialEntry>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<BTreeMap<String, CredentialEntry>>::deserialize(deserializer)?;
+    for name in value.iter().flat_map(|map| map.keys()) {
+        if !is_valid_env_name(name) {
+            return Err(serde::de::Error::custom(format!(
+                "sandbox.smolvm.credentials: '{name}' is not a valid environment variable name"
+            )));
+        }
+    }
+    Ok(value)
+}
+
+impl SmolvmConfig {
+    /// `credentials`, empty when unset.
+    pub fn credentials(&self) -> BTreeMap<String, CredentialEntry> {
+        self.credentials.clone().unwrap_or_default()
+    }
+
+    pub fn accepts_reduced_git_metadata_isolation(&self) -> bool {
+        self.accept_reduced_git_metadata_isolation.unwrap_or(false)
+    }
+
+    pub fn cpus(&self) -> Option<u32> {
+        self.cpus
+    }
+
+    pub fn provision_script(&self) -> Option<&str> {
+        self.provision.as_deref().filter(|s| !s.trim().is_empty())
+    }
+
+    /// `memory` in MiB, as smolvm's `--mem` takes it.
+    pub fn memory_mib(&self) -> Option<u64> {
+        // Validated at load, so a stored value always parses.
+        self.memory
+            .as_deref()
+            .and_then(|m| parse_memory_mib(m).ok())
+    }
+
+    /// Merge: project overrides global, per-field.
+    fn merge(global: Self, project: Self) -> Self {
+        Self {
+            cpus: project.cpus.or(global.cpus),
+            memory: project.memory.or(global.memory),
+            provision: project.provision.or(global.provision),
+            accept_reduced_git_metadata_isolation: {
+                if project.accept_reduced_git_metadata_isolation.is_some() {
+                    tracing::warn!(
+                        "sandbox.smolvm.accept_reduced_git_metadata_isolation in project config \
+                         (.workmux.yaml) is ignored -- move it to your global config \
+                         (~/.config/workmux/config.yaml)"
+                    );
+                }
+                global.accept_reduced_git_metadata_isolation
+            },
+            credentials: global_only("credentials", global.credentials, project.credentials),
+        }
+    }
+}
+
+/// A global-only `sandbox.smolvm` key: the project's value is ignored, with
+/// a warning.
+fn global_only<T>(key: &str, global: Option<T>, project: Option<T>) -> Option<T> {
+    if project.is_some() {
+        tracing::warn!(
+            "sandbox.smolvm.{key} in project config (.workmux.yaml) is ignored -- move it to \
+             your global config (~/.config/workmux/config.yaml)"
+        );
+    }
+    global
+}
+
+fn deserialize_smolvm_memory<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    if let Some(memory) = &value {
+        parse_memory_mib(memory).map_err(serde::de::Error::custom)?;
+    }
+    Ok(value)
+}
+
+/// Parse a size in Lima's format (`8GiB`, `512MiB`, `4G`, `1.5GiB`; binary
+/// units, case-insensitive) into whole MiB.
+fn parse_memory_mib(raw: &str) -> anyhow::Result<u64> {
+    let invalid = || {
+        anyhow::anyhow!(
+            "invalid sandbox.smolvm.memory {raw:?}: expected a size such as \"4GiB\" or \"512MiB\""
+        )
+    };
+    let trimmed = raw.trim();
+    let split = trimmed
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .ok_or_else(invalid)?;
+    let (number, unit) = trimmed.split_at(split);
+    let number: f64 = number.parse().map_err(|_| invalid())?;
+    let mib_per_unit = match unit.trim().to_ascii_lowercase().as_str() {
+        "m" | "mb" | "mib" => 1.0,
+        "g" | "gb" | "gib" => 1024.0,
+        "t" | "tb" | "tib" => 1024.0 * 1024.0,
+        _ => return Err(invalid()),
+    };
+    let mib = (number * mib_per_unit).floor();
+    if !mib.is_finite() || mib < 1.0 {
+        return Err(invalid());
+    }
+    Ok(mib as u64)
 }
 
 /// Host device mapping for container sandboxes.
@@ -2402,6 +2673,10 @@ pub struct SandboxConfig {
     #[serde(default)]
     pub lima: LimaConfig,
 
+    /// smolvm-specific configuration
+    #[serde(default)]
+    pub smolvm: SmolvmConfig,
+
     /// Container-specific configuration
     #[serde(default)]
     pub container: ContainerConfig,
@@ -2424,6 +2699,11 @@ impl SandboxConfig {
 
     pub fn backend(&self) -> SandboxBackend {
         self.backend.clone().unwrap_or_default()
+    }
+
+    /// Whether `backend` selects smolvm.
+    pub fn uses_smolvm(&self) -> bool {
+        self.backend() == SandboxBackend::Smolvm
     }
 
     pub fn runtime(&self) -> SandboxRuntime {
@@ -2460,11 +2740,15 @@ impl SandboxConfig {
             .unwrap_or_default()
     }
 
-    /// Get the RPC host address, using config override or runtime default.
+    /// Get the RPC host address, using config override or the backend's
+    /// default: smolvm's virtio-net gateway, or the container runtime's.
     pub fn resolved_rpc_host(&self) -> String {
         self.rpc_host
             .clone()
-            .unwrap_or_else(|| self.runtime().rpc_host_address().to_string())
+            .unwrap_or_else(|| match self.backend() {
+                SandboxBackend::Smolvm => crate::sandbox::smolvm::RPC_HOST.to_string(),
+                _ => self.runtime().rpc_host_address().to_string(),
+            })
     }
 
     pub fn toolchain(&self) -> ToolchainMode {
@@ -3085,6 +3369,9 @@ impl Config {
             .container
             .validate()
             .context("Invalid sandbox container config")?;
+        if config.sandbox.uses_smolvm() {
+            crate::sandbox::smolvm::network::validate_allowlist(&config.sandbox.network)?;
+        }
 
         Ok(config)
     }
@@ -3453,6 +3740,7 @@ impl Config {
                 self.sandbox.agent_config_dir.clone()
             },
             lima: LimaConfig::merge(self.sandbox.lima, project.sandbox.lima),
+            smolvm: SmolvmConfig::merge(self.sandbox.smolvm, project.sandbox.smolvm),
             // Security: sandbox.container.devices, group_add, oci_runtime,
             // cap_add and security_opt are global-only. devices/group_add
             // expose host hardware and can expand filesystem access via
@@ -4074,11 +4362,12 @@ mod tests {
     use super::{
         AgentColumn, AgentEnvValue, AgentIconConfig, AgentIconDetails, AllowedDomainDetails,
         AllowedDomainEntry, CLEANUP_NODE_MODULES_PLACEHOLDER, Config, ContainerConfig,
-        ContainerDevice, DEFAULT_AGENT_COLUMNS, DEFAULT_WORKTREE_COLUMNS, DashboardLayout,
-        ExtraMount, FileConfig, LayoutConfig, LimaConfig, NODE_MODULES_CLEANUP_SCRIPT,
-        NetworkConfig, NetworkPolicy, PaneConfig, SandboxConfig, SandboxRuntime, SandboxTarget,
-        SidebarEnterAction, SidebarHeight, SidebarPosition, SidebarWidth, SplitDirection,
-        ToolchainMode, WindowPlacement, WorktreeColumn, is_agent_command, validate_domain,
+        ContainerDevice, CredentialMode, DEFAULT_AGENT_COLUMNS, DEFAULT_WORKTREE_COLUMNS,
+        DashboardLayout, ExtraMount, FileConfig, LayoutConfig, LimaConfig,
+        NODE_MODULES_CLEANUP_SCRIPT, NetworkConfig, NetworkPolicy, PaneConfig, SandboxBackend,
+        SandboxConfig, SandboxRuntime, SandboxTarget, SidebarEnterAction, SidebarHeight,
+        SidebarPosition, SidebarWidth, SmolvmConfig, SplitDirection, ToolchainMode,
+        WindowPlacement, WorktreeColumn, is_agent_command, validate_domain,
         validate_group_add_entry, validate_layouts_config,
     };
     use super::{DashboardConfig, InputExitKey, RemoteConfig, RemoteIsolation};
@@ -6476,6 +6765,204 @@ container:
     }
 
     #[test]
+    fn smolvm_backend_and_resources_parse() {
+        let config: Config = serde_yaml::from_str(
+            "sandbox:\n  backend: smolvm\n  smolvm:\n    cpus: 6\n    memory: 8GiB\n",
+        )
+        .unwrap();
+        assert_eq!(config.sandbox.backend(), SandboxBackend::Smolvm);
+        assert_eq!(config.sandbox.smolvm.cpus(), Some(6));
+        assert_eq!(config.sandbox.smolvm.memory_mib(), Some(8192));
+    }
+
+    #[test]
+    fn smolvm_memory_takes_limas_format_in_mib() {
+        for (raw, mib) in [
+            ("8GiB", 8192),
+            ("512MiB", 512),
+            ("4G", 4096),
+            ("1.5GiB", 1536),
+            ("2gib", 2048),
+        ] {
+            let config: SmolvmConfig = serde_yaml::from_str(&format!("memory: {raw}\n")).unwrap();
+            assert_eq!(config.memory_mib(), Some(mib), "{raw}");
+        }
+        for bad in ["lots", "8", "0GiB", "-1GiB", "8 parsecs", "100KiB"] {
+            assert!(
+                serde_yaml::from_str::<SmolvmConfig>(&format!("memory: \"{bad}\"\n")).is_err(),
+                "{bad}"
+            );
+        }
+        assert_eq!(SmolvmConfig::default().memory_mib(), None);
+    }
+
+    #[test]
+    fn smolvm_resources_merge_project_over_global() {
+        let global: SmolvmConfig = serde_yaml::from_str("cpus: 2\nmemory: 2GiB\n").unwrap();
+        let project: SmolvmConfig = serde_yaml::from_str("cpus: 8\n").unwrap();
+        let merged = SmolvmConfig::merge(global, project);
+        assert_eq!(merged.cpus(), Some(8));
+        assert_eq!(merged.memory_mib(), Some(2048));
+    }
+
+    #[test]
+    fn smolvm_provision_is_project_overridable_and_blank_means_none() {
+        let global: Config = serde_yaml::from_str(
+            "sandbox:\n  smolvm:\n    provision: |\n      apt-get install -y tree\n",
+        )
+        .unwrap();
+        assert_eq!(
+            global.sandbox.smolvm.provision_script(),
+            Some("apt-get install -y tree\n")
+        );
+
+        let project = sandbox_cfg(|s| s.smolvm.provision = Some("echo project".into()));
+        let merged = global.clone().merge(project);
+        assert_eq!(
+            merged.sandbox.smolvm.provision_script(),
+            Some("echo project")
+        );
+
+        let fallback = global.clone().merge(Config::default());
+        assert_eq!(
+            fallback.sandbox.smolvm.provision_script(),
+            Some("apt-get install -y tree\n")
+        );
+
+        let blank = sandbox_cfg(|s| s.smolvm.provision = Some("  \n".into()));
+        let disabled = global.merge(blank);
+        assert_eq!(disabled.sandbox.smolvm.provision_script(), None);
+    }
+
+    #[test]
+    fn smolvm_rpc_host_defaults_to_the_gateway_name() {
+        let smolvm = sandbox_cfg(|sandbox| sandbox.backend = Some(SandboxBackend::Smolvm));
+        assert_eq!(smolvm.sandbox.resolved_rpc_host(), "host.smolvm.internal");
+
+        let overridden = sandbox_cfg(|sandbox| {
+            sandbox.backend = Some(SandboxBackend::Smolvm);
+            sandbox.rpc_host = Some("10.0.0.1".into());
+        });
+        assert_eq!(overridden.sandbox.resolved_rpc_host(), "10.0.0.1");
+    }
+
+    #[test]
+    fn smolvm_reduced_git_metadata_acceptance_is_global_only() {
+        let parse = |yaml: &str| -> Config { serde_yaml::from_str(yaml).unwrap() };
+        let accepting =
+            parse("sandbox:\n  smolvm:\n    accept_reduced_git_metadata_isolation: true\n");
+        assert!(
+            !Config::default()
+                .sandbox
+                .smolvm
+                .accepts_reduced_git_metadata_isolation()
+        );
+
+        let ignored = Config::default().merge(accepting.clone());
+        assert!(
+            !ignored
+                .sandbox
+                .smolvm
+                .accepts_reduced_git_metadata_isolation()
+        );
+
+        let refusing =
+            parse("sandbox:\n  smolvm:\n    accept_reduced_git_metadata_isolation: false\n");
+        let kept = accepting.merge(refusing);
+        assert!(kept.sandbox.smolvm.accepts_reduced_git_metadata_isolation());
+    }
+
+    #[test]
+    fn smolvm_credentials_parse_and_are_global_only() {
+        use crate::sandbox::smolvm::credentials::EnvSource;
+        let parse = |yaml: &str| -> Config { serde_yaml::from_str(yaml).unwrap() };
+        let listed = parse(
+            "sandbox:\n  smolvm:\n    credentials:\n      \
+             NPM_TOKEN: { hosts: [registry.npmjs.org] }\n      \
+             PLAIN: { hosts: [auth.example.com], mode: header }\n      \
+             KEYED: { hosts: [api.example.com], mode: { set_header: X-Api-Key }, from_keychain: keyed }\n      \
+             GH_TOKEN: { from_keychain: gh/me }\n",
+        );
+        let credentials = listed.sandbox.smolvm.credentials();
+        assert_eq!(credentials.len(), 4);
+        assert_eq!(
+            credentials["NPM_TOKEN"].hosts.as_deref(),
+            Some(&["registry.npmjs.org".to_string()][..])
+        );
+        assert_eq!(credentials["NPM_TOKEN"].mode, None);
+        assert_eq!(credentials["PLAIN"].mode, Some(CredentialMode::Header));
+        assert_eq!(
+            credentials["KEYED"].mode,
+            Some(CredentialMode::SetHeader("X-Api-Key".into()))
+        );
+        assert_eq!(
+            credentials["KEYED"].source,
+            Some(EnvSource::keychain("keyed").unwrap())
+        );
+        assert_eq!(
+            credentials["GH_TOKEN"].source,
+            Some(EnvSource::keychain("gh/me").unwrap())
+        );
+        assert_eq!(credentials["GH_TOKEN"].hosts, None);
+        // The frozen config a pane's supervisor reads round-trips.
+        let frozen: Config =
+            serde_yaml::from_str(&serde_yaml::to_string(&listed).unwrap()).unwrap();
+        assert_eq!(frozen.sandbox.smolvm.credentials(), credentials);
+
+        let ignored = Config::default().merge(listed.clone());
+        assert!(ignored.sandbox.smolvm.credentials().is_empty());
+        let kept = listed.merge(parse(
+            "sandbox:\n  smolvm:\n    credentials:\n      OTHER: { hosts: [x.com] }\n",
+        ));
+        assert_eq!(kept.sandbox.smolvm.credentials().len(), 4);
+    }
+
+    #[test]
+    fn smolvm_credentials_reject_malformed_entries_when_parsed() {
+        let cases = [
+            ("1BAD: { hosts: [x.com] }", "1BAD"),
+            // A credential's only source is from_keychain.
+            ("TOKEN: { hosts: [x.com], from_file: /run/t }", "from_file"),
+            ("TOKEN: { from_keychain: \"\" }", "service"),
+            ("TOKEN: { hosts: [x.com], mode: sideways }", "mode"),
+            ("TOKEN: { hostz: [x.com] }", "hostz"),
+        ];
+        for (entry, expected) in cases {
+            let yaml = format!("sandbox:\n  smolvm:\n    credentials:\n      {entry}\n");
+            let error = serde_yaml::from_str::<Config>(&yaml)
+                .err()
+                .unwrap_or_else(|| panic!("{entry} parsed"))
+                .to_string();
+            assert!(error.contains(expected), "{entry}: {error}");
+        }
+    }
+
+    #[test]
+    fn smolvm_allowed_domains_smolvm_cannot_take_are_errors_when_the_config_loads() {
+        // smolvm's --allow-host-pattern takes a DNS hostname or *.domain:
+        // letters, digits and hyphens.
+        let load = |domain: &str, backend: &str| {
+            let global: Config = serde_yaml::from_str(&format!(
+                "sandbox:\n  backend: {backend}\n  network:\n    policy: deny\n    \
+                 allowed_domains: ['{domain}']\n"
+            ))
+            .unwrap();
+            Config::merge_and_apply_defaults(
+                global,
+                Config::default(),
+                None,
+                std::path::Path::new(""),
+            )
+            .map_err(|error| format!("{error:#}"))
+        };
+        let error = load("foo_bar.example.com", "smolvm").unwrap_err();
+        assert!(error.contains("foo_bar.example.com"), "{error}");
+        assert!(error.contains("allowed_domains"), "{error}");
+        load("*.foo-bar.example.com", "smolvm").unwrap();
+        load("foo_bar.example.com", "container").unwrap();
+    }
+
+    #[test]
     fn lima_reduced_git_metadata_acceptance_defaults_to_false() {
         let default = LimaConfig::default();
         assert!(!default.accepts_reduced_git_metadata_isolation());
@@ -7167,6 +7654,23 @@ sandbox:
         assert!(SandboxRuntime::Docker.needs_deny_mode_caps());
         assert!(SandboxRuntime::Podman.needs_deny_mode_caps());
         assert!(!SandboxRuntime::AppleContainer.needs_deny_mode_caps());
+    }
+
+    #[test]
+    fn runtime_save_args() {
+        let out = std::path::Path::new("/state/img.tar");
+        assert_eq!(
+            SandboxRuntime::Docker.save_args("img:latest", out),
+            vec!["save", "-o", "/state/img.tar", "img:latest"]
+        );
+        assert_eq!(
+            SandboxRuntime::Podman.save_args("img:latest", out),
+            vec!["save", "-o", "/state/img.tar", "img:latest"]
+        );
+        assert_eq!(
+            SandboxRuntime::AppleContainer.save_args("img:latest", out),
+            vec!["image", "save", "-o", "/state/img.tar", "img:latest"]
+        );
     }
 
     #[test]

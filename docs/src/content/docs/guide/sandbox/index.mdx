@@ -64,18 +64,18 @@ Outbound network access can be restricted to only approved domains using [networ
 
 ## Choosing a backend
 
-workmux supports two sandboxing backends:
+workmux supports three sandboxing backends:
 
-|                      | Container (Docker/Podman/Apple Container)                                                  | Lima VM                                                                        |
-| -------------------- | ------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------ |
-| **Isolation**        | Process-level (namespaces) or VM-level (Apple Container)                                   | Machine-level (virtual machine)                                                |
-| **Persistence**      | Ephemeral (new container per session)                                                      | Persistent (stateful VMs)                                                      |
-| **Toolchain**        | Custom Dockerfile or [host commands](/guide/sandbox/features/#host-command-proxying)       | Built-in [Nix & Devbox](/guide/sandbox/lima/#nix-and-devbox-toolchain) support |
-| **Credential model** | Shared with host (see [credentials](/guide/sandbox/features/#credentials))                 | Shared with host (see [credentials](/guide/sandbox/features/#credentials))     |
-| **Network**          | Optional [restrictions](/guide/sandbox/container/#network-restrictions) (domain allowlist) | Unrestricted                                                                   |
-| **Platform**         | macOS, Linux (Apple Container: macOS only)                                                 | macOS, Linux                                                                   |
+|                      | Container (Docker/Podman/Apple Container)                                                  | Lima VM                                                                        | smolvm                                                                                              |
+| -------------------- | ------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------- |
+| **Isolation**        | Process-level (namespaces) or VM-level (Apple Container)                                   | Machine-level (virtual machine)                                                | Machine-level (microVM per pane)                                                                    |
+| **Persistence**      | Ephemeral (new container per session)                                                      | Persistent (stateful VMs)                                                      | Ephemeral (new machine per pane, from a per-project [pack](/guide/sandbox/smolvm/#packs))           |
+| **Toolchain**        | Custom Dockerfile or [host commands](/guide/sandbox/features/#host-command-proxying)       | Built-in [Nix & Devbox](/guide/sandbox/lima/#nix-and-devbox-toolchain) support | Image, `provision` and [Nix & Devbox](/guide/sandbox/smolvm/#nix-and-devbox-toolchains) in the pack |
+| **Credential model** | Shared with host (see [credentials](/guide/sandbox/features/#credentials))                 | Shared with host (see [credentials](/guide/sandbox/features/#credentials))     | Config directories shared; tokens passed as [placeholders](/guide/sandbox/smolvm/#credentials)      |
+| **Network**          | Optional [restrictions](/guide/sandbox/container/#network-restrictions) (domain allowlist) | Unrestricted                                                                   | Optional [restrictions](/guide/sandbox/smolvm/#network) (domain allowlist, every port)              |
+| **Platform**         | macOS, Linux (Apple Container: macOS only)                                                 | macOS, Linux                                                                   | macOS on Apple silicon, Linux with KVM                                                              |
 
-Container is a good default: it's simple to set up and ephemeral, so no state accumulates between sessions. Choose Lima if you want persistent VMs with built-in Nix/Devbox toolchain support.
+Container is a good default: it's simple to set up and ephemeral, so no state accumulates between sessions. Choose Lima if you want persistent VMs with built-in Nix/Devbox toolchain support. Choose smolvm if you want a VM per pane that starts in under a second, with API keys and tokens kept outside the VM.
 
 To run agents on another machine instead, see [remote servers](/guide/remote/): individual agents run on an SSH-reachable Linux server, directly or in Docker, while the rest stay local.
 

@@ -235,7 +235,7 @@ struct ProxyContext {
 ///
 /// Supports exact match and wildcard prefix (`*.example.com` matches
 /// `foo.example.com` but not `example.com` itself).
-fn domain_matches(domain: &str, pattern: &str) -> bool {
+pub(crate) fn domain_matches(domain: &str, pattern: &str) -> bool {
     let domain = domain.to_ascii_lowercase();
     let pattern = pattern.to_ascii_lowercase();
     if let Some(suffix) = pattern.strip_prefix('*') {
@@ -260,13 +260,13 @@ fn matching_rule<'a>(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AddressClass {
+pub(crate) enum AddressClass {
     Public,
     PrivateRoutable,
     AlwaysBlocked,
 }
 
-fn classify_ip(addr: &IpAddr) -> AddressClass {
+pub(crate) fn classify_ip(addr: &IpAddr) -> AddressClass {
     match addr {
         IpAddr::V4(ip) => {
             if ip.is_loopback()

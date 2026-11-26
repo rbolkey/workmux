@@ -1,6 +1,7 @@
 //! Sandbox backends for running agents in isolated environments.
 
 mod accept;
+pub(crate) mod acknowledgement;
 pub(crate) mod clipboard;
 mod constant_time;
 mod container;
@@ -13,6 +14,7 @@ pub(crate) mod notice;
 pub(crate) mod pi;
 pub mod rpc;
 pub(crate) mod shims;
+pub mod smolvm;
 pub(crate) mod toolchain;
 
 pub use container::CLAUDE_ONBOARDING_JSON;
@@ -20,6 +22,7 @@ pub use container::DEFAULT_IMAGE_REGISTRY;
 pub use container::DOCKERFILE_BASE;
 pub use container::KNOWN_AGENTS;
 pub use container::SandboxPaths;
+pub(crate) use container::agent_config_target;
 pub(crate) use container::build_docker_run_args;
 pub use container::build_image;
 pub use container::dockerfile_for_agent;
@@ -32,6 +35,7 @@ pub(crate) use container::validate_git_metadata_boundary;
 pub use container::wrap_for_container;
 pub use lima::ensure_vm_running as ensure_lima_vm;
 pub use lima::wrap_for_lima;
+pub use smolvm::wrap_for_smolvm;
 pub(crate) fn proxy_env_vars(
     rpc_host: &str,
     proxy_port: u16,

@@ -181,6 +181,18 @@ pub fn setup_environment(
         agent,
     )?;
 
+    // Build the smolvm project pack, if missing or stale, before the window
+    // opens, so its progress and errors show in the terminal.
+    pre_build_smolvm_packs(
+        mux,
+        config,
+        &all_resolved_panes,
+        effective_working_dir,
+        worktree_path,
+        options,
+        agent,
+    )?;
+
     let pane_setup_options = PaneSetupOptions {
         run_commands: options.run_pane_commands,
         prompt_file_path: options.prompt_file_path.as_deref(),
@@ -400,37 +412,80 @@ fn pre_boot_lima_vm(
 
     let shell = mux.get_default_shell()?;
 
-    // Check if any pane will actually need Lima wrapping by resolving
-    // commands the same way setup_panes does (respects run_commands flag).
-    let any_pane_needs_lima = panes.iter().any(|pane_config| {
-        let resolved = crate::multiplexer::util::resolve_pane_command_with_config(
-            pane_config.command.as_deref(),
-            options.run_pane_commands,
-            options.prompt_file_path.as_deref(),
-            working_dir,
-            config,
-            agent,
-            &shell,
-        );
-        if resolved.is_none() {
-            return false;
-        }
-        let is_agent_pane = resolved
-            .as_ref()
-            .is_some_and(|resolved| resolved.selected_agent.is_some());
-        match config.sandbox.target() {
-            crate::config::SandboxTarget::All => true,
-            crate::config::SandboxTarget::Agent => is_agent_pane,
-        }
-    });
-
-    if !any_pane_needs_lima {
+    // Check if any pane will actually need Lima wrapping.
+    if sandboxed_panes(config, panes, working_dir, options, agent, &shell).is_empty() {
         return Ok(None);
     }
 
     info!("pre-booting Lima VM before window creation");
     let vm_name = crate::sandbox::ensure_lima_vm(config, worktree_path)?;
     Ok(Some(vm_name))
+}
+
+/// The panes that will run sandboxed, resolved the same way setup_panes
+/// resolves them (respects the run_commands flag).
+fn sandboxed_panes(
+    config: &config::Config,
+    panes: &[config::PaneConfig],
+    working_dir: &Path,
+    options: &super::types::SetupOptions,
+    agent: Option<&str>,
+    shell: &str,
+) -> Vec<crate::multiplexer::util::ResolvedCommand> {
+    panes
+        .iter()
+        .filter_map(|pane_config| {
+            crate::multiplexer::util::resolve_pane_command_with_config(
+                pane_config.command.as_deref(),
+                options.run_pane_commands,
+                options.prompt_file_path.as_deref(),
+                working_dir,
+                config,
+                agent,
+                shell,
+            )
+        })
+        .filter(|resolved| match config.sandbox.target() {
+            crate::config::SandboxTarget::All => true,
+            crate::config::SandboxTarget::Agent => resolved.selected_agent.is_some(),
+        })
+        .collect()
+}
+
+/// Under the smolvm backend, build the packs the sandboxed panes need
+/// (one per agent image) before the window opens.
+#[allow(clippy::too_many_arguments)]
+fn pre_build_smolvm_packs(
+    mux: &dyn crate::multiplexer::Multiplexer,
+    config: &config::Config,
+    panes: &[config::PaneConfig],
+    working_dir: &Path,
+    worktree_path: &Path,
+    options: &super::types::SetupOptions,
+    agent: Option<&str>,
+) -> Result<()> {
+    if !config.sandbox.is_enabled() || !config.sandbox.uses_smolvm() {
+        return Ok(());
+    }
+    let shell = mux.get_default_shell()?;
+    let mut agents: Vec<&'static str> = Vec::new();
+    for resolved in sandboxed_panes(config, panes, working_dir, options, agent, &shell) {
+        // The agent the pane's wrap names to the supervisor.
+        let pane_agent = crate::sandbox::smolvm::machine_agent(
+            config,
+            crate::sandbox::smolvm::pane_agent(&resolved, config, agent)
+                .as_ref()
+                .map(|a| a.kind()),
+        );
+        if !agents.contains(&pane_agent) {
+            agents.push(pane_agent);
+        }
+    }
+    if agents.is_empty() {
+        return Ok(());
+    }
+    info!(?agents, "building smolvm packs before window creation");
+    crate::sandbox::smolvm::prepare_packs(config, worktree_path, &agents)
 }
 
 fn resolve_effective_agent(config: &config::Config, cli_agent: Option<&str>) -> Option<String> {
@@ -1081,5 +1136,25 @@ mod tests {
         // Verify content
         let content = std::fs::read_to_string(&path).unwrap();
         assert_eq!(content, "test prompt");
+    }
+
+    #[test]
+    fn sandboxed_panes_follow_sandbox_target() {
+        let panes = vec![
+            prompt_pane("<agent>"),
+            prompt_pane("nvim"),
+            config::PaneConfig::default(),
+        ];
+        let mut config = make_config_with_agent(Some("claude"));
+        let options = make_options_with_prompt(true);
+        let run = |config: &config::Config| {
+            super::sandboxed_panes(config, &panes, Path::new("/tmp"), &options, None, "sh")
+                .iter()
+                .map(|r| r.selected_agent.is_some())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(run(&config), vec![true]);
+        config.sandbox.target = Some(config::SandboxTarget::All);
+        assert_eq!(run(&config), vec![true, false]);
     }
 }

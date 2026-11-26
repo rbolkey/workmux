@@ -373,7 +373,7 @@ fn collect_worktree_git_pointers(worktree: &Path) -> Result<Vec<PathBuf>> {
     Ok(pointers)
 }
 
-fn config_include_paths(config: &Path) -> Result<Vec<PathBuf>> {
+pub(super) fn config_include_paths(config: &Path) -> Result<Vec<PathBuf>> {
     fn visit(
         config: &Path,
         visited: &mut std::collections::HashSet<PathBuf>,
@@ -502,7 +502,7 @@ fn ensure_policy_file(path: &Path) -> Result<()> {
 use std::os::unix::fs::MetadataExt;
 
 /// Reject hook layouts whose executable policy can be changed outside the protected directory.
-fn validate_git_hooks(common_dir: &Path) -> Result<()> {
+pub(super) fn validate_git_hooks(common_dir: &Path) -> Result<()> {
     let hooks = common_dir.join("hooks");
     if hooks.exists() {
         let metadata = std::fs::symlink_metadata(&hooks)?;
@@ -577,7 +577,7 @@ fn protect_writable_git_root(
     Ok(())
 }
 
-fn module_git_roots(common_dir: &Path) -> Result<Vec<PathBuf>> {
+pub(super) fn module_git_roots(common_dir: &Path) -> Result<Vec<PathBuf>> {
     fn visit(path: &Path, roots: &mut Vec<PathBuf>) -> Result<()> {
         if !path.is_dir() {
             return Ok(());
@@ -847,7 +847,7 @@ pub(crate) fn push_agent_home(
 
 /// Where an agent's config directory is mounted in the container, or `None`
 /// for agents whose config directory workmux doesn't mount.
-fn agent_config_target(agent: &str) -> Option<&'static str> {
+pub(crate) fn agent_config_target(agent: &str) -> Option<&'static str> {
     match agent {
         "claude" => Some("/tmp/.claude"),
         "copilot" => Some("/tmp/.copilot"),
@@ -1309,15 +1309,28 @@ pub fn wrap_for_container(
     worktree_root: &Path,
     pane_cwd: &Path,
 ) -> Result<String> {
+    supervisor_line(command, supervisor, &[], worktree_root, pane_cwd)
+}
+
+/// The supervisor command line [`wrap_for_container`] builds, with
+/// `options` (flag and value) after the supervisor's words, for backends
+/// that pass it more.
+pub(super) fn supervisor_line(
+    command: &str,
+    supervisor: Option<&str>,
+    options: &[(&str, &str)],
+    worktree_root: &Path,
+    pane_cwd: &Path,
+) -> Result<String> {
     // Strip the leading history-prevention space before passing the command to
     // the sandbox supervisor.
     let command = command.strip_prefix(' ').unwrap_or(command);
 
-    let mut parts = format!(
-        "{} '{}'",
-        supervisor.unwrap_or(DEFAULT_SUPERVISOR),
-        shell_escape(&pane_cwd.to_string_lossy()),
-    );
+    let mut parts = supervisor.unwrap_or(DEFAULT_SUPERVISOR).to_string();
+    for (flag, value) in options {
+        parts.push_str(&format!(" {flag} '{}'", shell_escape(value)));
+    }
+    parts.push_str(&format!(" '{}'", shell_escape(&pane_cwd.to_string_lossy())));
 
     // Only add --worktree-root when it differs from pane_cwd
     if worktree_root != pane_cwd {

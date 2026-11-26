@@ -805,6 +805,17 @@ pub trait Multiplexer: Send + Sync {
                                     working_dir,
                                 )
                             }
+                            crate::config::SandboxBackend::Smolvm => {
+                                crate::sandbox::wrap_for_smolvm(
+                                    &command_to_wrap,
+                                    &resolved,
+                                    config,
+                                    task_agent,
+                                    options.sandbox_supervisor,
+                                    wt_root,
+                                    working_dir,
+                                )
+                            }
                             crate::config::SandboxBackend::Lima => {
                                 let vm_name = options.lima_vm_name.ok_or_else(|| {
                                     anyhow!(
